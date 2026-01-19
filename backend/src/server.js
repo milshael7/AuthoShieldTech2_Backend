@@ -67,8 +67,6 @@ app.use('/api/company', require('./routes/company.routes'));
 app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
-
-// ✅ NEW: Live (Kraken private) endpoints (keys/status/balances/dry-run orders)
 app.use('/api/live', require('./routes/live.routes'));
 
 // ✅ Paper status endpoint
@@ -80,8 +78,19 @@ app.get('/api/paper/status', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
-// Last known prices
-let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
+// ✅ Track last known prices for ALL 10 symbols (for hello snapshot)
+let last = {
+  BTCUSDT: 65000,
+  ETHUSDT: 3500,
+  SOLUSDT: 150,
+  XRPUSDT: 1,
+  ADAUSDT: 0.5,
+  DOTUSDT: 7,
+  LINKUSDT: 15,
+  LTCUSDT: 80,
+  BCHUSDT: 250,
+  XLMUSDT: 0.12,
+};
 
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
@@ -103,8 +112,13 @@ paperTrader.start();
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
+    // tick: { type:'tick', symbol:'BTCUSDT'|'ETHUSDT'|..., price, ts }
     last[tick.symbol] = tick.price;
+
+    // feed paper trader
     paperTrader.tick(tick.symbol, tick.price, tick.ts);
+
+    // broadcast to frontend
     broadcast(tick);
   }
 });
