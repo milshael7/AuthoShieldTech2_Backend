@@ -10,10 +10,7 @@ const { WebSocketServer } = require('ws');
 const { ensureDb } = require('./lib/db');
 const users = require('./users/user.service');
 
-// ✅ Kraken live feed
 const { startKrakenFeed } = require('./services/krakenFeed');
-
-// ✅ Paper trader
 const paperTrader = require('./services/paperTrader');
 
 function requireEnv(name){
@@ -29,7 +26,7 @@ users.ensureAdminFromEnv();
 
 const app = express();
 
-// --- CORS allowlist (set CORS_ORIGINS="https://a.com,https://b.com") ---
+// --- CORS allowlist ---
 const allowlist = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -49,7 +46,6 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-// --- Rate limit auth endpoints ---
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.AUTH_RATELIMIT_MAX || 30),
@@ -69,16 +65,15 @@ app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
 
-// ✅ Paper status endpoint (frontend reads this)
+// ✅ Paper status endpoint
 app.get('/api/paper/status', (req, res) => {
   res.json(paperTrader.snapshot());
 });
 
-// --- WebSocket server: frontend connects here ---
+// --- WebSocket server for frontend chart ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
-// Keep last known prices
 let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
@@ -96,19 +91,18 @@ wss.on('connection', (ws) => {
 
 // ✅ Start paper trader
 paperTrader.start();
+// If you ever want ETH paper learning instead, set env: PAPER_SYMBOL=ETHUSDT
 
 // ✅ Start Kraken feed and broadcast ticks + feed paper trader
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
-    // tick: {type:'tick', symbol:'BTCUSDT', price, ts}
+    // tick: {type:'tick', symbol:'BTCUSDT'|'ETHUSDT', price, ts}
     last[tick.symbol] = tick.price;
-
-    // send to frontend
     broadcast(tick);
 
-    // ✅ feed into paper trader learning + decisions
-    paperTrader.tick(tick.symbol, tick.price, tick.ts);
+    // Feed the paper trader (only trades PAPER_SYMBOL)
+    paperTrader.tick(tick.symbol, tick.price);
   }
 });
 
