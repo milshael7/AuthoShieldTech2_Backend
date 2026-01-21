@@ -1,9 +1,11 @@
 // backend/src/services/paperTrader.js
 // Paper trading engine + learning stats + REALISTIC wallet accounting + WIN/LOSS totals + persistence
-// - FIXED: cash is reserved on entry (so wallet actually drops on BUY)
-// - FIXED: equity includes unrealized PnL when a position is open
-// - FIXED: prevents cross-symbol exits (no random huge jumps)
-// - FIXED: persistence path safe for Render Disk (/var/data) or /tmp fallback
+// - cash is reserved on entry (wallet drops on BUY)
+// - equity includes unrealized PnL when a position is open
+// - prevents cross-symbol exits (no random huge jumps)
+// - persistence safe for Render Disk (/var/data) or /tmp fallback
+// - adds strategy profiles: SCALP (quick) vs LONG (conviction)
+// - adds time-based expiry (shows countdown + can auto-exit on expiry)
 
 const fs = require('fs');
 const path = require('path');
@@ -12,23 +14,39 @@ const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
 
 const RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.01);
-const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
-const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
 // realism knobs
-const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);      // per side
-const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);     // basis points
-const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);         // basis points
-const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000); // min gap between entries
+const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
+const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
+const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
+const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
 
-// safety/limits
+// limits
 const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
-const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 25); // ✅ prevents tiny trades where fees dominate
+const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 25);
 const MAX_TRADES_PER_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-// persistence file
+// Strategy profiles (you can tweak later with env vars if you want)
+const SCALP = {
+  name: "SCALP",
+  // quick trades: tighter TP/SL, forced expiry
+  TP: Number(process.env.PAPER_SCALP_TP_PCT || 0.0025),   // 0.25%
+  SL: Number(process.env.PAPER_SCALP_SL_PCT || 0.0020),   // 0.20%
+  HOLD_MS: Number(process.env.PAPER_SCALP_HOLD_MS || 45000), // 45s
+  MIN_CONF: Number(process.env.PAPER_SCALP_MIN_CONF || 0.62),
+};
+
+const LONG = {
+  name: "LONG",
+  // longer trades: wider TP/SL, longer expiry
+  TP: Number(process.env.PAPER_LONG_TP_PCT || 0.010),     // 1.0%
+  SL: Number(process.env.PAPER_LONG_SL_PCT || 0.006),     // 0.60%
+  HOLD_MS: Number(process.env.PAPER_LONG_HOLD_MS || 45 * 60 * 1000), // 45m
+  MIN_CONF: Number(process.env.PAPER_LONG_MIN_CONF || 0.80),
+};
+
 const STATE_FILE =
   (process.env.PAPER_STATE_PATH && String(process.env.PAPER_STATE_PATH).trim()) ||
   path.join('/tmp', 'paper_state.json');
@@ -61,17 +79,16 @@ function defaultState() {
   return {
     running: true,
 
-    // ✅ wallet model
     startBalance: START_BAL,
-    cashBalance: START_BAL, // available cash
-    equity: START_BAL,      // cash + (open position marked-to-market)
-    pnl: 0,                 // realized net
+    cashBalance: START_BAL,
+    equity: START_BAL,
+    pnl: 0,
 
     realized: {
       wins: 0,
       losses: 0,
       grossProfit: 0,
-      grossLoss: 0, // negative
+      grossLoss: 0,
       net: 0
     },
 
@@ -83,8 +100,8 @@ function defaultState() {
 
     trades: [],
 
-    // position reserves cash at entryNotionalUsd + entryCosts
-    position: null, // {symbol, side:'LONG', qty, entry, entryTs, entryNotionalUsd, entryCosts}
+    // only ONE position for safety (keeps behavior "one after the other")
+    position: null, // {symbol, strategy, qty, entry, entryTs, expiresAt, holdMs, entryNotionalUsd, entryCosts}
 
     lastPriceBySymbol: {},
 
@@ -110,8 +127,6 @@ function defaultState() {
       START_BAL,
       WARMUP_TICKS,
       RISK_PCT,
-      TAKE_PROFIT_PCT,
-      STOP_LOSS_PCT,
       MIN_EDGE,
       FEE_RATE,
       SLIPPAGE_BP,
@@ -121,7 +136,9 @@ function defaultState() {
       MAX_USD_PER_TRADE,
       MAX_TRADES_PER_DAY,
       MAX_DRAWDOWN_PCT,
-      STATE_FILE
+      STATE_FILE,
+      SCALP,
+      LONG
     },
 
     buf: { BTCUSDT: [], ETHUSDT: [], SOLUSDT: [] }
@@ -130,9 +147,8 @@ function defaultState() {
 
 let state = defaultState();
 
-// ---- persistence (debounced) ----
+// ---- persistence ----
 let saveTimer = null;
-
 function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
@@ -152,9 +168,7 @@ function saveNow() {
     const tmp = STATE_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(safe, null, 2));
     fs.renameSync(tmp, STATE_FILE);
-  } catch {
-    // never crash due to disk
-  }
+  } catch {}
 }
 
 function loadNow() {
@@ -177,7 +191,6 @@ function loadNow() {
       buf: { ...base.buf, ...(parsed.buf || {}) }
     };
 
-    // new fields fallback
     if (!Number.isFinite(Number(state.cashBalance))) state.cashBalance = state.balance ?? base.cashBalance;
     if (!Number.isFinite(Number(state.equity))) state.equity = state.cashBalance;
     if (!Number.isFinite(Number(state.startBalance))) state.startBalance = base.startBalance;
@@ -266,7 +279,6 @@ function checkDaily(ts) {
 }
 
 function checkDrawdown() {
-  // use startBalance baseline for now
   const peak = state.startBalance;
   const dd = (peak - state.equity) / peak;
   if (dd >= MAX_DRAWDOWN_PCT) {
@@ -279,12 +291,23 @@ function computeUnrealized(symbol, price) {
   const pos = state.position;
   if (!pos) return 0;
   if (pos.symbol !== symbol) return 0;
-  return (price - pos.entry) * pos.qty; // gross unrealized
+  return (price - pos.entry) * pos.qty;
 }
 
 function updateEquity(symbol, price) {
   const unreal = computeUnrealized(symbol, price);
   state.equity = state.cashBalance + unreal;
+}
+
+// ---- strategy selection ----
+function pickStrategy({ conf, edge, volNorm }) {
+  // LONG only when confidence is high and trend is strong and not too noisy
+  const strongTrend = Math.abs(edge) >= (MIN_EDGE * 2);
+  const notCrazyNoisy = volNorm <= 0.85;
+
+  if (conf >= LONG.MIN_CONF && strongTrend && notCrazyNoisy) return LONG;
+  if (conf >= SCALP.MIN_CONF) return SCALP;
+  return null;
 }
 
 // ---- trading logic ----
@@ -302,8 +325,8 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  if (state.position) { state.learnStats.decision = "WAIT"; return; }
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) { state.learnStats.decision = "WAIT"; return; }
+  if (state.position) { state.learnStats.decision = "WAIT"; state.learnStats.lastReason = "holding_position"; return; }
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) { state.learnStats.decision = "WAIT"; state.learnStats.lastReason = "warming_up"; return; }
 
   if (Date.now() - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) {
     state.learnStats.decision = "WAIT";
@@ -317,23 +340,23 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  if (conf < 0.55) {
-    state.learnStats.decision = "WAIT";
-    state.learnStats.lastReason = "confidence_low";
-    return;
-  }
-
   if (Math.abs(edge) < MIN_EDGE) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "trend_below_threshold";
     return;
   }
 
-  // ✅ Notional sizing (uses cashBalance, not equity)
+  const strat = pickStrategy({ conf, edge, volNorm: vol });
+  if (!strat) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "confidence_low";
+    return;
+  }
+
+  // Notional sizing
   const desiredUsd = Math.min(state.cashBalance * RISK_PCT * 10, MAX_USD_PER_TRADE);
   let usdNotional = Math.max(MIN_USD_PER_TRADE, desiredUsd);
 
-  // Can't spend more than we have
   usdNotional = Math.min(usdNotional, Math.max(0, state.cashBalance - 1));
   if (usdNotional < MIN_USD_PER_TRADE) {
     state.learnStats.decision = "WAIT";
@@ -343,7 +366,6 @@ function maybeEnter(symbol, price, ts) {
 
   const qty = usdNotional / price;
 
-  // Apply entry costs and reserve cash
   const entryCosts = applyEntryCosts(usdNotional);
   const totalReserve = usdNotional + entryCosts;
 
@@ -355,8 +377,17 @@ function maybeEnter(symbol, price, ts) {
 
   state.cashBalance -= totalReserve;
 
+  const holdMs = strat.HOLD_MS;
+  const expiresAt = ts + holdMs;
+
   state.position = {
     symbol,
+    strategy: strat.name,
+    tpPct: strat.TP,
+    slPct: strat.SL,
+    holdMs,
+    expiresAt,
+
     side: "LONG",
     qty,
     entry: price,
@@ -369,10 +400,13 @@ function maybeEnter(symbol, price, ts) {
     time: ts,
     symbol,
     type: "BUY",
+    strategy: strat.name,
     price,
     qty,
     usd: usdNotional,
     cost: entryCosts,
+    expiresAt,
+    holdMs,
     note: "paper_entry"
   });
 
@@ -380,7 +414,7 @@ function maybeEnter(symbol, price, ts) {
   state.limits.tradesToday += 1;
 
   state.learnStats.decision = "BUY";
-  state.learnStats.lastReason = "entered_long";
+  state.learnStats.lastReason = `entered_${strat.name.toLowerCase()}`;
 
   updateEquity(symbol, price);
 }
@@ -388,27 +422,24 @@ function maybeEnter(symbol, price, ts) {
 function maybeExit(symbol, price, ts) {
   const pos = state.position;
   if (!pos) return;
-  if (pos.symbol !== symbol) return; // ✅ prevents cross-symbol exits
+  if (pos.symbol !== symbol) return;
 
   const entry = pos.entry;
   const change = (price - entry) / entry;
 
-  if (change >= TAKE_PROFIT_PCT || change <= -STOP_LOSS_PCT) {
-    const exitNotionalUsd = pos.qty * price;
+  const tpHit = change >= (pos.tpPct ?? SCALP.TP);
+  const slHit = change <= -(pos.slPct ?? SCALP.SL);
+  const timeUp = Number.isFinite(pos.expiresAt) && ts >= pos.expiresAt;
 
-    // gross profit in USD
+  if (tpHit || slHit || timeUp) {
+    const exitNotionalUsd = pos.qty * price;
     const gross = (price - entry) * pos.qty;
 
-    // exit fee charged on exit notional
     const exitFee = applyExitFee(exitNotionalUsd);
-
-    // net = gross - entryCosts - exitFee
     const net = gross - (pos.entryCosts || 0) - exitFee;
 
-    // ✅ release reserved principal back to cash
+    // release principal + pnl into cash
     state.cashBalance += pos.entryNotionalUsd;
-
-    // ✅ then add net PnL (profit/loss already includes all costs)
     state.cashBalance += net;
 
     state.realized.net += net;
@@ -419,39 +450,40 @@ function maybeExit(symbol, price, ts) {
       state.realized.grossProfit += net;
     } else {
       state.realized.losses += 1;
-      state.realized.grossLoss += net; // negative
+      state.realized.grossLoss += net;
     }
+
+    const holdMs = Math.max(0, ts - (pos.entryTs || ts));
 
     state.trades.push({
       time: ts,
       symbol: pos.symbol,
       type: "SELL",
+      strategy: pos.strategy || "—",
       price,
       qty: pos.qty,
       usd: exitNotionalUsd,
       profit: net,
       gross,
       fees: exitFee,
-      note: change >= TAKE_PROFIT_PCT ? "take_profit" : "stop_loss"
+      holdMs,
+      exitReason: tpHit ? "take_profit" : (slHit ? "stop_loss" : "expiry"),
+      note: tpHit ? "take_profit" : (slHit ? "stop_loss" : "expiry")
     });
 
     state.position = null;
-
-    // equity now equals cash (no open position)
     state.equity = state.cashBalance;
 
     checkDrawdown();
 
     state.learnStats.decision = "SELL";
-    state.learnStats.lastReason = change >= TAKE_PROFIT_PCT ? "tp_hit" : "sl_hit";
+    state.learnStats.lastReason = tpHit ? "tp_hit" : (slHit ? "sl_hit" : "time_expired");
   } else {
-    // keep equity updated while holding
     updateEquity(symbol, price);
     state.learnStats.decision = "WAIT";
   }
 }
 
-// supports tick(price) or tick(symbol, price, ts)
 function tick(a, b, c) {
   if (!state.running) return;
 
@@ -476,7 +508,7 @@ function tick(a, b, c) {
 
   pushBuf(symbol, price);
 
-  // exit before enter (same symbol only)
+  // exit before enter
   maybeExit(symbol, price, ts);
   maybeEnter(symbol, price, ts);
 
@@ -501,19 +533,29 @@ function snapshot() {
   const lastPx = sym ? state.lastPriceBySymbol[sym] : null;
   const unreal = (sym && lastPx && state.position) ? computeUnrealized(sym, Number(lastPx)) : 0;
 
+  const pos = state.position;
+  const now = Date.now();
+  const ageMs = pos ? Math.max(0, now - (pos.entryTs || now)) : 0;
+  const remainingMs = pos && Number.isFinite(pos.expiresAt) ? Math.max(0, pos.expiresAt - now) : null;
+
   return {
     running: state.running,
 
-    // ✅ what the UI should show
-    cashBalance: state.cashBalance,  // wallet you can actually spend from
-    equity: state.equity,            // wallet + open position marked-to-market
+    cashBalance: state.cashBalance,
+    equity: state.equity,
     pnl: state.pnl,
 
     realized: state.realized,
     costs: state.costs,
 
     trades: state.trades.slice(-240),
-    position: state.position,
+
+    position: pos ? {
+      ...pos,
+      ageMs,
+      remainingMs
+    } : null,
+
     unrealizedPnL: unreal,
 
     lastPriceBySymbol: state.lastPriceBySymbol,
