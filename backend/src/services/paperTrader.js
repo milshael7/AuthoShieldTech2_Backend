@@ -1,47 +1,50 @@
 // backend/src/services/paperTrader.js
-// Paper trading engine with 3-wallet model + percent sizing + overflow + storehouse top-up
-// Also includes realistic costs, win/loss totals, persistence, and cross-symbol exit fix.
+// Paper trading engine with REAL TIME wallet flow rules:
+// - Trading wallet starts funded, storehouse starts 0
+// - Trading wallet has a CAP; overflow goes to STOREHOUSE
+// - If trading wallet drops below TRIGGER, storehouse top-ups the trading wallet
+// - Trades sized by % (owner can override risk % anytime)
+// - Persistence uses PAPER_STATE_PATH (Render Disk recommended)
 
 const fs = require("fs");
 const path = require("path");
 
 // ---------- ENV DEFAULTS ----------
-const START_TRADING_WALLET = Number(process.env.PAPER_START_BALANCE || 100000); // AI wallet starts here
-const START_STOREHOUSE_WALLET = Number(process.env.PAPER_STOREHOUSE_START || 100000); // locked reserve
-const START_OWNER_WALLET = Number(process.env.PAPER_OWNER_START || 0);
+const START_TRADING_WALLET = Number(process.env.PAPER_START_BALANCE || 100000);
+const START_STOREHOUSE_WALLET = Number(process.env.PAPER_STOREHOUSE_START || 0);
 
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
 
-// percent sizing (the “plan” lives here)
-const BASE_RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.03);   // 3% default
-const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.5); // 50% max cap
+// % sizing
+const BASE_RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.12);     // 12% base (your example)
+const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.50);  // 50% max
 
-// profit / stop
+// take profit / stop loss
 const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
 const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
 // realism knobs
-const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026); // per side
+const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
 const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
 const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
 const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
 
-// safety / limits
+// safety
 const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
-const MAX_TRADES_PER_DAY_DEFAULT = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
+const MAX_TRADES_PER_DAY_DEFAULT = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 200); // paper can be high
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-// anti-fee tiny trade guardrails
+// anti “tiny trades / fee dominance”
 const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 50);
 const MIN_NET_TP_USD = Number(process.env.PAPER_MIN_NET_TP_USD || 1.0);
 
-// wallet system rules
-const TOPUP_AMOUNT = Number(process.env.PAPER_TOPUP_AMOUNT || 1000);             // storehouse -> AI wallet
-const TOPUP_TRIGGER = Number(process.env.PAPER_TOPUP_TRIGGER || 100);           // when AI wallet <= this, top up
-const TRADING_WALLET_CAP_DEFAULT = Number(process.env.PAPER_TRADING_WALLET_CAP || 150000); // overflow threshold
+// wallet flow rules (your numbers)
+const TRADING_WALLET_CAP_DEFAULT = Number(process.env.PAPER_TRADING_WALLET_CAP || 200000);
+const TOPUP_TRIGGER_DEFAULT = Number(process.env.PAPER_TOPUP_TRIGGER || 500000);
+const TOPUP_AMOUNT_DEFAULT = Number(process.env.PAPER_TOPUP_AMOUNT || 5000);
 
-// persistence path (Render Disk recommended)
+// persistence path
 const STATE_FILE =
   (process.env.PAPER_STATE_PATH && String(process.env.PAPER_STATE_PATH).trim()) ||
   path.join("/tmp", "paper_state.json");
@@ -74,14 +77,11 @@ function defaultState() {
   return {
     running: true,
 
-    // 3-wallet system
     wallets: {
-      trading: START_TRADING_WALLET,   // AI wallet
-      storehouse: START_STOREHOUSE_WALLET, // locked reserve
-      owner: START_OWNER_WALLET        // overflow wallet (owner withdraw later)
+      trading: START_TRADING_WALLET,
+      storehouse: START_STOREHOUSE_WALLET
     },
 
-    // accounting
     startBalance: START_TRADING_WALLET,
     pnl: 0,
     realized: { wins: 0, losses: 0, grossProfit: 0, grossLoss: 0, net: 0 },
@@ -101,11 +101,11 @@ function defaultState() {
       lastTickTs: null,
     },
 
-    // configurable knobs (saved + editable from UI)
     config: {
       WARMUP_TICKS,
       BASE_RISK_PCT,
       MAX_RISK_PCT,
+      MANUAL_RISK_PCT: null, // if set, overrides auto risk logic
       TAKE_PROFIT_PCT,
       STOP_LOSS_PCT,
       MIN_EDGE,
@@ -118,9 +118,9 @@ function defaultState() {
       MAX_DRAWDOWN_PCT,
       MIN_USD_PER_TRADE,
       MIN_NET_TP_USD,
-      TOPUP_AMOUNT,
-      TOPUP_TRIGGER,
       TRADING_WALLET_CAP: TRADING_WALLET_CAP_DEFAULT,
+      TOPUP_TRIGGER: TOPUP_TRIGGER_DEFAULT,
+      TOPUP_AMOUNT: TOPUP_AMOUNT_DEFAULT,
       STATE_FILE
     },
 
@@ -132,11 +132,7 @@ function defaultState() {
       haltReason: null
     },
 
-    // streak logic for percent scaling
-    streak: {
-      winsInRow: 0,
-      lossesInRow: 0
-    },
+    streak: { winsInRow: 0, lossesInRow: 0 },
 
     buf: { BTCUSDT: [], ETHUSDT: [] }
   };
@@ -166,6 +162,7 @@ function loadNow() {
   try {
     ensureDirFor(STATE_FILE);
     if (!fs.existsSync(STATE_FILE)) return false;
+
     const raw = fs.readFileSync(STATE_FILE, "utf-8");
     const parsed = JSON.parse(raw);
 
@@ -263,16 +260,15 @@ function applyExitFee(usdNotional) {
   return fee;
 }
 
-// ---------- WALLET RULES ----------
-function sweepOverflow() {
+// ---------- WALLET FLOW RULES ----------
+function sweepOverflowToStorehouse() {
   const cap = Number(state.config.TRADING_WALLET_CAP || 0);
   if (!cap || cap <= 0) return;
 
-  const trading = state.wallets.trading;
-  if (trading > cap) {
-    const overflow = trading - cap;
+  if (state.wallets.trading > cap) {
+    const overflow = state.wallets.trading - cap;
     state.wallets.trading -= overflow;
-    state.wallets.owner += overflow;
+    state.wallets.storehouse += overflow;
 
     state.trades.push({
       time: Date.now(),
@@ -281,20 +277,24 @@ function sweepOverflow() {
       price: 0,
       qty: 0,
       usd: overflow,
-      note: "overflow_to_owner_wallet"
+      note: "overflow_to_storehouse"
     });
   }
 }
 
 function maybeTopUpFromStorehouse() {
-  if (state.wallets.trading > state.config.TOPUP_TRIGGER) return;
+  const trigger = Number(state.config.TOPUP_TRIGGER || 0);
+  const amt = Number(state.config.TOPUP_AMOUNT || 0);
+  if (!trigger || trigger <= 0) return;
+  if (!amt || amt <= 0) return;
+
+  // top-up when trading wallet falls below trigger
+  if (state.wallets.trading >= trigger) return;
   if (state.wallets.storehouse <= 0) return;
 
-  const amt = Math.min(state.config.TOPUP_AMOUNT, state.wallets.storehouse);
-  if (amt <= 0) return;
-
-  state.wallets.storehouse -= amt;
-  state.wallets.trading += amt;
+  const transfer = Math.min(amt, state.wallets.storehouse);
+  state.wallets.storehouse -= transfer;
+  state.wallets.trading += transfer;
 
   state.trades.push({
     time: Date.now(),
@@ -302,7 +302,7 @@ function maybeTopUpFromStorehouse() {
     type: "TOPUP",
     price: 0,
     qty: 0,
-    usd: amt,
+    usd: transfer,
     note: "storehouse_to_trading_wallet"
   });
 }
@@ -328,19 +328,24 @@ function canTradeProfitablyAtTP() {
   return state.config.TAKE_PROFIT_PCT > rt;
 }
 
-// ---------- PERCENT SIZING (your “3%..50% plan”) ----------
+// ---------- RISK % LOGIC (AUTO + OWNER OVERRIDE) ----------
 function currentRiskPct() {
-  // Losses reduce risk; wins can increase it up to MAX
+  const manual = state.config.MANUAL_RISK_PCT;
+  if (manual !== null && manual !== undefined && Number.isFinite(Number(manual))) {
+    return clamp(Number(manual), 0.005, state.config.MAX_RISK_PCT);
+  }
+
   const base = state.config.BASE_RISK_PCT;
   const max = state.config.MAX_RISK_PCT;
 
-  const lossPenalty = Math.min(0.02 * state.streak.lossesInRow, base * 0.8); // step down after losses
-  const winBoost = Math.min(0.01 * state.streak.winsInRow, max - base);      // step up after wins
+  // losses reduce risk quickly; wins can increase slowly
+  const lossPenalty = Math.min(0.03 * state.streak.lossesInRow, base * 0.85);
+  const winBoost = Math.min(0.01 * state.streak.winsInRow, max - base);
 
   return clamp(base - lossPenalty + winBoost, 0.005, max);
 }
 
-// ---------- TRADING LOGIC ----------
+// ---------- TRADING ----------
 function maybeEnter(symbol, price, ts) {
   const { vol, edge, conf, reason } = computeSignals(symbol);
 
@@ -390,26 +395,24 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  // ✅ Size by % of AI trading wallet (this is what you asked for)
+  // size by % of trading wallet
   const pct = currentRiskPct();
   let usdNotional = state.wallets.trading * pct;
 
-  // apply guards
   usdNotional = Math.max(usdNotional, state.config.MIN_USD_PER_TRADE);
   usdNotional = Math.min(usdNotional, state.config.MAX_USD_PER_TRADE);
 
-  // also enforce min expected net at TP
+  // net-at-TP must be meaningful
   const rt = totalRoundTripCostRate();
   const netPerUsdAtTP = state.config.TAKE_PROFIT_PCT - rt;
   const expectedNetAtTP = usdNotional * Math.max(0, netPerUsdAtTP);
-
   if (expectedNetAtTP < state.config.MIN_NET_TP_USD) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "trade_too_small_for_net_tp";
     return;
   }
 
-  // ensure wallet can pay entry costs
+  // must be able to pay entry cost
   const worstEntryCosts = usdNotional * entryCostRate();
   if (state.wallets.trading <= worstEntryCosts + 1) {
     state.learnStats.decision = "WAIT";
@@ -452,7 +455,9 @@ function maybeEnter(symbol, price, ts) {
 function maybeExit(symbol, price, ts) {
   const pos = state.position;
   if (!pos) return;
-  if (pos.symbol !== symbol) return; // critical fix
+
+  // critical: prevent cross-symbol exits (the “millions/billions jump” bug)
+  if (pos.symbol !== symbol) return;
 
   const entry = pos.entry;
   const change = (price - entry) / entry;
@@ -465,7 +470,6 @@ function maybeExit(symbol, price, ts) {
     const net = gross - (pos.entryCosts || 0) - exitFee;
 
     state.wallets.trading += net;
-
     state.realized.net += net;
     state.pnl = state.realized.net;
 
@@ -495,10 +499,11 @@ function maybeExit(symbol, price, ts) {
     });
 
     state.position = null;
+
     checkDrawdown();
 
-    // apply wallet rules after a trade finishes
-    sweepOverflow();
+    // wallet flow after each completed trade
+    sweepOverflowToStorehouse();
     maybeTopUpFromStorehouse();
 
     state.learnStats.decision = "SELL";
@@ -508,7 +513,6 @@ function maybeExit(symbol, price, ts) {
   }
 }
 
-// supports tick(price) or tick(symbol, price, ts)
 function tick(a, b, c) {
   if (!state.running) return;
 
@@ -533,7 +537,6 @@ function tick(a, b, c) {
 
   pushBuf(symbol, price);
 
-  // exit before enter
   maybeExit(symbol, price, ts);
   maybeEnter(symbol, price, ts);
 
@@ -553,18 +556,28 @@ function hardReset() {
   saveNow();
 }
 
-// ✅ Config controls from UI (owner/admin)
 function updateConfig(patch = {}) {
   state.config = { ...state.config, ...patch };
 
-  // clamp the % values
-  state.config.BASE_RISK_PCT = clamp(Number(state.config.BASE_RISK_PCT || 0.03), 0.005, 0.5);
-  state.config.MAX_RISK_PCT = clamp(Number(state.config.MAX_RISK_PCT || 0.5), state.config.BASE_RISK_PCT, 0.9);
+  // clamp %
+  state.config.BASE_RISK_PCT = clamp(Number(state.config.BASE_RISK_PCT || 0.12), 0.005, 0.9);
+  state.config.MAX_RISK_PCT = clamp(Number(state.config.MAX_RISK_PCT || 0.5), state.config.BASE_RISK_PCT, 0.95);
 
-  // clamp wallet caps
+  // manual risk can be null or number
+  if (state.config.MANUAL_RISK_PCT === "" || state.config.MANUAL_RISK_PCT === undefined) {
+    state.config.MANUAL_RISK_PCT = null;
+  }
+  if (state.config.MANUAL_RISK_PCT !== null) {
+    const v = Number(state.config.MANUAL_RISK_PCT);
+    state.config.MANUAL_RISK_PCT = Number.isFinite(v) ? clamp(v, 0.005, state.config.MAX_RISK_PCT) : null;
+  }
+
+  // cap and topup
   state.config.TRADING_WALLET_CAP = Math.max(0, Number(state.config.TRADING_WALLET_CAP || TRADING_WALLET_CAP_DEFAULT));
+  state.config.TOPUP_TRIGGER = Math.max(0, Number(state.config.TOPUP_TRIGGER || TOPUP_TRIGGER_DEFAULT));
+  state.config.TOPUP_AMOUNT = Math.max(0, Number(state.config.TOPUP_AMOUNT || TOPUP_AMOUNT_DEFAULT));
 
-  // clamp trades/day
+  // trades/day
   state.config.MAX_TRADES_PER_DAY = Math.max(1, Number(state.config.MAX_TRADES_PER_DAY || MAX_TRADES_PER_DAY_DEFAULT));
 
   scheduleSave();
@@ -574,23 +587,16 @@ function updateConfig(patch = {}) {
 function snapshot() {
   return {
     running: state.running,
-
-    // wallets
     wallets: state.wallets,
-
     pnl: state.pnl,
     realized: state.realized,
     costs: state.costs,
-
     trades: state.trades.slice(-200),
     position: state.position,
-
     lastPriceBySymbol: state.lastPriceBySymbol,
     learnStats: state.learnStats,
     limits: state.limits,
     config: state.config,
-
-    // derived display
     riskPctNow: currentRiskPct()
   };
 }
