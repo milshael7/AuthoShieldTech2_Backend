@@ -1,14 +1,18 @@
 // backend/src/services/aiBrain.js
-// AutoProtect "Brain" — generates useful, non-repetitive replies from live context
-// ✅ No web surfing here (safe). It only explains what your system is doing.
-// ✅ Optional persistence so the brain doesn't reset on deploy (set BRAIN_STATE_PATH).
+// Persistent "Brain" for AutoProtect explanations + memory (NO trading execution here)
+// - Stores short-term memory + last decisions + notes
+// - Survives deploys when AI_BRAIN_PATH points to a Render Disk path
+// - Uses ONLY the context your frontend sends (paper stats, wins/losses, last price, etc.)
 
 const fs = require("fs");
 const path = require("path");
 
-const BRAIN_STATE_PATH =
-  (process.env.BRAIN_STATE_PATH && String(process.env.BRAIN_STATE_PATH).trim()) ||
-  path.join("/tmp", "ai_brain_state.json");
+const BRAIN_PATH =
+  (process.env.AI_BRAIN_PATH && String(process.env.AI_BRAIN_PATH).trim()) ||
+  "/tmp/ai_brain.json";
+
+const MAX_HISTORY = Number(process.env.AI_BRAIN_MAX_HISTORY || 80);
+const MAX_NOTES = Number(process.env.AI_BRAIN_MAX_NOTES || 50);
 
 function ensureDirFor(filePath) {
   try {
@@ -17,320 +21,333 @@ function ensureDirFor(filePath) {
   } catch {}
 }
 
-function loadState() {
-  try {
-    ensureDirFor(BRAIN_STATE_PATH);
-    if (!fs.existsSync(BRAIN_STATE_PATH)) return { sessions: {} };
-    return JSON.parse(fs.readFileSync(BRAIN_STATE_PATH, "utf-8"));
-  } catch {
-    return { sessions: {} };
-  }
-}
-
-function saveState(state) {
-  try {
-    ensureDirFor(BRAIN_STATE_PATH);
-    const tmp = BRAIN_STATE_PATH + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, BRAIN_STATE_PATH);
-  } catch {}
-}
-
-function fmtMoney(n, digits = 2) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return "—";
-  const sign = x < 0 ? "-" : "";
-  const ax = Math.abs(x);
-  return `${sign}$${ax.toLocaleString(undefined, { maximumFractionDigits: digits })}`;
-}
-
-function fmtPct(n, digits = 0) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return "—";
-  return (x * 100).toFixed(digits) + "%";
-}
-
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
 
-function hashCode(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
+function safeNum(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function pick(arr, seed) {
-  if (!arr.length) return "";
-  return arr[seed % arr.length];
+function money(n, digits = 2) {
+  const x = safeNum(n, NaN);
+  if (!Number.isFinite(x)) return "—";
+  return "$" + x.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
-function normalize(msg) {
-  return String(msg || "").trim();
+function pct01(n, digits = 0) {
+  const x = safeNum(n, NaN);
+  if (!Number.isFinite(x)) return "—";
+  return (x * 100).toFixed(digits) + "%";
 }
 
-function lower(msg) {
-  return normalize(msg).toLowerCase();
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function extractSessionId(user) {
-  // If you have user.id/email you can use it; otherwise single shared session.
-  if (!user) return "global";
-  return user.id || user.email || "global";
-}
-
-function buildScoreboard(ctx) {
-  const p = ctx?.paper || {};
-  const bal = Number(p.balance ?? 0);
-  const wins = Number(p.wins ?? p.realized?.wins ?? 0);
-  const losses = Number(p.losses ?? p.realized?.losses ?? 0);
-  const grossProfit = Number(p.grossProfit ?? p.realized?.grossProfit ?? 0);
-  const grossLoss = Number(p.grossLoss ?? p.realized?.grossLoss ?? 0);
-  const net = Number(p.net ?? p.pnl ?? p.realized?.net ?? 0);
-
-  const feePaid = Number(p.feePaid ?? p.costs?.feePaid ?? 0);
-  const slip = Number(p.slippageCost ?? p.costs?.slippageCost ?? 0);
-  const spr = Number(p.spreadCost ?? p.costs?.spreadCost ?? 0);
-
-  const ticksSeen = Number(p.ticksSeen ?? p.learnStats?.ticksSeen ?? 0);
-  const conf = Number(p.confidence ?? p.learnStats?.confidence ?? 0);
-  const decision = String(p.decision ?? p.learnStats?.decision ?? "WAIT");
-  const reason = String(p.decisionReason ?? p.learnStats?.lastReason ?? "—");
-
+function defaultBrain() {
   return {
-    bal, wins, losses, grossProfit, grossLoss, net,
-    feePaid, slip, spr,
-    ticksSeen, conf, decision, reason
+    version: 1,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+
+    // conversation memory (short & safe)
+    history: [], // [{ts, role:'user'|'ai', text}]
+    notes: [],   // [{ts, text}]
+
+    // last known context snapshot
+    lastContext: null,
+
+    // behavior config (safe defaults)
+    config: {
+      style: "business_clear",
+      maxHistory: MAX_HISTORY,
+      maxNotes: MAX_NOTES,
+    },
   };
 }
 
-function buildRiskRulesFromEnv() {
-  // These mirror your paperTrader env vars so AI can explain them.
-  const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
-  const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
-  const RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.01);
-  const TP = Number(process.env.PAPER_TP_PCT || 0.004);
-  const SL = Number(process.env.PAPER_SL_PCT || 0.003);
-  const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
+let brain = defaultBrain();
+let saveTimer = null;
 
-  const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
-  const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
-  const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
-  const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
+function loadBrain() {
+  try {
+    ensureDirFor(BRAIN_PATH);
+    if (!fs.existsSync(BRAIN_PATH)) return false;
+    const raw = fs.readFileSync(BRAIN_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
 
-  const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
-  const MAX_TRADES_PER_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
-  const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
+    const base = defaultBrain();
+    brain = {
+      ...base,
+      ...parsed,
+      config: { ...base.config, ...(parsed.config || {}) },
+      history: Array.isArray(parsed.history) ? parsed.history : base.history,
+      notes: Array.isArray(parsed.notes) ? parsed.notes : base.notes,
+    };
 
+    // clamp sizes
+    brain.history = brain.history.slice(-MAX_HISTORY);
+    brain.notes = brain.notes.slice(-MAX_NOTES);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function saveBrainNow() {
+  try {
+    ensureDirFor(BRAIN_PATH);
+    brain.updatedAt = nowIso();
+
+    const safe = {
+      ...brain,
+      history: brain.history.slice(-MAX_HISTORY),
+      notes: brain.notes.slice(-MAX_NOTES),
+    };
+
+    const tmp = BRAIN_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(safe, null, 2));
+    fs.renameSync(tmp, BRAIN_PATH);
+  } catch {
+    // never crash server due to brain persistence
+  }
+}
+
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveBrainNow();
+  }, 600);
+}
+
+loadBrain();
+
+// ------------------ memory helpers ------------------
+
+function addHistory(role, text) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+
+  brain.history.push({ ts: Date.now(), role, text: clean });
+  if (brain.history.length > MAX_HISTORY) brain.history = brain.history.slice(-MAX_HISTORY);
+  scheduleSave();
+}
+
+function addNote(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+
+  brain.notes.push({ ts: Date.now(), text: clean });
+  if (brain.notes.length > MAX_NOTES) brain.notes = brain.notes.slice(-MAX_NOTES);
+  scheduleSave();
+}
+
+function setLastContext(ctx) {
+  brain.lastContext = ctx || null;
+  scheduleSave();
+}
+
+function getSnapshot() {
   return {
-    START_BAL,
-    WARMUP_TICKS,
-    RISK_PCT,
-    TP,
-    SL,
-    MIN_EDGE,
-    FEE_RATE,
-    SLIPPAGE_BP,
-    SPREAD_BP,
-    COOLDOWN_MS,
-    MAX_USD_PER_TRADE,
-    MAX_TRADES_PER_DAY,
-    MAX_DRAWDOWN_PCT
+    ok: true,
+    brainPath: BRAIN_PATH,
+    createdAt: brain.createdAt,
+    updatedAt: brain.updatedAt,
+    historyCount: brain.history.length,
+    notesCount: brain.notes.length,
+    lastContext: brain.lastContext ? true : false,
+    config: brain.config,
   };
 }
 
-function summarizeState(ctx) {
-  const s = buildScoreboard(ctx);
-  const last = Number(ctx?.last ?? 0);
-  const symbol = String(ctx?.symbol ?? "—");
-  const mode = String(ctx?.mode ?? "Paper");
-
-  const lines = [
-    `Mode: ${mode} • Symbol: ${symbol} • Last price: ${last ? fmtMoney(last, 2).replace("$", "") : "—"}`,
-    `Balance: ${fmtMoney(s.bal)} • Net P&L: ${fmtMoney(s.net)} • Wins/Losses: ${s.wins}/${s.losses}`,
-    `Total Gain: ${fmtMoney(s.grossProfit)} • Total Loss: ${fmtMoney(s.grossLoss)}`,
-    `Costs — Fees: ${fmtMoney(s.feePaid)} • Slippage: ${fmtMoney(s.slip)} • Spread: ${fmtMoney(s.spr)}`,
-    `Learning — Ticks: ${s.ticksSeen} • Confidence: ${fmtPct(s.conf, 0)} • Decision: ${s.decision} • Reason: ${s.reason}`
-  ];
-  return lines.join("\n");
+function resetBrain() {
+  brain = defaultBrain();
+  saveBrainNow();
 }
 
-function answerWhyEnter(ctx) {
-  const s = buildScoreboard(ctx);
-  const rules = buildRiskRulesFromEnv();
+// ------------------ reasoning / reply engine ------------------
 
-  const confOk = s.conf >= 0.55;
-  const warmOk = s.ticksSeen >= rules.WARMUP_TICKS;
-  const decision = s.decision;
-
-  const checks = [
-    `Warmup: ${warmOk ? "OK" : "NOT READY"} (ticks ${s.ticksSeen}/${rules.WARMUP_TICKS})`,
-    `Confidence: ${confOk ? "OK" : "LOW"} (${fmtPct(s.conf, 0)} / needs ~55%+)`,
-    `Decision: ${decision}`,
-    `Reason tag: ${s.reason}`
-  ].join("\n");
-
-  const explain = [
-    `Here’s the exact checklist that leads to an entry:`,
-    checks,
-    ``,
-    `Current rules (paper): TP=${fmtPct(rules.TP, 2)} • SL=${fmtPct(rules.SL, 2)} • Max per trade=${fmtMoney(rules.MAX_USD_PER_TRADE)} • Cooldown=${Math.round(rules.COOLDOWN_MS/1000)}s`,
-  ].join("\n");
-
-  return explain;
+function normalizeMessage(s) {
+  return String(s || "").toLowerCase().trim();
 }
 
-function answerFeesTooHigh(ctx) {
-  const rules = buildRiskRulesFromEnv();
-  return [
-    `You’re right — if trades are tiny, fees/spread/slippage can eat the whole move.`,
-    ``,
-    `Right now your simulator uses:`,
-    `• Fee rate: ${fmtPct(rules.FEE_RATE, 2)} per side`,
-    `• Spread: ${rules.SPREAD_BP} bp • Slippage: ${rules.SLIPPAGE_BP} bp`,
-    `• Max USD per trade cap: ${fmtMoney(rules.MAX_USD_PER_TRADE)}`,
-    ``,
-    `Fix: enforce a MIN trade notional (example: $25–$100 minimum) and/or lower fee assumptions.`,
-    `If you want, we’ll add env vars like PAPER_MIN_USD_PER_TRADE and PAPER_MIN_EDGE_FOR_ENTRY.`
-  ].join("\n");
-}
-
-function answerMemory(ctx) {
-  return [
-    `Two different “memories” matter here:`,
-    `1) PaperTrader state (balance, trades, learning stats) — saved by PAPER_STATE_PATH (your Render Disk).`,
-    `2) Brain memory (chat continuity) — saved by BRAIN_STATE_PATH (separate file).`,
-    ``,
-    `If you set:`,
-    `• PAPER_STATE_PATH=/var/data/paper_state.json`,
-    `you already stopped paper resets. To stop chat resets too, set:`,
-    `• BRAIN_STATE_PATH=/var/data/ai_brain_state.json`
-  ].join("\n");
-}
-
-function genericHelp(ctx, msg) {
-  const s = buildScoreboard(ctx);
-  const rules = buildRiskRulesFromEnv();
-
-  const prompts = [
-    `Ask me: “why did you enter?”, “what’s my net P&L?”, “show wins/losses”, “explain fees”, “show risk rules”, “is live enabled?”`,
-    `Right now: Decision=${s.decision}, Confidence=${fmtPct(s.conf,0)}, Net=${fmtMoney(s.net)}`
-  ];
-
-  // Slight variety so it doesn't repeat the same opener forever
-  const seed = hashCode((msg || "") + "|" + String(s.ticksSeen));
-  const openers = [
-    "Got you.",
-    "Alright — here’s what I see.",
-    "Yep, checking the dashboard now.",
-    "I’m reading the current snapshot."
-  ];
-
-  return [
-    pick(openers, seed),
-    summarizeState(ctx),
-    ``,
-    `Risk rules snapshot: TP=${fmtPct(rules.TP,2)} • SL=${fmtPct(rules.SL,2)} • Warmup=${rules.WARMUP_TICKS} ticks • Max/trade=${fmtMoney(rules.MAX_USD_PER_TRADE)}`,
-    ``,
-    prompts.join("\n")
-  ].join("\n");
-}
-
-function buildReply({ message, context, user }) {
-  const msg = normalize(message);
-  const m = lower(msg);
-
-  // Context safety: never crash on missing context
-  const ctx = context || {};
-
-  // Basic intent routing
-  if (m.includes("summary") || m.includes("status") || m.includes("scoreboard")) {
-    return summarizeState(ctx);
-  }
-
-  if (m.includes("why") && (m.includes("enter") || m.includes("buy") || m.includes("trade"))) {
-    return answerWhyEnter(ctx);
-  }
-
-  if (m.includes("fee") || m.includes("fees") || m.includes("slippage") || m.includes("spread") || m.includes("tiny trade")) {
-    return answerFeesTooHigh(ctx);
-  }
-
-  if (m.includes("memory") || m.includes("reset") || m.includes("brain") || m.includes("doesn't reset")) {
-    return answerMemory(ctx);
-  }
-
-  if (m.includes("risk") || m.includes("rules") || m.includes("take profit") || m.includes("stop loss") || m.includes("tp") || m.includes("sl")) {
-    const r = buildRiskRulesFromEnv();
-    return [
-      `Current paper risk rules:`,
-      `• Start balance: ${fmtMoney(r.START_BAL)}`,
-      `• Warmup ticks: ${r.WARMUP_TICKS}`,
-      `• TP: ${fmtPct(r.TP, 2)} • SL: ${fmtPct(r.SL, 2)}`,
-      `• Min edge: ${fmtPct(r.MIN_EDGE, 3)}`,
-      `• Cooldown: ${Math.round(r.COOLDOWN_MS / 1000)}s`,
-      `• Max USD per trade: ${fmtMoney(r.MAX_USD_PER_TRADE)}`,
-      `• Max trades/day: ${r.MAX_TRADES_PER_DAY}`,
-      `• Max drawdown: ${fmtPct(r.MAX_DRAWDOWN_PCT, 0)}`
-    ].join("\n");
-  }
-
-  // Live questions (if frontend includes it in context later)
-  if (m.includes("live")) {
-    const live = ctx?.live || {};
-    const enabled = !!live.enabled;
-    const dryRun = !!live.dryRun;
-    const armed = !!live.armed;
-    const keys = !!live.keysPresent;
-    return [
-      `Live readiness:`,
-      `• Keys present: ${keys}`,
-      `• Enabled: ${enabled}`,
-      `• Armed: ${armed}`,
-      `• Dry-run: ${dryRun}`,
-      ``,
-      `Reminder: keep Dry-run ON until you explicitly decide to allow real orders.`
-    ].join("\n");
-  }
-
-  return genericHelp(ctx, msg);
-}
-
-function rememberTurn(sessionId, userText, aiText) {
-  const st = loadState();
-  if (!st.sessions) st.sessions = {};
-  if (!st.sessions[sessionId]) st.sessions[sessionId] = { last: [], updatedAt: Date.now() };
-
-  const s = st.sessions[sessionId];
-  s.last.push({ t: Date.now(), you: String(userText || ""), ai: String(aiText || "") });
-  while (s.last.length > 20) s.last.shift(); // keep short
-  s.updatedAt = Date.now();
-
-  saveState(st);
-}
-
-function getMemory(sessionId) {
-  const st = loadState();
-  const s = st.sessions?.[sessionId];
-  return s?.last || [];
-}
-
-async function chat({ message, context, user }) {
-  const sessionId = extractSessionId(user);
-
-  // We keep memory stored but we don’t “hallucinate” with it — it’s for future upgrade.
-  // For now, just stop repetition & answer from real context.
-  const reply = buildReply({ message, context, user });
-
-  rememberTurn(sessionId, message, reply);
-
+function extractPaper(ctx) {
+  const paper = ctx?.paper || ctx?.context?.paper || {};
+  const learn = paper.learnStats || paper.learnStats === null ? paper.learnStats : paper.learnStats;
   return {
-    reply,
-    meta: {
-      brainStatePath: BRAIN_STATE_PATH,
-      memoryTurns: getMemory(sessionId).length
-    }
+    running: !!paper.running,
+    balance: safeNum(paper.balance, 0),
+    pnl: safeNum(paper.pnl, 0),
+    realized: {
+      wins: safeNum(paper.realized?.wins, safeNum(paper.wins, 0)),
+      losses: safeNum(paper.realized?.losses, safeNum(paper.losses, 0)),
+      grossProfit: safeNum(paper.realized?.grossProfit, safeNum(paper.grossProfit, 0)),
+      grossLoss: safeNum(paper.realized?.grossLoss, safeNum(paper.grossLoss, 0)),
+      net: safeNum(paper.realized?.net, safeNum(paper.net, safeNum(paper.pnl, 0))),
+    },
+    costs: {
+      feePaid: safeNum(paper.costs?.feePaid, safeNum(paper.feePaid, 0)),
+      slippageCost: safeNum(paper.costs?.slippageCost, safeNum(paper.slippageCost, 0)),
+      spreadCost: safeNum(paper.costs?.spreadCost, safeNum(paper.spreadCost, 0)),
+    },
+    learnStats: {
+      ticksSeen: safeNum(paper.learnStats?.ticksSeen, safeNum(paper.ticksSeen, 0)),
+      confidence: safeNum(paper.learnStats?.confidence, safeNum(paper.confidence, 0)),
+      volatility: safeNum(paper.learnStats?.volatility, 0),
+      trendEdge: safeNum(paper.learnStats?.trendEdge, 0),
+      decision: String(paper.learnStats?.decision || paper.decision || "WAIT"),
+      lastReason: String(paper.learnStats?.lastReason || paper.decisionReason || "—"),
+      lastTickTs: paper.learnStats?.lastTickTs || null,
+    },
+    position: paper.position || null,
+    tradesCount: Array.isArray(paper.trades) ? paper.trades.length : 0,
   };
 }
 
-module.exports = { chat };
+function extractTop(ctx) {
+  const symbol = String(ctx?.symbol || ctx?.context?.symbol || "BTCUSD");
+  const mode = String(ctx?.mode || ctx?.context?.mode || "Paper");
+  const last = safeNum(ctx?.last ?? ctx?.context?.last, NaN);
+  return { symbol, mode, last };
+}
+
+function buildScoreboard(p) {
+  return [
+    `Paper Balance: ${money(p.balance)}`,
+    `Net P&L: ${money(p.realized.net)} (Wins: ${p.realized.wins} / Losses: ${p.realized.losses})`,
+    `Total Gain: ${money(p.realized.grossProfit)} • Total Loss: ${money(p.realized.grossLoss)}`,
+    `Fees: ${money(p.costs.feePaid)} • Slippage: ${money(p.costs.slippageCost)} • Spread: ${money(p.costs.spreadCost)}`,
+  ].join("\n");
+}
+
+function buildDecisionLine(p) {
+  return [
+    `Decision: ${p.learnStats.decision}`,
+    `Confidence: ${pct01(p.learnStats.confidence, 0)} • Volatility: ${pct01(p.learnStats.volatility, 0)} • Edge: ${pct01(p.learnStats.trendEdge, 2)}`,
+    `Reason: ${p.learnStats.lastReason}`,
+    `Ticks Seen: ${p.learnStats.ticksSeen}`,
+  ].join("\n");
+}
+
+function answer(message, context) {
+  const msg = String(message || "").trim();
+  const m = normalizeMessage(msg);
+
+  const top = extractTop(context);
+  const paper = extractPaper(context);
+
+  // update brain memory
+  addHistory("user", msg);
+  setLastContext({
+    ts: Date.now(),
+    symbol: top.symbol,
+    mode: top.mode,
+    last: top.last,
+    paper: {
+      running: paper.running,
+      balance: paper.balance,
+      net: paper.realized.net,
+      wins: paper.realized.wins,
+      losses: paper.realized.losses,
+      decision: paper.learnStats.decision,
+      reason: paper.learnStats.lastReason,
+      confidence: paper.learnStats.confidence,
+      ticksSeen: paper.learnStats.ticksSeen,
+    },
+  });
+
+  // Commands (admin-safe, but we still keep them simple)
+  if (m === "help" || m.includes("what can you do") || m.includes("commands")) {
+    const reply =
+      `AutoProtect Brain (persistent)\n` +
+      `Ask things like:\n` +
+      `- "why did you enter?"\n` +
+      `- "show scoreboard"\n` +
+      `- "wins and losses"\n` +
+      `- "fees and costs"\n` +
+      `- "what is the current decision?"\n` +
+      `- "explain last trade"\n` +
+      `- "add note: ..."\n`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.startsWith("add note:") || m.startsWith("note:")) {
+    const text = msg.split(":").slice(1).join(":").trim();
+    addNote(text);
+    const reply = `Saved note. (${brain.notes.length}/${MAX_NOTES})`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.includes("scoreboard") || m.includes("wins") || m.includes("loss") || m.includes("p&l") || m.includes("pnl")) {
+    const reply =
+      `Scoreboard (${top.symbol} • ${top.mode})\n` +
+      buildScoreboard(paper);
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.includes("fees") || m.includes("slippage") || m.includes("spread") || m.includes("cost")) {
+    const reply =
+      `Costs breakdown\n` +
+      `Fees Paid: ${money(paper.costs.feePaid)}\n` +
+      `Slippage Cost: ${money(paper.costs.slippageCost)}\n` +
+      `Spread Cost: ${money(paper.costs.spreadCost)}\n` +
+      `Tip: If fees dominate, increase minimum trade notional OR lower fee model in paper config.`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.includes("why") || m.includes("enter") || m.includes("buy") || m.includes("sell") || m.includes("decision") || m.includes("reason")) {
+    const lastPx = Number.isFinite(top.last) ? `Last Price: ${money(top.last).replace("$", "")}` : `Last Price: —`;
+
+    const posLine = paper.position
+      ? `Open Position: ${paper.position.side} ${paper.position.symbol} • Entry ${money(paper.position.entry).replace("$", "")} • Qty ${paper.position.qty}`
+      : `Open Position: none`;
+
+    const reply =
+      `Decision report (${top.symbol} • ${top.mode})\n` +
+      `${lastPx}\n` +
+      `${posLine}\n\n` +
+      buildDecisionLine(paper) +
+      `\n\n` +
+      `If you want tighter behavior: raise MIN_EDGE, raise warmup ticks, and enforce a minimum USD notional so fees don’t eat the trade.`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.includes("brain") || m.includes("memory") || m.includes("reset") || m.includes("persist")) {
+    const reply =
+      `Brain status\n` +
+      `- Brain file: ${BRAIN_PATH}\n` +
+      `- Updated: ${brain.updatedAt}\n` +
+      `- History: ${brain.history.length} messages\n` +
+      `- Notes: ${brain.notes.length}\n\n` +
+      `To make sure this never resets on deploy:\n` +
+      `Set AI_BRAIN_PATH to your Render Disk mount, e.g. /var/data/ai_brain.json`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  // fallback: be helpful, not repetitive
+  const reply =
+    `I got you. Ask me one of these so I can answer with real numbers:\n` +
+    `- "show scoreboard"\n` +
+    `- "why did you enter?"\n` +
+    `- "fees and costs"\n` +
+    `- "what is the current decision?"\n`;
+  addHistory("ai", reply);
+  return reply;
+}
+
+module.exports = {
+  answer,
+  addNote,
+  getSnapshot,
+  resetBrain,
+};
