@@ -6,14 +6,14 @@ const router = express.Router();
 
 const paperTrader = require('../services/paperTrader');
 
-// OPTIONAL protection so random people can’t reset/change your paper brain.
-// Set env PAPER_RESET_KEY and PAPER_CONFIG_KEY (recommended).
-// - Reset:  POST /api/paper/reset   header: x-reset-key: <key>
-// - Config: POST /api/paper/config  header: x-config-key: <key>
-function hasKey(req, envName) {
-  const key = String(process.env[envName] || '').trim();
-  if (!key) return true; // if you don't set it, it's open (not recommended)
-  const sent = String(req.headers['x-reset-key'] || req.headers['x-config-key'] || '').trim();
+// OPTIONAL protection for reset/config.
+// Set env PAPER_RESET_KEY to something long.
+// Then call POST /api/paper/reset or POST /api/paper/config with header:
+// x-reset-key: <your key>
+function resetAllowed(req) {
+  const key = String(process.env.PAPER_RESET_KEY || '').trim();
+  if (!key) return true; // if you don't set it, endpoints are open (not recommended)
+  const sent = String(req.headers['x-reset-key'] || '').trim();
   return sent && sent === key;
 }
 
@@ -29,10 +29,10 @@ router.get('/status', (req, res) => {
 // POST /api/paper/reset
 router.post('/reset', (req, res) => {
   try {
-    if (!hasKey(req, 'PAPER_RESET_KEY')) {
+    if (!resetAllowed(req)) {
       return res.status(403).json({
         ok: false,
-        error: 'Reset blocked. Missing/invalid key. Set PAPER_RESET_KEY on backend.',
+        error: 'Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY on backend).'
       });
     }
 
@@ -40,41 +40,48 @@ router.post('/reset', (req, res) => {
     return res.json({
       ok: true,
       message: 'Paper wallet reset complete.',
-      snapshot: paperTrader.snapshot(),
+      snapshot: paperTrader.snapshot()
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// ✅ POST /api/paper/config  (owner controls)
-router.post('/config', (req, res) => {
+// ✅ GET /api/paper/config -> shows current settings + sizing state
+router.get('/config', (req, res) => {
   try {
-    if (!hasKey(req, 'PAPER_CONFIG_KEY')) {
-      return res.status(403).json({
-        ok: false,
-        error: 'Config blocked. Missing/invalid key. Set PAPER_CONFIG_KEY on backend.',
-      });
-    }
-
-    const patch = req.body || {};
-    if (typeof paperTrader.setConfig !== 'function') {
-      return res.status(400).json({
-        ok: false,
-        error: 'paperTrader.setConfig() not found. Make sure you replaced backend/src/services/paperTrader.js with the version that exports setConfig.',
-      });
-    }
-
-    const owner = paperTrader.setConfig({
-      baselinePct: patch.baselinePct,
-      maxPct: patch.maxPct,
-      maxTradesPerDay: patch.maxTradesPerDay,
-    });
-
+    const snap = paperTrader.snapshot();
     return res.json({
       ok: true,
-      owner,
-      snapshot: paperTrader.snapshot(),
+      owner: snap.owner || null,
+      sizing: snap.sizing || null,
+      limits: snap.limits || null,
+      config: snap.config || null
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// ✅ POST /api/paper/config -> set baselinePct, maxPct, maxTradesPerDay
+router.post('/config', (req, res) => {
+  try {
+    if (!resetAllowed(req)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Config update blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY on backend).'
+      });
+    }
+
+    const { baselinePct, maxPct, maxTradesPerDay } = req.body || {};
+    const updated = paperTrader.setConfig({ baselinePct, maxPct, maxTradesPerDay });
+
+    const snap = paperTrader.snapshot();
+    return res.json({
+      ok: true,
+      owner: updated,
+      sizing: snap.sizing,
+      limits: snap.limits
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
