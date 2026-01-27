@@ -1,3 +1,4 @@
+// backend/src/server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -72,6 +73,9 @@ app.use('/api/live', require('./routes/live.routes'));
 
 // ✅ Paper routes (status + reset)
 app.use('/api/paper', require('./routes/paper.routes'));
+
+// ✅ NEW: Posture routes (cyber dashboards: individual/company/manager)
+app.use('/api/posture', require('./routes/posture.routes'));
 
 // --- WebSocket server ---
 const server = http.createServer(app);
