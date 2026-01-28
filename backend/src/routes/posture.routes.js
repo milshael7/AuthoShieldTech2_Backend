@@ -1,12 +1,12 @@
 // backend/src/routes/posture.routes.js
 // Cybersecurity "Posture" (MVP) — summary + checks + recent events
-// ✅ Manager + Admin can view everything
-// ✅ Company + Individual can view only their own scope (safe defaults)
+// ✅ Admin + Manager can view everything
+// ✅ Company + Individual can view only their own scope
 
 const express = require('express');
 const router = express.Router();
 
-const { authRequired, requireRole } = require('../middleware/auth');
+const { authRequired } = require('../middleware/auth');
 const { readDb } = require('../lib/db');
 const users = require('../users/user.service');
 
@@ -20,9 +20,8 @@ function nowISO() {
   return new Date().toISOString();
 }
 
-// Simple “checks” starter list (you can expand later)
+// Starter “checks” list (expand later with real signals)
 function buildChecks({ user }) {
-  // MVP logic: you can later wire these to real signals (failed logins, rate limit hits, etc.)
   return [
     {
       id: 'mfa',
@@ -50,18 +49,14 @@ function buildChecks({ user }) {
   ];
 }
 
-function getUserCompanyId(u) {
-  return u?.companyId || null;
-}
-
-// 🔒 Scope helper: what data can this requester see?
 function scopeFor(reqUser) {
   const role = reqUser?.role;
   if (role === users.ROLES.ADMIN || role === users.ROLES.MANAGER) {
     return { type: 'global' };
   }
   if (role === users.ROLES.COMPANY) {
-    return { type: 'company', companyId: getUserCompanyId(reqUser) || reqUser?.companyId || reqUser?.id };
+    // companyId should be on the user record (preferred)
+    return { type: 'company', companyId: reqUser?.companyId || reqUser?.id };
   }
   return { type: 'user', userId: reqUser?.id };
 }
@@ -77,7 +72,6 @@ router.get('/summary', authRequired, (req, res) => {
     const allUsers = db.users || [];
     const allCompanies = db.companies || [];
 
-    // Global summary (Admin/Manager)
     if (scope.type === 'global') {
       return res.json({
         scope,
@@ -91,12 +85,11 @@ router.get('/summary', authRequired, (req, res) => {
       });
     }
 
-    // Company summary
     if (scope.type === 'company') {
-      const companyId = scope.companyId;
-      const companyUsers = allUsers.filter(u => String(u.companyId || '') === String(companyId));
-      const companyAudit = audit.filter(ev => String(ev.companyId || '') === String(companyId));
-      const companyNotes = notifications.filter(n => String(n.companyId || '') === String(companyId));
+      const companyId = String(scope.companyId || '');
+      const companyUsers = allUsers.filter(u => String(u.companyId || '') === companyId);
+      const companyAudit = audit.filter(ev => String(ev.companyId || '') === companyId);
+      const companyNotes = notifications.filter(n => String(n.companyId || '') === companyId);
 
       return res.json({
         scope,
@@ -109,10 +102,11 @@ router.get('/summary', authRequired, (req, res) => {
       });
     }
 
-    // Individual summary
-    const userId = scope.userId;
-    const myAudit = audit.filter(ev => String(ev.actorId || '') === String(userId) || String(ev.targetId || '') === String(userId));
-    const myNotes = notifications.filter(n => String(n.userId || '') === String(userId));
+    const userId = String(scope.userId || '');
+    const myAudit = audit.filter(ev =>
+      String(ev.actorId || '') === userId || String(ev.targetId || '') === userId
+    );
+    const myNotes = notifications.filter(n => String(n.userId || '') === userId);
 
     return res.json({
       scope,
@@ -140,18 +134,16 @@ router.get('/checks', authRequired, (req, res) => {
   }
 });
 
-// GET /api/posture/recent
-// Optional: ?limit=50 (max 200)
+// GET /api/posture/recent?limit=50 (max 200)
 router.get('/recent', authRequired, (req, res) => {
   try {
     const db = readDb();
     const scope = scopeFor(req.user);
     const limit = clampInt(req.query.limit, 1, 200, 50);
 
-    const audit = (db.audit || []).slice().reverse(); // newest first
+    const audit = (db.audit || []).slice().reverse();
     const notifications = (db.notifications || []).slice().reverse();
 
-    // Admin/Manager see everything
     if (scope.type === 'global') {
       return res.json({
         scope,
@@ -161,22 +153,20 @@ router.get('/recent', authRequired, (req, res) => {
       });
     }
 
-    // Company
     if (scope.type === 'company') {
-      const companyId = scope.companyId;
-      const a = audit.filter(ev => String(ev.companyId || '') === String(companyId)).slice(0, limit);
-      const n = notifications.filter(x => String(x.companyId || '') === String(companyId)).slice(0, limit);
+      const companyId = String(scope.companyId || '');
+      const a = audit.filter(ev => String(ev.companyId || '') === companyId).slice(0, limit);
+      const n = notifications.filter(x => String(x.companyId || '') === companyId).slice(0, limit);
       return res.json({ scope, audit: a, notifications: n, time: nowISO() });
     }
 
-    // User
-    const userId = scope.userId;
+    const userId = String(scope.userId || '');
     const a = audit
-      .filter(ev => String(ev.actorId || '') === String(userId) || String(ev.targetId || '') === String(userId))
+      .filter(ev => String(ev.actorId || '') === userId || String(ev.targetId || '') === userId)
       .slice(0, limit);
 
     const n = notifications
-      .filter(x => String(x.userId || '') === String(userId))
+      .filter(x => String(x.userId || '') === userId)
       .slice(0, limit);
 
     return res.json({ scope, audit: a, notifications: n, time: nowISO() });
