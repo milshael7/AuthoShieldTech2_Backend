@@ -8,7 +8,6 @@ const router = express.Router();
 
 const { authRequired } = require('../middleware/auth');
 const { readDb } = require('../lib/db');
-const users = require('../users/user.service');
 
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
@@ -20,8 +19,25 @@ function nowISO() {
   return new Date().toISOString();
 }
 
+function roleOf(u) {
+  return String(u?.role || '');
+}
+
+function isAdmin(u) {
+  return roleOf(u) === 'Admin';
+}
+
+function isManager(u) {
+  return roleOf(u) === 'Manager';
+}
+
+function isCompany(u) {
+  return roleOf(u) === 'Company';
+}
+
 // Starter “checks” list (expand later with real signals)
 function buildChecks({ user }) {
+  const ap = !!(user && (user.autoprotectEnabled || user.autoprotechEnabled)); // supports your typo too
   return [
     {
       id: 'mfa',
@@ -40,8 +56,8 @@ function buildChecks({ user }) {
     {
       id: 'autoprotect',
       title: 'AutoProtect Status',
-      status: user?.autoprotectEnabled ? 'ok' : 'warn',
-      message: user?.autoprotectEnabled
+      status: ap ? 'ok' : 'warn',
+      message: ap
         ? 'AutoProtect is enabled for this account.'
         : 'AutoProtect is disabled for this account.',
       at: nowISO(),
@@ -50,14 +66,18 @@ function buildChecks({ user }) {
 }
 
 function scopeFor(reqUser) {
-  const role = reqUser?.role;
-  if (role === users.ROLES.ADMIN || role === users.ROLES.MANAGER) {
+  // Admin/Manager see global
+  if (isAdmin(reqUser) || isManager(reqUser)) {
     return { type: 'global' };
   }
-  if (role === users.ROLES.COMPANY) {
-    // companyId should be on the user record (preferred)
+
+  // Company sees company scope
+  if (isCompany(reqUser)) {
+    // Prefer companyId if present; otherwise fall back to their own id
     return { type: 'company', companyId: reqUser?.companyId || reqUser?.id };
   }
+
+  // Individual sees user scope
   return { type: 'user', userId: reqUser?.id };
 }
 
