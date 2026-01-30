@@ -1,8 +1,12 @@
 // backend/src/routes/company.routes.js
 // Company Room API (members + notifications)
-// ✅ Company role can manage members in their company
-// ✅ Admin can view/manage any company (by passing ?companyId=...)
+//
+// ✅ Company role can manage members in their own company
+// ✅ Admin can view/manage any company (by passing ?companyId=... or {companyId} in body)
 // ✅ Safe scoping: cannot read/mark notifications outside company scope
+//
+// NOTE: We do NOT call markRead() first anymore (to avoid marking something read
+// and then rejecting). We scope-check first, then mark read safely.
 
 const express = require('express');
 const router = express.Router();
@@ -10,23 +14,30 @@ const router = express.Router();
 const { authRequired, requireRole } = require('../middleware/auth');
 const users = require('../users/user.service');
 const companies = require('../companies/company.service');
-const { listNotifications, markRead } = require('../lib/notify');
+const { listNotifications } = require('../lib/notify');
+const { readDb, writeDb } = require('../lib/db');
 
 router.use(authRequired);
 
-// helper: resolve company scope
+// ---------------- helpers ----------------
+
+function safeStr(v) {
+  return String(v || '').trim();
+}
+
+// Resolve company scope for this request
 function getCompanyId(req) {
   const role = req.user?.role;
 
-  // Admin can inspect any company by query/body
+  // Admin can inspect any company by query/body (fallback to their own if present)
   if (role === users.ROLES.ADMIN) {
-    const fromQuery = (req.query.companyId || '').toString().trim();
-    const fromBody = (req.body?.companyId || '').toString().trim();
-    return fromQuery || fromBody || (req.user.companyId || '').toString().trim();
+    const fromQuery = safeStr(req.query.companyId);
+    const fromBody = safeStr(req.body?.companyId);
+    return fromQuery || fromBody || safeStr(req.user.companyId);
   }
 
-  // Normal company users: only their assigned company
-  return (req.user.companyId || '').toString().trim();
+  // Company users: only their assigned company
+  return safeStr(req.user.companyId);
 }
 
 function requireCompany(req, res) {
@@ -37,6 +48,24 @@ function requireCompany(req, res) {
   }
   return companyId;
 }
+
+// Safe mark-read that enforces company scope BEFORE changing anything
+function markReadScoped({ id, companyId }) {
+  const db = readDb();
+  const n = (db.notifications || []).find(x => String(x.id) === String(id));
+  if (!n) return { ok: false, status: 404, error: 'Not found' };
+
+  // Must match company scope
+  if (String(n.companyId || '') !== String(companyId || '')) {
+    return { ok: false, status: 403, error: 'Forbidden' };
+  }
+
+  n.read = true;
+  writeDb(db);
+  return { ok: true, notification: n };
+}
+
+// ---------------- routes ----------------
 
 // ✅ GET /api/company/me
 router.get(
@@ -82,25 +111,13 @@ router.post(
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
-      const id = String(req.params.id || '').trim();
+      const id = safeStr(req.params.id);
       if (!id) return res.status(400).json({ error: 'Missing notification id' });
 
-      // markRead() signature may vary in your codebase, so call safely
-      let n = null;
-      try {
-        n = markRead(id, req.user.id);
-      } catch {
-        n = markRead(id);
-      }
+      const result = markReadScoped({ id, companyId });
+      if (!result.ok) return res.status(result.status).json({ error: result.error });
 
-      if (!n) return res.status(404).json({ error: 'Not found' });
-
-      // ✅ Scope check: don’t allow cross-company marking
-      if (String(n.companyId || '') !== String(companyId)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-
-      return res.json(n);
+      return res.json(result.notification);
     } catch (e) {
       return res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
@@ -116,7 +133,7 @@ router.post(
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
-      const userId = String(req.body?.userId || '').trim();
+      const userId = safeStr(req.body?.userId);
       if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
       return res.json(companies.addMember(companyId, userId, req.user.id));
@@ -135,7 +152,7 @@ router.post(
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
-      const userId = String(req.body?.userId || '').trim();
+      const userId = safeStr(req.body?.userId);
       if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
       return res.json(companies.removeMember(companyId, userId, req.user.id));
