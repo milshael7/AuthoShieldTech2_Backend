@@ -1,7 +1,7 @@
 // backend/src/routes/manager.routes.js
 // Manager Room API (read-only)
-// ✅ Admin can see everything Manager sees (same endpoints, same data)
-// ✅ Adds safe limits + basic filtering + consistent error handling
+// ✅ Admin can see everything Manager sees
+// ✅ Safe limits + filtering + stable responses
 
 const express = require('express');
 const router = express.Router();
@@ -13,11 +13,15 @@ const users = require('../users/user.service');
 const companies = require('../companies/company.service');
 const { listNotifications } = require('../lib/notify');
 
+// ---------------- Role safety ----------------
+const ADMIN = users?.ROLES?.ADMIN || 'Admin';
+const MANAGER = users?.ROLES?.MANAGER || 'Manager';
+
+// ---------------- Middleware ----------------
 router.use(authRequired);
+router.use(requireRole(ADMIN, MANAGER));
 
-// ✅ Admin + Manager allowed
-router.use(requireRole(users.ROLES.ADMIN, users.ROLES.MANAGER));
-
+// ---------------- Helpers ----------------
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
   if (!Number.isFinite(x)) return fallback;
@@ -30,7 +34,9 @@ function safeStr(v, maxLen = 120) {
   return s.slice(0, maxLen);
 }
 
-// Overview counts for manager room
+// ---------------- Routes ----------------
+
+// ✅ GET /api/manager/overview
 router.get('/overview', (req, res) => {
   try {
     const db = readDb();
@@ -46,7 +52,7 @@ router.get('/overview', (req, res) => {
   }
 });
 
-// Read-only lists
+// ✅ GET /api/manager/users (read-only)
 router.get('/users', (req, res) => {
   try {
     return res.json(users.listUsers());
@@ -55,6 +61,7 @@ router.get('/users', (req, res) => {
   }
 });
 
+// ✅ GET /api/manager/companies (read-only)
 router.get('/companies', (req, res) => {
   try {
     return res.json(companies.listCompanies());
@@ -63,25 +70,23 @@ router.get('/companies', (req, res) => {
   }
 });
 
-// Notifications (read-only)
-// Supports optional ?limit= (default 200, max 1000)
+// ✅ GET /api/manager/notifications
+// Optional: ?limit=200 (max 1000)
 router.get('/notifications', (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 1, 1000, 200);
-
     const all = listNotifications({}) || [];
-    // newest first
-    return res.json(all.slice(0, limit));
+    return res.json(all.slice(0, limit)); // newest first
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// Audit log (read-only)
-// Supports:
-//   ?limit=200 (max 1000)
-//   ?actorId=...  (filter)
-//   ?action=...   (partial match)
+// ✅ GET /api/manager/audit
+// Filters:
+//   ?limit=200
+//   ?actorId=...
+//   ?action=partial
 router.get('/audit', (req, res) => {
   try {
     const db = readDb();
@@ -90,11 +95,16 @@ router.get('/audit', (req, res) => {
     const actorId = safeStr(req.query.actorId);
     const actionQ = safeStr(req.query.action).toLowerCase();
 
-    // ✅ filter first, then limit newest-first
     let items = (db.audit || []).slice().reverse();
 
-    if (actorId) items = items.filter(ev => String(ev.actorId || '') === actorId);
-    if (actionQ) items = items.filter(ev => String(ev.action || '').toLowerCase().includes(actionQ));
+    if (actorId) {
+      items = items.filter(ev => String(ev.actorId || '') === actorId);
+    }
+    if (actionQ) {
+      items = items.filter(ev =>
+        String(ev.action || '').toLowerCase().includes(actionQ)
+      );
+    }
 
     return res.json(items.slice(0, limit));
   } catch (e) {
