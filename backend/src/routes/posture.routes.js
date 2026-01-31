@@ -2,12 +2,16 @@
 // Cybersecurity "Posture" (MVP) — summary + checks + recent events
 // ✅ Admin + Manager can view everything
 // ✅ Company + Individual can view only their own scope
+// ✅ Normalizes notification fields (at + createdAt) so frontend never breaks
 
 const express = require('express');
 const router = express.Router();
 
 const { authRequired } = require('../middleware/auth');
 const { readDb } = require('../lib/db');
+const users = require('../users/user.service');
+
+router.use(authRequired);
 
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
@@ -24,20 +28,29 @@ function roleOf(u) {
 }
 
 function isAdmin(u) {
-  return roleOf(u) === 'Admin';
+  return roleOf(u) === users.ROLES.ADMIN;
 }
-
 function isManager(u) {
-  return roleOf(u) === 'Manager';
+  return roleOf(u) === users.ROLES.MANAGER;
+}
+function isCompany(u) {
+  return roleOf(u) === users.ROLES.COMPANY;
 }
 
-function isCompany(u) {
-  return roleOf(u) === 'Company';
+// Normalize notifications so UI can safely read either field
+function normNotification(n) {
+  if (!n) return n;
+  const at = n.at || n.createdAt || null;
+  return {
+    ...n,
+    at,
+    createdAt: n.createdAt || at, // keep both
+  };
 }
 
 // Starter “checks” list (expand later with real signals)
 function buildChecks({ user }) {
-  const ap = !!(user && (user.autoprotectEnabled || user.autoprotechEnabled)); // supports your typo too
+  const ap = !!(user && (user.autoprotectEnabled || user.autoprotechEnabled)); // supports typo too
   return [
     {
       id: 'mfa',
@@ -67,9 +80,7 @@ function buildChecks({ user }) {
 
 function scopeFor(reqUser) {
   // Admin/Manager see global
-  if (isAdmin(reqUser) || isManager(reqUser)) {
-    return { type: 'global' };
-  }
+  if (isAdmin(reqUser) || isManager(reqUser)) return { type: 'global' };
 
   // Company sees company scope
   if (isCompany(reqUser)) {
@@ -82,7 +93,7 @@ function scopeFor(reqUser) {
 }
 
 // GET /api/posture/summary
-router.get('/summary', authRequired, (req, res) => {
+router.get('/summary', (req, res) => {
   try {
     const db = readDb();
     const scope = scopeFor(req.user);
@@ -142,7 +153,7 @@ router.get('/summary', authRequired, (req, res) => {
 });
 
 // GET /api/posture/checks
-router.get('/checks', authRequired, (req, res) => {
+router.get('/checks', (req, res) => {
   try {
     return res.json({
       scope: scopeFor(req.user),
@@ -155,7 +166,7 @@ router.get('/checks', authRequired, (req, res) => {
 });
 
 // GET /api/posture/recent?limit=50 (max 200)
-router.get('/recent', authRequired, (req, res) => {
+router.get('/recent', (req, res) => {
   try {
     const db = readDb();
     const scope = scopeFor(req.user);
@@ -168,7 +179,7 @@ router.get('/recent', authRequired, (req, res) => {
       return res.json({
         scope,
         audit: audit.slice(0, limit),
-        notifications: notifications.slice(0, limit),
+        notifications: notifications.slice(0, limit).map(normNotification),
         time: nowISO(),
       });
     }
@@ -176,7 +187,11 @@ router.get('/recent', authRequired, (req, res) => {
     if (scope.type === 'company') {
       const companyId = String(scope.companyId || '');
       const a = audit.filter(ev => String(ev.companyId || '') === companyId).slice(0, limit);
-      const n = notifications.filter(x => String(x.companyId || '') === companyId).slice(0, limit);
+      const n = notifications
+        .filter(x => String(x.companyId || '') === companyId)
+        .slice(0, limit)
+        .map(normNotification);
+
       return res.json({ scope, audit: a, notifications: n, time: nowISO() });
     }
 
@@ -187,7 +202,8 @@ router.get('/recent', authRequired, (req, res) => {
 
     const n = notifications
       .filter(x => String(x.userId || '') === userId)
-      .slice(0, limit);
+      .slice(0, limit)
+      .map(normNotification);
 
     return res.json({ scope, audit: a, notifications: n, time: nowISO() });
   } catch (e) {
