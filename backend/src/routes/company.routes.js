@@ -4,9 +4,6 @@
 // ✅ Company role can manage members in their own company
 // ✅ Admin can view/manage any company (by passing ?companyId=... or {companyId} in body)
 // ✅ Safe scoping: cannot read/mark notifications outside company scope
-//
-// NOTE: We do NOT call markRead() first anymore (to avoid marking something read
-// and then rejecting). We scope-check first, then mark read safely.
 
 const express = require('express');
 const router = express.Router();
@@ -14,8 +11,7 @@ const router = express.Router();
 const { authRequired, requireRole } = require('../middleware/auth');
 const users = require('../users/user.service');
 const companies = require('../companies/company.service');
-const { listNotifications } = require('../lib/notify');
-const { readDb, writeDb } = require('../lib/db');
+const { listNotifications, markRead } = require('../lib/notify');
 
 router.use(authRequired);
 
@@ -47,22 +43,6 @@ function requireCompany(req, res) {
     return null;
   }
   return companyId;
-}
-
-// Safe mark-read that enforces company scope BEFORE changing anything
-function markReadScoped({ id, companyId }) {
-  const db = readDb();
-  const n = (db.notifications || []).find(x => String(x.id) === String(id));
-  if (!n) return { ok: false, status: 404, error: 'Not found' };
-
-  // Must match company scope
-  if (String(n.companyId || '') !== String(companyId || '')) {
-    return { ok: false, status: 403, error: 'Forbidden' };
-  }
-
-  n.read = true;
-  writeDb(db);
-  return { ok: true, notification: n };
 }
 
 // ---------------- routes ----------------
@@ -114,10 +94,11 @@ router.post(
       const id = safeStr(req.params.id);
       if (!id) return res.status(400).json({ error: 'Missing notification id' });
 
-      const result = markReadScoped({ id, companyId });
-      if (!result.ok) return res.status(result.status).json({ error: result.error });
+      // ✅ scope enforced here (companyId must match)
+      const n = markRead(id, null, companyId);
+      if (!n) return res.status(404).json({ error: 'Not found' });
 
-      return res.json(result.notification);
+      return res.json(n);
     } catch (e) {
       return res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
