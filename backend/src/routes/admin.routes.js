@@ -1,4 +1,7 @@
 // backend/src/routes/admin.routes.js
+// Admin API — full control (users, companies, notifications)
+// ✅ Stable, safe, complete
+
 const express = require('express');
 const router = express.Router();
 
@@ -9,10 +12,21 @@ const users = require('../users/user.service');
 const companies = require('../companies/company.service');
 const { listNotifications } = require('../lib/notify');
 
+// ---------------- Role safety ----------------
+const ADMIN_ROLE = users?.ROLES?.ADMIN || 'Admin';
+
+// ---------------- Middleware ----------------
 router.use(authRequired);
-router.use(requireRole(users.ROLES.ADMIN));
+router.use(requireRole(ADMIN_ROLE));
+
+// ---------------- Helpers ----------------
+function cleanStr(v, max = 200) {
+  return String(v || '').trim().slice(0, max);
+}
 
 // ---------------- Users ----------------
+
+// GET /api/admin/users
 router.get('/users', (req, res) => {
   try {
     return res.json(users.listUsers());
@@ -21,13 +35,16 @@ router.get('/users', (req, res) => {
   }
 });
 
+// POST /api/admin/users
 router.post('/users', (req, res) => {
   try {
-    // Optional: basic cleanup (prevents weird saves)
     const body = req.body || {};
-    if (typeof body.email === 'string') body.email = body.email.trim();
-    if (typeof body.role === 'string') body.role = body.role.trim();
-    if (typeof body.companyId === 'string') body.companyId = body.companyId.trim() || null;
+
+    if (typeof body.email === 'string') body.email = cleanStr(body.email, 200);
+    if (typeof body.role === 'string') body.role = cleanStr(body.role, 50);
+    if (typeof body.companyId === 'string') {
+      body.companyId = cleanStr(body.companyId, 100) || null;
+    }
 
     return res.status(201).json(users.createUser(body));
   } catch (e) {
@@ -35,35 +52,43 @@ router.post('/users', (req, res) => {
   }
 });
 
+// POST /api/admin/users/:id/rotate-id
 router.post('/users/:id/rotate-id', (req, res) => {
   try {
-    return res.json(users.rotatePlatformIdAndForceReset(req.params.id, req.user.id));
+    return res.json(
+      users.rotatePlatformIdAndForceReset(req.params.id, req.user.id)
+    );
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
+// POST /api/admin/users/:id/subscription
 router.post('/users/:id/subscription', (req, res) => {
   try {
     const patch = {};
     const body = req.body || {};
 
     if (typeof body.subscriptionStatus === 'string') {
-      patch.subscriptionStatus = body.subscriptionStatus.trim();
+      patch.subscriptionStatus = cleanStr(body.subscriptionStatus, 50);
     }
 
-    // ✅ Keep compatibility with your existing schema typo (autoprotechEnabled)
+    // ✅ support DB typo + frontend-friendly name
     if (typeof body.autoprotectEnabled !== 'undefined') {
       patch.autoprotechEnabled = !!body.autoprotectEnabled;
     }
 
-    return res.json(users.updateUser(req.params.id, patch, req.user.id));
+    return res.json(
+      users.updateUser(req.params.id, patch, req.user.id)
+    );
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
 // ---------------- Companies ----------------
+
+// GET /api/admin/companies
 router.get('/companies', (req, res) => {
   try {
     return res.json(companies.listCompanies());
@@ -72,13 +97,17 @@ router.get('/companies', (req, res) => {
   }
 });
 
+// POST /api/admin/companies
 router.post('/companies', (req, res) => {
   try {
     const body = req.body || {};
-    if (typeof body.name === 'string') body.name = body.name.trim();
+    if (typeof body.name === 'string') body.name = cleanStr(body.name, 200);
 
     return res.status(201).json(
-      companies.createCompany({ ...body, createdBy: req.user.id })
+      companies.createCompany({
+        ...body,
+        createdBy: req.user.id,
+      })
     );
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
@@ -86,6 +115,8 @@ router.post('/companies', (req, res) => {
 });
 
 // ---------------- Notifications ----------------
+
+// GET /api/admin/notifications
 router.get('/notifications', (req, res) => {
   try {
     return res.json(listNotifications({}));
@@ -95,11 +126,12 @@ router.get('/notifications', (req, res) => {
 });
 
 // ======================================================
-// ✅ Admin “Manager View” (read-only): overview + audit
-// (Admin can already access /api/manager/*, but this keeps
-// an admin-only mirror if you want it.)
+// ✅ Admin “Manager View” (read-only mirror)
+// (Admin can already access /api/manager/* — this is optional
+// but kept for clarity + future separation)
 // ======================================================
 
+// GET /api/admin/manager/overview
 router.get('/manager/overview', (req, res) => {
   try {
     const db = readDb();
@@ -115,17 +147,18 @@ router.get('/manager/overview', (req, res) => {
   }
 });
 
+// GET /api/admin/manager/audit
 router.get('/manager/audit', (req, res) => {
   try {
     const db = readDb();
     const limit = Math.min(Number(req.query.limit || 200), 1000);
-    const items = (db.audit || []).slice(-limit).reverse();
-    return res.json(items);
+    return res.json((db.audit || []).slice(-limit).reverse());
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
+// GET /api/admin/manager/notifications
 router.get('/manager/notifications', (req, res) => {
   try {
     return res.json(listNotifications({}));
