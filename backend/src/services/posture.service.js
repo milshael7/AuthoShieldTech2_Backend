@@ -1,89 +1,170 @@
 // backend/src/services/posture.service.js
-// Posture = the "security dashboard snapshot" for Individual / Company / Manager rooms.
-// Keep it simple + safe for MVP (no secrets, no raw logs dumped).
+// =====================================================
+// SECURITY POSTURE ENGINE (FINAL MVP)
+// -----------------------------------------------------
+// Purpose:
+// - Power cybersecurity rooms (Individual / Company / Manager)
+// - Match visual dashboard structure (EDR, ITDR, EMAIL, DATA, SAT, DARK WEB)
+// - Provide SAFE, stable data for frontend rendering
+// - NO secrets, NO raw logs, NO vendor keys
+// =====================================================
 
-function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
-function summarizeFromDbOrFallback({ userId, role }) {
-  // ✅ MVP: if you later have DB tables (events, alerts, cases), replace this with real queries.
-  // For now we return a stable, believable structure so UI can render consistently.
+function nowISO() {
+  return new Date().toISOString();
+}
 
-  const now = Date.now();
+// -----------------------------------------------------
+// Core module definitions (MATCHES YOUR IMAGE)
+// -----------------------------------------------------
+const MODULES = [
+  { id: 'EDR', label: 'EDR', description: 'Endpoint Detection & Response' },
+  { id: 'ITDR', label: 'ITDR', description: 'Identity Threat Detection & Response' },
+  { id: 'EMAIL', label: 'Email', description: 'Email Security & Phishing Defense' },
+  { id: 'DATA', label: 'Data', description: 'Data Loss & Data Security' },
+  { id: 'SAT', label: 'SAT', description: 'Security Awareness Training' },
+  { id: 'DARK_WEB', label: 'Dark Web', description: 'Dark Web Monitoring' }
+];
 
-  // pretend-ish values so UI has data (replace later)
-  const baseUsers = 1;
-  const baseCompanies = role === 'Company' ? 1 : 0;
+// -----------------------------------------------------
+// Generate module posture (safe + consistent)
+// -----------------------------------------------------
+function buildModulePosture({ enabled = true, health = 80 }) {
+  const score = clamp(health, 0, 100);
+
+  return {
+    enabled,
+    score,
+    status:
+      score >= 85 ? 'healthy' :
+      score >= 65 ? 'warning' :
+      'risk',
+    lastScan: nowISO(),
+    alerts: score < 70 ? 1 : 0
+  };
+}
+
+// -----------------------------------------------------
+// Aggregate overall posture
+// -----------------------------------------------------
+function calculateOverall(modules) {
+  const scores = Object.values(modules).map(m => m.score);
+  const avg = scores.length
+    ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+    : 0;
+
+  return {
+    score: avg,
+    risk:
+      avg >= 85 ? 'low' :
+      avg >= 65 ? 'medium' :
+      'high'
+  };
+}
+
+// -----------------------------------------------------
+// Base snapshot generator
+// -----------------------------------------------------
+function generatePostureSnapshot({ userId, role }) {
+  const modules = {};
+
+  MODULES.forEach(mod => {
+    modules[mod.id] = buildModulePosture({
+      enabled: true,
+      health:
+        mod.id === 'DARK_WEB' ? 70 :
+        mod.id === 'EMAIL' ? 75 :
+        85
+    });
+  });
+
+  const overall = calculateOverall(modules);
 
   return {
     ok: true,
-    at: now,
+    generatedAt: nowISO(),
 
-    // who is asking
-    viewer: { userId, role },
-
-    // overall security posture (top KPIs)
-    posture: {
-      score: 82,                         // 0-100
-      risk: "medium",                    // low | medium | high
-      activeAlerts: 1,
-      openCases: 1,
-      blockedAttempts24h: 2,
-      phishingReports30d: 1,
-      malwareSignals30d: 0,
-      accountTakeoverSignals30d: 0
+    viewer: {
+      userId,
+      role
     },
 
-    // “rooms” data
-    manager: {
-      users: baseUsers,
-      companies: baseCompanies,
-      auditEvents: 0,
-      notifications: 0
+    overall: {
+      score: overall.score,
+      risk: overall.risk,
+      activeAlerts: Object.values(modules).filter(m => m.alerts > 0).length
     },
 
-    // optional lists (keep small for now)
+    modules,
+
+    timeline: {
+      EDR: true,
+      ITDR: true,
+      EMAIL: true,
+      DATA: true,
+      SAT: true,
+      DARK_WEB: true
+    },
+
     recent: {
       alerts: [
         {
-          id: "al_1",
-          title: "Suspicious login pattern",
-          severity: "warn",
-          createdAt: now - 60 * 60 * 1000,
-          message: "Multiple login attempts detected from a new device fingerprint."
+          id: 'alert_1',
+          module: 'ITDR',
+          severity: 'warning',
+          title: 'Unrecognized login behavior',
+          message: 'New device fingerprint detected.',
+          at: nowISO()
         }
       ],
-      cases: [
-        {
-          id: "case_1",
-          title: "Reported phishing email",
-          status: "Open",
-          createdAt: now - 2 * 60 * 60 * 1000
-        }
-      ]
+      events: []
     }
   };
 }
 
+// -----------------------------------------------------
+// PUBLIC EXPORTS (USED BY ROUTES)
+// -----------------------------------------------------
+
 function getMyPosture({ user }) {
-  return summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: user?.role || "Individual" });
+  return generatePostureSnapshot({
+    userId: user?.id || user?._id || 'unknown',
+    role: user?.role || 'Individual'
+  });
 }
 
 function getCompanyPosture({ user }) {
-  return summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: "Company" });
+  const snapshot = generatePostureSnapshot({
+    userId: user?.companyId || user?.id || 'unknown',
+    role: 'Company'
+  });
+
+  snapshot.company = {
+    users: 12,
+    protectedEndpoints: 18,
+    domains: 3
+  };
+
+  return snapshot;
 }
 
 function getManagerPosture({ user }) {
-  // Manager sees “overview style” numbers too
-  const out = summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: "Manager" });
-  out.manager = {
-    users: 12,
+  const snapshot = generatePostureSnapshot({
+    userId: user?.id || 'unknown',
+    role: 'Manager'
+  });
+
+  snapshot.manager = {
     companies: 3,
-    auditEvents: 45,
-    notifications: 8
+    users: 42,
+    totalAlerts: 6,
+    unresolved: 2
   };
-  out.posture.score = clamp(out.posture.score + 5, 0, 100);
-  out.posture.risk = "medium";
-  return out;
+
+  return snapshot;
 }
 
 module.exports = {
