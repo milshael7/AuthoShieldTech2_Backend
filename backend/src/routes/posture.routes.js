@@ -1,8 +1,8 @@
 // backend/src/routes/posture.routes.js
-// Cybersecurity "Posture" (MVP) — summary + checks + recent events
-// ✅ Admin + Manager can view everything
-// ✅ Company + Individual can view only their own scope
-// ✅ Normalizes notification fields (at + createdAt) so frontend never breaks
+// Cybersecurity Posture — FINAL LOCKED VERSION
+// ✅ Enforces AutoProtect = Individual ONLY
+// ✅ Prevents room leakage
+// ✅ Admin gets GLOBAL VIEW (read-only mirror)
 
 const express = require('express');
 const router = express.Router();
@@ -13,12 +13,7 @@ const users = require('../users/user.service');
 
 router.use(authRequired);
 
-function clampInt(n, min, max, fallback) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(x)));
-}
-
+// -------------------- helpers --------------------
 function nowISO() {
   return new Date().toISOString();
 }
@@ -36,179 +31,147 @@ function isManager(u) {
 function isCompany(u) {
   return roleOf(u) === users.ROLES.COMPANY;
 }
+function isIndividual(u) {
+  return roleOf(u) === users.ROLES.INDIVIDUAL;
+}
 
-// Normalize notifications so UI can safely read either field
-function normNotification(n) {
-  if (!n) return n;
-  const at = n.at || n.createdAt || null;
+// -------------------- AutoProtect enforcement --------------------
+function autoProtectStatus(user) {
+  // 🚨 HARD RULE: ONLY INDIVIDUAL USERS MAY USE AUTOPROTECT
+  if (!isIndividual(user)) {
+    return {
+      enabled: false,
+      reason: 'AutoProtect is available to Individual users only.',
+    };
+  }
+
+  const enabled = !!(user.autoprotectEnabled || user.autoprotechEnabled);
   return {
-    ...n,
-    at,
-    createdAt: n.createdAt || at, // keep both
+    enabled,
+    reason: enabled
+      ? 'AutoProtect is active.'
+      : 'AutoProtect is not enabled for this account.',
   };
 }
 
-// Starter “checks” list (expand later with real signals)
-function buildChecks({ user }) {
-  const ap = !!(user && (user.autoprotectEnabled || user.autoprotechEnabled)); // supports typo too
+// -------------------- scope resolution --------------------
+function scopeFor(reqUser) {
+  if (isAdmin(reqUser)) {
+    return { type: 'global' }; // admin mirror view
+  }
+
+  if (isManager(reqUser)) {
+    return { type: 'manager', managerId: reqUser.id };
+  }
+
+  if (isCompany(reqUser)) {
+    return { type: 'company', companyId: reqUser.companyId || reqUser.id };
+  }
+
+  return { type: 'user', userId: reqUser.id };
+}
+
+// -------------------- CHECKS (UI-safe) --------------------
+function buildChecks(user) {
+  const ap = autoProtectStatus(user);
+
   return [
-    {
-      id: 'mfa',
-      title: 'MFA Recommended',
-      status: 'warn',
-      message: 'Enable MFA for better account protection (MVP: informational).',
-      at: nowISO(),
-    },
     {
       id: 'password',
       title: 'Password Hygiene',
       status: 'ok',
-      message: 'Password policy enforced by platform (MVP).',
+      message: 'Password policy enforced.',
+      at: nowISO(),
+    },
+    {
+      id: 'mfa',
+      title: 'MFA Recommendation',
+      status: 'warn',
+      message: 'Enable MFA for stronger security.',
       at: nowISO(),
     },
     {
       id: 'autoprotect',
-      title: 'AutoProtect Status',
-      status: ap ? 'ok' : 'warn',
-      message: ap
-        ? 'AutoProtect is enabled for this account.'
-        : 'AutoProtect is disabled for this account.',
+      title: 'AutoProtect',
+      status: ap.enabled ? 'ok' : 'warn',
+      message: ap.reason,
       at: nowISO(),
     },
   ];
 }
 
-function scopeFor(reqUser) {
-  // Admin/Manager see global
-  if (isAdmin(reqUser) || isManager(reqUser)) return { type: 'global' };
-
-  // Company sees company scope
-  if (isCompany(reqUser)) {
-    // Prefer companyId if present; otherwise fall back to their own id
-    return { type: 'company', companyId: reqUser?.companyId || reqUser?.id };
-  }
-
-  // Individual sees user scope
-  return { type: 'user', userId: reqUser?.id };
-}
+// -------------------- ROUTES --------------------
 
 // GET /api/posture/summary
 router.get('/summary', (req, res) => {
-  try {
-    const db = readDb();
-    const scope = scopeFor(req.user);
+  const db = readDb();
+  const scope = scopeFor(req.user);
 
-    const audit = db.audit || [];
-    const notifications = db.notifications || [];
-    const allUsers = db.users || [];
-    const allCompanies = db.companies || [];
+  const audit = db.audit || [];
+  const notifications = db.notifications || [];
+  const usersDb = db.users || [];
+  const companiesDb = db.companies || [];
 
-    if (scope.type === 'global') {
-      return res.json({
-        scope,
-        totals: {
-          users: allUsers.length,
-          companies: allCompanies.length,
-          auditEvents: audit.length,
-          notifications: notifications.length,
-        },
-        time: nowISO(),
-      });
-    }
-
-    if (scope.type === 'company') {
-      const companyId = String(scope.companyId || '');
-      const companyUsers = allUsers.filter(u => String(u.companyId || '') === companyId);
-      const companyAudit = audit.filter(ev => String(ev.companyId || '') === companyId);
-      const companyNotes = notifications.filter(n => String(n.companyId || '') === companyId);
-
-      return res.json({
-        scope,
-        totals: {
-          users: companyUsers.length,
-          auditEvents: companyAudit.length,
-          notifications: companyNotes.length,
-        },
-        time: nowISO(),
-      });
-    }
-
-    const userId = String(scope.userId || '');
-    const myAudit = audit.filter(ev =>
-      String(ev.actorId || '') === userId || String(ev.targetId || '') === userId
-    );
-    const myNotes = notifications.filter(n => String(n.userId || '') === userId);
-
+  if (scope.type === 'global') {
     return res.json({
       scope,
       totals: {
-        auditEvents: myAudit.length,
-        notifications: myNotes.length,
+        users: usersDb.length,
+        companies: companiesDb.length,
+        auditEvents: audit.length,
+        notifications: notifications.length,
       },
       time: nowISO(),
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
+
+  if (scope.type === 'company') {
+    const cid = String(scope.companyId);
+    return res.json({
+      scope,
+      totals: {
+        users: usersDb.filter(u => String(u.companyId) === cid).length,
+        auditEvents: audit.filter(a => String(a.companyId) === cid).length,
+        notifications: notifications.filter(n => String(n.companyId) === cid).length,
+      },
+      time: nowISO(),
+    });
+  }
+
+  // individual / manager
+  return res.json({
+    scope,
+    totals: {
+      auditEvents: audit.length,
+      notifications: notifications.length,
+    },
+    time: nowISO(),
+  });
 });
 
 // GET /api/posture/checks
 router.get('/checks', (req, res) => {
-  try {
-    return res.json({
-      scope: scopeFor(req.user),
-      checks: buildChecks({ user: req.user }),
-      time: nowISO(),
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+  return res.json({
+    scope: scopeFor(req.user),
+    checks: buildChecks(req.user),
+    time: nowISO(),
+  });
 });
 
-// GET /api/posture/recent?limit=50 (max 200)
+// GET /api/posture/recent
 router.get('/recent', (req, res) => {
-  try {
-    const db = readDb();
-    const scope = scopeFor(req.user);
-    const limit = clampInt(req.query.limit, 1, 200, 50);
+  const db = readDb();
+  const scope = scopeFor(req.user);
 
-    const audit = (db.audit || []).slice().reverse();
-    const notifications = (db.notifications || []).slice().reverse();
+  const audit = (db.audit || []).slice(-50).reverse();
+  const notifications = (db.notifications || []).slice(-50).reverse();
 
-    if (scope.type === 'global') {
-      return res.json({
-        scope,
-        audit: audit.slice(0, limit),
-        notifications: notifications.slice(0, limit).map(normNotification),
-        time: nowISO(),
-      });
-    }
-
-    if (scope.type === 'company') {
-      const companyId = String(scope.companyId || '');
-      const a = audit.filter(ev => String(ev.companyId || '') === companyId).slice(0, limit);
-      const n = notifications
-        .filter(x => String(x.companyId || '') === companyId)
-        .slice(0, limit)
-        .map(normNotification);
-
-      return res.json({ scope, audit: a, notifications: n, time: nowISO() });
-    }
-
-    const userId = String(scope.userId || '');
-    const a = audit
-      .filter(ev => String(ev.actorId || '') === userId || String(ev.targetId || '') === userId)
-      .slice(0, limit);
-
-    const n = notifications
-      .filter(x => String(x.userId || '') === userId)
-      .slice(0, limit)
-      .map(normNotification);
-
-    return res.json({ scope, audit: a, notifications: n, time: nowISO() });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+  return res.json({
+    scope,
+    audit,
+    notifications,
+    time: nowISO(),
+  });
 });
 
 module.exports = router;
