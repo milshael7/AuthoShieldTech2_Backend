@@ -2,15 +2,20 @@
 const express = require('express');
 const router = express.Router();
 const { authRequired } = require('../middleware/auth');
+const paperTrader = require('../services/paperTrader');
 
 /**
- * TRADING SAFETY GATE
- * - Does NOT place real trades
- * - Controls paper vs live availability only
- * - Safe by default
+ * TRADING SAFETY GATE + PAPER TRADING API
+ *
+ * ✅ No real trades placed here
+ * ✅ Paper trading is ALWAYS allowed
+ * ✅ Live trading requires:
+ *    - ENV enable
+ *    - Admin arming
+ * ✅ Admin + Manager can view paper data
  */
 
-// ------------------ STATE ------------------
+// ------------------ LIVE STATE ------------------
 let LIVE = {
   enabled: String(process.env.LIVE_TRADING_ENABLED || '').toLowerCase() === 'true',
   armedUntil: 0,
@@ -19,9 +24,13 @@ let LIVE = {
 const now = () => Date.now();
 const isArmed = () => LIVE.armedUntil > now();
 
-// ✅ CORRECT ADMIN CHECK (FIXED)
+// ------------------ ROLE CHECK ------------------
 function isAdmin(req) {
   return req?.user?.role === 'Admin';
+}
+
+function isManagerOrAdmin(req) {
+  return req?.user?.role === 'Admin' || req?.user?.role === 'Manager';
 }
 
 // ------------------ MOCK CANDLES ------------------
@@ -50,14 +59,14 @@ function genCandles({ start, count = 120, base = 65000, volatility = 120 }) {
   });
 }
 
-// ------------------ PUBLIC ------------------
+// ------------------ PUBLIC (NO AUTH) ------------------
 
-// Symbols (no auth)
+// Symbols
 router.get('/symbols', (req, res) => {
   res.json({ ok: true, symbols: ['BTCUSDT', 'ETHUSDT'] });
 });
 
-// Candles (no auth)
+// Candles
 router.get('/candles', (req, res) => {
   const symbol = String(req.query.symbol || 'BTCUSDT');
   const base = symbol === 'ETHUSDT' ? 3500 : 65000;
@@ -75,7 +84,7 @@ router.get('/candles', (req, res) => {
   });
 });
 
-// Status (no auth)
+// Trading mode status
 router.get('/status', (req, res) => {
   res.json({
     ok: true,
@@ -98,7 +107,52 @@ router.get('/status', (req, res) => {
 // ------------------ PROTECTED ------------------
 router.use(authRequired);
 
-// Arm live trading (ADMIN ONLY)
+// ------------------ PAPER TRADER ------------------
+
+/**
+ * GET /api/trading/paper/snapshot
+ * Admin + Manager
+ */
+router.get('/paper/snapshot', (req, res) => {
+  if (!isManagerOrAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden' });
+  }
+
+  res.json({ ok: true, snapshot: paperTrader.snapshot() });
+});
+
+/**
+ * POST /api/trading/paper/config
+ * Admin ONLY
+ */
+router.post('/paper/config', (req, res) => {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Admin only' });
+  }
+
+  const updated = paperTrader.setConfig(req.body || {});
+  res.json({ ok: true, config: updated });
+});
+
+/**
+ * POST /api/trading/paper/reset
+ * Admin ONLY
+ */
+router.post('/paper/reset', (req, res) => {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Admin only' });
+  }
+
+  paperTrader.hardReset();
+  res.json({ ok: true });
+});
+
+// ------------------ LIVE ARMING ------------------
+
+/**
+ * POST /api/trading/live/arm
+ * Admin ONLY
+ */
 router.post('/live/arm', (req, res) => {
   if (!isAdmin(req)) {
     return res.status(403).json({ ok: false, error: 'Admin only' });
@@ -119,7 +173,10 @@ router.post('/live/arm', (req, res) => {
   });
 });
 
-// Disarm immediately (ADMIN ONLY)
+/**
+ * POST /api/trading/live/disarm
+ * Admin ONLY
+ */
 router.post('/live/disarm', (req, res) => {
   if (!isAdmin(req)) {
     return res.status(403).json({ ok: false, error: 'Admin only' });
