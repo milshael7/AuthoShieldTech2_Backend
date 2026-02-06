@@ -5,7 +5,6 @@
 const WebSocket = require("ws");
 
 function startKrakenFeed({ onTick, onStatus }) {
-  // Use newer endpoint (more stable)
   const URL = "wss://ws.kraken.com";
 
   // Kraken USD pairs (public)
@@ -22,7 +21,7 @@ function startKrakenFeed({ onTick, onStatus }) {
     "XLM/USD",
   ];
 
-  // Internal normalization (YES, still called USDT internally — intentional)
+  // Internal normalization (kept as USDT internally on purpose)
   const MAP = {
     "XBT/USD": "BTCUSDT",
     "ETH/USD": "ETHUSDT",
@@ -47,7 +46,7 @@ function startKrakenFeed({ onTick, onStatus }) {
 
   // Throttle per symbol (ms)
   const lastEmit = Object.create(null);
-  const EMIT_INTERVAL = 250; // 4 ticks/sec max per symbol
+  const EMIT_INTERVAL = 250; // max 4 ticks/sec per symbol
 
   function safeStatus(s) {
     try {
@@ -56,19 +55,17 @@ function startKrakenFeed({ onTick, onStatus }) {
   }
 
   function clearTimers() {
-    if (watchdog) clearInterval(watchdog);
+    try { if (watchdog) clearInterval(watchdog); } catch {}
     watchdog = null;
 
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+    try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch {}
     reconnectTimer = null;
   }
 
   function cleanupSocket() {
-    if (ws) {
-      try {
-        ws.removeAllListeners();
-      } catch {}
-    }
+    try {
+      if (ws) ws.removeAllListeners();
+    } catch {}
     ws = null;
   }
 
@@ -116,12 +113,12 @@ function startKrakenFeed({ onTick, onStatus }) {
         return;
       }
 
-      // Ignore event objects
+      // Ignore non-data events (heartbeat, systemStatus, subscribeStatus)
       if (msg && typeof msg === "object" && !Array.isArray(msg)) return;
       if (!Array.isArray(msg)) return;
 
       const data = msg[1];
-      const pair = msg[3] || msg[2]; // defensive
+      const pair = typeof msg[3] === "string" ? msg[3] : null;
       if (!data || !pair) return;
 
       const lastStr = data?.c?.[0];
@@ -131,7 +128,7 @@ function startKrakenFeed({ onTick, onStatus }) {
       const symbol = MAP[pair] || pair;
       const now = Date.now();
 
-      // Throttle
+      // Throttle per symbol
       if (lastEmit[symbol] && now - lastEmit[symbol] < EMIT_INTERVAL) return;
       lastEmit[symbol] = now;
 
@@ -158,7 +155,7 @@ function startKrakenFeed({ onTick, onStatus }) {
       } catch {}
     });
 
-    // Watchdog: force reconnect if silent
+    // Watchdog: force reconnect if silent for 20s
     watchdog = setInterval(() => {
       if (closedByUs) return;
       if (Date.now() - lastMsgAt > 20000) {
