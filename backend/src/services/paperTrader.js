@@ -29,23 +29,6 @@ function dayKey(ts) {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
-function load() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(STATE_FILE));
-      state = { ...defaultState(), ...raw };
-    }
-  } catch {
-    state = defaultState();
-  }
-}
-
-function save() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch {}
-}
-
 /* ---------------- STATE ---------------- */
 function defaultState() {
   return {
@@ -87,9 +70,35 @@ function defaultState() {
 }
 
 let state = defaultState();
+
+/* ---------------- PERSISTENCE ---------------- */
+function load() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(STATE_FILE));
+      state = { ...defaultState(), ...raw };
+    }
+  } catch {
+    state = defaultState();
+  }
+}
+function save() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch {}
+}
 load();
 
 /* ---------------- CORE ---------------- */
+function resetDayIfNeeded(ts) {
+  const dk = dayKey(ts);
+  if (state.limits.dayKey !== dk) {
+    state.limits.dayKey = dk;
+    state.limits.tradesToday = 0;
+    state.limits.lossesToday = 0;
+  }
+}
+
 function updateEquity(price) {
   if (state.position) {
     state.equity =
@@ -116,9 +125,11 @@ function canTrade(ts) {
   return true;
 }
 
+/* ---------------- EXECUTION ---------------- */
 function openPosition(symbol, price, riskPct) {
-  const usd = state.cashBalance * riskPct;
-  if (usd < 25) return;
+  const maxUsd = state.cashBalance - 10; // hard safety
+  const usd = clamp(state.cashBalance * riskPct, 25, maxUsd);
+  if (usd <= 0) return;
 
   const spread = price * (SPREAD_BP / 10000);
   const slip = price * (SLIPPAGE_BP / 10000);
@@ -163,6 +174,7 @@ function closePosition(price, reason) {
     exit: price,
     pnl: gross - fee,
     reason,
+    ts: Date.now(),
   });
 
   state.position = null;
@@ -172,13 +184,18 @@ function closePosition(price, reason) {
 function tick(symbol, price, ts = Date.now()) {
   if (!state.running) return;
 
+  resetDayIfNeeded(ts);
+
   state.lastPriceBySymbol[symbol] = price;
   state.learnStats.ticksSeen++;
 
   updateEquity(price);
   checkDrawdown();
 
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) return;
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) {
+    save();
+    return;
+  }
 
   const plan = makeDecision({
     symbol,
@@ -191,18 +208,21 @@ function tick(symbol, price, ts = Date.now()) {
   state.learnStats.decision = plan.action;
   state.learnStats.lastReason = plan.blockedReason || plan.action;
 
-  if (!canTrade(ts)) return;
+  if (!canTrade(ts)) {
+    save();
+    return;
+  }
 
   if (plan.action === "BUY" && !state.position) {
     openPosition(symbol, price, plan.riskPct);
   }
 
   if (
-    plan.action === "CLOSE" &&
+    (plan.action === "CLOSE" || plan.action === "SELL") &&
     state.position &&
     state.position.symbol === symbol
   ) {
-    closePosition(price, "brain_close");
+    closePosition(price, plan.action.toLowerCase());
   }
 
   save();
