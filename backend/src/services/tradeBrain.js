@@ -46,26 +46,38 @@ function makeDecision(context = {}) {
   const limits = paper.limits || {};
   const config = paper.config || {};
 
-  // Ask AI brain for its view (authoritative)
-  const aiView = aiBrain.decide
-    ? aiBrain.decide({ symbol, last, paper })
-    : {};
+  // Ask AI brain for its view (SAFE: optional)
+  let aiView = {};
+  try {
+    if (typeof aiBrain.decide === "function") {
+      aiView = aiBrain.decide({ symbol, last, paper }) || {};
+    }
+  } catch {
+    aiView = {};
+  }
 
   const rawDecision = String(
-    aiView.action || learn.decision || "WAIT"
+    aiView.action ?? learn.decision ?? "WAIT"
   ).toUpperCase();
 
-  const action = ALLOWED_ACTIONS.has(rawDecision)
+  const baseAction = ALLOWED_ACTIONS.has(rawDecision)
     ? rawDecision
     : "WAIT";
 
-  const confidence = safeNum(aiView.confidence ?? learn.confidence, 0);
-  const edge = safeNum(aiView.edge ?? learn.trendEdge, 0);
+  const confidence = safeNum(
+    aiView.confidence ?? learn.confidence,
+    0
+  );
+
+  const edge = safeNum(
+    aiView.edge ?? learn.trendEdge,
+    0
+  );
 
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  let finalAction = action;
+  let finalAction = baseAction;
   let blockedReason = "";
 
   // ---------------- HARD SAFETY GATES ----------------
@@ -87,16 +99,34 @@ function makeDecision(context = {}) {
   }
 
   // ---------------- RISK MODEL ----------------
-  const baselinePct = clamp(safeNum(config.baselinePct, 0.01), 0.001, 0.02);
-  const maxPct = clamp(safeNum(config.maxPct, 0.03), baselinePct, 0.05);
+  const baselinePct = clamp(
+    safeNum(config.baselinePct, 0.01),
+    0.001,
+    0.02
+  );
+
+  const maxPct = clamp(
+    safeNum(config.maxPct, 0.03),
+    baselinePct,
+    0.05
+  );
 
   const riskPct =
     lossesToday >= 2
       ? baselinePct
       : clamp(baselinePct * 2, baselinePct, maxPct);
 
-  const slPct = clamp(safeNum(config.slPct, 0.005), 0.002, 0.02);
-  const tpPct = clamp(safeNum(config.tpPct, 0.01), slPct, 0.05);
+  const slPct = clamp(
+    safeNum(config.slPct, 0.005),
+    0.002,
+    0.02
+  );
+
+  const tpPct = clamp(
+    safeNum(config.tpPct, 0.01),
+    slPct,
+    0.05
+  );
 
   // ---------------- FINAL PLAN ----------------
   return {
@@ -115,9 +145,12 @@ function makeDecision(context = {}) {
 
 // ---------------- EXPLAIN (UI / LOGS) ----------------
 function explain(message, context) {
-  return aiBrain.answer
-    ? aiBrain.answer(message, context)
-    : "AI explanation unavailable.";
+  try {
+    if (typeof aiBrain.answer === "function") {
+      return aiBrain.answer(message, context);
+    }
+  } catch {}
+  return "AI explanation unavailable.";
 }
 
 module.exports = {
