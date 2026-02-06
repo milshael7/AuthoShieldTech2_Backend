@@ -1,32 +1,32 @@
 // backend/src/services/liveTrader.js
 // Live trading engine (SAFE by default)
-// - Receives Kraken ticks (already wired in server.js)
-// - Can be "armed" without sending orders (intent logging only)
-// - Optional execute mode if you later add Kraken credentials
-// - Persists state to disk so it DOES NOT RESET on deploy (use Render Disk)
+// Accepts signals, logs intents, NEVER trades unless explicitly armed.
 
 const fs = require("fs");
 const path = require("path");
 
-const START_BAL = Number(process.env.LIVE_START_BALANCE || 0);
+const LIVE_REFERENCE_BALANCE = Number(process.env.LIVE_START_BALANCE || 0);
 
-// Persist state here (IMPORTANT: set this to Render Disk mount, not /tmp)
+// Persist state here (use Render Disk, NOT /tmp in production)
 const STATE_PATH =
   (process.env.LIVE_TRADER_STATE_PATH && String(process.env.LIVE_TRADER_STATE_PATH).trim()) ||
   "/tmp/live_trader_state.json";
 
-// Gate #1: allow the live engine to run / accept signals
+// ---------------- ENV GATES ----------------
+function envTrue(name) {
+  const v = String(process.env[name] || "").toLowerCase().trim();
+  return v === "true" || v === "1" || v === "yes";
+}
+
 function isEnabled() {
-  const v = String(process.env.LIVE_TRADING_ENABLED || "").toLowerCase().trim();
-  return v === "true" || v === "1" || v === "yes";
+  return envTrue("LIVE_TRADING_ENABLED");
 }
 
-// Gate #2: allow real orders to be transmitted to exchange (OFF unless explicitly enabled)
 function isExecuteEnabled() {
-  const v = String(process.env.LIVE_TRADING_EXECUTE || "").toLowerCase().trim();
-  return v === "true" || v === "1" || v === "yes";
+  return envTrue("LIVE_TRADING_EXECUTE");
 }
 
+// ---------------- HELPERS ----------------
 function ensureDirFor(filePath) {
   try {
     const dir = path.dirname(filePath);
@@ -43,30 +43,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function loadState() {
-  try {
-    ensureDirFor(STATE_PATH);
-    if (!fs.existsSync(STATE_PATH)) return null;
-    const raw = fs.readFileSync(STATE_PATH, "utf-8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveState(state) {
-  try {
-    ensureDirFor(STATE_PATH);
-    const tmp = STATE_PATH + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_PATH);
-  } catch {}
-}
-
+// ---------------- STATE ----------------
 function defaultState() {
   return {
-    version: 2,
+    version: 3,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -80,21 +60,17 @@ function defaultState() {
     stats: {
       ticksSeen: 0,
       lastTickTs: null,
-      lastReason: "not_started",
       lastSignalTs: null,
+      lastReason: "not_started",
     },
 
-    // We store "intents" here (unified format). Even in execute mode,
-    // intents are written first, then execution happens.
     intents: [],
-
-    // placeholder (later: filled with exchange order ids / statuses)
     orders: [],
 
     lastError: null,
 
     config: {
-      LIVE_START_BALANCE: START_BAL,
+      LIVE_REFERENCE_BALANCE,
       STATE_PATH,
     },
   };
@@ -109,7 +85,27 @@ function scheduleSave() {
     saveTimer = null;
     state.updatedAt = nowIso();
     saveState(state);
-  }, 500);
+  }, 400);
+}
+
+function saveState(s) {
+  try {
+    ensureDirFor(STATE_PATH);
+    const tmp = STATE_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+    fs.renameSync(tmp, STATE_PATH);
+  } catch {}
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_PATH)) return null;
+    const raw = fs.readFileSync(STATE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function refreshFlags() {
@@ -121,25 +117,31 @@ function refreshFlags() {
   else state.mode = "live-armed";
 }
 
+// ---------------- LIFECYCLE ----------------
 function start() {
-  // load persisted state (so it doesn't reset every deploy)
   const persisted = loadState();
   if (persisted && persisted.version >= 1) {
-    state = { ...defaultState(), ...persisted };
+    state = {
+      ...defaultState(),
+      ...persisted,
+      stats: { ...defaultState().stats, ...(persisted.stats || {}) },
+    };
   }
 
   state.running = true;
   refreshFlags();
 
   state.stats.lastReason = state.enabled
-    ? (state.execute ? "executing_enabled_waiting_for_signal" : "armed_waiting_for_signal")
+    ? state.execute
+      ? "executing_enabled_waiting_for_signal"
+      : "armed_waiting_for_signal"
     : "disabled_by_env";
 
   state.lastError = null;
   scheduleSave();
 }
 
-// Receive Kraken ticks (already wired)
+// ---------------- TICKS ----------------
 function tick(symbol, price, ts) {
   if (!state.running) return;
 
@@ -154,76 +156,58 @@ function tick(symbol, price, ts) {
   state.stats.lastTickTs = t;
 
   refreshFlags();
-
-  if (!state.enabled) {
-    state.stats.lastReason = "disabled_by_env";
-    scheduleSave();
-    return;
-  }
-
-  // Live trader does NOT invent trades on its own.
-  // It waits for a "signal" pushed from your strategy/brain layer.
-  state.stats.lastReason = state.execute
-    ? "executing_enabled_waiting_for_signal"
-    : "armed_waiting_for_signal";
+  state.stats.lastReason = state.enabled
+    ? state.execute
+      ? "executing_enabled_waiting_for_signal"
+      : "armed_waiting_for_signal"
+    : "disabled_by_env";
 
   scheduleSave();
 }
 
-/**
- * pushSignal(signal)
- * This is the ONE entry point we will use for BOTH paper + live later.
- * Your brain/strategy decides, then pushes signal here.
- *
- * signal = {
- *   symbol: "BTCUSDT",
- *   side: "BUY"|"SELL",
- *   type: "MARKET"|"LIMIT"|"STOP",
- *   qty: number,
- *   price?: number,
- *   tp?: number,
- *   sl?: number,
- *   reason?: string,
- *   confidence?: number (0..1)
- * }
- */
+// ---------------- SIGNAL ENTRY POINT ----------------
 async function pushSignal(signal = {}) {
   try {
     refreshFlags();
 
     if (!state.running) throw new Error("liveTrader not running");
     if (!state.enabled) {
-      state.stats.lastReason = "signal_rejected_disabled_by_env";
+      state.stats.lastReason = "signal_rejected_disabled";
       scheduleSave();
       return { ok: false, error: "LIVE_TRADING_ENABLED is off" };
     }
 
-    const sym = String(signal.symbol || "BTCUSDT");
     const side = String(signal.side || "").toUpperCase();
-    const type = String(signal.type || "MARKET").toUpperCase();
+
+    // WAIT / CLOSE are valid but non-executable
+    if (side === "WAIT" || side === "CLOSE") {
+      state.stats.lastReason = "signal_logged_non_executable";
+      scheduleSave();
+      return { ok: true, ignored: true, reason: side };
+    }
+
+    if (!(side === "BUY" || side === "SELL")) {
+      throw new Error("Invalid trade side");
+    }
 
     const qty = safeNum(signal.qty, null);
-    const px = safeNum(signal.price, null);
-    const conf = safeNum(signal.confidence, null);
-
-    if (!(side === "BUY" || side === "SELL")) throw new Error("Invalid side");
     if (!qty || qty <= 0) throw new Error("Invalid qty");
 
     const intent = {
-      id: String(Date.now()) + "_" + Math.random().toString(16).slice(2),
+      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
       ts: Date.now(),
       iso: nowIso(),
 
-      symbol: sym,
+      symbol: String(signal.symbol || "BTCUSDT"),
       side,
-      type,
+      type: String(signal.type || "MARKET").toUpperCase(),
       qty,
 
-      price: px, // optional (for LIMIT/STOP)
+      price: safeNum(signal.price, null),
       tp: safeNum(signal.tp, null),
       sl: safeNum(signal.sl, null),
 
-      confidence: conf,
+      confidence: safeNum(signal.confidence, null),
       reason: String(signal.reason || "").slice(0, 500),
 
       mode: state.mode,
@@ -232,21 +216,21 @@ async function pushSignal(signal = {}) {
     };
 
     state.intents.push(intent);
-    state.intents = state.intents.slice(-400); // bounded
+    state.intents = state.intents.slice(-400);
     state.stats.lastSignalTs = intent.ts;
 
-    // If execute is OFF, we stop right here (SAFE).
     if (!state.execute) {
-      state.stats.lastReason = "signal_accepted_armed_no_execute";
+      state.stats.lastReason = "signal_logged_armed_no_execute";
       scheduleSave();
       return { ok: true, accepted: true, executed: false, intent };
     }
 
-    // EXECUTE MODE (we still do nothing until Kraken adapter is added properly)
-    // For now we keep it safe and mark as "needs_adapter".
-    intent.executed = false;
-    intent.execution = { status: "needs_kraken_adapter", note: "Add Kraken REST adapter + signing before real orders." };
-    state.stats.lastReason = "signal_accepted_execute_on_but_no_adapter";
+    intent.execution = {
+      status: "adapter_missing",
+      note: "Kraken execution adapter not wired yet.",
+    };
+
+    state.stats.lastReason = "execute_enabled_adapter_missing";
     scheduleSave();
 
     return { ok: true, accepted: true, executed: false, intent };
@@ -258,6 +242,7 @@ async function pushSignal(signal = {}) {
   }
 }
 
+// ---------------- SNAPSHOT ----------------
 function snapshot() {
   refreshFlags();
   return {
@@ -278,10 +263,10 @@ function snapshot() {
     config: {
       LIVE_TRADING_ENABLED: state.enabled,
       LIVE_TRADING_EXECUTE: state.execute,
-      LIVE_START_BALANCE: START_BAL,
-      LIVE_TRADER_STATE_PATH: STATE_PATH,
+      LIVE_REFERENCE_BALANCE,
+      STATE_PATH,
       NOTE:
-        "Safe design: enabled=accept signals, execute=allow sending orders. Execution adapter not added yet.",
+        "Safe design: enabled=accept signals, execute=send orders (adapter required).",
     },
   };
 }
