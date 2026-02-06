@@ -13,7 +13,7 @@ const STATE_PATH =
     String(process.env.LIVE_TRADER_STATE_PATH).trim()) ||
   "/tmp/live_trader_state.json";
 
-// ---------------- ENV GATES ----------------
+/* ---------------- ENV GATES ---------------- */
 function envTrue(name) {
   const v = String(process.env[name] || "").toLowerCase().trim();
   return v === "true" || v === "1" || v === "yes";
@@ -27,7 +27,7 @@ function isExecuteEnabled() {
   return envTrue("LIVE_TRADING_EXECUTE");
 }
 
-// ---------------- HELPERS ----------------
+/* ---------------- HELPERS ---------------- */
 function ensureDirFor(filePath) {
   try {
     const dir = path.dirname(filePath);
@@ -44,10 +44,14 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-// ---------------- STATE ----------------
+function dayKey(ts) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+/* ---------------- STATE ---------------- */
 function defaultState() {
   return {
-    version: 3,
+    version: 4,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -56,6 +60,8 @@ function defaultState() {
     execute: false,
 
     mode: "live-disabled", // live-disabled | live-armed | live-executing
+    dayKey: dayKey(Date.now()),
+
     lastPriceBySymbol: {},
 
     stats: {
@@ -80,7 +86,7 @@ function defaultState() {
 let state = defaultState();
 let saveTimer = null;
 
-// ---------------- PERSISTENCE ----------------
+/* ---------------- PERSISTENCE ---------------- */
 function saveState(s) {
   try {
     ensureDirFor(STATE_PATH);
@@ -119,7 +125,14 @@ function refreshFlags() {
   else state.mode = "live-armed";
 }
 
-// ---------------- LIFECYCLE ----------------
+function resetDayIfNeeded(ts) {
+  const dk = dayKey(ts);
+  if (state.dayKey !== dk) {
+    state.dayKey = dk;
+  }
+}
+
+/* ---------------- LIFECYCLE ---------------- */
 function start() {
   const persisted = loadState();
   if (persisted && persisted.version >= 1) {
@@ -146,9 +159,16 @@ function start() {
   scheduleSave();
 }
 
-// ---------------- TICKS ----------------
-function tick(symbol, price, ts) {
+function stop() {
+  state.running = false;
+  scheduleSave();
+}
+
+/* ---------------- TICKS ---------------- */
+function tick(symbol, price, ts = Date.now()) {
   if (!state.running) return;
+
+  resetDayIfNeeded(ts);
 
   const sym = String(symbol || "BTCUSDT");
   const p = safeNum(price, null);
@@ -170,7 +190,7 @@ function tick(symbol, price, ts) {
   scheduleSave();
 }
 
-// ---------------- SIGNAL ENTRY POINT ----------------
+/* ---------------- SIGNAL ENTRY POINT ---------------- */
 async function pushSignal(signal = {}) {
   try {
     refreshFlags();
@@ -183,28 +203,34 @@ async function pushSignal(signal = {}) {
       return { ok: false, error: "LIVE_TRADING_ENABLED is off" };
     }
 
+    const symbol = String(signal.symbol || "BTCUSDT");
     const side = String(signal.side || "").toUpperCase();
 
-    // WAIT / CLOSE are valid but non-executable
-    if (side === "WAIT" || side === "CLOSE") {
+    // WAIT / CLOSE / SELL are NON-executable by design
+    if (side === "WAIT" || side === "CLOSE" || side === "SELL") {
       state.stats.lastReason = "signal_logged_non_executable";
       scheduleSave();
       return { ok: true, ignored: true, reason: side };
     }
 
-    if (side !== "BUY" && side !== "SELL") {
+    if (side !== "BUY") {
       throw new Error("Invalid trade side");
     }
 
     const qty = safeNum(signal.qty, null);
     if (!qty || qty <= 0) throw new Error("Invalid qty");
 
+    const lastPrice = state.lastPriceBySymbol[symbol];
+    if (!Number.isFinite(lastPrice)) {
+      throw new Error("Missing last price for symbol");
+    }
+
     const intent = {
       id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
       ts: Date.now(),
       iso: nowIso(),
 
-      symbol: String(signal.symbol || "BTCUSDT"),
+      symbol,
       side,
       type: String(signal.type || "MARKET").toUpperCase(),
       qty,
@@ -249,7 +275,7 @@ async function pushSignal(signal = {}) {
   }
 }
 
-// ---------------- SNAPSHOT ----------------
+/* ---------------- SNAPSHOT ---------------- */
 function snapshot() {
   refreshFlags();
   return {
@@ -280,6 +306,7 @@ function snapshot() {
 
 module.exports = {
   start,
+  stop,
   tick,
   snapshot,
   pushSignal,
