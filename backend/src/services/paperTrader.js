@@ -1,12 +1,13 @@
 // backend/src/services/paperTrader.js
-// Paper trading engine — FULL REPLACEMENT (SAFE)
+// Paper trading engine — SAFE, deterministic, brain-driven
 
-const fs = require('fs');
-const path = require('path');
+const fs = require("fs");
+const path = require("path");
+const { makeDecision } = require("./tradeBrain");
 
+/* ---------------- CONFIG ---------------- */
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
-const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
 const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
 const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
@@ -14,86 +15,20 @@ const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
 const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
 
 const BASELINE_PCT = Number(process.env.PAPER_BASELINE_PCT || 0.03);
-const MAX_PCT = Number(process.env.PAPER_OWNER_MAX_PCT || 0.50);
+const MAX_PCT = Number(process.env.PAPER_OWNER_MAX_PCT || 0.5);
 const MAX_TRADES_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
-
-const TIER_SIZE = Number(process.env.PAPER_TIER_SIZE || 100000);
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-const STATE_FILE = process.env.PAPER_STATE_PATH || path.join('/tmp', 'paper_state.json');
+const STATE_FILE =
+  process.env.PAPER_STATE_PATH || path.join("/tmp", "paper_state.json");
 
+/* ---------------- HELPERS ---------------- */
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 
 function dayKey(ts) {
-  const d = new Date(ts);
-  return d.toISOString().slice(0, 10);
+  return new Date(ts).toISOString().slice(0, 10);
 }
 
-function defaultState() {
-  return {
-    running: true,
-
-    startBalance: START_BAL,
-    cashBalance: START_BAL,
-    equity: START_BAL,
-    peakEquity: START_BAL,
-    pnl: 0,
-
-    realized: {
-      wins: 0,
-      losses: 0,
-      grossProfit: 0,
-      grossLoss: 0,
-      net: 0,
-    },
-
-    costs: {
-      feePaid: 0,
-      slippageCost: 0,
-      spreadCost: 0,
-    },
-
-    trades: [],
-    position: null,
-    lastPriceBySymbol: {},
-
-    learnStats: {
-      ticksSeen: 0,
-      confidence: 0,
-      trendEdge: 0,
-      decision: 'WAIT',
-      lastReason: 'boot',
-      lastTickTs: null,
-    },
-
-    limits: {
-      dayKey: dayKey(Date.now()),
-      tradesToday: 0,
-      lossesToday: 0,
-      forceBaseline: false,
-      lastTradeTs: 0,
-      halted: false,
-      haltReason: null,
-    },
-
-    owner: {
-      baselinePct: BASELINE_PCT,
-      maxPct: MAX_PCT,
-      maxTradesPerDay: MAX_TRADES_DAY,
-    },
-
-    buf: { BTCUSDT: [], ETHUSDT: [] },
-  };
-}
-
-let state = defaultState();
-
-/* ---------- persistence ---------- */
-function save() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch {}
-}
 function load() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -104,22 +39,62 @@ function load() {
     state = defaultState();
   }
 }
-load();
 
-/* ---------- safety ---------- */
-function checkDaily(ts) {
-  const dk = dayKey(ts);
-  if (state.limits.dayKey !== dk) {
-    state.limits.dayKey = dk;
-    state.limits.tradesToday = 0;
-    state.limits.lossesToday = 0;
-    state.limits.forceBaseline = false;
-  }
+function save() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch {}
 }
 
+/* ---------------- STATE ---------------- */
+function defaultState() {
+  return {
+    running: true,
+
+    cashBalance: START_BAL,
+    equity: START_BAL,
+    peakEquity: START_BAL,
+
+    realized: { wins: 0, losses: 0, net: 0 },
+    costs: { fees: 0, slippage: 0, spread: 0 },
+
+    position: null,
+    trades: [],
+    lastPriceBySymbol: {},
+
+    learnStats: {
+      ticksSeen: 0,
+      confidence: 0,
+      trendEdge: 0,
+      decision: "WAIT",
+      lastReason: "boot",
+    },
+
+    limits: {
+      dayKey: dayKey(Date.now()),
+      tradesToday: 0,
+      lossesToday: 0,
+      lastTradeTs: 0,
+      halted: false,
+      haltReason: null,
+    },
+
+    config: {
+      baselinePct: BASELINE_PCT,
+      maxPct: MAX_PCT,
+    },
+  };
+}
+
+let state = defaultState();
+load();
+
+/* ---------------- CORE ---------------- */
 function updateEquity(price) {
   if (state.position) {
-    state.equity = state.cashBalance + (state.position.qty * price);
+    state.equity =
+      state.cashBalance +
+      (price - state.position.entry) * state.position.qty;
   } else {
     state.equity = state.cashBalance;
   }
@@ -130,68 +105,133 @@ function checkDrawdown() {
   const dd = (state.peakEquity - state.equity) / state.peakEquity;
   if (dd >= MAX_DRAWDOWN_PCT) {
     state.limits.halted = true;
-    state.limits.haltReason = `max_drawdown_${Math.round(MAX_DRAWDOWN_PCT * 100)}%`;
+    state.limits.haltReason = "max_drawdown";
   }
 }
 
-/* ---------- buffers ---------- */
-function pushBuf(sym, price) {
-  const b = state.buf[sym] || [];
-  b.push(price);
-  while (b.length > 60) b.shift();
-  state.buf[sym] = b;
+function canTrade(ts) {
+  if (state.limits.halted) return false;
+  if (state.limits.tradesToday >= MAX_TRADES_DAY) return false;
+  if (ts - state.limits.lastTradeTs < COOLDOWN_MS) return false;
+  return true;
 }
 
-/* ---------- sizing ---------- */
-function tierBase() {
-  return Math.max(TIER_SIZE, Math.floor(state.equity / TIER_SIZE) * TIER_SIZE);
+function openPosition(symbol, price, riskPct) {
+  const usd = state.cashBalance * riskPct;
+  if (usd < 25) return;
+
+  const spread = price * (SPREAD_BP / 10000);
+  const slip = price * (SLIPPAGE_BP / 10000);
+  const fill = price + spread + slip;
+
+  const qty = usd / fill;
+  const fee = usd * FEE_RATE;
+
+  state.cashBalance -= usd + fee;
+  state.costs.fees += fee;
+  state.costs.spread += spread * qty;
+  state.costs.slippage += slip * qty;
+
+  state.position = {
+    symbol,
+    entry: fill,
+    qty,
+    ts: Date.now(),
+  };
+
+  state.limits.tradesToday++;
+  state.limits.lastTradeTs = Date.now();
 }
 
-function sizePct() {
-  if (state.limits.forceBaseline) return BASELINE_PCT;
-  const base = tierBase();
-  const top = base + TIER_SIZE;
-  const p = clamp((state.equity - base) / (top - base), 0, 1);
-  return clamp(BASELINE_PCT + p * (MAX_PCT - BASELINE_PCT), BASELINE_PCT, MAX_PCT);
+function closePosition(price, reason) {
+  const pos = state.position;
+  if (!pos) return;
+
+  const gross = (price - pos.entry) * pos.qty;
+  const fee = Math.abs(gross) * FEE_RATE;
+
+  state.cashBalance += pos.qty * price - fee;
+  state.costs.fees += fee;
+  state.realized.net += gross - fee;
+
+  if (gross > 0) state.realized.wins++;
+  else state.realized.losses++;
+
+  state.trades.push({
+    symbol: pos.symbol,
+    entry: pos.entry,
+    exit: price,
+    pnl: gross - fee,
+    reason,
+  });
+
+  state.position = null;
 }
 
-function tradeSizeUsd() {
-  return Math.max(25, Math.min(state.cashBalance - 1, tierBase() * sizePct()));
-}
+/* ---------------- TICK ---------------- */
+function tick(symbol, price, ts = Date.now()) {
+  if (!state.running) return;
 
-/* ---------- trading ---------- */
-function tick(sym, price, ts = Date.now()) {
-  if (!state.running || state.limits.halted) return;
-
-  checkDaily(ts);
+  state.lastPriceBySymbol[symbol] = price;
   state.learnStats.ticksSeen++;
-  state.lastPriceBySymbol[sym] = price;
-
-  pushBuf(sym, price);
 
   updateEquity(price);
   checkDrawdown();
 
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) return;
+
+  const plan = makeDecision({
+    symbol,
+    last: price,
+    paper: state,
+  });
+
+  state.learnStats.confidence = plan.confidence;
+  state.learnStats.trendEdge = plan.edge;
+  state.learnStats.decision = plan.action;
+  state.learnStats.lastReason = plan.blockedReason || plan.action;
+
+  if (!canTrade(ts)) return;
+
+  if (plan.action === "BUY" && !state.position) {
+    openPosition(symbol, price, plan.riskPct);
+  }
+
+  if (
+    plan.action === "CLOSE" &&
+    state.position &&
+    state.position.symbol === symbol
+  ) {
+    closePosition(price, "brain_close");
+  }
+
   save();
 }
 
+/* ---------------- API ---------------- */
 function snapshot() {
-  const pos = state.position;
-  const lastPx = pos ? state.lastPriceBySymbol[pos.symbol] : null;
-  const unreal = pos && lastPx ? (lastPx - pos.entry) * pos.qty : 0;
-
   return {
     ...state,
-    unrealizedPnL: unreal,
-    sizing: {
-      tierBase: tierBase(),
-      sizePct: sizePct(),
-      sizeUsd: tradeSizeUsd(),
-    },
+    unrealizedPnL: state.position
+      ? (state.lastPriceBySymbol[state.position.symbol] -
+          state.position.entry) *
+        state.position.qty
+      : 0,
   };
 }
 
-function start() { state.running = true; }
-function hardReset() { state = defaultState(); save(); }
+function start() {
+  state.running = true;
+}
 
-module.exports = { start, tick, snapshot, hardReset };
+function hardReset() {
+  state = defaultState();
+  save();
+}
+
+module.exports = {
+  start,
+  tick,
+  snapshot,
+  hardReset,
+};
