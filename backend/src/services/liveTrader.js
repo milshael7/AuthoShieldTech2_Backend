@@ -9,7 +9,8 @@ const LIVE_REFERENCE_BALANCE = Number(process.env.LIVE_START_BALANCE || 0);
 
 // Persist state here (use Render Disk, NOT /tmp in production)
 const STATE_PATH =
-  (process.env.LIVE_TRADER_STATE_PATH && String(process.env.LIVE_TRADER_STATE_PATH).trim()) ||
+  (process.env.LIVE_TRADER_STATE_PATH &&
+    String(process.env.LIVE_TRADER_STATE_PATH).trim()) ||
   "/tmp/live_trader_state.json";
 
 // ---------------- ENV GATES ----------------
@@ -79,15 +80,7 @@ function defaultState() {
 let state = defaultState();
 let saveTimer = null;
 
-function scheduleSave() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    state.updatedAt = nowIso();
-    saveState(state);
-  }, 400);
-}
-
+// ---------------- PERSISTENCE ----------------
 function saveState(s) {
   try {
     ensureDirFor(STATE_PATH);
@@ -108,6 +101,15 @@ function loadState() {
   }
 }
 
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    state.updatedAt = nowIso();
+    saveState(state);
+  }, 400);
+}
+
 function refreshFlags() {
   state.enabled = isEnabled();
   state.execute = state.enabled && isExecuteEnabled();
@@ -124,7 +126,10 @@ function start() {
     state = {
       ...defaultState(),
       ...persisted,
-      stats: { ...defaultState().stats, ...(persisted.stats || {}) },
+      stats: {
+        ...defaultState().stats,
+        ...(persisted.stats || {}),
+      },
     };
   }
 
@@ -171,6 +176,7 @@ async function pushSignal(signal = {}) {
     refreshFlags();
 
     if (!state.running) throw new Error("liveTrader not running");
+
     if (!state.enabled) {
       state.stats.lastReason = "signal_rejected_disabled";
       scheduleSave();
@@ -186,7 +192,7 @@ async function pushSignal(signal = {}) {
       return { ok: true, ignored: true, reason: side };
     }
 
-    if (!(side === "BUY" || side === "SELL")) {
+    if (side !== "BUY" && side !== "SELL") {
       throw new Error("Invalid trade side");
     }
 
@@ -225,6 +231,7 @@ async function pushSignal(signal = {}) {
       return { ok: true, accepted: true, executed: false, intent };
     }
 
+    // Execution intentionally blocked until adapter is wired
     intent.execution = {
       status: "adapter_missing",
       note: "Kraken execution adapter not wired yet.",
