@@ -1,111 +1,113 @@
 // backend/src/routes/trading.routes.js
-const express = require("express");
+const express = require('express');
 const router = express.Router();
 
-const { authRequired } = require("../middleware/auth");
-const paperTrader = require("../services/paperTrader");
-const tradeBrain = require("../services/tradeBrain");
-const liveTrader = require("../services/liveTrader");
+const { authRequired } = require('../middleware/auth');
+const paperTrader = require('../services/paperTrader');
+const liveTrader = require('../services/liveTrader');
 
-// --------------------------------------------------
-// GET /api/trading/status
-// Unified status for UI (paper + live)
-// --------------------------------------------------
-router.get("/status", authRequired, (req, res) => {
-  try {
-    const paper = paperTrader.snapshot();
-    const live = liveTrader.snapshot();
+/**
+ * TRADING ROUTES
+ *
+ * Design rules:
+ * - NO mock market logic
+ * - NO duplicated live state
+ * - Routes are THIN
+ * - Decisions happen in tradeBrain
+ * - Execution handled by paperTrader / liveTrader
+ */
 
-    return res.json({
-      ok: true,
-      paper,
-      live,
-      ts: Date.now(),
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
-  }
+// ---------- ROLE HELPERS ----------
+function isAdmin(req) {
+  return req?.user?.role === 'admin';
+}
+
+function isManagerOrAdmin(req) {
+  return req?.user?.role === 'admin' || req?.user?.role === 'manager';
+}
+
+// ---------- PUBLIC (NO AUTH) ----------
+
+// Supported symbols (frontend helpers)
+router.get('/symbols', (req, res) => {
+  res.json({
+    ok: true,
+    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'],
+  });
 });
 
-// --------------------------------------------------
-// POST /api/trading/decide
-// Brain-only decision (NO execution)
-// Used by UI, paper trader, or diagnostics
-// --------------------------------------------------
-router.post("/decide", authRequired, (req, res) => {
-  try {
-    const { symbol } = req.body || {};
-    const last = paperTrader.getLastPrice(symbol);
+// ---------- PROTECTED ----------
+router.use(authRequired);
 
-    const context = {
-      symbol,
-      last,
-      paper: paperTrader.context(symbol),
-    };
+// ---------- PAPER TRADING ----------
 
-    const plan = tradeBrain.makeDecision(context);
-
-    return res.json({
-      ok: true,
-      plan,
-    });
-  } catch (e) {
-    return res.status(400).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
+/**
+ * GET /api/trading/paper/snapshot
+ * Admin + Manager
+ */
+router.get('/paper/snapshot', (req, res) => {
+  if (!isManagerOrAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden' });
   }
+
+  res.json({
+    ok: true,
+    snapshot: paperTrader.snapshot(),
+  });
 });
 
-// --------------------------------------------------
-// POST /api/trading/explain
-// Natural-language explanation (AI reasoning)
-// --------------------------------------------------
-router.post("/explain", authRequired, async (req, res) => {
-  try {
-    const { message, context } = req.body || {};
-
-    const explanation = await tradeBrain.explain(
-      message || "Explain last trading decision.",
-      context || {}
-    );
-
-    return res.json({
-      ok: true,
-      explanation,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
+/**
+ * POST /api/trading/paper/config
+ * Admin only
+ */
+router.post('/paper/config', (req, res) => {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Admin only' });
   }
+
+  const updated = paperTrader.setConfig(req.body || {});
+  res.json({ ok: true, config: updated });
 });
 
-// --------------------------------------------------
-// POST /api/trading/signal
-// Push a signal to LIVE trader (SAFE)
-// NOTE: This does NOT execute trades unless env allows
-// --------------------------------------------------
-router.post("/signal", authRequired, async (req, res) => {
-  try {
-    const signal = req.body || {};
-
-    const result = await liveTrader.pushSignal(signal);
-
-    return res.json({
-      ok: true,
-      result,
-    });
-  } catch (e) {
-    return res.status(400).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
+/**
+ * POST /api/trading/paper/reset
+ * Admin only
+ */
+router.post('/paper/reset', (req, res) => {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Admin only' });
   }
+
+  paperTrader.hardReset();
+  res.json({ ok: true });
+});
+
+// ---------- LIVE TRADING (SAFE) ----------
+
+/**
+ * GET /api/trading/live/snapshot
+ * Admin + Manager
+ */
+router.get('/live/snapshot', (req, res) => {
+  if (!isManagerOrAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden' });
+  }
+
+  res.json(liveTrader.snapshot());
+});
+
+/**
+ * POST /api/trading/live/signal
+ * Admin only
+ * (Signals are logged; execution depends on env + arming)
+ */
+router.post('/live/signal', async (req, res) => {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ ok: false, error: 'Admin only' });
+  }
+
+  const result = await liveTrader.pushSignal(req.body || {});
+  res.json(result);
 });
 
 module.exports = router;
