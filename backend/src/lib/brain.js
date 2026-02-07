@@ -1,27 +1,26 @@
 // backend/src/lib/brain.js
-// AutoShield AI — Persistent Brain (Memory + Voices + Personality)
-// 🔒 NON-RESETTING CORE
+// AuthoDev 6.5 — Tenant-Scoped Persistent Brain
+// MSP-grade isolation • Non-resetting • Confidential by design
 //
-// Exposes:
-// - addMemory({ type, text, meta })
-// - listMemory({ limit, type })
-// - buildPersonality(voiceId?)
-// - listVoices()
-// - getVoice(voiceId)
+// EXPOSES:
+// - addMemory({ tenantId, type, text, meta })
+// - listMemory({ tenantId, limit, type })
+// - buildPersonality({ tenantId })
 //
-// This file is the LONG-TERM BRAIN.
-// Voice, memory, and personality live here and survive resets.
+// 🔒 GUARANTEES:
+// - No cross-company leakage
+// - No admin/backend exposure
+// - Memory survives restarts
+// - AI only knows what backend injects
 
 const fs = require("fs");
 const path = require("path");
 
 /* ================= CONFIG ================= */
 
-const MEMORY_PATH =
+const BASE_PATH =
   (process.env.AI_MEMORY_PATH && String(process.env.AI_MEMORY_PATH).trim()) ||
-  "/tmp/autoshield_brain.json";
-
-const MAX_TOTAL = Number(process.env.AI_MEMORY_MAX_ITEMS || 600);
+  "/tmp/autoshield_brains";
 
 const MAX_PER_TYPE = {
   site: 50,
@@ -30,6 +29,8 @@ const MAX_PER_TYPE = {
   note: 200,
   trade_event: 300,
 };
+
+const MAX_TOTAL = Number(process.env.AI_MEMORY_MAX_ITEMS || 600);
 
 /* ================= HELPERS ================= */
 
@@ -41,124 +42,83 @@ function safeStr(v, max = 8000) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-function ensureDirFor(filePath) {
+function ensureDir(dir) {
   try {
-    const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   } catch {}
 }
 
-/* ================= VOICE REGISTRY ================= */
-/**
- * These voices NEVER reset.
- * VoiceAI + ai.routes.js can reference them by ID.
- */
-
-const VOICES = {
-  alex: {
-    id: "alex",
-    name: "Alex",
-    role: "Primary Operator",
-    tone: "calm, confident, direct, present-tense",
-    description:
-      "Explains what is happening right now. Live trading, live incidents, real-time awareness.",
-  },
-
-  jordan: {
-    id: "jordan",
-    name: "Jordan",
-    role: "Analyst / Explainer",
-    tone: "clear, patient, educational",
-    description:
-      "Explains why things happened. Breaks down decisions step by step without assumptions.",
-  },
-
-  morgan: {
-    id: "morgan",
-    name: "Morgan",
-    role: "Risk & Compliance",
-    tone: "conservative, factual, policy-driven",
-    description:
-      "Focuses on limits, drawdowns, exposure, and rules. Never emotional.",
-  },
-
-  taylor: {
-    id: "taylor",
-    name: "Taylor",
-    role: "Systems & Security",
-    tone: "technical, precise, human",
-    description:
-      "Explains systems, attacks, signals, infrastructure, and platform health.",
-  },
-
-  casey: {
-    id: "casey",
-    name: "Casey",
-    role: "Executive Summary",
-    tone: "high-level, calm, strategic",
-    description:
-      "Summarizes activity for leadership. No jargon unless asked.",
-  },
-};
-
-/* ================= STATE ================= */
-
-let state = {
-  version: 3,
-  createdAt: nowIso(),
-  updatedAt: nowIso(),
-  items: [],
-};
+function brainPath(tenantId) {
+  const t = safeStr(tenantId || "unknown", 60);
+  return path.join(BASE_PATH, `brain_${t}.json`);
+}
 
 /* ================= LOAD / SAVE ================= */
 
-function load() {
-  try {
-    ensureDirFor(MEMORY_PATH);
-    if (!fs.existsSync(MEMORY_PATH)) return;
+function loadBrain(tenantId) {
+  const file = brainPath(tenantId);
+  ensureDir(BASE_PATH);
 
-    const raw = JSON.parse(fs.readFileSync(MEMORY_PATH, "utf-8"));
+  try {
+    if (!fs.existsSync(file)) {
+      return {
+        version: 1,
+        tenantId,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        items: [],
+      };
+    }
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
     if (raw && Array.isArray(raw.items)) {
-      state = {
-        version: raw.version || 3,
+      return {
+        version: raw.version || 1,
+        tenantId,
         createdAt: raw.createdAt || nowIso(),
         updatedAt: raw.updatedAt || nowIso(),
         items: raw.items.slice(-MAX_TOTAL),
       };
     }
-  } catch {
-    state = {
-      version: 3,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      items: [],
-    };
-  }
+  } catch {}
+
+  return {
+    version: 1,
+    tenantId,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    items: [],
+  };
 }
 
-function save() {
+function saveBrain(state) {
   try {
-    ensureDirFor(MEMORY_PATH);
+    ensureDir(BASE_PATH);
     state.updatedAt = nowIso();
 
     if (state.items.length > MAX_TOTAL) {
       state.items = state.items.slice(-MAX_TOTAL);
     }
 
-    const tmp = MEMORY_PATH + ".tmp";
+    const tmp = brainPath(state.tenantId) + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, MEMORY_PATH);
+    fs.renameSync(tmp, brainPath(state.tenantId));
   } catch {}
 }
 
-load();
+/* ================= CORE API ================= */
 
-/* ================= MEMORY ================= */
+function addMemory({ tenantId, type = "note", text = "", meta = {} } = {}) {
+  if (!tenantId) return null;
 
-function addMemory({ type = "note", text = "", meta = {} } = {}) {
+  const state = loadBrain(tenantId);
   const t = safeStr(type, 40).toLowerCase();
   const txt = safeStr(text, 8000);
+
   if (!txt) return null;
+
+  // 🔒 NEVER STORE ADMIN / BACKEND SECRETS
+  if (t === "admin" || t === "backend" || t === "secret") return null;
 
   const rec = {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -171,66 +131,53 @@ function addMemory({ type = "note", text = "", meta = {} } = {}) {
   state.items.unshift(rec);
 
   const cap = MAX_PER_TYPE[t] || 100;
-  const sameType = state.items.filter((m) => m.type === t);
-  if (sameType.length > cap) {
-    const removeIds = sameType.slice(cap).map((m) => m.id);
-    state.items = state.items.filter((m) => !removeIds.includes(m.id));
+  const same = state.items.filter((m) => m.type === t);
+  if (same.length > cap) {
+    const remove = same.slice(cap).map((m) => m.id);
+    state.items = state.items.filter((m) => !remove.includes(m.id));
   }
 
-  save();
+  saveBrain(state);
   return rec;
 }
 
-function listMemory({ limit = 50, type = null } = {}) {
+function listMemory({ tenantId, limit = 50, type = null } = {}) {
+  if (!tenantId) return [];
+
+  const state = loadBrain(tenantId);
   const n = Math.max(1, Math.min(500, Number(limit) || 50));
   const t = type ? safeStr(type, 40).toLowerCase() : null;
 
   let items = state.items;
-  if (t) items = items.filter((x) => x.type === t);
+  if (t) items = items.filter((m) => m.type === t);
 
   return items.slice(0, n);
 }
 
-/* ================= PERSONALITY ================= */
-/**
- * Builds personality per VOICE.
- * This is what ai.routes.js should feed into OpenAI/system prompts.
- */
-
-function buildPersonality(voiceId = "alex") {
-  const voice = VOICES[voiceId] || VOICES.alex;
+function buildPersonality({ tenantId } = {}) {
+  const rules = listMemory({ tenantId, type: "rule", limit: 20 }).map(
+    (m) => m.text
+  );
+  const prefs = listMemory({ tenantId, type: "preference", limit: 20 }).map(
+    (m) => m.text
+  );
+  const site = listMemory({ tenantId, type: "site", limit: 20 }).map(
+    (m) => m.text
+  );
 
   return {
-    identity: voice.name,
-    role: voice.role,
-    tone: voice.tone,
-    description: voice.description,
-
-    rules: listMemory({ type: "rule", limit: 20 }).map((m) => m.text),
-    preferences: listMemory({ type: "preference", limit: 20 }).map((m) => m.text),
-    platformFacts: listMemory({ type: "site", limit: 20 }).map((m) => m.text),
+    identity: "AuthoDev 6.5",
+    tone: "calm, professional, human, precise",
+    rules,
+    preferences: prefs,
+    platformFacts: site,
   };
-}
-
-/* ================= VOICE API ================= */
-
-function listVoices() {
-  return Object.values(VOICES);
-}
-
-function getVoice(id) {
-  return VOICES[id] || VOICES.alex;
 }
 
 /* ================= EXPORT ================= */
 
 module.exports = {
-  // memory
   addMemory,
   listMemory,
-
-  // voice + personality
   buildPersonality,
-  listVoices,
-  getVoice,
 };
