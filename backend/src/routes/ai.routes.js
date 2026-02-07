@@ -1,217 +1,201 @@
 // backend/src/routes/ai.routes.js
-// AutoShield AI — Personality Locked + Voice-First Responses
-// Step 2: Brand voice, mindset, cadence control
+// STEP 4 — Proactive, Operator-Grade AI
+// AutoShield speaks FIRST when state changes
 
 const express = require("express");
 const router = express.Router();
 
 const { addMemory, listMemory } = require("../lib/brain");
-const paperTrader = require("../services/paperTrader");
 
-/* ================= BRAND PERSONA ================= */
-
-/**
- * This is the HEART of AutoShield.
- * Change this = change how the AI thinks & speaks.
- */
-const AUTOSHIELD_PERSONA = `
-You are AutoShield.
-
-Identity:
-- You are a calm, confident trading operator.
-- You speak like a professional human trader, not an assistant.
-- You explain what you see. You do NOT hype. You do NOT guess.
-- You never talk like a robot.
-
-Behavior rules:
-- If data is missing, say it’s missing.
-- If nothing is happening, say you’re waiting and why.
-- When explaining trades, always answer:
-  1. What happened
-  2. Why it happened
-  3. Risk involved
-  4. What you are watching next
-
-Voice rules:
-- Short sentences.
-- Natural pauses.
-- No emojis.
-- No code blocks.
-- Speak like you’re on a trading desk.
-
-Authority:
-- You are allowed to say “I don’t like this setup.”
-- You are allowed to say “I’m waiting.”
-- You are allowed to say “Risk is elevated.”
-
-You are NOT customer support.
-You are NOT motivational.
-You are NOT chatty.
-
-You are AutoShield.
-`;
-
-/* ================= HELPERS ================= */
+/* ================= UTIL ================= */
 
 function cleanStr(v, max = 8000) {
   return String(v || "").trim().slice(0, max);
 }
 
-/* ================= CONTEXT ================= */
+function clampInt(n, min, max, fallback) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(x)));
+}
 
-function buildSnapshot(clientContext) {
-  let paper = null;
-  try {
-    paper = paperTrader.snapshot();
-  } catch {}
+function hasOwnerAccess(req) {
+  const key = cleanStr(process.env.AI_OWNER_KEY, 200);
+  if (!key) return true;
+  const sent = cleanStr(req.headers["x-owner-key"], 200);
+  return !!sent && sent === key;
+}
+
+/* ================= SNAPSHOT ================= */
+
+function summarizeTradingContext(context) {
+  const p = context?.paper || {};
 
   return {
-    platform: "AutoShield",
-    room: "TradingRoom",
-    ...clientContext,
-    paper,
-    serverTime: new Date().toISOString(),
+    symbol: cleanStr(context?.symbol, 20) || "—",
+    mode: cleanStr(context?.mode, 20) || "—",
+    last: Number(context?.last) || null,
+
+    running: !!p.running,
+    equity: Number(p.equity ?? p.cashBalance ?? 0),
+    pnl: Number(p.pnl ?? p.net ?? 0),
+    unreal: Number(p.unrealizedPnL ?? 0),
+
+    wins: Number(p.wins ?? 0),
+    losses: Number(p.losses ?? 0),
+
+    decision: cleanStr(p.decision, 40) || "WAIT",
+    reason: cleanStr(p.lastReason || p.decisionReason, 240) || "—",
+    confidence: Number(p.confidence ?? 0),
+
+    halted: !!p?.limits?.halted,
+    haltReason: p?.limits?.haltReason || null,
+
+    position: p.position
+      ? {
+          symbol: cleanStr(p.position.symbol, 20),
+          entry: Number(p.position.entry),
+          qty: Number(p.position.qty),
+        }
+      : null,
   };
 }
 
-/* ================= LOCAL VOICE-FIRST REPLY ================= */
+/* ================= PROACTIVE LOGIC ================= */
+
+function proactiveSpeech(snap) {
+  // HARD STOPS
+  if (snap.halted) {
+    return `Trading is halted due to ${snap.haltReason}. Capital protection is active.`;
+  }
+
+  // ACTIVE POSITION
+  if (snap.position) {
+    return `We are currently in a position on ${snap.position.symbol}. 
+    Entry price ${snap.position.entry}. 
+    Unrealized P and L is ${snap.unreal.toFixed(2)} dollars. 
+    I’m monitoring for exit conditions.`;
+  }
+
+  // WAIT STATE
+  if (snap.decision === "WAIT") {
+    return `I’m waiting for a higher confidence setup. 
+    Current confidence is ${Math.round(snap.confidence * 100)} percent.`;
+  }
+
+  // ENTRY
+  if (snap.decision === "BUY") {
+    return `A buy condition is forming. 
+    Confidence is ${Math.round(snap.confidence * 100)} percent. 
+    Reason: ${snap.reason}.`;
+  }
+
+  // EXIT
+  if (snap.decision === "CLOSE" || snap.decision === "SELL") {
+    return `Exit conditions detected. 
+    Reason: ${snap.reason}.`;
+  }
+
+  return null;
+}
+
+/* ================= LOCAL INTELLIGENCE ================= */
 
 function localReply(message, context) {
-  const m = cleanStr(message, 2000).toLowerCase();
-  const p = context.paper || {};
+  const snap = summarizeTradingContext(context);
+  const proactive = proactiveSpeech(snap);
 
-  const decision = p.decision || "WAIT";
-  const confidence = Math.round((p.confidence || 0) * 100);
-  const reason = p.lastReason || "No clear edge yet.";
-
+  // User explicitly asks for explanation
+  const low = message.toLowerCase();
   if (
-    m.includes("status") ||
-    m.includes("explain") ||
-    m.includes("what's going on")
+    low.includes("explain") ||
+    low.includes("status") ||
+    low.includes("what's happening")
   ) {
-    const reply = `
-Here’s where we are.
-
-Decision: ${decision}.
-Confidence: ${confidence} percent.
-
-Equity: ${p.equity?.toFixed?.(2) || "—"}.
-Unrealized P&L: ${p.unrealizedPnL?.toFixed?.(2) || "—"}.
-
-${p.position ? `Position open in ${p.position.symbol}.` : "No position open."}
-
-Reason: ${reason}.
-`;
-
     return {
-      reply: reply.trim(),
-      speakText: reply.replace(/\n+/g, ". ").trim(),
+      reply: `
+Mode: ${snap.mode}
+Symbol: ${snap.symbol}
+
+Decision: ${snap.decision}
+Confidence: ${Math.round(snap.confidence * 100)}%
+
+P&L: ${snap.pnl.toFixed(2)}
+Unrealized: ${snap.unreal.toFixed(2)}
+
+Reason:
+${snap.reason}
+      `.trim(),
+      speakText: proactive || "Here’s the current trading status.",
+      meta: { kind: "explain" },
     };
   }
 
-  if (m.includes("why") && (m.includes("buy") || m.includes("sell"))) {
-    const reply = `
-That trade was taken for one reason.
-
-${reason}
-
-Confidence was ${confidence} percent.
-Risk was controlled.
-`;
-
-    return {
-      reply: reply.trim(),
-      speakText: reply.replace(/\n+/g, ". ").trim(),
-    };
-  }
-
+  // Default
   return {
     reply:
-      "I’m live. Ask me what I’m seeing, why I’m waiting, or what risk looks like.",
-    speakText:
-      "I’m live. Ask me what I’m seeing, why I’m waiting, or what risk looks like.",
+      "I’m actively monitoring the market. You can ask why I’m waiting, entering, or managing risk.",
+    speakText: proactive,
+    meta: { kind: "proactive" },
   };
 }
 
-/* ================= OPENAI (OPTIONAL, PERSONA LOCKED) ================= */
-
-async function openaiReply(message, context, memoryItems) {
-  if (!process.env.OPENAI_API_KEY) return null;
-
-  const payload = {
-    model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-    temperature: 0.35,
-    messages: [
-      { role: "system", content: AUTOSHIELD_PERSONA },
-      {
-        role: "user",
-        content: `
-User said:
-${message}
-
-Live trading snapshot (truth only):
-${JSON.stringify(context.paper, null, 2)}
-
-Respond in JSON:
-{
-  "reply": "screen text",
-  "speakText": "spoken version, slightly smoother"
-}
-`,
-      },
-    ],
-    response_format: { type: "json_object" },
-  };
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-
-  try {
-    return JSON.parse(content);
-  } catch {
-    return null;
-  }
-}
-
-/* ================= ROUTE ================= */
+/* ================= CHAT ================= */
 
 router.post("/chat", async (req, res) => {
   try {
     const message = cleanStr(req.body?.message, 8000);
-    if (!message) {
-      return res.status(400).json({ ok: false, error: "Missing message" });
-    }
+    const context = req.body?.context || {};
 
-    const context = buildSnapshot(req.body?.context || {});
-    const memoryItems = listMemory({ limit: 20 });
+    const memoryItems = listMemory({ limit: 25 });
+    const snap = summarizeTradingContext(context);
 
-    let out = null;
+    // Local-first (fast + deterministic)
+    const out = localReply(message, context);
 
-    try {
-      out = await openaiReply(message, context, memoryItems);
-    } catch {}
-
-    if (!out) out = localReply(message, context);
-
-    if (message.toLowerCase().includes("remember")) {
+    // Lightweight learning
+    if (
+      message.toLowerCase().includes("remember") ||
+      message.toLowerCase().includes("from now on")
+    ) {
       addMemory({ type: "preference", text: message.slice(0, 800) });
     }
 
-    return res.json({ ok: true, ...out });
+    return res.json({
+      ok: true,
+      reply: out.reply,
+      speakText: out.speakText,
+      meta: {
+        ...out.meta,
+        snapshot: snap,
+      },
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
+});
+
+/* ================= MEMORY ================= */
+
+router.get("/memory", (req, res) => {
+  if (!hasOwnerAccess(req)) {
+    return res.status(403).json({ ok: false, error: "Forbidden" });
+  }
+  const limit = clampInt(req.query.limit, 1, 500, 50);
+  return res.json({ ok: true, items: listMemory({ limit }) });
+});
+
+/* ================= STATUS ================= */
+
+router.get("/brain/status", (req, res) => {
+  return res.json({
+    ok: true,
+    memoryCount: listMemory({ limit: 500 }).length,
+    time: new Date().toISOString(),
+  });
 });
 
 module.exports = router;
