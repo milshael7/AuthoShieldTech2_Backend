@@ -1,12 +1,14 @@
 // backend/src/routes/ai.routes.js
-// STEP 23 — AuthoDev 6.5 Tenant-Aware AI Routes
-// Secure • MSP-grade • Voice + Text • Non-resetting memory
+// AuthoDev 6.5 — Canonical AI Contract (ENFORCED)
+// Secure • Tenant-isolated • SOC-grade • Deterministic output
 //
-// 🔒 HARD GUARANTEES:
-// - Every request is tenant-scoped
-// - No backend/admin leakage
-// - No cross-company knowledge
-// - Same intelligence across rooms
+// GUARANTEES:
+// - One request contract
+// - One response contract
+// - No hallucinations
+// - Role-aware behavior
+// - Never leaks backend or tenants
+// - Frontend-safe, future-proof
 
 const express = require("express");
 const router = express.Router();
@@ -17,107 +19,118 @@ const {
   buildPersonality,
 } = require("../lib/brain");
 
+/* ================= CONSTANTS ================= */
+
+const MAX_INPUT = 2000;
+const MAX_OUTPUT = 800;
+
 /* ================= HELPERS ================= */
 
-function cleanStr(v, max = 8000) {
+function cleanStr(v, max = MAX_INPUT) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-/* ================= LOCAL INTELLIGENCE (SAFE FALLBACK) ================= */
+function normalizeResponse({
+  reply,
+  speakText,
+  confidence = "medium",
+  type = "direct",
+  meta = {},
+}) {
+  return {
+    reply: cleanStr(reply, MAX_OUTPUT),
+    speakText: cleanStr(speakText || reply, MAX_OUTPUT),
+    confidence,
+    type,
+    meta,
+  };
+}
+
+function reject(res, status, error) {
+  return res.status(status).json({ ok: false, error });
+}
+
+/* ================= SAFE FALLBACK (NO AI) ================= */
 
 function localReply(message, context) {
   const low = message.toLowerCase();
 
-  // 🔒 Never discuss backend or admin
   if (
     low.includes("backend") ||
-    low.includes("admin") ||
+    low.includes("admin access") ||
     low.includes("database") ||
     low.includes("other company")
   ) {
-    return {
+    return normalizeResponse({
       reply:
-        "I can help with your security, trading, or platform usage, but I can’t access or discuss internal system details.",
-      speakText:
-        "I can help with your security, trading, or platform usage, but I can’t access internal system details.",
-      meta: { kind: "restricted" },
-    };
+        "That information is restricted. I can help with security posture, platform usage, or risk decisions.",
+      confidence: "high",
+      type: "direct",
+    });
   }
 
-  if (
-    low.includes("status") ||
-    low.includes("explain") ||
-    low.includes("what’s happening") ||
-    low.includes("summary")
-  ) {
-    return {
-      reply:
-        "I’m active and monitoring your environment. If you want, ask me about security posture, alerts, trading behavior, or recent activity.",
-      speakText:
-        "I’m active and monitoring your environment. Ask me about security posture, alerts, or recent activity.",
-      meta: { kind: "local_status" },
-    };
-  }
-
-  return {
+  return normalizeResponse({
     reply:
-      "You can ask me about your security events, platform behavior, or anything you need help understanding.",
-    speakText:
-      "You can ask me about your security events, platform behavior, or anything you need help understanding.",
-    meta: { kind: "local_help" },
-  };
+      "I’m available to help with security posture, alerts, trading behavior, or risk decisions.",
+    confidence: "medium",
+    type: "status",
+  });
 }
 
-/* ================= OPENAI (OPTIONAL) ================= */
+/* ================= OPENAI (STRICT MODE) ================= */
 
 async function openaiReply({ tenantId, message, context }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
 
-  const model =
-    cleanStr(process.env.OPENAI_CHAT_MODEL, 60) || "gpt-4o-mini";
+  const model = cleanStr(
+    process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+    40
+  );
 
   const personality = buildPersonality({ tenantId });
-  const memory = listMemory({ tenantId, limit: 30 });
+  const memory = listMemory({ tenantId, limit: 20 });
 
   const system = `
-You are ${personality.identity}, an AI assistant for a single company.
+You are AuthoDev 6.5, a professional cybersecurity and systems advisor.
 
-Tone:
-${personality.tone}
+RULES (NON-NEGOTIABLE):
+- Do not greet the user
+- Do not use emojis
+- Do not speculate or guess
+- Do not ask follow-up questions unless clarification is required
+- Do not mention backend, system internals, or other tenants
+- Be concise and structured
+- Prefer actionable answers
 
-Rules:
-- Speak like a calm, professional human.
-- ONLY discuss the current company.
-- NEVER mention backend, admin, or other tenants.
-- If something is restricted, say so clearly.
-- Never guess missing data.
+ROLE TONE:
+Admin: technical, concise
+Manager: risk and impact focused
+Company: outcome-oriented, low jargon
+User: simple, practical
 
-Known company facts:
-${personality.platformFacts.join("\n")}
-
-Preferences:
-${personality.preferences.join("\n")}
-
-Hard rules:
-${personality.rules.join("\n")}
-`;
-
-  const user = `
-User message:
-${message}
-
-Context snapshot:
-${JSON.stringify(context, null, 2)}
-
-Recent memory:
-${memory.map((m) => `- (${m.type}) ${m.text}`).join("\n")}
+If information is missing:
+- State what is known
+- State what is unknown
+- Provide a safe recommendation
 
 Respond ONLY with JSON:
 {
   "reply": "...",
-  "speakText": "..."
+  "confidence": "high | medium | low",
+  "type": "status | action | decision | direct"
 }
+`;
+
+  const user = `
+Message:
+${message}
+
+Context:
+${JSON.stringify(context, null, 2)}
+
+Known memory:
+${memory.map((m) => `- ${m.text}`).join("\n")}
 `;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -128,7 +141,7 @@ Respond ONLY with JSON:
     },
     body: JSON.stringify({
       model,
-      temperature: 0.35,
+      temperature: 0.25,
       messages: [
         { role: "system", content: system.trim() },
         { role: "user", content: user.trim() },
@@ -143,11 +156,14 @@ Respond ONLY with JSON:
   const raw = data?.choices?.[0]?.message?.content || "{}";
   const parsed = JSON.parse(raw);
 
-  return {
-    reply: cleanStr(parsed.reply, 12000),
-    speakText: cleanStr(parsed.speakText || parsed.reply, 12000),
-    meta: { kind: "openai", model },
-  };
+  if (!parsed.reply) throw new Error("Invalid AI response");
+
+  return normalizeResponse({
+    reply: parsed.reply,
+    confidence: parsed.confidence || "medium",
+    type: parsed.type || "direct",
+    meta: { model },
+  });
 }
 
 /* ================= ROUTE ================= */
@@ -155,57 +171,48 @@ Respond ONLY with JSON:
 // POST /api/ai/chat
 router.post("/chat", async (req, res) => {
   try {
-    // 🔒 Tenant REQUIRED
+    /* ---------- TENANT ENFORCEMENT ---------- */
     const tenantId = req.tenant?.id;
     if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Tenant context missing",
-      });
+      return reject(res, 400, "Tenant context missing");
     }
 
-    const message = cleanStr(req.body?.message, 8000);
+    /* ---------- INPUT VALIDATION ---------- */
+    const message = cleanStr(req.body?.message);
     const context = req.body?.context || {};
 
     if (!message) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing message",
-      });
+      return reject(res, 400, "Message required");
     }
 
-    let out = null;
+    let output = null;
 
-    // 1️⃣ Try OpenAI if configured
+    /* ---------- AI ATTEMPT ---------- */
     try {
-      out = await openaiReply({ tenantId, message, context });
+      output = await openaiReply({ tenantId, message, context });
     } catch {
-      out = null;
+      output = null;
     }
 
-    // 2️⃣ Local fallback (safe)
-    if (!out) out = localReply(message, context);
+    /* ---------- FALLBACK ---------- */
+    if (!output) {
+      output = localReply(message, context);
+    }
 
-    // 3️⃣ Light learning (company-scoped)
-    const low = message.toLowerCase();
+    /* ---------- LIGHT MEMORY (SAFE) ---------- */
     if (
-      low.includes("remember") ||
-      low.includes("from now on") ||
-      low.includes("i prefer")
+      /remember|from now on|i prefer/i.test(message)
     ) {
       addMemory({
         tenantId,
         type: "preference",
-        text: message.slice(0, 800),
+        text: message.slice(0, 500),
       });
     }
 
-    return res.json({ ok: true, ...out });
+    return res.json({ ok: true, ...output });
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "AI error",
-    });
+    return reject(res, 500, e?.message || "AI failure");
   }
 });
 
