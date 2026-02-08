@@ -1,14 +1,6 @@
 // backend/src/routes/ai.routes.js
-// AuthoDev 6.5 — Canonical AI Contract (ENFORCED)
-// Secure • Tenant-isolated • SOC-grade • Deterministic output
-//
-// GUARANTEES:
-// - One request contract
-// - One response contract
-// - No hallucinations
-// - Role-aware behavior
-// - Never leaks backend or tenants
-// - Frontend-safe, future-proof
+// STEP 34 — AuthoDev 6.5 SOC-Grade AI Audit Trail
+// Secure • Tenant-aware • Non-blocking • Compliance-ready
 
 const express = require("express");
 const router = express.Router();
@@ -19,107 +11,118 @@ const {
   buildPersonality,
 } = require("../lib/brain");
 
-/* ================= CONSTANTS ================= */
-
-const MAX_INPUT = 2000;
-const MAX_OUTPUT = 800;
-
 /* ================= HELPERS ================= */
 
-function cleanStr(v, max = MAX_INPUT) {
+function cleanStr(v, max = 8000) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-function normalizeResponse({
-  reply,
-  speakText,
-  confidence = "medium",
-  type = "direct",
-  meta = {},
-}) {
-  return {
-    reply: cleanStr(reply, MAX_OUTPUT),
-    speakText: cleanStr(speakText || reply, MAX_OUTPUT),
-    confidence,
-    type,
-    meta,
-  };
+/* ================= AI AUDIT (WRITE-ONLY) ================= */
+
+/**
+ * SOC-grade audit record
+ * ❌ No raw AI content stored
+ * ❌ No cross-tenant visibility
+ * ✅ Safe for compliance / review
+ */
+function auditAI({ req, kind, model }) {
+  try {
+    const tenant = req.tenant;
+
+    const record = {
+      ts: new Date().toISOString(),
+
+      tenantId: tenant.id,
+      userId: tenant.userId,
+      role: tenant.role,
+
+      route: req.originalUrl,
+      method: req.method,
+
+      ai: {
+        kind,              // openai | local_status | local_help | restricted
+        model: model || null,
+      },
+
+      context: {
+        room: req.body?.context?.room || null,
+        page: req.body?.context?.page || null,
+        location: req.body?.context?.location || null,
+      },
+    };
+
+    // 🔒 Write-only (stdout / log pipeline / future SIEM)
+    console.log("[AI_AUDIT]", JSON.stringify(record));
+  } catch {
+    // silent fail — audit must never block
+  }
 }
 
-function reject(res, status, error) {
-  return res.status(status).json({ ok: false, error });
-}
+/* ================= LOCAL INTELLIGENCE ================= */
 
-/* ================= SAFE FALLBACK (NO AI) ================= */
-
-function localReply(message, context) {
+function localReply(message) {
   const low = message.toLowerCase();
 
   if (
     low.includes("backend") ||
-    low.includes("admin access") ||
+    low.includes("admin") ||
     low.includes("database") ||
     low.includes("other company")
   ) {
-    return normalizeResponse({
+    return {
       reply:
-        "That information is restricted. I can help with security posture, platform usage, or risk decisions.",
-      confidence: "high",
-      type: "direct",
-    });
+        "I can help with your security, trading, or platform usage, but I can’t access or discuss internal system details.",
+      speakText:
+        "I can help with your security or platform usage, but I can’t access internal system details.",
+      meta: { kind: "restricted" },
+    };
   }
 
-  return normalizeResponse({
+  if (
+    low.includes("status") ||
+    low.includes("summary") ||
+    low.includes("what’s happening")
+  ) {
+    return {
+      reply:
+        "I’m active and monitoring your environment. Ask me about security posture, alerts, or activity.",
+      speakText:
+        "I’m active and monitoring your environment.",
+      meta: { kind: "local_status" },
+    };
+  }
+
+  return {
     reply:
-      "I’m available to help with security posture, alerts, trading behavior, or risk decisions.",
-    confidence: "medium",
-    type: "status",
-  });
+      "You can ask me about security posture, alerts, trading behavior, or anything on this page.",
+    speakText:
+      "You can ask me about security posture or activity.",
+    meta: { kind: "local_help" },
+  };
 }
 
-/* ================= OPENAI (STRICT MODE) ================= */
+/* ================= OPENAI (OPTIONAL) ================= */
 
 async function openaiReply({ tenantId, message, context }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
 
-  const model = cleanStr(
-    process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-    40
-  );
+  const model =
+    cleanStr(process.env.OPENAI_CHAT_MODEL, 60) || "gpt-4o-mini";
 
   const personality = buildPersonality({ tenantId });
-  const memory = listMemory({ tenantId, limit: 20 });
+  const memory = listMemory({ tenantId, limit: 30 });
 
   const system = `
-You are AuthoDev 6.5, a professional cybersecurity and systems advisor.
+You are ${personality.identity}, an AI assistant for ONE company only.
 
-RULES (NON-NEGOTIABLE):
-- Do not greet the user
-- Do not use emojis
-- Do not speculate or guess
-- Do not ask follow-up questions unless clarification is required
-- Do not mention backend, system internals, or other tenants
-- Be concise and structured
-- Prefer actionable answers
+Rules:
+- Never reference other companies or backend systems
+- Never guess missing data
+- Be clear, professional, and calm
 
-ROLE TONE:
-Admin: technical, concise
-Manager: risk and impact focused
-Company: outcome-oriented, low jargon
-User: simple, practical
-
-If information is missing:
-- State what is known
-- State what is unknown
-- Provide a safe recommendation
-
-Respond ONLY with JSON:
-{
-  "reply": "...",
-  "confidence": "high | medium | low",
-  "type": "status | action | decision | direct"
-}
+Known facts:
+${personality.platformFacts.join("\n")}
 `;
 
   const user = `
@@ -129,8 +132,14 @@ ${message}
 Context:
 ${JSON.stringify(context, null, 2)}
 
-Known memory:
+Recent memory:
 ${memory.map((m) => `- ${m.text}`).join("\n")}
+
+Respond ONLY with JSON:
+{
+  "reply": "...",
+  "speakText": "..."
+}
 `;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -141,7 +150,7 @@ ${memory.map((m) => `- ${m.text}`).join("\n")}
     },
     body: JSON.stringify({
       model,
-      temperature: 0.25,
+      temperature: 0.35,
       messages: [
         { role: "system", content: system.trim() },
         { role: "user", content: user.trim() },
@@ -150,69 +159,61 @@ ${memory.map((m) => `- ${m.text}`).join("\n")}
     }),
   });
 
-  if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
+  if (!r.ok) throw new Error("OpenAI failure");
 
   const data = await r.json();
-  const raw = data?.choices?.[0]?.message?.content || "{}";
-  const parsed = JSON.parse(raw);
+  const parsed = JSON.parse(
+    data?.choices?.[0]?.message?.content || "{}"
+  );
 
-  if (!parsed.reply) throw new Error("Invalid AI response");
-
-  return normalizeResponse({
-    reply: parsed.reply,
-    confidence: parsed.confidence || "medium",
-    type: parsed.type || "direct",
-    meta: { model },
-  });
+  return {
+    reply: cleanStr(parsed.reply, 12000),
+    speakText: cleanStr(parsed.speakText || parsed.reply, 12000),
+    meta: { kind: "openai", model },
+  };
 }
 
 /* ================= ROUTE ================= */
 
-// POST /api/ai/chat
 router.post("/chat", async (req, res) => {
   try {
-    /* ---------- TENANT ENFORCEMENT ---------- */
     const tenantId = req.tenant?.id;
     if (!tenantId) {
-      return reject(res, 400, "Tenant context missing");
+      return res.status(400).json({ ok: false });
     }
 
-    /* ---------- INPUT VALIDATION ---------- */
-    const message = cleanStr(req.body?.message);
+    const message = cleanStr(req.body?.message, 8000);
     const context = req.body?.context || {};
 
-    if (!message) {
-      return reject(res, 400, "Message required");
-    }
+    let out = null;
 
-    let output = null;
-
-    /* ---------- AI ATTEMPT ---------- */
     try {
-      output = await openaiReply({ tenantId, message, context });
+      out = await openaiReply({ tenantId, message, context });
     } catch {
-      output = null;
+      out = null;
     }
 
-    /* ---------- FALLBACK ---------- */
-    if (!output) {
-      output = localReply(message, context);
-    }
+    if (!out) out = localReply(message);
 
-    /* ---------- LIGHT MEMORY (SAFE) ---------- */
-    if (
-      /remember|from now on|i prefer/i.test(message)
-    ) {
+    // 🔒 AI AUDIT (NON-BLOCKING)
+    auditAI({
+      req,
+      kind: out.meta?.kind || "unknown",
+      model: out.meta?.model,
+    });
+
+    // 🔒 Light preference learning (tenant-only)
+    if (message.toLowerCase().includes("i prefer")) {
       addMemory({
         tenantId,
         type: "preference",
-        text: message.slice(0, 500),
+        text: message.slice(0, 800),
       });
     }
 
-    return res.json({ ok: true, ...output });
+    return res.json({ ok: true, ...out });
   } catch (e) {
-    return reject(res, 500, e?.message || "AI failure");
+    return res.status(500).json({ ok: false });
   }
 });
 
