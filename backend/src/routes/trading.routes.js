@@ -1,105 +1,122 @@
 // backend/src/routes/trading.routes.js
+// Trading Routes — HARDENED + TENANT SAFE
+//
+// Guarantees:
+// - Auth required
+// - Tenant-isolated
+// - Admin/Manager role enforcement
+// - Audited live signals
+// - Safe-by-default execution
+
 const express = require("express");
 const router = express.Router();
 
-const { authRequired } = require("../middleware/auth");
+const { authRequired, requireRole } = require("../middleware/auth");
+const { audit } = require("../lib/audit");
+
 const paperTrader = require("../services/paperTrader");
 const liveTrader = require("../services/liveTrader");
 
-/**
- * TRADING ROUTES
- *
- * Design rules:
- * - Routes are THIN
- * - NO mock market logic
- * - NO duplicated live state
- * - Decisions happen in tradeBrain
- * - Execution handled by paperTrader / liveTrader
- * - Live trading is SAFE by default
- */
+// ---------------- ROLES ----------------
+const ADMIN = "Admin";
+const MANAGER = "Manager";
 
-// ---------- ROLE HELPERS ----------
-function isAdmin(req) {
-  return String(req?.user?.role || "").toLowerCase() === "admin";
-}
-
-function isManagerOrAdmin(req) {
-  const r = String(req?.user?.role || "").toLowerCase();
-  return r === "admin" || r === "manager";
-}
-
-// ---------- PUBLIC (NO AUTH) ----------
+// ---------------- PUBLIC ----------------
 
 /**
  * GET /api/trading/symbols
  * Frontend helper only
  */
 router.get("/symbols", (req, res) => {
-  res.json({
+  return res.json({
     ok: true,
     symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
   });
 });
 
-// ---------- PROTECTED ----------
+// ---------------- PROTECTED ----------------
 router.use(authRequired);
 
-// ---------- PAPER TRADING ----------
+// ---------------- PAPER TRADING ----------------
 
 /**
  * GET /api/trading/paper/snapshot
  * Admin + Manager
  */
-router.get("/paper/snapshot", (req, res) => {
-  if (!isManagerOrAdmin(req)) {
-    return res.status(403).json({ ok: false, error: "Forbidden" });
+router.get(
+  "/paper/snapshot",
+  requireRole(ADMIN, MANAGER),
+  (req, res) => {
+    return res.json({
+      ok: true,
+      tenantId: req.tenant.id,
+      snapshot: paperTrader.snapshot(req.tenant.id),
+    });
   }
-
-  return res.json({
-    ok: true,
-    snapshot: paperTrader.snapshot(),
-  });
-});
+);
 
 /**
  * POST /api/trading/paper/config
  * Admin only
  */
-router.post("/paper/config", (req, res) => {
-  if (!isAdmin(req)) {
-    return res.status(403).json({ ok: false, error: "Admin only" });
-  }
+router.post(
+  "/paper/config",
+  requireRole(ADMIN),
+  (req, res) => {
+    const updated = paperTrader.setConfig(req.tenant.id, req.body || {});
 
-  const updated = paperTrader.setConfig(req.body || {});
-  return res.json({ ok: true, config: updated });
-});
+    audit({
+      actorId: req.user.id,
+      action: "PAPER_TRADING_CONFIG_UPDATED",
+      targetType: "TradingConfig",
+      targetId: "paper",
+      companyId: req.tenant.id,
+      metadata: updated,
+    });
+
+    return res.json({ ok: true, config: updated });
+  }
+);
 
 /**
  * POST /api/trading/paper/reset
  * Admin only
  */
-router.post("/paper/reset", (req, res) => {
-  if (!isAdmin(req)) {
-    return res.status(403).json({ ok: false, error: "Admin only" });
+router.post(
+  "/paper/reset",
+  requireRole(ADMIN),
+  (req, res) => {
+    paperTrader.hardReset(req.tenant.id);
+
+    audit({
+      actorId: req.user.id,
+      action: "PAPER_TRADING_RESET",
+      targetType: "TradingState",
+      targetId: "paper",
+      companyId: req.tenant.id,
+    });
+
+    return res.json({ ok: true });
   }
+);
 
-  paperTrader.hardReset();
-  return res.json({ ok: true });
-});
-
-// ---------- LIVE TRADING (SAFE) ----------
+// ---------------- LIVE TRADING (SAFE MODE) ----------------
 
 /**
  * GET /api/trading/live/snapshot
  * Admin + Manager
  */
-router.get("/live/snapshot", (req, res) => {
-  if (!isManagerOrAdmin(req)) {
-    return res.status(403).json({ ok: false, error: "Forbidden" });
+router.get(
+  "/live/snapshot",
+  requireRole(ADMIN, MANAGER),
+  (req, res) => {
+    return res.json({
+      ok: true,
+      tenantId: req.tenant.id,
+      snapshot: liveTrader.snapshot(req.tenant.id),
+    });
   }
-
-  return res.json(liveTrader.snapshot());
-});
+);
 
 /**
  * POST /api/trading/live/signal
@@ -107,23 +124,42 @@ router.get("/live/snapshot", (req, res) => {
  *
  * Signals are:
  * - validated
- * - logged
- * - NEVER executed unless env + execution adapter allow it
+ * - audited
+ * - never executed unless live trading is explicitly enabled
  */
-router.post("/live/signal", async (req, res) => {
-  if (!isAdmin(req)) {
-    return res.status(403).json({ ok: false, error: "Admin only" });
-  }
+router.post(
+  "/live/signal",
+  requireRole(ADMIN),
+  async (req, res) => {
+    try {
+      const signal = req.body || {};
 
-  try {
-    const result = await liveTrader.pushSignal(req.body || {});
-    return res.json(result);
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "Live signal error",
-    });
+      const result = await liveTrader.pushSignal({
+        ...signal,
+        tenantId: req.tenant.id,
+        actorId: req.user.id,
+      });
+
+      audit({
+        actorId: req.user.id,
+        action: "LIVE_TRADING_SIGNAL",
+        targetType: "TradingSignal",
+        targetId: signal.symbol || "unknown",
+        companyId: req.tenant.id,
+        metadata: {
+          mode: "live",
+          signal: signal.type || "unknown",
+        },
+      });
+
+      return res.json(result);
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || "Live trading error",
+      });
+    }
   }
-});
+);
 
 module.exports = router;
