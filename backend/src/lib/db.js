@@ -7,33 +7,40 @@ const path = require('path');
 const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
 const TMP_PATH = DB_PATH + '.tmp';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+
+/* ======================================================
+   UTIL
+   ====================================================== */
 
 function ensureDir(p) {
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+function now() {
+  return new Date().toISOString();
+}
+
+/* ======================================================
+   DEFAULT DB
+   ====================================================== */
+
 function defaultDb() {
   return {
     schemaVersion: SCHEMA_VERSION,
 
-    // existing
     users: [],
     companies: [],
     audit: [],
     notifications: [],
 
-    // NEW: persistent "brain" areas
     brain: {
-      // reserved for long-term memory (summaries, rules, etc)
-      memory: [], // [{ts, type, text, meta}]
-      // reserved for system notes/flags
-      notes: [],  // [{ts, text}]
+      memory: [],
+      notes: [],
     },
 
     paper: {
-      // rolling stats that survive restarts
       summary: {
         startBalance: 0,
         balance: 0,
@@ -45,27 +52,27 @@ function defaultDb() {
         fees: 0,
         slippage: 0,
         spread: 0,
-        lastTradeTs: 0
+        lastTradeTs: 0,
       },
-      // last N trades persisted (so you can review after restart)
-      trades: [], // [{time, symbol, type, price, qty, profit, note}]
-      // optional daily rollups
-      daily: []   // [{dayKey, trades, pnl, wins, losses, totalGain, totalLoss}]
+      trades: [],
+      daily: [],
     },
 
     live: {
-      events: [], // audit trail for live readiness / dry-run orders
-    }
+      events: [],
+    },
   };
 }
 
-// Fix old dbs into new schema (non-breaking)
+/* ======================================================
+   MIGRATION
+   ====================================================== */
+
 function migrate(db) {
   if (!db || typeof db !== 'object') return defaultDb();
 
   if (!db.schemaVersion) db.schemaVersion = 1;
 
-  // Add missing collections safely
   if (!Array.isArray(db.users)) db.users = [];
   if (!Array.isArray(db.companies)) db.companies = [];
   if (!Array.isArray(db.audit)) db.audit = [];
@@ -88,7 +95,7 @@ function migrate(db) {
       fees: 0,
       slippage: 0,
       spread: 0,
-      lastTradeTs: 0
+      lastTradeTs: 0,
     };
   }
   if (!Array.isArray(db.paper.trades)) db.paper.trades = [];
@@ -101,49 +108,43 @@ function migrate(db) {
   return db;
 }
 
+/* ======================================================
+   CORE IO
+   ====================================================== */
+
 function ensureDb() {
   ensureDir(DB_PATH);
 
   if (!fs.existsSync(DB_PATH)) {
-    const fresh = defaultDb();
-    fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
     return;
   }
 
-  // If file exists but schema is old/missing pieces, migrate once
   try {
     const raw = fs.readFileSync(DB_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
     const migrated = migrate(parsed);
     fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
   } catch {
-    // If corrupted, preserve a backup then rebuild
     try {
       const bad = fs.readFileSync(DB_PATH, 'utf-8');
       fs.writeFileSync(DB_PATH + '.corrupt.' + Date.now(), bad);
     } catch {}
-    const fresh = defaultDb();
-    fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
   }
 }
 
 function readDb() {
   ensureDb();
-  const raw = fs.readFileSync(DB_PATH, 'utf-8');
-  const parsed = JSON.parse(raw);
-  return migrate(parsed);
+  return migrate(JSON.parse(fs.readFileSync(DB_PATH, 'utf-8')));
 }
 
-// Atomic write so deploy/restart never half-writes db.json
 function writeDb(db) {
-  ensureDb();
   const safe = migrate(db);
-  const json = JSON.stringify(safe, null, 2);
-  fs.writeFileSync(TMP_PATH, json);
+  fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
   fs.renameSync(TMP_PATH, DB_PATH);
 }
 
-// Convenience updater (read -> mutate -> write)
 function updateDb(mutator) {
   const db = readDb();
   const out = mutator(db) || db;
@@ -151,4 +152,52 @@ function updateDb(mutator) {
   return out;
 }
 
-module.exports = { DB_PATH, ensureDb, readDb, writeDb, updateDb };
+/* ======================================================
+   AUDIT WRITES (NEW)
+   ====================================================== */
+
+/**
+ * writeAudit({
+ *   actorId,
+ *   actorRole,
+ *   companyId,
+ *   action,
+ *   target,
+ *   meta
+ * })
+ */
+function writeAudit(event = {}) {
+  try {
+    updateDb((db) => {
+      db.audit.push({
+        ts: now(),
+        actorId: event.actorId || 'system',
+        actorRole: event.actorRole || 'system',
+        companyId: event.companyId || null,
+        action: String(event.action || 'unknown').slice(0, 120),
+        target: String(event.target || '').slice(0, 120),
+        meta: event.meta || {},
+      });
+
+      // hard cap (prevents unbounded growth)
+      if (db.audit.length > 5000) {
+        db.audit = db.audit.slice(-4000);
+      }
+    });
+  } catch (e) {
+    console.error('AUDIT WRITE FAILED:', e);
+  }
+}
+
+/* ======================================================
+   EXPORTS
+   ====================================================== */
+
+module.exports = {
+  DB_PATH,
+  ensureDb,
+  readDb,
+  writeDb,
+  updateDb,
+  writeAudit, // ✅ NEW
+};
