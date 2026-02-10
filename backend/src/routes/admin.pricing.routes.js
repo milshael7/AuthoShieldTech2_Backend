@@ -1,5 +1,5 @@
 // backend/src/routes/admin.pricing.routes.js
-// Admin Pricing API — HARDENED
+// Admin Pricing API — HARDENED (FIXED)
 //
 // PURPOSE:
 // - Admin-controlled plans & pricing
@@ -17,6 +17,7 @@ const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
 const users = require("../users/user.service");
 
 // ---------------- ROLE SAFETY ----------------
@@ -31,24 +32,12 @@ function cleanStr(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
 
-function audit(db, entry) {
-  db.audit = db.audit || [];
-  db.audit.push({
-    id: crypto.randomUUID(),
-    ts: Date.now(),
-    actor: entry.actor,
-    action: entry.action,
-    target: entry.target || null,
-    detail: entry.detail || {},
-  });
-}
-
-// ---------------- DEFAULT PLANS ----------------
+// ---------------- DEFAULT PRICING ----------------
 function ensurePricing(db) {
   if (!db.pricing) {
     db.pricing = {
       plans: [],
-      updatedAt: Date.now(),
+      updatedAt: new Date().toISOString(),
     };
   }
 }
@@ -75,7 +64,7 @@ router.post("/plan", (req, res) => {
     const body = req.body || {};
 
     const plan = {
-      id: cleanStr(body.id || crypto.randomUUID(), 100),
+      id: cleanStr(body.id || cryptoSafeId(), 100),
       name: cleanStr(body.name, 120),
       tier: cleanStr(body.tier, 50), // individual | small_company | company | admin
       priceMonthly: Number(body.priceMonthly || 0),
@@ -83,9 +72,9 @@ router.post("/plan", (req, res) => {
       features: Array.isArray(body.features)
         ? body.features.map((f) => cleanStr(f, 200))
         : [],
-      limits: body.limits || {},
+      limits: typeof body.limits === "object" ? body.limits : {},
       active: body.active !== false,
-      updatedAt: Date.now(),
+      updatedAt: new Date().toISOString(),
     };
 
     if (!plan.name || !plan.tier) {
@@ -102,13 +91,19 @@ router.post("/plan", (req, res) => {
         db.pricing.plans.push(plan);
       }
 
-      db.pricing.updatedAt = Date.now();
+      db.pricing.updatedAt = new Date().toISOString();
 
-      audit(db, {
-        actor: req.user.id,
+      audit({
+        actorId: req.user.id,
         action: "PRICING_PLAN_UPSERT",
-        target: plan.id,
-        detail: { name: plan.name, tier: plan.tier },
+        targetType: "pricing_plan",
+        targetId: plan.id,
+        companyId: req.user.companyId || null,
+        metadata: {
+          name: plan.name,
+          tier: plan.tier,
+          active: plan.active,
+        },
       });
 
       return db;
@@ -135,14 +130,16 @@ router.delete("/plan/:id", (req, res) => {
       if (!plan) throw new Error("Plan not found");
 
       plan.active = false;
-      plan.updatedAt = Date.now();
-      db.pricing.updatedAt = Date.now();
+      plan.updatedAt = new Date().toISOString();
+      db.pricing.updatedAt = new Date().toISOString();
 
-      audit(db, {
-        actor: req.user.id,
+      audit({
+        actorId: req.user.id,
         action: "PRICING_PLAN_DEACTIVATED",
-        target: planId,
-        detail: { name: plan.name },
+        targetType: "pricing_plan",
+        targetId: planId,
+        companyId: req.user.companyId || null,
+        metadata: { name: plan.name },
       });
 
       return db;
@@ -153,5 +150,13 @@ router.delete("/plan/:id", (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 });
+
+// ---------------- SAFE ID ----------------
+function cryptoSafeId() {
+  return (
+    Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 10)
+  );
+}
 
 module.exports = router;
