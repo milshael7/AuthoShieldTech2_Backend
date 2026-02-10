@@ -73,9 +73,10 @@ router.post('/users/:id/subscription', (req, res) => {
       patch.subscriptionStatus = cleanStr(body.subscriptionStatus, 50);
     }
 
-    // ✅ support DB typo + frontend-friendly name
+    // ✅ FIXED: correct field + legacy support
     if (typeof body.autoprotectEnabled !== 'undefined') {
-      patch.autoprotechEnabled = !!body.autoprotectEnabled;
+      patch.autoprotectEnabled = !!body.autoprotectEnabled;
+      patch.autoprotechEnabled = !!body.autoprotectEnabled; // legacy DB typo support
     }
 
     return res.json(
@@ -127,8 +128,6 @@ router.get('/notifications', (req, res) => {
 
 // ======================================================
 // ✅ Admin “Manager View” (read-only mirror)
-// (Admin can already access /api/manager/* — this is optional
-// but kept for clarity + future separation)
 // ======================================================
 
 // GET /api/admin/manager/overview
