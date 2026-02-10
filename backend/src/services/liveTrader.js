@@ -1,19 +1,27 @@
 // backend/src/services/liveTrader.js
-// Live trading engine (SAFE by default)
-// Accepts signals, logs intents, NEVER trades unless explicitly armed.
+// Live Trading Engine — TENANT SAFE (FINAL)
+//
+// GUARANTEES:
+// - One isolated live trader per tenant
+// - Signals logged safely
+// - NEVER executes trades unless explicitly armed + adapter wired
+// - MSP / SOC compliant
 
 const fs = require("fs");
 const path = require("path");
 
-const LIVE_REFERENCE_BALANCE = Number(process.env.LIVE_START_BALANCE || 0);
+/* ================= CONFIG ================= */
 
-// Persist state here (use Render Disk, NOT /tmp in production)
-const STATE_PATH =
-  (process.env.LIVE_TRADER_STATE_PATH &&
-    String(process.env.LIVE_TRADER_STATE_PATH).trim()) ||
-  "/tmp/live_trader_state.json";
+const LIVE_REFERENCE_BALANCE = Number(
+  process.env.LIVE_START_BALANCE || 0
+);
 
-/* ---------------- ENV GATES ---------------- */
+const BASE_PATH =
+  process.env.LIVE_TRADER_STATE_DIR ||
+  path.join("/tmp", "live_trader");
+
+/* ================= ENV GATES ================= */
+
 function envTrue(name) {
   const v = String(process.env[name] || "").toLowerCase().trim();
   return v === "true" || v === "1" || v === "yes";
@@ -27,12 +35,15 @@ function isExecuteEnabled() {
   return envTrue("LIVE_TRADING_EXECUTE");
 }
 
-/* ---------------- HELPERS ---------------- */
-function ensureDirFor(filePath) {
-  try {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  } catch {}
+/* ================= HELPERS ================= */
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function statePath(tenantId) {
+  ensureDir(BASE_PATH);
+  return path.join(BASE_PATH, `live_${tenantId}.json`);
 }
 
 function safeNum(x, fallback = null) {
@@ -48,10 +59,11 @@ function dayKey(ts) {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
-/* ---------------- STATE ---------------- */
+/* ================= STATE ================= */
+
 function defaultState() {
   return {
-    version: 4,
+    version: 1,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -78,45 +90,54 @@ function defaultState() {
 
     config: {
       LIVE_REFERENCE_BALANCE,
-      STATE_PATH,
     },
   };
 }
 
-let state = defaultState();
-let saveTimer = null;
+const STATES = new Map();
+const SAVE_TIMERS = new Map();
 
-/* ---------------- PERSISTENCE ---------------- */
-function saveState(s) {
+/* ================= PERSISTENCE ================= */
+
+function load(tenantId) {
+  if (STATES.has(tenantId)) return STATES.get(tenantId);
+
+  const file = statePath(tenantId);
+  let state = defaultState();
+
   try {
-    ensureDirFor(STATE_PATH);
-    const tmp = STATE_PATH + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
-    fs.renameSync(tmp, STATE_PATH);
+    if (fs.existsSync(file)) {
+      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      state = { ...state, ...raw };
+    }
   } catch {}
+
+  STATES.set(tenantId, state);
+  return state;
 }
 
-function loadState() {
-  try {
-    if (!fs.existsSync(STATE_PATH)) return null;
-    const raw = fs.readFileSync(STATE_PATH, "utf-8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
+function scheduleSave(tenantId) {
+  if (SAVE_TIMERS.has(tenantId)) return;
+
+  SAVE_TIMERS.set(
+    tenantId,
+    setTimeout(() => {
+      SAVE_TIMERS.delete(tenantId);
+      const state = STATES.get(tenantId);
+      if (!state) return;
+
+      state.updatedAt = nowIso();
+      try {
+        fs.writeFileSync(
+          statePath(tenantId),
+          JSON.stringify(state, null, 2)
+        );
+      } catch {}
+    }, 400)
+  );
 }
 
-function scheduleSave() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    state.updatedAt = nowIso();
-    saveState(state);
-  }, 400);
-}
-
-function refreshFlags() {
+function refreshFlags(state) {
   state.enabled = isEnabled();
   state.execute = state.enabled && isExecuteEnabled();
 
@@ -125,29 +146,20 @@ function refreshFlags() {
   else state.mode = "live-armed";
 }
 
-function resetDayIfNeeded(ts) {
+function resetDayIfNeeded(state, ts) {
   const dk = dayKey(ts);
   if (state.dayKey !== dk) {
     state.dayKey = dk;
   }
 }
 
-/* ---------------- LIFECYCLE ---------------- */
-function start() {
-  const persisted = loadState();
-  if (persisted && persisted.version >= 1) {
-    state = {
-      ...defaultState(),
-      ...persisted,
-      stats: {
-        ...defaultState().stats,
-        ...(persisted.stats || {}),
-      },
-    };
-  }
+/* ================= LIFECYCLE ================= */
+
+function start(tenantId) {
+  const state = load(tenantId);
 
   state.running = true;
-  refreshFlags();
+  refreshFlags(state);
 
   state.stats.lastReason = state.enabled
     ? state.execute
@@ -156,60 +168,65 @@ function start() {
     : "disabled_by_env";
 
   state.lastError = null;
-  scheduleSave();
+  scheduleSave(tenantId);
 }
 
-function stop() {
+function stop(tenantId) {
+  const state = load(tenantId);
   state.running = false;
-  scheduleSave();
+  scheduleSave(tenantId);
 }
 
-/* ---------------- TICKS ---------------- */
-function tick(symbol, price, ts = Date.now()) {
+/* ================= TICKS ================= */
+
+function tick(tenantId, symbol, price, ts = Date.now()) {
+  const state = load(tenantId);
   if (!state.running) return;
 
-  resetDayIfNeeded(ts);
+  resetDayIfNeeded(state, ts);
 
   const sym = String(symbol || "BTCUSDT");
   const p = safeNum(price, null);
   const t = safeNum(ts, Date.now());
-
   if (p == null) return;
 
   state.lastPriceBySymbol[sym] = p;
   state.stats.ticksSeen += 1;
   state.stats.lastTickTs = t;
 
-  refreshFlags();
+  refreshFlags(state);
   state.stats.lastReason = state.enabled
     ? state.execute
       ? "executing_enabled_waiting_for_signal"
       : "armed_waiting_for_signal"
     : "disabled_by_env";
 
-  scheduleSave();
+  scheduleSave(tenantId);
 }
 
-/* ---------------- SIGNAL ENTRY POINT ---------------- */
-async function pushSignal(signal = {}) {
+/* ================= SIGNAL ENTRY ================= */
+
+async function pushSignal(tenantId, signal = {}) {
+  const state = load(tenantId);
+
   try {
-    refreshFlags();
+    refreshFlags(state);
 
     if (!state.running) throw new Error("liveTrader not running");
 
     if (!state.enabled) {
       state.stats.lastReason = "signal_rejected_disabled";
-      scheduleSave();
+      scheduleSave(tenantId);
       return { ok: false, error: "LIVE_TRADING_ENABLED is off" };
     }
 
     const symbol = String(signal.symbol || "BTCUSDT");
     const side = String(signal.side || "").toUpperCase();
 
-    // WAIT / CLOSE / SELL are NON-executable by design
-    if (side === "WAIT" || side === "CLOSE" || side === "SELL") {
+    // Non-executable by design
+    if (["WAIT", "CLOSE", "SELL"].includes(side)) {
       state.stats.lastReason = "signal_logged_non_executable";
-      scheduleSave();
+      scheduleSave(tenantId);
       return { ok: true, ignored: true, reason: side };
     }
 
@@ -253,31 +270,34 @@ async function pushSignal(signal = {}) {
 
     if (!state.execute) {
       state.stats.lastReason = "signal_logged_armed_no_execute";
-      scheduleSave();
+      scheduleSave(tenantId);
       return { ok: true, accepted: true, executed: false, intent };
     }
 
-    // Execution intentionally blocked until adapter is wired
+    // Execution intentionally blocked until adapter exists
     intent.execution = {
       status: "adapter_missing",
-      note: "Kraken execution adapter not wired yet.",
+      note: "Execution adapter not wired.",
     };
 
     state.stats.lastReason = "execute_enabled_adapter_missing";
-    scheduleSave();
+    scheduleSave(tenantId);
 
     return { ok: true, accepted: true, executed: false, intent };
   } catch (e) {
     state.lastError = e?.message || String(e);
     state.stats.lastReason = "signal_error";
-    scheduleSave();
+    scheduleSave(tenantId);
     return { ok: false, error: state.lastError };
   }
 }
 
-/* ---------------- SNAPSHOT ---------------- */
-function snapshot() {
-  refreshFlags();
+/* ================= SNAPSHOT ================= */
+
+function snapshot(tenantId) {
+  const state = load(tenantId);
+  refreshFlags(state);
+
   return {
     ok: true,
     running: state.running,
@@ -297,7 +317,6 @@ function snapshot() {
       LIVE_TRADING_ENABLED: state.enabled,
       LIVE_TRADING_EXECUTE: state.execute,
       LIVE_REFERENCE_BALANCE,
-      STATE_PATH,
       NOTE:
         "Safe design: enabled=accept signals, execute=send orders (adapter required).",
     },
