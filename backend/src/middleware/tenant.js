@@ -1,22 +1,6 @@
 // backend/src/middleware/tenant.js
-// AuthoDev 6.5 — Company / Tenant Isolation Core
-// MSP-grade • AI-aware • Non-resetting context
-
-/**
- * PURPOSE
- * - Resolve company (tenant) for every request
- * - Attach a single, trusted req.tenant object
- * - Used by:
- *   - AI (brain, voice, text panels)
- *   - Cybersecurity rooms
- *   - Trading rooms
- *   - Dashboards & logs
- *
- * Tenant resolution order:
- * 1) Auth token (req.user.companyId)  ✅ primary
- * 2) x-company-id header              (admin / API)
- * 3) subdomain                        (future-ready)
- */
+// AuthoDev 6.5 — Company / Tenant Isolation Core (HARDENED)
+// MSP-grade • AI-aware • Zero trust • Deterministic
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
@@ -34,21 +18,29 @@ function resolveFromSubdomain(req) {
 }
 
 function tenantMiddleware(req, res, next) {
+  // 🔒 Auth MUST already be resolved for protected routes
+  if (!req.user) {
+    return res.status(401).json({
+      ok: false,
+      error: "Authentication required",
+    });
+  }
+
   let companyId = null;
 
   /* ================= RESOLUTION ================= */
 
-  // 1️⃣ Authenticated user (preferred)
-  if (req.user?.companyId) {
+  // 1️⃣ Auth token (primary & safest)
+  if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
   }
 
-  // 2️⃣ Explicit header (admin tools, internal APIs)
+  // 2️⃣ Explicit header (admin / internal tooling only)
   if (!companyId && req.headers["x-company-id"]) {
     companyId = clean(req.headers["x-company-id"], 50);
   }
 
-  // 3️⃣ Subdomain (future expansion)
+  // 3️⃣ Subdomain (future expansion only)
   if (!companyId) {
     companyId = resolveFromSubdomain(req);
   }
@@ -57,34 +49,37 @@ function tenantMiddleware(req, res, next) {
     return res.status(400).json({
       ok: false,
       error: "Company context missing",
-      hint: "Authenticate or provide x-company-id",
     });
   }
+
+  const role = String(req.user.role || "").toLowerCase();
 
   /* ================= TENANT CONTEXT ================= */
 
   /**
    * 🔒 SINGLE SOURCE OF TRUTH
-   * Everything downstream MUST read from req.tenant
+   * All downstream systems MUST read from req.tenant
    */
   req.tenant = {
     id: companyId,
 
-    // user context
-    userId: req.user?.id || null,
-    role: req.user?.role || "user",
+    // user identity
+    userId: req.user.id,
+    role: req.user.role,
 
-    // scope flags (used later by AI + rooms)
+    // scope classification (FIXED)
     scope: {
-      isCompany: true,
-      isUser: !!req.user,
+      isAdmin: role === "admin",
+      isManager: role === "manager",
+      isCompany: role === "company",
+      isIndividual: role === "individual",
     },
 
-    // AI brain partition key (non-resetting memory)
-    brainKey: `company:${companyId}`,
+    // 🔑 AI memory / brain partition (ALIGNED)
+    brainKey: companyId,
 
-    // audit helpers
-    resolvedFrom: req.user?.companyId
+    // audit metadata
+    resolvedFrom: req.user.companyId
       ? "auth"
       : req.headers["x-company-id"]
       ? "header"
