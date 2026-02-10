@@ -1,57 +1,91 @@
 // backend/src/middleware/auth.js
-// JWT auth middleware used by protected routes (Admin/Manager gates)
+// JWT auth middleware used by protected routes (Admin / Manager / Company gates)
 
-const { verify } = require('../auth/jwt');
+const { verify } = require("../auth/jwt");
 
+/* ======================================================
+   AUTH REQUIRED
+   ====================================================== */
 function authRequired(req, res, next) {
-  const h = String(req.headers.authorization || '');
-  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : null;
+  const h = String(req.headers.authorization || "");
+  const token = h.startsWith("Bearer ")
+    ? h.slice(7).trim()
+    : null;
 
-  if (!token) return res.status(401).json({ error: 'Missing token' });
+  if (!token) {
+    return res.status(401).json({ error: "Missing token" });
+  }
 
   try {
-    req.user = verify(token, process.env.JWT_SECRET);
+    const payload = verify(token, process.env.JWT_SECRET);
+
+    // 🔒 Hard validation of token payload
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      typeof payload.role !== "string"
+    ) {
+      return res.status(401).json({ error: "Invalid token payload" });
+    }
+
+    req.user = payload;
     return next();
   } catch (e) {
-    return res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: "Invalid token" });
   }
 }
 
-// normalize role to comparable string
+/* ======================================================
+   ROLE GUARD
+   ====================================================== */
+
 function normRole(r) {
-  return String(r || '').trim().toLowerCase();
+  return String(r || "").trim().toLowerCase();
 }
 
 /**
  * requireRole('Admin','Manager')
  * requireRole(['Admin','Manager'])
- * requireRole('Manager', { adminAlso: true })  // ✅ Admin can access Manager routes
+ * requireRole('Manager', { adminAlso: true })
  */
 function requireRole(...args) {
-  // Optional options object as last argument
   let opts = {};
-  if (args.length && typeof args[args.length - 1] === 'object' && !Array.isArray(args[args.length - 1])) {
+
+  // options object as last argument
+  if (
+    args.length &&
+    typeof args[args.length - 1] === "object" &&
+    !Array.isArray(args[args.length - 1])
+  ) {
     opts = args.pop() || {};
   }
 
-  // Flatten roles
   const rawRoles = args.flat().filter(Boolean);
   const allow = new Set(rawRoles.map(normRole));
 
-  const adminAlso = !!opts.adminAlso; // if true, Admin role always passes
-  const adminRole = normRole(opts.adminRole || 'Admin');
+  const adminRole = normRole(opts.adminRole || "Admin");
+  const adminAlso = !!opts.adminAlso;
 
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Missing auth' });
+    if (!req.user) {
+      return res.status(401).json({ error: "Missing auth" });
+    }
 
     const userRole = normRole(req.user.role);
 
-    // ✅ Admin override option
-    if (adminAlso && userRole === adminRole) return next();
+    // ✅ Admin always allowed if explicitly listed
+    if (allow.has(adminRole) && userRole === adminRole) {
+      return next();
+    }
+
+    // ✅ Optional admin override
+    if (adminAlso && userRole === adminRole) {
+      return next();
+    }
 
     if (!allow.has(userRole)) {
       return res.status(403).json({
-        error: 'Forbidden',
+        error: "Forbidden",
         role: req.user.role,
         allowed: Array.from(allow),
       });
