@@ -3,23 +3,22 @@
 // ✅ Admin can see everything Manager sees
 // ✅ Safe limits + filtering + stable responses
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-const { authRequired, requireRole } = require('../middleware/auth');
-const { readDb } = require('../lib/db');
+const { authRequired, requireRole } = require("../middleware/auth");
+const { readDb } = require("../lib/db");
 
-const users = require('../users/user.service');
-const companies = require('../companies/company.service');
-const { listNotifications } = require('../lib/notify');
+const users = require("../users/user.service");
+const companies = require("../companies/company.service");
+const { listNotifications } = require("../lib/notify");
 
 // ---------------- Role safety ----------------
-const ADMIN = users?.ROLES?.ADMIN || 'Admin';
-const MANAGER = users?.ROLES?.MANAGER || 'Manager';
+const MANAGER = users?.ROLES?.MANAGER || "Manager";
 
 // ---------------- Middleware ----------------
 router.use(authRequired);
-router.use(requireRole(ADMIN, MANAGER));
+router.use(requireRole(MANAGER, { adminAlso: true }));
 
 // ---------------- Helpers ----------------
 function clampInt(n, min, max, fallback) {
@@ -29,15 +28,14 @@ function clampInt(n, min, max, fallback) {
 }
 
 function safeStr(v, maxLen = 120) {
-  const s = String(v || '').trim();
-  if (!s) return '';
-  return s.slice(0, maxLen);
+  const s = String(v || "").trim();
+  return s ? s.slice(0, maxLen) : "";
 }
 
 // ---------------- Routes ----------------
 
-// ✅ GET /api/manager/overview
-router.get('/overview', (req, res) => {
+// GET /api/manager/overview
+router.get("/overview", (req, res) => {
   try {
     const db = readDb();
     return res.json({
@@ -52,8 +50,8 @@ router.get('/overview', (req, res) => {
   }
 });
 
-// ✅ GET /api/manager/users (read-only)
-router.get('/users', (req, res) => {
+// GET /api/manager/users (read-only)
+router.get("/users", (req, res) => {
   try {
     return res.json(users.listUsers());
   } catch (e) {
@@ -61,8 +59,8 @@ router.get('/users', (req, res) => {
   }
 });
 
-// ✅ GET /api/manager/companies (read-only)
-router.get('/companies', (req, res) => {
+// GET /api/manager/companies (read-only)
+router.get("/companies", (req, res) => {
   try {
     return res.json(companies.listCompanies());
   } catch (e) {
@@ -70,24 +68,19 @@ router.get('/companies', (req, res) => {
   }
 });
 
-// ✅ GET /api/manager/notifications
-// Optional: ?limit=200 (max 1000)
-router.get('/notifications', (req, res) => {
+// GET /api/manager/notifications
+router.get("/notifications", (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 1, 1000, 200);
     const all = listNotifications({}) || [];
-    return res.json(all.slice(0, limit)); // newest first
+    return res.json(all.slice(0, limit));
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// ✅ GET /api/manager/audit
-// Filters:
-//   ?limit=200
-//   ?actorId=...
-//   ?action=partial
-router.get('/audit', (req, res) => {
+// GET /api/manager/audit
+router.get("/audit", (req, res) => {
   try {
     const db = readDb();
     const limit = clampInt(req.query.limit, 1, 1000, 200);
@@ -98,11 +91,13 @@ router.get('/audit', (req, res) => {
     let items = (db.audit || []).slice().reverse();
 
     if (actorId) {
-      items = items.filter(ev => String(ev.actorId || '') === actorId);
+      items = items.filter(
+        (ev) => String(ev.actorId || "") === actorId
+      );
     }
     if (actionQ) {
-      items = items.filter(ev =>
-        String(ev.action || '').toLowerCase().includes(actionQ)
+      items = items.filter((ev) =>
+        String(ev.action || "").toLowerCase().includes(actionQ)
       );
     }
 
