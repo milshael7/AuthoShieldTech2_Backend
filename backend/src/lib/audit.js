@@ -1,56 +1,67 @@
 // backend/src/lib/audit.js
-const { readDb, writeDb } = require('./db');
-const { nanoid } = require('nanoid');
+// Central Audit Writer — HARDENED & SAFE
+//
+// PURPOSE:
+// - Single source of truth for audit events
+// - Safe concurrent writes
+// - Consistent schema across admin / manager / system
+//
+// RULES:
+// - No auth logic
+// - Never throws
+// - Always returns a record or null
 
-function ensureAudit(db) {
-  if (!db.audit) db.audit = [];
-  if (!Array.isArray(db.audit)) db.audit = [];
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function safeObj(v) {
-  if (v && typeof v === 'object' && !Array.isArray(v)) return v;
-  return {};
-}
+const crypto = require("crypto");
+const { updateDb } = require("./db");
 
 /**
- * audit({
- *   actorId,
- *   action,
- *   targetType,
- *   targetId,
- *   companyId,
- *   metadata
+ * writeAudit({
+ *   actor,        // user id or "system"
+ *   role,         // admin | manager | system | user
+ *   action,       // STRING ENUM (ex: USER_CREATED)
+ *   target,       // optional id (userId, companyId, tradeId)
+ *   companyId,    // optional tenant scope
+ *   detail        // optional object
  * })
  */
-function audit(event = {}) {
-  const db = readDb();
-  ensureAudit(db);
+function writeAudit(input = {}) {
+  try {
+    const record = {
+      id: crypto.randomUUID(),
+      ts: Date.now(),
 
-  const e = safeObj(event);
+      actor: String(input.actor || "system"),
+      role: String(input.role || "system"),
+      action: String(input.action || "UNKNOWN"),
 
-  const rec = {
-    id: nanoid(),
-    at: nowISO(),
+      target: input.target ? String(input.target) : null,
+      companyId: input.companyId ? String(input.companyId) : null,
 
-    // normalized fields (but we keep whatever else you pass too)
-    actorId: e.actorId ?? null,
-    action: e.action ?? 'EVENT',
-    targetType: e.targetType ?? null,
-    targetId: e.targetId ?? null,
-    companyId: e.companyId ?? null,
-    metadata: e.metadata && typeof e.metadata === 'object' ? e.metadata : null,
+      detail:
+        input.detail && typeof input.detail === "object"
+          ? input.detail
+          : {},
+    };
 
-    // keep any extra fields for future expansion
-    ...e,
-  };
+    updateDb((db) => {
+      if (!Array.isArray(db.audit)) db.audit = [];
+      db.audit.push(record);
 
-  db.audit.push(rec);
-  writeDb(db);
-  return rec;
+      // Hard cap: keep last 10,000 events
+      if (db.audit.length > 10_000) {
+        db.audit = db.audit.slice(-10_000);
+      }
+
+      return db;
+    });
+
+    return record;
+  } catch (err) {
+    console.error("⚠️ Audit write failed:", err);
+    return null;
+  }
 }
 
-module.exports = { audit };
+module.exports = {
+  writeAudit,
+};
