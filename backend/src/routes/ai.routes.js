@@ -4,6 +4,7 @@
 
 const express = require("express");
 const router = express.Router();
+const fetch = require("node-fetch");
 
 const {
   addMemory,
@@ -17,30 +18,32 @@ function cleanStr(v, max = 8000) {
   return String(v ?? "").trim().slice(0, max);
 }
 
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
 /* ================= AI AUDIT (WRITE-ONLY) ================= */
 
-/**
- * SOC-grade audit record
- * ❌ No raw AI content stored
- * ❌ No cross-tenant visibility
- * ✅ Safe for compliance / review
- */
 function auditAI({ req, kind, model }) {
   try {
-    const tenant = req.tenant;
+    const tenant = req?.tenant || {};
 
     const record = {
       ts: new Date().toISOString(),
 
-      tenantId: tenant.id,
-      userId: tenant.userId,
-      role: tenant.role,
+      tenantId: tenant.id || null,
+      userId: tenant.userId || null,
+      role: tenant.role || null,
 
       route: req.originalUrl,
       method: req.method,
 
       ai: {
-        kind,              // openai | local_status | local_help | restricted
+        kind,
         model: model || null,
       },
 
@@ -51,10 +54,9 @@ function auditAI({ req, kind, model }) {
       },
     };
 
-    // 🔒 Write-only (stdout / log pipeline / future SIEM)
     console.log("[AI_AUDIT]", JSON.stringify(record));
   } catch {
-    // silent fail — audit must never block
+    // audit must never block
   }
 }
 
@@ -71,7 +73,7 @@ function localReply(message) {
   ) {
     return {
       reply:
-        "I can help with your security, trading, or platform usage, but I can’t access or discuss internal system details.",
+        "I can help with your security or platform usage, but I can’t access or discuss internal system details.",
       speakText:
         "I can help with your security or platform usage, but I can’t access internal system details.",
       meta: { kind: "restricted" },
@@ -86,8 +88,7 @@ function localReply(message) {
     return {
       reply:
         "I’m active and monitoring your environment. Ask me about security posture, alerts, or activity.",
-      speakText:
-        "I’m active and monitoring your environment.",
+      speakText: "I’m active and monitoring your environment.",
       meta: { kind: "local_status" },
     };
   }
@@ -142,35 +143,47 @@ Respond ONLY with JSON:
 }
 `;
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.35,
-      messages: [
-        { role: "system", content: system.trim() },
-        { role: "user", content: user.trim() },
-      ],
-      response_format: { type: "json_object" },
-    }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
 
-  if (!r.ok) throw new Error("OpenAI failure");
+  try {
+    const r = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.35,
+          messages: [
+            { role: "system", content: system.trim() },
+            { role: "user", content: user.trim() },
+          ],
+          response_format: { type: "json_object" },
+        }),
+      }
+    );
 
-  const data = await r.json();
-  const parsed = JSON.parse(
-    data?.choices?.[0]?.message?.content || "{}"
-  );
+    if (!r.ok) throw new Error("OpenAI failure");
 
-  return {
-    reply: cleanStr(parsed.reply, 12000),
-    speakText: cleanStr(parsed.speakText || parsed.reply, 12000),
-    meta: { kind: "openai", model },
-  };
+    const data = await r.json();
+    const raw = data?.choices?.[0]?.message?.content;
+    const parsed = safeJsonParse(raw);
+
+    if (!parsed || !parsed.reply) return null;
+
+    return {
+      reply: cleanStr(parsed.reply, 12000),
+      speakText: cleanStr(parsed.speakText || parsed.reply, 12000),
+      meta: { kind: "openai", model },
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* ================= ROUTE ================= */
@@ -195,14 +208,12 @@ router.post("/chat", async (req, res) => {
 
     if (!out) out = localReply(message);
 
-    // 🔒 AI AUDIT (NON-BLOCKING)
     auditAI({
       req,
       kind: out.meta?.kind || "unknown",
       model: out.meta?.model,
     });
 
-    // 🔒 Light preference learning (tenant-only)
     if (message.toLowerCase().includes("i prefer")) {
       addMemory({
         tenantId,
@@ -212,7 +223,7 @@ router.post("/chat", async (req, res) => {
     }
 
     return res.json({ ok: true, ...out });
-  } catch (e) {
+  } catch {
     return res.status(500).json({ ok: false });
   }
 });
