@@ -10,11 +10,14 @@ const { WebSocketServer } = require("ws");
 const { ensureDb } = require("./lib/db");
 const users = require("./users/user.service");
 
-const tenantMiddleware = require("./middleware/tenant"); // ✅ ADD THIS
+const tenantMiddleware = require("./middleware/tenant");
 
 const paperTrader = require("./services/paperTrader");
 const liveTrader = require("./services/liveTrader");
 const { startKrakenFeed } = require("./services/krakenFeed");
+
+// ✅ SECURITY ROUTE (ADDED)
+const securityRoutes = require("./routes/security.routes");
 
 // ---------------- ENV CHECKS ----------------
 function requireEnv(name) {
@@ -75,7 +78,6 @@ app.get("/health", (req, res) =>
 app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
 
 // 🔒 TENANT CONTEXT STARTS HERE
-// Everything below this line REQUIRES a company context
 app.use(tenantMiddleware);
 
 // ---------------- TENANT-SCOPED ROUTES ----------------
@@ -89,6 +91,9 @@ app.use("/api/voice", require("./routes/voice.routes"));
 app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
 app.use("/api/posture", require("./routes/posture.routes"));
+
+// ✅ SECURITY ROUTE MOUNT (CRITICAL LINE)
+app.use("/api/security", securityRoutes);
 
 // ---------------- SERVER + WS ----------------
 const server = http.createServer(app);
