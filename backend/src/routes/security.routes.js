@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 
 /* =========================================================
-   TOOL REGISTRY (Persistent)
+   TOOL REGISTRY
    ========================================================= */
 
 const TOOLS_PATH =
@@ -15,12 +15,12 @@ const TOOLS_PATH =
   path.join("/tmp", "security_tools.json");
 
 const TOOL_CATALOG = [
-  { id: "edr", name: "Endpoint Detection & Response", weight: 15 },
-  { id: "itdr", name: "Identity Threat Detection", weight: 15 },
-  { id: "email", name: "Email Protection", weight: 20 },
-  { id: "data", name: "Cloud Data Shield", weight: 15 },
-  { id: "sat", name: "Security Awareness Training", weight: 10 },
-  { id: "darkweb", name: "Dark Web Monitoring", weight: 10 },
+  { id: "edr", name: "Endpoint Detection & Response", domain: "endpoint", weight: 15 },
+  { id: "itdr", name: "Identity Threat Detection", domain: "identity", weight: 15 },
+  { id: "email", name: "Email Protection", domain: "email", weight: 20 },
+  { id: "data", name: "Cloud Data Shield", domain: "cloud", weight: 15 },
+  { id: "sat", name: "Security Awareness Training", domain: "awareness", weight: 10 },
+  { id: "darkweb", name: "Dark Web Monitoring", domain: "threat", weight: 10 },
 ];
 
 let toolState = {};
@@ -47,55 +47,69 @@ loadTools();
    SCORE ENGINE
    ========================================================= */
 
-function calculateSecurityScore() {
-  const totalWeight = TOOL_CATALOG.reduce((sum, t) => sum + t.weight, 0);
-
-  let activeWeight = 0;
+function calculateDomains() {
+  const domains = {};
 
   TOOL_CATALOG.forEach((tool) => {
+    if (!domains[tool.domain]) {
+      domains[tool.domain] = {
+        coverageWeight: 0,
+        totalWeight: 0,
+      };
+    }
+
+    domains[tool.domain].totalWeight += tool.weight;
+
     if (toolState[tool.id]) {
-      activeWeight += tool.weight;
+      domains[tool.domain].coverageWeight += tool.weight;
     }
   });
 
-  const coverage = Math.round((activeWeight / totalWeight) * 100);
+  return Object.entries(domains).map(([key, val]) => {
+    const coverage =
+      val.totalWeight === 0
+        ? 0
+        : Math.round((val.coverageWeight / val.totalWeight) * 100);
 
-  return coverage;
+    const issues = TOOL_CATALOG.filter(
+      (t) => t.domain === key && !toolState[t.id]
+    ).length;
+
+    return {
+      key,
+      label: key.charAt(0).toUpperCase() + key.slice(1),
+      coverage,
+      issues,
+    };
+  });
 }
 
-function calculateIssues() {
-  // Simple demo logic:
-  // More missing tools = more issues
-
-  const missing = TOOL_CATALOG.filter((t) => !toolState[t.id]).length;
-  return missing;
+function calculateOverall(domains) {
+  if (!domains.length) return 0;
+  const avg =
+    domains.reduce((sum, d) => sum + d.coverage, 0) / domains.length;
+  return Math.round(avg);
 }
 
 /* =========================================================
-   POSTURE (Dynamic Now)
+   POSTURE
    ========================================================= */
 
 router.get("/posture", (req, res) => {
-  const coverageScore = calculateSecurityScore();
-  const issues = calculateIssues();
+  const domains = calculateDomains();
+  const overall = calculateOverall(domains);
 
   const posture = {
     updatedAt: new Date().toISOString(),
-    domains: [
-      {
-        key: "overall",
-        label: "Overall Security",
-        coverage: coverageScore,
-        issues,
-      },
-    ],
+    score: overall,
+    domains,
   };
 
   return res.json({ ok: true, posture });
 });
 
 /* =========================================================
-   LIVE SECURITY EVENTS
+   EVENTS
    ========================================================= */
 
 router.get("/events", (req, res) => {
@@ -105,12 +119,8 @@ router.get("/events", (req, res) => {
 
     const events = listEvents({ limit, severity });
 
-    return res.json({
-      ok: true,
-      events,
-    });
+    return res.json({ ok: true, events });
   } catch (err) {
-    console.error("Security events error:", err);
     return res.status(500).json({
       ok: false,
       error: "Unable to fetch security events",
@@ -126,6 +136,7 @@ router.get("/tools", (req, res) => {
   const tools = TOOL_CATALOG.map((tool) => ({
     id: tool.id,
     name: tool.name,
+    domain: tool.domain,
     installed: !!toolState[tool.id],
   }));
 
@@ -133,7 +144,7 @@ router.get("/tools", (req, res) => {
 });
 
 /* =========================================================
-   INSTALL TOOL
+   INSTALL / UNINSTALL
    ========================================================= */
 
 router.post("/tools/:id/install", (req, res) => {
@@ -148,10 +159,6 @@ router.post("/tools/:id/install", (req, res) => {
 
   return res.json({ ok: true, installed: true });
 });
-
-/* =========================================================
-   UNINSTALL TOOL
-   ========================================================= */
 
 router.post("/tools/:id/uninstall", (req, res) => {
   const id = req.params.id;
