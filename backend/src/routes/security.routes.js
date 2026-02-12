@@ -36,45 +36,44 @@ const TOOL_CATALOG = [
 
 let toolState = {};
 let scoreHistory = [];
+let lastRecordedScore = null;
 
 /* =========================================================
    LOAD / SAVE
    ========================================================= */
 
-function loadTools() {
+function safeLoad(file, fallback) {
   try {
-    if (fs.existsSync(TOOLS_PATH)) {
-      toolState = JSON.parse(fs.readFileSync(TOOLS_PATH, "utf-8"));
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, "utf-8"));
     }
-  } catch {
-    toolState = {};
-  }
+  } catch {}
+  return fallback;
+}
+
+function safeSave(file, data) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch {}
+}
+
+function loadAll() {
+  toolState = safeLoad(TOOLS_PATH, {});
+  scoreHistory = safeLoad(HISTORY_PATH, []);
+  lastRecordedScore = scoreHistory.length
+    ? scoreHistory[scoreHistory.length - 1].score
+    : null;
 }
 
 function saveTools() {
-  try {
-    fs.writeFileSync(TOOLS_PATH, JSON.stringify(toolState, null, 2));
-  } catch {}
-}
-
-function loadHistory() {
-  try {
-    if (fs.existsSync(HISTORY_PATH)) {
-      scoreHistory = JSON.parse(fs.readFileSync(HISTORY_PATH, "utf-8"));
-    }
-  } catch {
-    scoreHistory = [];
-  }
+  safeSave(TOOLS_PATH, toolState);
 }
 
 function saveHistory() {
-  try {
-    fs.writeFileSync(HISTORY_PATH, JSON.stringify(scoreHistory, null, 2));
-  } catch {}
+  safeSave(HISTORY_PATH, scoreHistory);
 }
 
-loadTools();
-loadHistory();
+loadAll();
 
 /* =========================================================
    DOMAIN LABELS
@@ -152,18 +151,31 @@ function classifyScore(score) {
 }
 
 function calculateTrend(currentScore) {
-  if (scoreHistory.length === 0) return "stable";
-
-  const last = scoreHistory[scoreHistory.length - 1];
-
-  if (!last) return "stable";
-
-  if (currentScore > last.score) return "up";
-  if (currentScore < last.score) return "down";
+  if (lastRecordedScore === null) return "stable";
+  if (currentScore > lastRecordedScore) return "up";
+  if (currentScore < lastRecordedScore) return "down";
   return "stable";
 }
 
+function calculateVolatility() {
+  if (scoreHistory.length < 5) return "low";
+
+  const lastFive = scoreHistory.slice(-5);
+  const scores = lastFive.map((e) => e.score);
+
+  const max = Math.max(...scores);
+  const min = Math.min(...scores);
+
+  const diff = max - min;
+
+  if (diff > 20) return "high";
+  if (diff > 10) return "moderate";
+  return "low";
+}
+
 function recordHistory(score) {
+  if (lastRecordedScore === score) return; // prevent spam duplicates
+
   const entry = {
     ts: Date.now(),
     iso: new Date().toISOString(),
@@ -176,6 +188,7 @@ function recordHistory(score) {
     scoreHistory = scoreHistory.slice(-200);
   }
 
+  lastRecordedScore = score;
   saveHistory();
 }
 
@@ -188,6 +201,7 @@ router.get("/posture", (req, res) => {
   const overall = calculateOverall(domains);
   const classification = classifyScore(overall);
   const trend = calculateTrend(overall);
+  const volatility = calculateVolatility();
 
   recordHistory(overall);
 
@@ -197,6 +211,7 @@ router.get("/posture", (req, res) => {
     tier: classification.tier,
     risk: classification.risk,
     trend,
+    volatility,
     domains,
   };
 
@@ -204,7 +219,7 @@ router.get("/posture", (req, res) => {
 });
 
 /* =========================================================
-   SCORE HISTORY (NEW)
+   SCORE HISTORY
    ========================================================= */
 
 router.get("/score-history", (req, res) => {
