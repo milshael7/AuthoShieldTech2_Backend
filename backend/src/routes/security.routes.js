@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const { listEvents } = require("../services/securityEvents");
+const { listEvents, recordEvent } = require("../services/securityEvents");
 const fs = require("fs");
 const path = require("path");
 
@@ -173,8 +173,40 @@ function calculateVolatility() {
   return "low";
 }
 
+/* =========================================================
+   ALERT ENGINE (NEW)
+   ========================================================= */
+
+function evaluateAlerts(currentScore) {
+  if (lastRecordedScore === null) return;
+
+  const drop = lastRecordedScore - currentScore;
+
+  // Major drop alert
+  if (drop >= 15) {
+    recordEvent({
+      type: "posture_drop",
+      severity: "critical",
+      description: `Security posture dropped by ${drop} points`,
+      meta: { previous: lastRecordedScore, current: currentScore },
+    });
+  }
+
+  // Critical threshold alert
+  if (currentScore < 40) {
+    recordEvent({
+      type: "critical_posture",
+      severity: "critical",
+      description: `Security posture is critically low (${currentScore})`,
+      meta: { score: currentScore },
+    });
+  }
+}
+
 function recordHistory(score) {
-  if (lastRecordedScore === score) return; // prevent spam duplicates
+  if (lastRecordedScore === score) return;
+
+  evaluateAlerts(score);
 
   const entry = {
     ts: Date.now(),
