@@ -3,6 +3,45 @@ const express = require("express");
 const router = express.Router();
 
 const { listEvents } = require("../services/securityEvents");
+const fs = require("fs");
+const path = require("path");
+
+/* =========================================================
+   SIMPLE TOOL REGISTRY (Persistent)
+   ========================================================= */
+
+const TOOLS_PATH =
+  process.env.SECURITY_TOOLS_PATH ||
+  path.join("/tmp", "security_tools.json");
+
+const TOOL_CATALOG = [
+  { id: "edr", name: "Endpoint Detection & Response" },
+  { id: "itdr", name: "Identity Threat Detection" },
+  { id: "email", name: "Email Protection" },
+  { id: "data", name: "Cloud Data Shield" },
+  { id: "sat", name: "Security Awareness Training" },
+  { id: "darkweb", name: "Dark Web Monitoring" },
+];
+
+let toolState = {};
+
+function loadTools() {
+  try {
+    if (fs.existsSync(TOOLS_PATH)) {
+      toolState = JSON.parse(fs.readFileSync(TOOLS_PATH, "utf-8"));
+    }
+  } catch {
+    toolState = {};
+  }
+}
+
+function saveTools() {
+  try {
+    fs.writeFileSync(TOOLS_PATH, JSON.stringify(toolState, null, 2));
+  } catch {}
+}
+
+loadTools();
 
 /* =========================================================
    POSTURE (Radar + Coverage)
@@ -47,6 +86,50 @@ router.get("/events", (req, res) => {
       error: "Unable to fetch security events",
     });
   }
+});
+
+/* =========================================================
+   TOOL LIST
+   ========================================================= */
+router.get("/tools", (req, res) => {
+  const tools = TOOL_CATALOG.map((tool) => ({
+    ...tool,
+    installed: !!toolState[tool.id],
+  }));
+
+  return res.json({ ok: true, tools });
+});
+
+/* =========================================================
+   INSTALL TOOL
+   ========================================================= */
+router.post("/tools/:id/install", (req, res) => {
+  const id = req.params.id;
+
+  if (!TOOL_CATALOG.find((t) => t.id === id)) {
+    return res.status(404).json({ ok: false, error: "Tool not found" });
+  }
+
+  toolState[id] = true;
+  saveTools();
+
+  return res.json({ ok: true, installed: true });
+});
+
+/* =========================================================
+   UNINSTALL TOOL
+   ========================================================= */
+router.post("/tools/:id/uninstall", (req, res) => {
+  const id = req.params.id;
+
+  if (!TOOL_CATALOG.find((t) => t.id === id)) {
+    return res.status(404).json({ ok: false, error: "Tool not found" });
+  }
+
+  delete toolState[id];
+  saveTools();
+
+  return res.json({ ok: true, installed: false });
 });
 
 module.exports = router;
