@@ -6,12 +6,20 @@ const fs = require("fs");
 const path = require("path");
 
 /* =========================================================
-   TOOL REGISTRY
+   STORAGE PATHS
    ========================================================= */
 
 const TOOLS_PATH =
   process.env.SECURITY_TOOLS_PATH ||
   path.join("/tmp", "security_tools.json");
+
+const HISTORY_PATH =
+  process.env.SECURITY_HISTORY_PATH ||
+  path.join("/tmp", "security_score_history.json");
+
+/* =========================================================
+   TOOL CATALOG
+   ========================================================= */
 
 const TOOL_CATALOG = [
   { id: "edr", name: "Endpoint Detection & Response", domain: "endpoint", weight: 15 },
@@ -22,7 +30,16 @@ const TOOL_CATALOG = [
   { id: "darkweb", name: "Dark Web Monitoring", domain: "threat", weight: 10 },
 ];
 
+/* =========================================================
+   STATE
+   ========================================================= */
+
 let toolState = {};
+let scoreHistory = [];
+
+/* =========================================================
+   LOAD / SAVE
+   ========================================================= */
 
 function loadTools() {
   try {
@@ -40,10 +57,27 @@ function saveTools() {
   } catch {}
 }
 
+function loadHistory() {
+  try {
+    if (fs.existsSync(HISTORY_PATH)) {
+      scoreHistory = JSON.parse(fs.readFileSync(HISTORY_PATH, "utf-8"));
+    }
+  } catch {
+    scoreHistory = [];
+  }
+}
+
+function saveHistory() {
+  try {
+    fs.writeFileSync(HISTORY_PATH, JSON.stringify(scoreHistory, null, 2));
+  } catch {}
+}
+
 loadTools();
+loadHistory();
 
 /* =========================================================
-   SCORE ENGINE
+   DOMAIN LABELS
    ========================================================= */
 
 const DOMAIN_LABELS = {
@@ -54,6 +88,10 @@ const DOMAIN_LABELS = {
   awareness: "Security Awareness",
   threat: "Threat Intelligence",
 };
+
+/* =========================================================
+   SCORE ENGINE
+   ========================================================= */
 
 function calculateDomains() {
   const domains = {};
@@ -113,6 +151,34 @@ function classifyScore(score) {
   return { tier: "Critical", risk: "Severe" };
 }
 
+function calculateTrend(currentScore) {
+  if (scoreHistory.length === 0) return "stable";
+
+  const last = scoreHistory[scoreHistory.length - 1];
+
+  if (!last) return "stable";
+
+  if (currentScore > last.score) return "up";
+  if (currentScore < last.score) return "down";
+  return "stable";
+}
+
+function recordHistory(score) {
+  const entry = {
+    ts: Date.now(),
+    iso: new Date().toISOString(),
+    score,
+  };
+
+  scoreHistory.push(entry);
+
+  if (scoreHistory.length > 200) {
+    scoreHistory = scoreHistory.slice(-200);
+  }
+
+  saveHistory();
+}
+
 /* =========================================================
    POSTURE
    ========================================================= */
@@ -121,17 +187,31 @@ router.get("/posture", (req, res) => {
   const domains = calculateDomains();
   const overall = calculateOverall(domains);
   const classification = classifyScore(overall);
+  const trend = calculateTrend(overall);
+
+  recordHistory(overall);
 
   const posture = {
     updatedAt: new Date().toISOString(),
     score: overall,
     tier: classification.tier,
     risk: classification.risk,
-    trend: "stable", // placeholder (future historical tracking)
+    trend,
     domains,
   };
 
   return res.json({ ok: true, posture });
+});
+
+/* =========================================================
+   SCORE HISTORY (NEW)
+   ========================================================= */
+
+router.get("/score-history", (req, res) => {
+  return res.json({
+    ok: true,
+    history: scoreHistory.slice(-50),
+  });
 });
 
 /* =========================================================
