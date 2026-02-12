@@ -1,16 +1,14 @@
 // backend/src/middleware/tenant.js
-// AuthoDev 6.5 — Company / Tenant Isolation Core (HARDENED)
-// MSP-grade • AI-aware • Zero trust • Deterministic
+// AutoDev 6.5 — Enterprise Tenant Isolation Core (HARDENED)
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
 }
 
 function resolveFromSubdomain(req) {
-  const host = clean(req.headers.host);
+  const host = clean(req.hostname || req.headers.host);
   if (!host) return null;
 
-  // example: acme.autoshield.com
   const parts = host.split(".");
   if (parts.length < 3) return null;
 
@@ -18,7 +16,6 @@ function resolveFromSubdomain(req) {
 }
 
 function tenantMiddleware(req, res, next) {
-  // 🔒 Auth MUST already be resolved for protected routes
   if (!req.user) {
     return res.status(401).json({
       ok: false,
@@ -26,23 +23,54 @@ function tenantMiddleware(req, res, next) {
     });
   }
 
+  const role = String(req.user.role || "").toLowerCase();
+  const isAdmin = role === "admin";
+
   let companyId = null;
+  let resolvedFrom = null;
 
-  /* ================= RESOLUTION ================= */
+  /* ================= RESOLUTION ORDER ================= */
 
-  // 1️⃣ Auth token (primary & safest)
+  // 1️⃣ Primary: Auth token
   if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
+    resolvedFrom = "auth";
   }
 
-  // 2️⃣ Explicit header (admin / internal tooling only)
-  if (!companyId && req.headers["x-company-id"]) {
+  // 2️⃣ Admin-only override
+  if (!companyId && isAdmin && req.headers["x-company-id"]) {
     companyId = clean(req.headers["x-company-id"], 50);
+    resolvedFrom = "admin-header";
   }
 
-  // 3️⃣ Subdomain (future expansion only)
+  // 3️⃣ Subdomain (optional future usage)
   if (!companyId) {
-    companyId = resolveFromSubdomain(req);
+    const sub = resolveFromSubdomain(req);
+    if (sub) {
+      companyId = sub;
+      resolvedFrom = "subdomain";
+    }
+  }
+
+  /* ================= ADMIN GLOBAL ACCESS ================= */
+
+  if (isAdmin && !companyId) {
+    req.tenant = {
+      id: null,
+      type: "global",
+      userId: req.user.id,
+      role: req.user.role,
+      scope: {
+        isAdmin: true,
+        isManager: false,
+        isCompany: false,
+        isIndividual: false,
+      },
+      brainKey: "global",
+      resolvedFrom: "admin-global",
+    };
+
+    return next();
   }
 
   if (!companyId) {
@@ -52,38 +80,21 @@ function tenantMiddleware(req, res, next) {
     });
   }
 
-  const role = String(req.user.role || "").toLowerCase();
-
   /* ================= TENANT CONTEXT ================= */
 
-  /**
-   * 🔒 SINGLE SOURCE OF TRUTH
-   * All downstream systems MUST read from req.tenant
-   */
   req.tenant = {
     id: companyId,
-
-    // user identity
+    type: "tenant",
     userId: req.user.id,
     role: req.user.role,
-
-    // scope classification (FIXED)
     scope: {
-      isAdmin: role === "admin",
+      isAdmin,
       isManager: role === "manager",
       isCompany: role === "company",
       isIndividual: role === "individual",
     },
-
-    // 🔑 AI memory / brain partition (ALIGNED)
     brainKey: companyId,
-
-    // audit metadata
-    resolvedFrom: req.user.companyId
-      ? "auth"
-      : req.headers["x-company-id"]
-      ? "header"
-      : "subdomain",
+    resolvedFrom,
   };
 
   next();
