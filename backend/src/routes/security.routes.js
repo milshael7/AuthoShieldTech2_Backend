@@ -1,4 +1,3 @@
-// backend/src/routes/security.routes.js
 const express = require("express");
 const router = express.Router();
 
@@ -47,6 +46,15 @@ loadTools();
    SCORE ENGINE
    ========================================================= */
 
+const DOMAIN_LABELS = {
+  endpoint: "Endpoint Security",
+  identity: "Identity Protection",
+  email: "Email Security",
+  cloud: "Cloud Data Protection",
+  awareness: "Security Awareness",
+  threat: "Threat Intelligence",
+};
+
 function calculateDomains() {
   const domains = {};
 
@@ -77,18 +85,32 @@ function calculateDomains() {
 
     return {
       key,
-      label: key.charAt(0).toUpperCase() + key.slice(1),
+      label: DOMAIN_LABELS[key] || key,
       coverage,
       issues,
+      weight: val.totalWeight,
     };
   });
 }
 
 function calculateOverall(domains) {
   if (!domains.length) return 0;
-  const avg =
-    domains.reduce((sum, d) => sum + d.coverage, 0) / domains.length;
-  return Math.round(avg);
+
+  const totalWeight = domains.reduce((sum, d) => sum + d.weight, 0);
+
+  const weighted =
+    domains.reduce((sum, d) => sum + d.coverage * d.weight, 0) /
+    totalWeight;
+
+  return Math.round(weighted);
+}
+
+function classifyScore(score) {
+  if (score >= 90) return { tier: "Hardened", risk: "Low" };
+  if (score >= 75) return { tier: "Strong", risk: "Low" };
+  if (score >= 60) return { tier: "Stable", risk: "Moderate" };
+  if (score >= 40) return { tier: "Weak", risk: "High" };
+  return { tier: "Critical", risk: "Severe" };
 }
 
 /* =========================================================
@@ -98,10 +120,14 @@ function calculateOverall(domains) {
 router.get("/posture", (req, res) => {
   const domains = calculateDomains();
   const overall = calculateOverall(domains);
+  const classification = classifyScore(overall);
 
   const posture = {
     updatedAt: new Date().toISOString(),
     score: overall,
+    tier: classification.tier,
+    risk: classification.risk,
+    trend: "stable", // placeholder (future historical tracking)
     domains,
   };
 
@@ -120,7 +146,7 @@ router.get("/events", (req, res) => {
     const events = listEvents({ limit, severity });
 
     return res.json({ ok: true, events });
-  } catch (err) {
+  } catch {
     return res.status(500).json({
       ok: false,
       error: "Unable to fetch security events",
