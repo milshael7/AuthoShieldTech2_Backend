@@ -1,8 +1,6 @@
-// backend/src/users/user.service.js
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
-const { readDb, writeDb } = require("../lib/db");
-const { audit } = require("../lib/audit");
+const { readDb, writeDb, writeAudit: audit } = require("../lib/db");
 const { createNotification } = require("../lib/notify");
 
 const ROLES = {
@@ -37,8 +35,6 @@ function sanitize(u) {
  * ======================================================
  * AUTOPROTECT — SINGLE SOURCE OF TRUTH
  * ======================================================
- * Canonical field: autoprotectEnabled
- * Legacy support: autoprotechEnabled (read + mirror only)
  */
 
 function getAutoprotect(u) {
@@ -47,8 +43,8 @@ function getAutoprotect(u) {
 
 function setAutoprotect(u, enabled) {
   const val = !!enabled;
-  u.autoprotectEnabled = val;      // canonical
-  u.autoprotechEnabled = val;      // legacy mirror
+  u.autoprotectEnabled = val;
+  u.autoprotechEnabled = val; // legacy mirror
 }
 
 function requireValidRole(role) {
@@ -59,9 +55,10 @@ function requireValidRole(role) {
   return r;
 }
 
-// ======================================================
-// ADMIN BOOTSTRAP
-// ======================================================
+/* ======================================================
+   ADMIN BOOTSTRAP
+====================================================== */
+
 function ensureAdminFromEnv() {
   const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
   if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
@@ -95,15 +92,16 @@ function ensureAdminFromEnv() {
 
   audit({
     actorId: admin.id,
+    actorRole: admin.role,
     action: "ADMIN_BOOTSTRAP",
-    targetType: "User",
-    targetId: admin.id,
+    target: admin.id,
   });
 }
 
-// ======================================================
-// USER CREATION
-// ======================================================
+/* ======================================================
+   USER CREATION
+====================================================== */
+
 function createUser({ email, password, role, profile = {}, companyId = null }) {
   const db = readDb();
   ensureArrays(db);
@@ -148,9 +146,9 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 
   audit({
     actorId: u.id,
+    actorRole: u.role,
     action: "USER_CREATED",
-    targetType: "User",
-    targetId: u.id,
+    target: u.id,
   });
 
   createNotification({
@@ -164,9 +162,10 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
   return sanitize(u);
 }
 
-// ======================================================
-// QUERIES
-// ======================================================
+/* ======================================================
+   QUERIES
+====================================================== */
+
 function findByEmail(email) {
   const db = readDb();
   ensureArrays(db);
@@ -179,9 +178,10 @@ function listUsers() {
   return db.users.map(sanitize);
 }
 
-// ======================================================
-// UPDATE
-// ======================================================
+/* ======================================================
+   UPDATE
+====================================================== */
+
 function updateUser(id, patch, actorId) {
   const db = readDb();
   ensureArrays(db);
@@ -206,18 +206,19 @@ function updateUser(id, patch, actorId) {
 
   audit({
     actorId,
+    actorRole: "system",
     action: "USER_UPDATED",
-    targetType: "User",
-    targetId: id,
-    metadata: patch,
+    target: id,
+    meta: patch,
   });
 
   return sanitize(u);
 }
 
-// ======================================================
-// SECURITY
-// ======================================================
+/* ======================================================
+   SECURITY
+====================================================== */
+
 function rotatePlatformIdAndForceReset(id, actorId) {
   const db = readDb();
   ensureArrays(db);
@@ -231,9 +232,9 @@ function rotatePlatformIdAndForceReset(id, actorId) {
 
   audit({
     actorId,
+    actorRole: "system",
     action: "USER_ROTATE_ID",
-    targetType: "User",
-    targetId: id,
+    target: id,
   });
 
   createNotification({
@@ -264,9 +265,9 @@ function setPassword(id, newPassword, actorId) {
 
   audit({
     actorId,
+    actorRole: "system",
     action: "USER_PASSWORD_SET",
-    targetType: "User",
-    targetId: id,
+    target: id,
   });
 
   return sanitize(u);
