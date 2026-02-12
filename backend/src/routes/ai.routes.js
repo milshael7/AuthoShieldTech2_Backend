@@ -4,7 +4,9 @@
 
 const express = require("express");
 const router = express.Router();
-const fetch = require("node-fetch");
+
+// ❌ REMOVED: const fetch = require("node-fetch");
+// ✅ Node 22 has native global fetch
 
 const {
   addMemory,
