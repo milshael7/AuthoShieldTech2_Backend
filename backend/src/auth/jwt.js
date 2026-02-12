@@ -1,30 +1,79 @@
+// backend/src/lib/jwt.js
+// AutoShield — Enterprise JWT Core (Hardened)
+
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
-/**
- * Sign a JWT
- * - Default expiration: 7 days
- */
-const sign = (payload, secret = process.env.JWT_SECRET, expiresIn = "7d") => {
-  if (!secret) {
-    throw new Error("JWT_SECRET is not defined");
-  }
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_ISSUER = process.env.JWT_ISSUER || "autoshield-tech";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "autoshield-clients";
+const JWT_ALGORITHM = "HS256";
 
-  return jwt.sign(payload, secret, { expiresIn });
-};
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is not defined");
+}
 
-/**
- * Verify a JWT
- * - Uses JWT_SECRET by default
- * - Adds clock tolerance to prevent refresh failures
- */
-const verify = (token, secret = process.env.JWT_SECRET) => {
-  if (!secret) {
-    throw new Error("JWT_SECRET is not defined");
-  }
+/* =========================================================
+   ACCESS TOKEN (Short-lived)
+   ========================================================= */
 
-  return jwt.verify(token, secret, {
-    clockTolerance: 5, // ⏱ allows small clock drift (VERY IMPORTANT)
+function signAccess(payload, expiresIn = "15m") {
+  const jti = crypto.randomUUID();
+
+  return jwt.sign(
+    {
+      ...payload,
+      type: "access",
+      jti,
+    },
+    JWT_SECRET,
+    {
+      expiresIn,
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      algorithm: JWT_ALGORITHM,
+    }
+  );
+}
+
+/* =========================================================
+   REFRESH TOKEN (Long-lived)
+   ========================================================= */
+
+function signRefresh(payload, expiresIn = "7d") {
+  const jti = crypto.randomUUID();
+
+  return jwt.sign(
+    {
+      ...payload,
+      type: "refresh",
+      jti,
+    },
+    JWT_SECRET,
+    {
+      expiresIn,
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      algorithm: JWT_ALGORITHM,
+    }
+  );
+}
+
+/* =========================================================
+   VERIFY TOKEN
+   ========================================================= */
+
+function verify(token) {
+  return jwt.verify(token, JWT_SECRET, {
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    algorithms: [JWT_ALGORITHM],
+    clockTolerance: 5,
   });
-};
+}
 
-module.exports = { sign, verify };
+module.exports = {
+  signAccess,
+  signRefresh,
+  verify,
+};
