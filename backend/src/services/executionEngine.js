@@ -1,7 +1,8 @@
 // backend/src/services/executionEngine.js
-// Phase 9.1 — Institutional Execution Engine (Hardened)
-// Handles paper execution logic
-// Unified execution layer for Paper + Future Live Adapter
+// Phase 9.5 — Institutional Execution Engine
+// Partial Fills • Slippage Bands • Latency Simulation
+// Execution Audit Trail • Fill Quality Metrics
+// Unified for Paper + Future Live Adapter
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -11,14 +12,48 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 const CONFIG = Object.freeze({
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
-  slippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005),
+
+  baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005),
+  maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.002),
+
   minOrderUsd: 50,
   maxCapitalFraction: 0.5,
+
+  partialFillProbability: 0.35,
+  minPartialFillPct: 0.4,
+
+  simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 15),
 });
 
 /* =========================================================
    INTERNAL HELPERS
 ========================================================= */
+
+function randomBetween(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function simulateSlippage(price, side) {
+  const slipPct = randomBetween(
+    CONFIG.baseSlippagePct,
+    CONFIG.maxSlippagePct
+  );
+
+  if (side === "BUY") return price * (1 + slipPct);
+  return price * (1 - slipPct);
+}
+
+function simulatePartialFill(qty) {
+  if (Math.random() > CONFIG.partialFillProbability)
+    return qty;
+
+  const fillPct = randomBetween(
+    CONFIG.minPartialFillPct,
+    0.95
+  );
+
+  return qty * fillPct;
+}
 
 function recalcEquity(state) {
   if (!state) return;
@@ -38,8 +73,10 @@ function recalcEquity(state) {
   );
 }
 
-function validAction(a) {
-  return a === "BUY" || a === "SELL" || a === "CLOSE";
+function buildExecutionId() {
+  return `${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}`;
 }
 
 /* =========================================================
@@ -56,14 +93,13 @@ function executePaperOrder({
   ts = Date.now(),
 }) {
   if (!state) return null;
-  if (!validAction(action)) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
+
+  const executionId = buildExecutionId();
 
   /* ================= ENTRY ================= */
 
-  if (action === "BUY") {
-    if (state.position) return null;
-
+  if (action === "BUY" && !state.position) {
     const safeRisk = clamp(
       Number(riskPct) || 0,
       0,
@@ -76,15 +112,17 @@ function executePaperOrder({
       state.cashBalance * CONFIG.maxCapitalFraction
     );
 
-    if (!Number.isFinite(usd) || usd <= 0) return null;
+    if (usd <= 0) return null;
 
-    const slippedPrice =
-      price * (1 + CONFIG.slippagePct);
+    const slippedPrice = simulateSlippage(price, "BUY");
 
-    const qty = usd / slippedPrice;
-    const fee = usd * CONFIG.feeRate;
+    let qty = usd / slippedPrice;
+    qty = simulatePartialFill(qty);
 
-    state.cashBalance -= usd + fee;
+    const notional = qty * slippedPrice;
+    const fee = notional * CONFIG.feeRate;
+
+    state.cashBalance -= notional + fee;
     state.costs.feePaid += fee;
 
     state.position = {
@@ -92,6 +130,9 @@ function executePaperOrder({
       entry: slippedPrice,
       qty,
       ts,
+      executionId,
+      riskPct: safeRisk,
+      feesPaid: fee,
     };
 
     state.limits.tradesToday =
@@ -99,43 +140,44 @@ function executePaperOrder({
 
     recalcEquity(state);
 
-    return {
-      narration: {
-        text: `Entered ${symbol} at ${slippedPrice.toFixed(
-          2
-        )}`,
-        meta: {
-          action: "BUY",
-          usd,
-          slippedPrice,
-          qty,
-        },
-      },
-    };
+    pushAudit(state, {
+      type: "ENTRY",
+      symbol,
+      qty,
+      price: slippedPrice,
+      fee,
+      executionId,
+    });
+
+    return narration(
+      `Entered ${symbol} at ${slippedPrice.toFixed(2)}`,
+      {
+        action: "BUY",
+        qty,
+        slippedPrice,
+        executionId,
+      }
+    );
   }
 
   /* ================= EXIT ================= */
 
-  if (action === "SELL" || action === "CLOSE") {
-    if (!state.position) return null;
-
+  if (
+    (action === "SELL" || action === "CLOSE") &&
+    state.position
+  ) {
     const pos = state.position;
 
-    const slippedPrice =
-      price * (1 - CONFIG.slippagePct);
+    const slippedPrice = simulateSlippage(price, "SELL");
 
-    const gross =
-      (slippedPrice - pos.entry) * pos.qty;
+    let qty = simulatePartialFill(pos.qty);
 
-    const fee =
-      Math.abs(slippedPrice * pos.qty) *
-      CONFIG.feeRate;
-
+    const notional = qty * slippedPrice;
+    const gross = (slippedPrice - pos.entry) * qty;
+    const fee = notional * CONFIG.feeRate;
     const pnl = gross - fee;
 
-    state.cashBalance +=
-      pos.qty * slippedPrice - fee;
-
+    state.cashBalance += notional - fee;
     state.costs.feePaid += fee;
     state.realized.net += pnl;
 
@@ -152,32 +194,64 @@ function executePaperOrder({
     state.trades.push({
       time: ts,
       symbol: pos.symbol,
-      type: "CLOSE",
       entry: pos.entry,
       exit: slippedPrice,
-      qty: pos.qty,
+      qty,
       profit: pnl,
+      executionId,
+      latencyMs: CONFIG.simulatedLatencyMs,
     });
 
     state.position = null;
 
     recalcEquity(state);
 
-    return {
-      narration: {
-        text: `Closed ${symbol}. ${
-          pnl >= 0 ? "Profit" : "Loss"
-        } ${pnl.toFixed(2)}`,
-        meta: {
-          action: "CLOSE",
-          pnl,
-          slippedPrice,
-        },
-      },
-    };
+    pushAudit(state, {
+      type: "EXIT",
+      symbol,
+      qty,
+      price: slippedPrice,
+      pnl,
+      executionId,
+    });
+
+    return narration(
+      `Closed ${symbol}. ${
+        pnl >= 0 ? "Profit" : "Loss"
+      } ${pnl.toFixed(2)}`,
+      {
+        action: "CLOSE",
+        pnl,
+        executionId,
+      }
+    );
   }
 
   return null;
+}
+
+/* =========================================================
+   AUDIT TRAIL
+========================================================= */
+
+function pushAudit(state, record) {
+  state.executionAudit = state.executionAudit || [];
+  state.executionAudit.push({
+    ts: Date.now(),
+    ...record,
+  });
+
+  state.executionAudit =
+    state.executionAudit.slice(-500);
+}
+
+function narration(text, meta) {
+  return {
+    narration: {
+      text,
+      meta,
+    },
+  };
 }
 
 /* =========================================================
