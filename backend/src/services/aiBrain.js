@@ -1,14 +1,9 @@
 // backend/src/services/aiBrain.js
-// AutoShield AI Brain — Phase 3
-// Conversational + Persistent + Trading Bias Engine
-// Provides:
-// - answer() for chat
-// - decide() for trade bias overlay
-// - persistent mindset
-// - memory + notes
+// Phase 10 — Institutional AI Signal Fusion Engine
+// Conversational + Persistent + Regime-Aware Trade Bias Layer
+// Tenant Safe • Deterministic • Noise Suppressed
 
 const fs = require("fs");
-const path = require("path");
 
 /* =========================================================
    CONFIG
@@ -20,28 +15,30 @@ const BRAIN_PATH =
 const MAX_HISTORY = Number(process.env.AI_BRAIN_MAX_HISTORY || 120);
 const MAX_NOTES = Number(process.env.AI_BRAIN_MAX_NOTES || 80);
 
-const DEFAULT_MAX_REPLY_CHARS = Number(
+const MAX_REPLY_CHARS = Number(
   process.env.AI_BRAIN_MAX_REPLY_CHARS || 1800
 );
+
+const SIGNAL_MEMORY_LIMIT = 50;
 
 /* =========================================================
    LOCKED WIN/LOSS MINDSET
 ========================================================= */
 
-const MINDSET_VERSION = 2;
+const MINDSET_VERSION = 3;
 
 const DEFAULT_MINDSET = {
   version: MINDSET_VERSION,
-  title: "AutoShield Win/Loss Mindset",
+  title: "AutoShield Institutional Capital Doctrine",
   summary:
-    "Primary objective is capital protection. Loss is failure. Waiting is acceptable.",
+    "Primary objective is capital protection. Loss minimization overrides profit seeking.",
   rules: [
-    "Avoid loss before seeking profit.",
-    "Loss = failure. Do not normalize losses.",
-    "Waiting is acceptable. Forced trades are failure-prone.",
-    "Confidence must reflect rule completion.",
-    "After loss: tighten filters.",
-    "Protect capital above all.",
+    "Capital preservation > profit.",
+    "Loss = system failure signal.",
+    "Do not normalize losses.",
+    "Waiting is superior to forced trades.",
+    "After degradation: tighten filters.",
+    "Signal alignment required before biasing.",
   ],
 };
 
@@ -67,17 +64,22 @@ function nowIso() {
 }
 
 /* =========================================================
-   PERSISTENT BRAIN
+   PERSISTENT BRAIN STATE
 ========================================================= */
 
 function defaultBrain() {
   return {
-    version: 4,
+    version: 5,
     createdAt: nowIso(),
     updatedAt: nowIso(),
+
     mindset: DEFAULT_MINDSET,
+
     history: [],
     notes: [],
+
+    signalMemory: [],   // recent trade signals
+    falseSignalCount: 0,
   };
 }
 
@@ -88,10 +90,8 @@ function loadBrain() {
     if (!fs.existsSync(BRAIN_PATH)) return;
 
     const raw = JSON.parse(fs.readFileSync(BRAIN_PATH, "utf-8"));
-    brain = {
-      ...defaultBrain(),
-      ...raw,
-    };
+
+    brain = { ...defaultBrain(), ...raw };
 
     if (!brain.mindset || brain.mindset.version < MINDSET_VERSION) {
       brain.mindset = DEFAULT_MINDSET;
@@ -110,6 +110,10 @@ function saveBrain() {
 }
 
 loadBrain();
+
+/* =========================================================
+   MEMORY HELPERS
+========================================================= */
 
 function addHistory(role, text) {
   brain.history.push({
@@ -138,8 +142,40 @@ function addNote(text) {
   saveBrain();
 }
 
+function recordSignal(result) {
+  brain.signalMemory.push({
+    ts: Date.now(),
+    action: result.action,
+    confidence: result.confidence,
+    edge: result.edge,
+  });
+
+  if (brain.signalMemory.length > SIGNAL_MEMORY_LIMIT) {
+    brain.signalMemory =
+      brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
+  }
+
+  saveBrain();
+}
+
 /* =========================================================
-   TRADE BIAS ENGINE (USED BY tradeBrain.js)
+   SIGNAL CONSISTENCY MODEL
+========================================================= */
+
+function signalConsistencyScore() {
+  if (brain.signalMemory.length < 5) return 1;
+
+  const recent = brain.signalMemory.slice(-10);
+  const buys = recent.filter(s => s.action === "BUY").length;
+  const sells = recent.filter(s => s.action === "SELL").length;
+
+  const imbalance = Math.abs(buys - sells) / 10;
+
+  return clamp(1 - imbalance * 0.5, 0.7, 1.1);
+}
+
+/* =========================================================
+   TRADE BIAS ENGINE
 ========================================================= */
 
 function decide(context = {}) {
@@ -147,30 +183,68 @@ function decide(context = {}) {
   const paper = context.paper || {};
   const learn = paper.learnStats || {};
   const limits = paper.limits || {};
+  const regime = paper.regime || "neutral";
 
   if (!Number.isFinite(last)) {
     return { action: "WAIT", confidence: 0, edge: 0 };
   }
 
-  // Basic adaptive tightening after loss
+  /* ---- Hard Safety ---- */
+
   if (limits.lossesToday >= 2) {
-    return {
-      action: "WAIT",
-      confidence: 0.3,
-      edge: 0,
-    };
+    return { action: "WAIT", confidence: 0.2, edge: 0 };
   }
 
-  const edge = safeNum(learn.trendEdge, 0);
-  const confidence = safeNum(learn.confidence, 0);
+  /* ---- Base Signal ---- */
 
-  // AI never overrides safety — only biases upward
+  const baseEdge = safeNum(learn.trendEdge, 0);
+  const baseConfidence = safeNum(learn.confidence, 0);
+
+  /* ---- Noise Suppression ---- */
+
+  if (Math.abs(baseEdge) < 0.0005) {
+    return { action: "WAIT", confidence: 0, edge: 0 };
+  }
+
+  /* ---- Regime Bias ---- */
+
+  let edge = baseEdge;
+  let confidence = baseConfidence;
+
+  if (regime === "trend") {
+    edge *= 1.1;
+    confidence *= 1.05;
+  }
+
+  if (regime === "range") {
+    edge *= 0.8;
+    confidence *= 0.85;
+  }
+
+  /* ---- Consistency Dampener ---- */
+
+  const consistency = signalConsistencyScore();
+  confidence *= consistency;
+
+  /* ---- False Signal Dampening ---- */
+
+  if (brain.falseSignalCount >= 3) {
+    confidence *= 0.8;
+  }
+
+  confidence = clamp(confidence, 0, 1);
+
   if (confidence > 0.75 && Math.abs(edge) > 0.0015) {
-    return {
-      action: edge > 0 ? "BUY" : "SELL",
-      confidence: clamp(confidence + 0.05, 0, 1),
-      edge: edge * 1.1,
+    const action = edge > 0 ? "BUY" : "SELL";
+
+    const result = {
+      action,
+      confidence,
+      edge,
     };
+
+    recordSignal(result);
+    return result;
   }
 
   return {
@@ -195,15 +269,14 @@ function mindsetText() {
   ].join("\n");
 }
 
-function answer(message = "", context = {}) {
+function answer(message = "") {
   const msg = safeStr(message).toLowerCase();
-
   addHistory("user", message);
 
   if (msg.includes("mindset")) {
     const reply = mindsetText();
     addHistory("ai", reply);
-    return reply;
+    return reply.slice(0, MAX_REPLY_CHARS);
   }
 
   if (msg.startsWith("add note:")) {
@@ -218,13 +291,14 @@ function answer(message = "", context = {}) {
     const reply =
       `Brain file: ${BRAIN_PATH}\n` +
       `History: ${brain.history.length}\n` +
-      `Notes: ${brain.notes.length}`;
+      `Notes: ${brain.notes.length}\n` +
+      `Signals: ${brain.signalMemory.length}`;
     addHistory("ai", reply);
     return reply;
   }
 
   const reply =
-    "I analyze your trading context. Ask about mindset, losses, decisions, or performance.";
+    "AI layer active. Monitoring signal quality and capital protection doctrine.";
 
   addHistory("ai", reply);
   return reply;
@@ -236,6 +310,7 @@ function getSnapshot() {
     updatedAt: brain.updatedAt,
     historyCount: brain.history.length,
     notesCount: brain.notes.length,
+    signalMemory: brain.signalMemory.length,
     mindsetVersion: brain.mindset.version,
   };
 }
