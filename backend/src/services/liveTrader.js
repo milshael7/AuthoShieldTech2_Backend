@@ -1,26 +1,21 @@
 // backend/src/services/liveTrader.js
-// Live Trading Engine — TENANT SAFE (FINAL)
-//
-// GUARANTEES:
-// - One isolated live trader per tenant
-// - Signals logged safely
-// - NEVER executes trades unless explicitly armed + adapter wired
-// - MSP / SOC compliant
+// Live Trading Engine — Phase 2 (Brain Aligned, Execution Locked)
 
 const fs = require("fs");
 const path = require("path");
+const { buildDecision } = require("./strategyEngine");
 
 /* ================= CONFIG ================= */
-
-const LIVE_REFERENCE_BALANCE = Number(
-  process.env.LIVE_START_BALANCE || 0
-);
 
 const BASE_PATH =
   process.env.LIVE_TRADER_STATE_DIR ||
   path.join("/tmp", "live_trader");
 
-/* ================= ENV GATES ================= */
+const LIVE_REFERENCE_BALANCE = Number(
+  process.env.LIVE_START_BALANCE || 0
+);
+
+/* ================= ENV FLAGS ================= */
 
 function envTrue(name) {
   const v = String(process.env[name] || "").toLowerCase().trim();
@@ -63,29 +58,30 @@ function dayKey(ts) {
 
 function defaultState() {
   return {
-    version: 1,
+    version: 2,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
     running: false,
     enabled: false,
     execute: false,
+    mode: "live-disabled",
 
-    mode: "live-disabled", // live-disabled | live-armed | live-executing
     dayKey: dayKey(Date.now()),
 
-    lastPriceBySymbol: {},
+    lastPrice: null,
+    volatility: 0.002,
 
     stats: {
       ticksSeen: 0,
-      lastTickTs: null,
-      lastSignalTs: null,
+      lastDecision: "WAIT",
+      confidence: 0,
+      edge: 0,
       lastReason: "not_started",
     },
 
     intents: [],
     orders: [],
-
     lastError: null,
 
     config: {
@@ -95,9 +91,8 @@ function defaultState() {
 }
 
 const STATES = new Map();
-const SAVE_TIMERS = new Map();
 
-/* ================= PERSISTENCE ================= */
+/* ================= PERSIST ================= */
 
 function load(tenantId) {
   if (STATES.has(tenantId)) return STATES.get(tenantId);
@@ -116,25 +111,17 @@ function load(tenantId) {
   return state;
 }
 
-function scheduleSave(tenantId) {
-  if (SAVE_TIMERS.has(tenantId)) return;
+function save(tenantId) {
+  const state = STATES.get(tenantId);
+  if (!state) return;
 
-  SAVE_TIMERS.set(
-    tenantId,
-    setTimeout(() => {
-      SAVE_TIMERS.delete(tenantId);
-      const state = STATES.get(tenantId);
-      if (!state) return;
-
-      state.updatedAt = nowIso();
-      try {
-        fs.writeFileSync(
-          statePath(tenantId),
-          JSON.stringify(state, null, 2)
-        );
-      } catch {}
-    }, 400)
-  );
+  state.updatedAt = nowIso();
+  try {
+    fs.writeFileSync(
+      statePath(tenantId),
+      JSON.stringify(state, null, 2)
+    );
+  } catch {}
 }
 
 function refreshFlags(state) {
@@ -146,150 +133,90 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
-function resetDayIfNeeded(state, ts) {
-  const dk = dayKey(ts);
-  if (state.dayKey !== dk) {
-    state.dayKey = dk;
+/* ================= CORE ================= */
+
+function updateVolatility(state, price) {
+  if (!state.lastPrice) {
+    state.lastPrice = price;
+    return;
   }
+
+  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+
+  state.volatility =
+    state.volatility * 0.9 + change * 0.1;
+
+  state.lastPrice = price;
 }
 
 /* ================= LIFECYCLE ================= */
 
 function start(tenantId) {
   const state = load(tenantId);
-
   state.running = true;
   refreshFlags(state);
-
-  state.stats.lastReason = state.enabled
-    ? state.execute
-      ? "executing_enabled_waiting_for_signal"
-      : "armed_waiting_for_signal"
-    : "disabled_by_env";
-
-  state.lastError = null;
-  scheduleSave(tenantId);
+  save(tenantId);
 }
 
 function stop(tenantId) {
   const state = load(tenantId);
   state.running = false;
-  scheduleSave(tenantId);
+  save(tenantId);
 }
 
-/* ================= TICKS ================= */
+/* ================= TICK ================= */
 
 function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
-  resetDayIfNeeded(state, ts);
-
-  const sym = String(symbol || "BTCUSDT");
-  const p = safeNum(price, null);
-  const t = safeNum(ts, Date.now());
-  if (p == null) return;
-
-  state.lastPriceBySymbol[sym] = p;
-  state.stats.ticksSeen += 1;
-  state.stats.lastTickTs = t;
-
   refreshFlags(state);
-  state.stats.lastReason = state.enabled
-    ? state.execute
-      ? "executing_enabled_waiting_for_signal"
-      : "armed_waiting_for_signal"
-    : "disabled_by_env";
 
-  scheduleSave(tenantId);
-}
+  const p = safeNum(price, null);
+  if (!Number.isFinite(p)) return;
 
-/* ================= SIGNAL ENTRY ================= */
+  state.stats.ticksSeen++;
+  updateVolatility(state, p);
 
-async function pushSignal(tenantId, signal = {}) {
-  const state = load(tenantId);
+  const plan = buildDecision({
+    symbol,
+    price: p,
+    volatility: state.volatility,
+    limits: {},
+  });
 
-  try {
-    refreshFlags(state);
+  state.stats.lastDecision = plan.action;
+  state.stats.confidence = plan.confidence;
+  state.stats.edge = plan.edge;
+  state.stats.lastReason = plan.reason;
 
-    if (!state.running) throw new Error("liveTrader not running");
-
-    if (!state.enabled) {
-      state.stats.lastReason = "signal_rejected_disabled";
-      scheduleSave(tenantId);
-      return { ok: false, error: "LIVE_TRADING_ENABLED is off" };
-    }
-
-    const symbol = String(signal.symbol || "BTCUSDT");
-    const side = String(signal.side || "").toUpperCase();
-
-    // Non-executable by design
-    if (["WAIT", "CLOSE", "SELL"].includes(side)) {
-      state.stats.lastReason = "signal_logged_non_executable";
-      scheduleSave(tenantId);
-      return { ok: true, ignored: true, reason: side };
-    }
-
-    if (side !== "BUY") {
-      throw new Error("Invalid trade side");
-    }
-
-    const qty = safeNum(signal.qty, null);
-    if (!qty || qty <= 0) throw new Error("Invalid qty");
-
-    const lastPrice = state.lastPriceBySymbol[symbol];
-    if (!Number.isFinite(lastPrice)) {
-      throw new Error("Missing last price for symbol");
-    }
-
+  // Log intent only if armed
+  if (state.enabled && plan.action !== "WAIT") {
     const intent = {
-      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      id: `${Date.now()}_${Math.random()
+        .toString(16)
+        .slice(2)}`,
       ts: Date.now(),
-      iso: nowIso(),
-
       symbol,
-      side,
-      type: String(signal.type || "MARKET").toUpperCase(),
-      qty,
-
-      price: safeNum(signal.price, null),
-      tp: safeNum(signal.tp, null),
-      sl: safeNum(signal.sl, null),
-
-      confidence: safeNum(signal.confidence, null),
-      reason: String(signal.reason || "").slice(0, 500),
-
-      mode: state.mode,
+      side: plan.action,
+      confidence: plan.confidence,
+      edge: plan.edge,
+      reason: plan.reason,
       executed: false,
-      execution: null,
     };
 
     state.intents.push(intent);
-    state.intents = state.intents.slice(-400);
-    state.stats.lastSignalTs = intent.ts;
+    state.intents = state.intents.slice(-200);
 
-    if (!state.execute) {
-      state.stats.lastReason = "signal_logged_armed_no_execute";
-      scheduleSave(tenantId);
-      return { ok: true, accepted: true, executed: false, intent };
+    if (state.execute) {
+      intent.execution = {
+        status: "adapter_missing",
+        note: "Execution adapter not wired.",
+      };
     }
-
-    // Execution intentionally blocked until adapter exists
-    intent.execution = {
-      status: "adapter_missing",
-      note: "Execution adapter not wired.",
-    };
-
-    state.stats.lastReason = "execute_enabled_adapter_missing";
-    scheduleSave(tenantId);
-
-    return { ok: true, accepted: true, executed: false, intent };
-  } catch (e) {
-    state.lastError = e?.message || String(e);
-    state.stats.lastReason = "signal_error";
-    scheduleSave(tenantId);
-    return { ok: false, error: state.lastError };
   }
+
+  save(tenantId);
 }
 
 /* ================= SNAPSHOT ================= */
@@ -304,21 +231,13 @@ function snapshot(tenantId) {
     enabled: state.enabled,
     execute: state.execute,
     mode: state.mode,
-
-    lastPriceBySymbol: state.lastPriceBySymbol,
     stats: state.stats,
-
     intents: state.intents.slice(-50),
-    orders: state.orders.slice(-50),
-
     lastError: state.lastError,
-
     config: {
       LIVE_TRADING_ENABLED: state.enabled,
       LIVE_TRADING_EXECUTE: state.execute,
       LIVE_REFERENCE_BALANCE,
-      NOTE:
-        "Safe design: enabled=accept signals, execute=send orders (adapter required).",
     },
   };
 }
@@ -328,5 +247,4 @@ module.exports = {
   stop,
   tick,
   snapshot,
-  pushSignal,
 };
