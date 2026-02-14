@@ -1,28 +1,17 @@
 // backend/src/lib/audit.js
-// Central Audit Writer — HARDENED & SAFE
+// Central Audit Writer — ENTERPRISE SAFE + BACKWARD COMPATIBLE
 //
-// PURPOSE:
-// - Single source of truth for audit events
-// - Safe concurrent writes
-// - Consistent schema across admin / manager / system
-//
-// RULES:
-// - No auth logic
+// Guarantees:
 // - Never throws
-// - Always returns a record or null
+// - Safe schema
+// - Backward compatible with older routes using `audit()`
+// - Hard capped storage
 
 const crypto = require("crypto");
 const { updateDb } = require("./db");
 
 /**
- * writeAudit({
- *   actor,        // user id or "system"
- *   role,         // admin | manager | system | user
- *   action,       // STRING ENUM (ex: USER_CREATED)
- *   target,       // optional id (userId, companyId, tradeId)
- *   companyId,    // optional tenant scope
- *   detail        // optional object
- * })
+ * Core writer
  */
 function writeAudit(input = {}) {
   try {
@@ -30,15 +19,28 @@ function writeAudit(input = {}) {
       id: crypto.randomUUID(),
       ts: Date.now(),
 
-      actor: String(input.actor || "system"),
+      actorId: String(input.actorId || input.actor || "system"),
       role: String(input.role || "system"),
       action: String(input.action || "UNKNOWN"),
 
-      target: input.target ? String(input.target) : null,
-      companyId: input.companyId ? String(input.companyId) : null,
+      targetType: input.targetType
+        ? String(input.targetType)
+        : null,
 
-      detail:
-        input.detail && typeof input.detail === "object"
+      targetId: input.targetId
+        ? String(input.targetId)
+        : input.target
+        ? String(input.target)
+        : null,
+
+      companyId: input.companyId
+        ? String(input.companyId)
+        : null,
+
+      metadata:
+        input.metadata && typeof input.metadata === "object"
+          ? input.metadata
+          : input.detail && typeof input.detail === "object"
           ? input.detail
           : {},
     };
@@ -47,7 +49,7 @@ function writeAudit(input = {}) {
       if (!Array.isArray(db.audit)) db.audit = [];
       db.audit.push(record);
 
-      // Hard cap: keep last 10,000 events
+      // Hard cap to prevent uncontrolled growth
       if (db.audit.length > 10_000) {
         db.audit = db.audit.slice(-10_000);
       }
@@ -62,6 +64,15 @@ function writeAudit(input = {}) {
   }
 }
 
+/**
+ * Backward-compatible alias
+ * Many routes import: const { audit } = require(...)
+ */
+function audit(input = {}) {
+  return writeAudit(input);
+}
+
 module.exports = {
   writeAudit,
+  audit,
 };
