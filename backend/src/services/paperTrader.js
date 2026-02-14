@@ -1,6 +1,6 @@
 // backend/src/services/paperTrader.js
-// Phase 6.5 — Institutional Paper Engine (Corrected)
-// Strategy → Risk → Portfolio → Execution
+// Phase 9 — Institutional Paper Engine
+// Strategy → Risk → Portfolio → ExecutionEngine
 // Fully Adaptive • Multi-Layer Protected • Tenant Safe
 
 const fs = require("fs");
@@ -9,13 +9,13 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
+const executionEngine = require("./executionEngine");
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200);
-const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
 
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
@@ -148,11 +148,12 @@ function updateVolatility(state, price) {
   state.lastPrice = price;
 }
 
-function updateEquity(state, price) {
-  if (state.position) {
+function updateEquity(state) {
+  if (state.position && state.lastPrice) {
     state.equity =
       state.cashBalance +
-      (price - state.position.entry) * state.position.qty;
+      (state.lastPrice - state.position.entry) *
+        state.position.qty;
   } else {
     state.equity = state.cashBalance;
   }
@@ -169,91 +170,21 @@ function resetDaily(state, ts) {
   }
 }
 
-/* ================= EXECUTION ================= */
-
-function openPosition(state, tenantId, symbol, price, riskPct) {
-  const usd = clamp(
-    state.cashBalance * riskPct,
-    50,
-    state.cashBalance * 0.5
-  );
-
-  if (usd <= 0) return;
-
-  const qty = usd / price;
-  const fee = usd * FEE_RATE;
-
-  state.cashBalance -= usd + fee;
-  state.costs.feePaid += fee;
-
-  state.position = {
-    symbol,
-    entry: price,
-    qty,
-    ts: Date.now(),
-  };
-
-  state.limits.tradesToday++;
-
-  narrate(tenantId, `Entered ${symbol} at ${price}`, {
-    action: "BUY",
-    usd,
-  });
-}
-
-function closePosition(state, tenantId, price, reason) {
-  const pos = state.position;
-  if (!pos) return;
-
-  const gross = (price - pos.entry) * pos.qty;
-  const fee = Math.abs(gross) * FEE_RATE;
-  const pnl = gross - fee;
-
-  state.cashBalance += pos.qty * price - fee;
-  state.costs.feePaid += fee;
-  state.realized.net += pnl;
-
-  if (pnl > 0) {
-    state.realized.wins++;
-    state.realized.grossProfit += pnl;
-  } else {
-    state.realized.losses++;
-    state.realized.grossLoss += Math.abs(pnl);
-    state.limits.lossesToday++;
-  }
-
-  state.trades.push({
-    time: Date.now(),
-    symbol: pos.symbol,
-    type: "CLOSE",
-    profit: pnl,
-    exitReason: reason,
-  });
-
-  state.position = null;
-
-  narrate(
-    tenantId,
-    `Closed ${pos.symbol}. ${pnl >= 0 ? "Profit" : "Loss"} ${pnl.toFixed(2)}`,
-    { action: "CLOSE", pnl }
-  );
-}
-
 /* ================= TICK ================= */
 
 function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
-  state.lastPrice = price; // 🔥 critical fix
+  state.lastPrice = price;
 
   resetDaily(state, ts);
 
   state.learnStats.ticksSeen++;
   updateVolatility(state, price);
-  updateEquity(state, price);
+  updateEquity(state);
 
-  /* ========= 1️⃣ GLOBAL RISK ========= */
+  /* ========= 1️⃣ RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -293,23 +224,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason;
 
-  /* ========= 3️⃣ EXIT LOGIC ========= */
-
-  if (
-    (plan.action === "SELL" || plan.action === "CLOSE") &&
-    state.position
-  ) {
-    closePosition(state, tenantId, price, plan.reason);
-    save(tenantId);
-    return;
-  }
-
-  if (plan.action !== "BUY" || state.position) {
-    save(tenantId);
-    return;
-  }
-
-  /* ========= 4️⃣ PORTFOLIO ========= */
+  /* ========= 3️⃣ PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -320,14 +235,11 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   });
 
   if (!portfolioCheck.allow) {
-    narrate(tenantId, `Trade blocked: ${portfolioCheck.reason}`, {
-      action: "BLOCKED",
-    });
     save(tenantId);
     return;
   }
 
-  /* ========= 5️⃣ FINAL EXECUTION ========= */
+  /* ========= 4️⃣ EXECUTION ENGINE ========= */
 
   const adjustedRisk = clamp(
     portfolioCheck.adjustedRiskPct *
@@ -336,7 +248,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     0.05
   );
 
-  openPosition(state, tenantId, symbol, price, adjustedRisk);
+  const result = executionEngine.executePaperOrder({
+    tenantId,
+    symbol,
+    action: plan.action,
+    price,
+    riskPct: adjustedRisk,
+    state,
+    ts,
+  });
+
+  if (result?.narration) {
+    narrate(tenantId, result.narration.text, result.narration.meta);
+  }
 
   save(tenantId);
 }
