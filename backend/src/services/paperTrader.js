@@ -1,6 +1,6 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine — Phase 2 FINAL
-// Proper Architecture: paperTrader → tradeBrain → strategyEngine
+// Paper Trading Engine — Phase 3
+// Fully Adaptive • Tenant Safe • StrategyEngine Integrated
 
 const fs = require("fs");
 const path = require("path");
@@ -73,7 +73,6 @@ function defaultState() {
     trades: [],
 
     lastPrice: null,
-
     volatility: 0.002,
 
     learnStats: {
@@ -132,6 +131,7 @@ function updateVolatility(state, price) {
   }
 
   const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+
   state.volatility = clamp(
     state.volatility * 0.9 + change * 0.1,
     0.0001,
@@ -250,6 +250,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   }
 
   const plan = makeDecision({
+    tenantId,
     symbol,
     last: price,
     paper: state,
@@ -258,7 +259,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
-  state.learnStats.lastReason = plan.blockedReason || plan.action;
+  state.learnStats.lastReason = plan.reason || plan.blockedReason;
 
   if (state.limits.halted) {
     save(tenantId);
@@ -273,7 +274,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     (plan.action === "SELL" || plan.action === "CLOSE") &&
     state.position
   ) {
-    closePosition(state, tenantId, price, plan.blockedReason || "signal");
+    closePosition(state, tenantId, price, plan.reason || "signal");
   }
 
   save(tenantId);
