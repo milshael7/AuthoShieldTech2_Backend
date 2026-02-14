@@ -1,28 +1,20 @@
 // backend/src/services/tradeBrain.js
-// ONE decision brain for BOTH paper + live trading.
-// Brain decides. Executors execute. No exceptions.
+// PHASE 1 UPGRADE — Rule Engine + Strategy Engine + Adaptive Hooks
 
 const aiBrain = require("./aiBrain");
+const strategyEngine = require("./strategyEngine");
 
 /* ---------------- SAFETY CONSTANTS ---------------- */
-const MIN_CONF = Number(process.env.TRADE_MIN_CONF || 0.62);
-const MIN_EDGE = Number(process.env.TRADE_MIN_EDGE || 0.0007); // 0.07%
+
+const BASE_MIN_CONF = Number(process.env.TRADE_MIN_CONF || 0.62);
+const BASE_MIN_EDGE = Number(process.env.TRADE_MIN_EDGE || 0.0007);
 const MAX_TRADES_PER_DAY = Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
+const MAX_LOSS_STREAK = Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
 
 const ALLOWED_ACTIONS = new Set(["WAIT", "BUY", "SELL", "CLOSE"]);
 
-/* ---------------- MINDSET (IMMUTABLE) ---------------- */
-const MINDSET = Object.freeze({
-  winIsSuccess: true,
-  loseIsFailure: true,
-  ruleFirst: true,
-  message:
-    "Winning is success. Losing is failure. The mission is to avoid losing. " +
-    "Rules come before entries. If rules are not met, WAIT. " +
-    "Losses are failure signals: learn, tighten filters, and do not repeat.",
-});
-
 /* ---------------- HELPERS ---------------- */
+
 function safeNum(x, fallback = 0) {
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
@@ -33,6 +25,7 @@ function clamp(n, min, max) {
 }
 
 /* ---------------- CORE DECISION ---------------- */
+
 function makeDecision(context = {}) {
   const symbol = String(context.symbol || "BTCUSDT");
   const last = safeNum(context.last, NaN);
@@ -42,59 +35,71 @@ function makeDecision(context = {}) {
   const limits = paper.limits || {};
   const config = paper.config || {};
 
-  /* -------- AI INPUT (OPTIONAL, NEVER TRUSTED BLINDLY) -------- */
-  let aiView = {};
-  try {
-    if (typeof aiBrain.decide === "function") {
-      aiView = aiBrain.decide({ symbol, last, paper }) || {};
-    }
-  } catch {
-    aiView = {};
-  }
-
-  const proposedAction = String(
-    aiView.action ?? learn.decision ?? "WAIT"
-  ).toUpperCase();
-
-  const baseAction = ALLOWED_ACTIONS.has(proposedAction)
-    ? proposedAction
-    : "WAIT";
-
-  const confidence = safeNum(
-    aiView.confidence ?? learn.confidence,
-    0
-  );
-
-  const edge = safeNum(
-    aiView.edge ?? learn.trendEdge,
-    0
-  );
-
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  let action = baseAction;
+  /* ---------------- ADAPTIVE THRESHOLDS ---------------- */
+
+  const dynamicMinConf =
+    lossesToday >= 2 ? BASE_MIN_CONF + 0.05 : BASE_MIN_CONF;
+
+  const dynamicMinEdge =
+    lossesToday >= 2 ? BASE_MIN_EDGE * 1.4 : BASE_MIN_EDGE;
+
+  /* ---------------- STRATEGY ENGINE (RULE BASED CORE) ---------------- */
+
+  const strategyView = strategyEngine.evaluate({
+    symbol,
+    last,
+    paper,
+  });
+
+  let action = strategyView.action;
+  let confidence = strategyView.confidence;
+  let edge = strategyView.edge;
   let blockedReason = "";
 
+  /* ---------------- AI OVERLAY (SOFT) ---------------- */
+
+  try {
+    if (typeof aiBrain.decide === "function") {
+      const aiView = aiBrain.decide({ symbol, last, paper }) || {};
+
+      if (
+        aiView.action &&
+        ALLOWED_ACTIONS.has(aiView.action.toUpperCase())
+      ) {
+        // AI can only bias, not override safety
+        confidence = Math.max(confidence, safeNum(aiView.confidence, 0));
+        edge = Math.max(edge, safeNum(aiView.edge, 0));
+      }
+    }
+  } catch {}
+
   /* ---------------- HARD SAFETY GATES ---------------- */
+
   if (!Number.isFinite(last)) {
     action = "WAIT";
-    blockedReason = "Missing last price.";
+    blockedReason = "Missing price.";
   } else if (limits.halted) {
     action = "WAIT";
-    blockedReason = `Halted: ${limits.haltReason || "safety stop"}`;
+    blockedReason = "System halted.";
   } else if (tradesToday >= MAX_TRADES_PER_DAY) {
     action = "WAIT";
-    blockedReason = `Daily trade limit reached (${tradesToday}/${MAX_TRADES_PER_DAY}).`;
-  } else if (confidence < MIN_CONF) {
+    blockedReason = "Daily trade limit reached.";
+  } else if (lossesToday >= MAX_LOSS_STREAK) {
     action = "WAIT";
-    blockedReason = `Confidence too low (${confidence.toFixed(2)} < ${MIN_CONF}).`;
-  } else if (Math.abs(edge) < MIN_EDGE) {
+    blockedReason = "Loss streak protection.";
+  } else if (confidence < dynamicMinConf) {
     action = "WAIT";
-    blockedReason = `Edge too small (${edge.toFixed(6)} < ${MIN_EDGE}).`;
+    blockedReason = "Confidence below adaptive threshold.";
+  } else if (Math.abs(edge) < dynamicMinEdge) {
+    action = "WAIT";
+    blockedReason = "Edge below adaptive threshold.";
   }
 
   /* ---------------- RISK MODEL ---------------- */
+
   const baselinePct = clamp(
     safeNum(config.baselinePct, 0.01),
     0.001,
@@ -124,7 +129,6 @@ function makeDecision(context = {}) {
     0.05
   );
 
-  /* ---------------- FINAL PLAN ---------------- */
   return {
     symbol,
     action,
@@ -133,23 +137,11 @@ function makeDecision(context = {}) {
     riskPct,
     slPct,
     tpPct,
-    mindset: MINDSET,
     blockedReason,
     ts: Date.now(),
   };
 }
 
-/* ---------------- EXPLAIN ---------------- */
-function explain(message, context) {
-  try {
-    if (typeof aiBrain.answer === "function") {
-      return aiBrain.answer(message, context);
-    }
-  } catch {}
-  return "AI explanation unavailable.";
-}
-
 module.exports = {
   makeDecision,
-  explain,
 };
