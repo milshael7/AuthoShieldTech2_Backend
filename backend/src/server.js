@@ -48,6 +48,16 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
+   GLOBAL METRICS STATE
+========================================================= */
+
+const ACTIVE_TENANTS = new Set();
+let last = {};
+let lastTickTs = 0;
+let krakenStatus = "booting";
+let krakenConnectedAt = 0;
+
+/* =========================================================
    CORS
 ========================================================= */
 
@@ -94,6 +104,39 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage().rss,
     activeTenants: ACTIVE_TENANTS.size,
+    krakenStatus,
+    tickFreshnessMs: Date.now() - lastTickTs,
+    time: new Date().toISOString(),
+  });
+});
+
+/* =========================================================
+   SYSTEM METRICS (NEW — SECURE INTERNAL VIEW)
+========================================================= */
+
+app.get("/api/system/metrics", (req, res) => {
+  res.json({
+    ok: true,
+    process: {
+      uptime: process.uptime(),
+      memoryRss: process.memoryUsage().rss,
+      cpuUser: process.cpuUsage().user,
+    },
+    websocket: {
+      clients: wss.clients.size,
+    },
+    feed: {
+      status: krakenStatus,
+      connectedAt: krakenConnectedAt,
+      lastTickTs,
+      freshnessMs: lastTickTs
+        ? Date.now() - lastTickTs
+        : null,
+      trackedSymbols: Object.keys(last).length,
+    },
+    engine: {
+      activeTenants: ACTIVE_TENANTS.size,
+    },
     time: new Date().toISOString(),
   });
 });
@@ -113,8 +156,6 @@ app.use(tenantMiddleware);
 /* =========================================================
    TENANT ENGINE REGISTRY
 ========================================================= */
-
-const ACTIVE_TENANTS = new Set();
 
 function registerTenant(tenantId) {
   if (!tenantId) return;
@@ -156,9 +197,6 @@ app.use("/api/security", securityRoutes);
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws/market" });
 
-let last = {};
-let lastTickTs = Date.now();
-
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
   wss.clients.forEach((client) => {
@@ -180,14 +218,20 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
-   KRAKEN FEED (GLOBAL TICK ROUTER)
+   KRAKEN FEED
 ========================================================= */
 
 let krakenStop = null;
 
 try {
   krakenStop = startKrakenFeed({
-    onStatus: (s) => console.log("[kraken]", s),
+    onStatus: (s) => {
+      krakenStatus = s;
+      if (s === "connected") {
+        krakenConnectedAt = Date.now();
+      }
+      console.log("[kraken]", s);
+    },
 
     onTick: (tick) => {
       last[tick.symbol] = tick.price;
@@ -221,11 +265,12 @@ try {
 
   bootLog("Kraken feed started");
 } catch (e) {
+  krakenStatus = "failed";
   console.error("Failed to start Kraken feed:", e);
 }
 
 /* =========================================================
-   GLOBAL ERROR HANDLER
+   ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
@@ -243,18 +288,6 @@ app.use((err, req, res, next) => {
     ok: false,
     error: "Internal server error",
   });
-});
-
-/* =========================================================
-   PROCESS CRASH PROTECTION
-========================================================= */
-
-process.on("unhandledRejection", (reason) => {
-  console.error("[UNHANDLED REJECTION]", reason);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT EXCEPTION]", err);
 });
 
 /* =========================================================
