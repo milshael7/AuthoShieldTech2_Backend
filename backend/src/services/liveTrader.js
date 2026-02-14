@@ -1,6 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 18 — Regime-Aware Institutional Engine
-// Liquidity + Dynamic Leverage + Market Regime Intelligence
+// Phase 19 — Adaptive Capital Intelligence Engine
+// Regime + Router + Cross Margin + Performance Scaling
 
 const fs = require("fs");
 const path = require("path");
@@ -19,9 +19,7 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
-
-const MAX_TOTAL_EXPOSURE_PCT = 1.5;
-const MAX_POSITION_PER_SYMBOL_PCT = 0.4;
+const PERFORMANCE_WINDOW = 20;
 
 /* ================= HELPERS ================= */
 
@@ -51,7 +49,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 18,
+    version: 19,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -61,17 +59,23 @@ function defaultState() {
 
     cashBalance: START_BALANCE,
     equity: START_BALANCE,
+    peakEquity: START_BALANCE,
 
     volatility: 0.002,
     acceleration: 0,
     regime: "LOW_VOL",
 
     dynamicLeverage: 3,
+
     grossExposure: 0,
     netExposure: 0,
 
-    marginUsed: 0,
-    liquidationFlag: false,
+    performance: {
+      recentTrades: [],
+      winRate: 0.5,
+      equitySlope: 0,
+      score: 0.5,
+    },
 
     lastPrices: {},
     positions: {},
@@ -84,6 +88,38 @@ function defaultState() {
 
 const STATES = new Map();
 
+/* ================= PERFORMANCE ENGINE ================= */
+
+function updatePerformance(state, pnl) {
+  const perf = state.performance;
+
+  perf.recentTrades.push(pnl);
+  if (perf.recentTrades.length > PERFORMANCE_WINDOW)
+    perf.recentTrades = perf.recentTrades.slice(-PERFORMANCE_WINDOW);
+
+  const wins = perf.recentTrades.filter(p => p > 0).length;
+  perf.winRate =
+    perf.recentTrades.length > 0
+      ? wins / perf.recentTrades.length
+      : 0.5;
+
+  const drawdown =
+    (state.peakEquity - state.equity) /
+    Math.max(state.peakEquity, 1);
+
+  const slope =
+    (state.equity - state.peakEquity * 0.95) /
+    state.peakEquity;
+
+  perf.equitySlope = slope;
+
+  let score = perf.winRate * 0.6 + (1 - drawdown) * 0.4;
+
+  if (slope < -0.05) score *= 0.5;
+
+  perf.score = clamp(score, 0.2, 1.5);
+}
+
 /* ================= REGIME ENGINE ================= */
 
 function updateMarketMetrics(state, symbol, price) {
@@ -95,8 +131,11 @@ function updateMarketMetrics(state, symbol, price) {
 
   const change = (price - last) / last;
 
-  state.volatility = state.volatility * 0.9 + Math.abs(change) * 0.1;
-  state.acceleration = state.acceleration * 0.9 + change * 0.1;
+  state.volatility =
+    state.volatility * 0.9 + Math.abs(change) * 0.1;
+
+  state.acceleration =
+    state.acceleration * 0.9 + change * 0.1;
 
   state.lastPrices[symbol] = price;
 }
@@ -111,23 +150,13 @@ function classifyRegime(state) {
   return "RANGING";
 }
 
-function regimeRiskMultiplier(regime) {
+function regimeMultiplier(regime) {
   switch (regime) {
     case "TRENDING": return 1.2;
     case "RANGING": return 0.7;
     case "PANIC": return 0.3;
     case "LOW_VOL": return 1.0;
     default: return 1;
-  }
-}
-
-function regimeLeverageCap(regime) {
-  switch (regime) {
-    case "PANIC": return 1;
-    case "RANGING": return 2;
-    case "TRENDING": return 4;
-    case "LOW_VOL": return 5;
-    default: return 3;
   }
 }
 
@@ -152,9 +181,10 @@ function recalcPortfolio(state) {
   state.grossExposure = gross;
   state.netExposure = net;
   state.equity = state.cashBalance + unrealized;
+  state.peakEquity = Math.max(state.peakEquity, state.equity);
 }
 
-/* ================= POSITION ENGINE ================= */
+/* ================= POSITION ================= */
 
 function applyFill(state, { symbol, side, price, qty }) {
   state.positions[symbol] = state.positions[symbol] || {
@@ -171,8 +201,25 @@ function applyFill(state, { symbol, side, price, qty }) {
       pos.avgEntry * pos.qty + price * signedQty;
 
     pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0 ? totalCost / pos.qty : 0;
+    pos.avgEntry = pos.qty !== 0
+      ? totalCost / pos.qty
+      : 0;
   } else {
+    const closingQty = Math.min(
+      Math.abs(pos.qty),
+      Math.abs(signedQty)
+    );
+
+    const pnl =
+      (price - pos.avgEntry) *
+      closingQty *
+      Math.sign(pos.qty);
+
+    state.cashBalance += pnl;
+    state.trades.push({ symbol, pnl });
+
+    updatePerformance(state, pnl);
+
     pos.qty = newQty;
     pos.avgEntry = price;
   }
@@ -210,36 +257,20 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  if (state.grossExposure >= state.equity * MAX_TOTAL_EXPOSURE_PCT) {
-    save(tenantId);
-    return;
-  }
+  const regimeMult = regimeMultiplier(state.regime);
+  const performanceMult = state.performance.score;
 
-  /* ================= REGIME ADJUSTMENTS ================= */
-
-  const riskMultiplier = regimeRiskMultiplier(state.regime);
-  const leverageCap = regimeLeverageCap(state.regime);
-
-  state.dynamicLeverage = clamp(
-    state.dynamicLeverage,
-    1,
-    leverageCap
-  );
-
-  const adjustedRisk = plan.riskPct * riskMultiplier;
+  const finalRisk =
+    plan.riskPct *
+    regimeMult *
+    performanceMult;
 
   const positionValue =
     state.equity *
-    adjustedRisk *
+    clamp(finalRisk, 0.001, 0.05) *
     state.dynamicLeverage;
 
-  const cappedPositionValue = clamp(
-    positionValue,
-    0,
-    state.equity * MAX_POSITION_PER_SYMBOL_PCT
-  );
-
-  const qty = cappedPositionValue / price;
+  const qty = positionValue / price;
 
   try {
     const result = await exchangeRouter.routeLiveOrder({
@@ -264,9 +295,9 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       ts,
       symbol,
       side: plan.action,
-      ok: result?.ok,
-      exchange: result?.exchange,
       regime: state.regime,
+      perfScore: state.performance.score,
+      ok: result?.ok,
     });
 
     if (state.orders.length > MAX_ORDERS)
@@ -322,11 +353,10 @@ function snapshot(tenantId) {
     ok: true,
     equity: state.equity,
     regime: state.regime,
-    leverage: state.dynamicLeverage,
-    volatility: state.volatility,
+    performanceScore: state.performance.score,
+    winRate: state.performance.winRate,
     grossExposure: state.grossExposure,
     netExposure: state.netExposure,
-    positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
 }
