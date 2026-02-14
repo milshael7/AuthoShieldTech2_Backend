@@ -1,14 +1,17 @@
 // backend/src/services/exchangeRouter.js
-// Phase 15 — Liquidation-Aware Institutional Smart Router
+// Enterprise Institutional Smart Router
 // Dynamic Ranking • Latency Scoring • Circuit Breaker
-// Liquidation Priority Routing • Timeout Protection
-// Adapter-Agnostic • Production Hardened
+// Timeout Hardened • Kill Switch Enabled • Telemetry Enhanced
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 /* =========================================================
    CONFIG
 ========================================================= */
+
+const EXECUTION_ENABLED =
+  String(process.env.EXECUTION_ENABLED || "true")
+    .toLowerCase() !== "false";
 
 const CONFIG = Object.freeze({
   primary: process.env.EXECUTION_PRIMARY || "binance",
@@ -22,7 +25,7 @@ const CONFIG = Object.freeze({
 
   executionTimeoutMs: Number(process.env.EXECUTION_TIMEOUT_MS || 8000),
 
-  liquidationLatencyWeight: 0.6, // prioritizes speed in liquidation
+  liquidationLatencyWeight: 0.6,
 });
 
 /* =========================================================
@@ -50,10 +53,11 @@ function getAdapterState(name) {
       lastError: null,
 
       metrics: {
-        total: 0,
+        totalAttempts: 0,
         success: 0,
         latencySamples: [],
         partialFills: 0,
+        timeouts: 0,
       },
     });
   }
@@ -61,13 +65,23 @@ function getAdapterState(name) {
 }
 
 /* =========================================================
-   HEALTH + METRICS
+   METRICS
 ========================================================= */
 
-function markFailure(name, err) {
+function markAttempt(name) {
   const state = getAdapterState(name);
+  state.metrics.totalAttempts++;
+}
+
+function markFailure(name, err, isTimeout = false) {
+  const state = getAdapterState(name);
+
   state.failures++;
   state.lastError = String(err?.message || err || "unknown");
+
+  if (isTimeout) {
+    state.metrics.timeouts++;
+  }
 
   if (state.failures >= CONFIG.failureThreshold) {
     state.cooldownUntil = Date.now() + CONFIG.cooldownMs;
@@ -81,7 +95,6 @@ function markSuccess(name, latencyMs, result = {}) {
   state.cooldownUntil = 0;
   state.lastError = null;
 
-  state.metrics.total++;
   state.metrics.success++;
 
   if (Number.isFinite(latencyMs)) {
@@ -92,16 +105,12 @@ function markSuccess(name, latencyMs, result = {}) {
     }
   }
 
-  if (result?.filledQty && result?.requestedQty) {
-    if (result.filledQty < result.requestedQty) {
-      state.metrics.partialFills++;
-    }
-  }
-}
+  const filled = result?.order?.filledQty;
+  const requested = result?.order?.requestedQty;
 
-function markAttempt(name) {
-  const state = getAdapterState(name);
-  state.metrics.total++;
+  if (filled && requested && filled < requested) {
+    state.metrics.partialFills++;
+  }
 }
 
 function adapterAvailable(name) {
@@ -116,22 +125,26 @@ function avgLatency(samples = []) {
 
 function scoreAdapter(name, { forceClose } = {}) {
   const state = getAdapterState(name);
-  const { total, success, latencySamples } = state.metrics;
+  const { totalAttempts, success, latencySamples } = state.metrics;
 
-  const successRate = total > 0 ? success / total : 1;
-  const latencyScore = 1 / clamp(avgLatency(latencySamples), 1, 10_000);
+  const successRate =
+    totalAttempts > 0 ? success / totalAttempts : 1;
+
+  const latencyScore =
+    1 / clamp(avgLatency(latencySamples), 1, 10000);
 
   if (forceClose) {
-    // During liquidation: prioritize speed more heavily
-    return successRate * (1 - CONFIG.liquidationLatencyWeight) +
-           latencyScore * CONFIG.liquidationLatencyWeight;
+    return (
+      successRate * (1 - CONFIG.liquidationLatencyWeight) +
+      latencyScore * CONFIG.liquidationLatencyWeight
+    );
   }
 
   return successRate * 0.7 + latencyScore * 0.3;
 }
 
 /* =========================================================
-   ROUTE ORDER (DYNAMIC RANKING)
+   ROUTE ORDER
 ========================================================= */
 
 function getRouteOrder(context = {}) {
@@ -143,8 +156,8 @@ function getRouteOrder(context = {}) {
 
   return base
     .filter((name) => ADAPTERS[name])
-    .sort((a, b) =>
-      scoreAdapter(b, context) - scoreAdapter(a, context)
+    .sort(
+      (a, b) => scoreAdapter(b, context) - scoreAdapter(a, context)
     );
 }
 
@@ -153,12 +166,17 @@ function getRouteOrder(context = {}) {
 ========================================================= */
 
 function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Execution timeout")), ms)
-    ),
-  ]);
+  let timeout;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error("Execution timeout")),
+      ms
+    );
+  });
+
+  return Promise.race([promise, timeoutPromise])
+    .finally(() => clearTimeout(timeout));
 }
 
 /* =========================================================
@@ -166,11 +184,20 @@ function withTimeout(promise, ms) {
 ========================================================= */
 
 async function routeLiveOrder(params = {}) {
+
+  if (!EXECUTION_ENABLED) {
+    return {
+      ok: false,
+      error: "Execution globally disabled (EXECUTION_ENABLED=false)",
+    };
+  }
+
   const { forceClose } = params;
 
   const route = getRouteOrder({ forceClose });
 
   for (const exchange of route) {
+
     if (!adapterAvailable(exchange)) continue;
 
     const adapterFactory = ADAPTERS[exchange];
@@ -178,10 +205,7 @@ async function routeLiveOrder(params = {}) {
 
     try {
       const adapter = adapterFactory();
-
-      if (typeof adapter.executeLiveOrder !== "function") {
-        continue;
-      }
+      if (typeof adapter.executeLiveOrder !== "function") continue;
 
       markAttempt(exchange);
 
@@ -202,8 +226,12 @@ async function routeLiveOrder(params = {}) {
         latencyMs: latency,
         result,
       };
+
     } catch (err) {
-      markFailure(exchange, err);
+      const isTimeout =
+        String(err?.message || "").toLowerCase().includes("timeout");
+
+      markFailure(exchange, err, isTimeout);
     }
   }
 
@@ -218,21 +246,32 @@ async function routeLiveOrder(params = {}) {
 ========================================================= */
 
 function getHealth() {
-  const out = {};
+  const out = {
+    config: {
+      executionEnabled: EXECUTION_ENABLED,
+      primary: CONFIG.primary,
+      secondary: CONFIG.secondary,
+      tertiary: CONFIG.tertiary,
+    },
+    adapters: {},
+  };
 
   for (const [name, state] of ADAPTER_STATE.entries()) {
     const { metrics } = state;
 
-    out[name] = {
+    out.adapters[name] = {
       failures: state.failures,
       cooling: Date.now() < state.cooldownUntil,
       lastError: state.lastError,
+
       successRate:
-        metrics.total > 0
-          ? metrics.success / metrics.total
+        metrics.totalAttempts > 0
+          ? metrics.success / metrics.totalAttempts
           : 1,
+
       avgLatencyMs: avgLatency(metrics.latencySamples),
       partialFills: metrics.partialFills,
+      timeouts: metrics.timeouts,
     };
   }
 
