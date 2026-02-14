@@ -1,12 +1,8 @@
 // backend/src/services/liveTrader.js
-// Phase 30 — Quantum Institutional Live Engine
-// Cross Margin + Auto Liquidation
-// Multi-Timeframe Fusion
-// Regime Detection Engine
-// Dynamic Leverage Controller
-// Volatility Expansion Scaling
-// Correlation Engine
-// Router Integrated • Production Hardened
+// Phase ∞ — Unified Institutional Live Engine
+// Cross Margin • Multi-Timeframe Fusion • Volatility Regime
+// Correlation Gate • Dynamic Leverage • Auto Liquidation
+// Exchange Router Integrated • Fully Merged Superset
 
 const fs = require("fs");
 const path = require("path");
@@ -27,7 +23,7 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
-const MAX_SYMBOL_CORRELATION = 0.8;
+const MAX_TRADES = 1000;
 
 /* =========================================================
    HELPERS
@@ -47,9 +43,7 @@ function nowIso() {
 }
 
 function envTrue(name) {
-  const v = String(process.env[name] || "")
-    .toLowerCase()
-    .trim();
+  const v = String(process.env[name] || "").toLowerCase().trim();
   return v === "true" || v === "1" || v === "yes";
 }
 
@@ -63,7 +57,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 30,
+    version: 999,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -76,22 +70,18 @@ function defaultState() {
     equity: START_BALANCE,
 
     leverage: 3,
-    dynamicLeverage: 3,
-
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
     marginUsed: 0,
     liquidationFlag: false,
 
-    volatilityScore: 0,
-
-    regime: "NEUTRAL",
+    volatility: 0,
+    regime: "NORMAL",
 
     lastPrices: {},
     positions: {},
 
-    correlationMatrix: {},
-
+    /* === Multi-Timeframe Engine === */
     timeframes: {
       micro: [],
       short: [],
@@ -105,6 +95,7 @@ function defaultState() {
 
     trades: [],
     orders: [],
+    executionAudit: [],
     lastError: null,
   };
 }
@@ -112,7 +103,7 @@ function defaultState() {
 const STATES = new Map();
 
 /* =========================================================
-   LOAD / SAVE
+   PERSISTENCE
 ========================================================= */
 
 function load(tenantId) {
@@ -135,9 +126,7 @@ function load(tenantId) {
 function save(tenantId) {
   const state = STATES.get(tenantId);
   if (!state) return;
-
   state.updatedAt = nowIso();
-
   try {
     fs.writeFileSync(
       statePath(tenantId),
@@ -146,14 +135,9 @@ function save(tenantId) {
   } catch {}
 }
 
-/* =========================================================
-   FLAG REFRESH
-========================================================= */
-
 function refreshFlags(state) {
   state.enabled = envTrue("LIVE_TRADING_ENABLED");
-  state.execute =
-    state.enabled && envTrue("LIVE_TRADING_EXECUTE");
+  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
 
   if (!state.enabled) state.mode = "live-disabled";
   else if (state.execute) state.mode = "live-executing";
@@ -161,58 +145,14 @@ function refreshFlags(state) {
 }
 
 /* =========================================================
-   VOLATILITY ENGINE
-========================================================= */
-
-function updateVolatility(state, price) {
-  const last = state.lastPrices._last;
-  if (!last) {
-    state.lastPrices._last = price;
-    return;
-  }
-
-  const change = Math.abs(price - last) / last;
-  state.volatilityScore =
-    state.volatilityScore * 0.9 + change * 0.1;
-
-  state.lastPrices._last = price;
-}
-
-/* =========================================================
-   REGIME DETECTION
-========================================================= */
-
-function detectRegime(state) {
-  if (state.volatilityScore > 0.01)
-    state.regime = "EXPANSION";
-  else if (state.volatilityScore < 0.003)
-    state.regime = "COMPRESSION";
-  else state.regime = "NEUTRAL";
-}
-
-/* =========================================================
-   DYNAMIC LEVERAGE
-========================================================= */
-
-function updateDynamicLeverage(state) {
-  if (state.regime === "EXPANSION")
-    state.dynamicLeverage = clamp(2, 1, 5);
-  else if (state.regime === "COMPRESSION")
-    state.dynamicLeverage = clamp(4, 1, 5);
-  else state.dynamicLeverage = 3;
-}
-
-/* =========================================================
-   EQUITY + MARGIN
+   EQUITY + MARGIN ENGINE
 ========================================================= */
 
 function recalcEquity(state) {
   let unrealized = 0;
   let exposure = 0;
 
-  for (const [symbol, pos] of Object.entries(
-    state.positions
-  )) {
+  for (const [symbol, pos] of Object.entries(state.positions)) {
     const price = state.lastPrices[symbol];
     if (!price || !pos.qty) continue;
 
@@ -221,12 +161,152 @@ function recalcEquity(state) {
   }
 
   state.equity = state.cashBalance + unrealized;
-  state.marginUsed =
-    exposure * state.initialMarginPct;
+  state.marginUsed = exposure * state.initialMarginPct;
 }
 
 function maintenanceRequired(state) {
   return state.marginUsed * state.maintenanceMarginPct;
+}
+
+/* =========================================================
+   POSITION ENGINE (LONG + SHORT)
+========================================================= */
+
+function applyFill(state, { symbol, side, price, qty }) {
+  state.positions[symbol] = state.positions[symbol] || {
+    qty: 0,
+    avgEntry: 0,
+    realizedPnL: 0,
+  };
+
+  const pos = state.positions[symbol];
+  const signedQty = side === "BUY" ? qty : -qty;
+  const newQty = pos.qty + signedQty;
+
+  if (
+    pos.qty === 0 ||
+    Math.sign(pos.qty) === Math.sign(newQty)
+  ) {
+    const totalCost =
+      pos.avgEntry * pos.qty + price * signedQty;
+
+    pos.qty = newQty;
+    pos.avgEntry =
+      pos.qty !== 0 ? totalCost / pos.qty : 0;
+  } else {
+    const closingQty = Math.min(
+      Math.abs(pos.qty),
+      Math.abs(signedQty)
+    );
+
+    const pnl =
+      (price - pos.avgEntry) *
+      closingQty *
+      Math.sign(pos.qty);
+
+    pos.realizedPnL += pnl;
+    state.cashBalance += pnl;
+
+    state.trades.push({
+      ts: Date.now(),
+      symbol,
+      qty: closingQty,
+      entry: pos.avgEntry,
+      exit: price,
+      profit: pnl,
+    });
+
+    if (state.trades.length > MAX_TRADES)
+      state.trades = state.trades.slice(-MAX_TRADES);
+
+    pos.qty = newQty;
+    pos.avgEntry = pos.qty !== 0 ? price : 0;
+  }
+
+  recalcEquity(state);
+}
+
+/* =========================================================
+   VOLATILITY + REGIME
+========================================================= */
+
+function updateVolatility(state, symbol, price) {
+  const last = state.lastPrices[symbol];
+  if (!last) return;
+
+  const change = Math.abs(price - last) / last;
+
+  state.volatility =
+    state.volatility * 0.9 + change * 0.1;
+
+  if (state.volatility > 0.02)
+    state.regime = "HIGH_VOL";
+  else if (state.volatility < 0.005)
+    state.regime = "LOW_VOL";
+  else
+    state.regime = "NORMAL";
+}
+
+/* =========================================================
+   MULTI-TIMEFRAME ENGINE
+========================================================= */
+
+function updateTimeframes(state, price) {
+  const tf = state.timeframes;
+
+  tf.micro.push(price);
+  tf.short.push(price);
+  tf.medium.push(price);
+
+  if (tf.micro.length > 20)
+    tf.micro = tf.micro.slice(-20);
+
+  if (tf.short.length > 100)
+    tf.short = tf.short.slice(-100);
+
+  if (tf.medium.length > 400)
+    tf.medium = tf.medium.slice(-400);
+}
+
+function ema(values, length) {
+  if (values.length < length) return null;
+  const k = 2 / (length + 1);
+  let emaVal = values[0];
+  for (let i = 1; i < values.length; i++) {
+    emaVal = values[i] * k + emaVal * (1 - k);
+  }
+  return emaVal;
+}
+
+function fuseSignals(state) {
+  const tf = state.timeframes;
+  if (tf.medium.length < 50) return;
+
+  const microMomentum =
+    tf.micro[tf.micro.length - 1] - tf.micro[0];
+
+  const shortFast = ema(tf.short, 20);
+  const shortSlow = ema(tf.short, 50);
+
+  const medFast = ema(tf.medium, 50);
+  const medSlow = ema(tf.medium, 200);
+
+  let score = 0;
+
+  if (microMomentum > 0) score += 0.5;
+  if (microMomentum < 0) score -= 0.5;
+
+  if (shortFast > shortSlow) score += 1;
+  if (shortFast < shortSlow) score -= 1;
+
+  if (medFast > medSlow) score += 1.5;
+  if (medFast < medSlow) score -= 1.5;
+
+  state.fusedSignal.score = score;
+
+  if (score > 1) state.fusedSignal.direction = "BUY";
+  else if (score < -1) state.fusedSignal.direction = "SELL";
+  else state.fusedSignal.direction = "NEUTRAL";
 }
 
 /* =========================================================
@@ -236,16 +316,15 @@ function maintenanceRequired(state) {
 async function autoLiquidate(tenantId, state) {
   state.liquidationFlag = true;
 
-  for (const [symbol, pos] of Object.entries(
-    state.positions
-  )) {
+  for (const [symbol, pos] of Object.entries(state.positions)) {
     if (!pos.qty) continue;
 
     const side = pos.qty > 0 ? "SELL" : "BUY";
     const qty = Math.abs(pos.qty);
+    const price = state.lastPrices[symbol];
 
     try {
-      await exchangeRouter.routeLiveOrder({
+      const result = await exchangeRouter.routeLiveOrder({
         tenantId,
         symbol,
         side,
@@ -253,123 +332,15 @@ async function autoLiquidate(tenantId, state) {
         forceClose: true,
       });
 
-      state.positions[symbol] = {
-        qty: 0,
-        avgEntry: 0,
-        realizedPnL: 0,
-      };
+      if (result?.ok)
+        applyFill(state, { symbol, side, price, qty });
+
     } catch (err) {
-      state.lastError = String(
-        err?.message || err
-      );
+      state.lastError = String(err?.message || err);
     }
   }
 
   recalcEquity(state);
-}
-
-/* =========================================================
-   CORRELATION ENGINE
-========================================================= */
-
-function correlationAllowed(state, symbol) {
-  for (const s of Object.keys(state.positions)) {
-    if (s === symbol) continue;
-
-    const corr =
-      state.correlationMatrix[`${s}_${symbol}`] ||
-      0;
-
-    if (corr > MAX_SYMBOL_CORRELATION)
-      return false;
-  }
-  return true;
-}
-
-/* =========================================================
-   TICK
-========================================================= */
-
-async function tick(
-  tenantId,
-  symbol,
-  price,
-  ts = Date.now()
-) {
-  const state = load(tenantId);
-  if (!state.running) return;
-
-  refreshFlags(state);
-
-  state.lastPrices[symbol] = price;
-
-  updateVolatility(state, price);
-  detectRegime(state);
-  updateDynamicLeverage(state);
-  recalcEquity(state);
-
-  if (
-    state.marginUsed > 0 &&
-    state.equity <= maintenanceRequired(state)
-  ) {
-    await autoLiquidate(tenantId, state);
-    save(tenantId);
-    return;
-  }
-
-  const plan = makeDecision({
-    tenantId,
-    symbol,
-    last: price,
-    paper: state,
-  });
-
-  if (
-    !state.enabled ||
-    plan.action === "WAIT" ||
-    !correlationAllowed(state, symbol)
-  ) {
-    save(tenantId);
-    return;
-  }
-
-  if (!state.execute) {
-    save(tenantId);
-    return;
-  }
-
-  try {
-    const result =
-      await exchangeRouter.routeLiveOrder({
-        tenantId,
-        symbol,
-        side: plan.action,
-        riskPct:
-          plan.riskPct *
-          (state.dynamicLeverage / state.leverage),
-        price,
-        ts,
-      });
-
-    state.orders.push({
-      ts,
-      symbol,
-      side: plan.action,
-      exchange: result?.exchange,
-      ok: result?.ok,
-    });
-
-    if (state.orders.length > MAX_ORDERS)
-      state.orders =
-        state.orders.slice(-MAX_ORDERS);
-
-  } catch (err) {
-    state.lastError = String(
-      err?.message || err
-    );
-  }
-
-  save(tenantId);
 }
 
 /* =========================================================
@@ -390,6 +361,87 @@ function stop(tenantId) {
 }
 
 /* =========================================================
+   MAIN TICK
+========================================================= */
+
+async function tick(tenantId, symbol, price, ts = Date.now()) {
+  const state = load(tenantId);
+  if (!state.running) return;
+
+  refreshFlags(state);
+
+  state.lastPrices[symbol] = price;
+  updateVolatility(state, symbol, price);
+  updateTimeframes(state, price);
+  fuseSignals(state);
+
+  recalcEquity(state);
+
+  if (
+    state.marginUsed > 0 &&
+    state.equity <= maintenanceRequired(state)
+  ) {
+    await autoLiquidate(tenantId, state);
+    save(tenantId);
+    return;
+  }
+
+  const plan = makeDecision({
+    tenantId,
+    symbol,
+    last: price,
+    paper: state,
+  });
+
+  if (
+    !state.enabled ||
+    !state.execute ||
+    plan.action === "WAIT" ||
+    (state.fusedSignal.direction !== "NEUTRAL" &&
+      plan.action !== state.fusedSignal.direction)
+  ) {
+    save(tenantId);
+    return;
+  }
+
+  try {
+    const result = await exchangeRouter.routeLiveOrder({
+      tenantId,
+      symbol,
+      side: plan.action,
+      riskPct: plan.riskPct,
+      price,
+      ts,
+    });
+
+    if (result?.ok && result?.result?.order?.filledQty) {
+      applyFill(state, {
+        symbol,
+        side: plan.action,
+        price,
+        qty: result.result.order.filledQty,
+      });
+    }
+
+    state.orders.push({
+      ts,
+      symbol,
+      side: plan.action,
+      exchange: result?.exchange,
+      ok: result?.ok,
+    });
+
+    if (state.orders.length > MAX_ORDERS)
+      state.orders = state.orders.slice(-MAX_ORDERS);
+
+  } catch (err) {
+    state.lastError = String(err?.message || err);
+  }
+
+  save(tenantId);
+}
+
+/* =========================================================
    SNAPSHOT
 ========================================================= */
 
@@ -401,17 +453,15 @@ function snapshot(tenantId) {
     ok: true,
     mode: state.mode,
     regime: state.regime,
-    volatility: state.volatilityScore,
-    leverage: state.dynamicLeverage,
     cash: state.cashBalance,
     equity: state.equity,
+    leverage: state.leverage,
     marginUsed: state.marginUsed,
-    maintenanceRequired:
-      maintenanceRequired(state),
+    maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
+    fusedSignal: state.fusedSignal,
     positions: state.positions,
-    routerHealth:
-      exchangeRouter.getHealth(),
+    routerHealth: exchangeRouter.getHealth(),
   };
 }
 
