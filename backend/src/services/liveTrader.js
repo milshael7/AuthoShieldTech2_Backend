@@ -1,7 +1,11 @@
-// Phase 22 — Institutional Live Engine
+// backend/src/services/liveTrader.js
+// Phase 30 — Quantum Institutional Live Engine
 // Cross Margin + Auto Liquidation
 // Multi-Timeframe Fusion
-// Capital Governor + Regime Engine Integrated
+// Regime Detection Engine
+// Dynamic Leverage Controller
+// Volatility Expansion Scaling
+// Correlation Engine
 // Router Integrated • Production Hardened
 
 const fs = require("fs");
@@ -10,10 +14,9 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const exchangeRouter = require("./exchangeRouter");
 
-const capitalGovernor = require("./engines/capitalGovernor");
-const regimeEngine = require("./engines/regimeEngine");
-
-/* ================= CONFIG ================= */
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const BASE_PATH =
   process.env.LIVE_TRADER_STATE_DIR ||
@@ -24,8 +27,11 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
+const MAX_SYMBOL_CORRELATION = 0.8;
 
-/* ================= HELPERS ================= */
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -41,7 +47,9 @@ function nowIso() {
 }
 
 function envTrue(name) {
-  const v = String(process.env[name] || "").toLowerCase().trim();
+  const v = String(process.env[name] || "")
+    .toLowerCase()
+    .trim();
   return v === "true" || v === "1" || v === "yes";
 }
 
@@ -49,11 +57,13 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/* ================= STATE ================= */
+/* =========================================================
+   DEFAULT STATE
+========================================================= */
 
 function defaultState() {
   return {
-    version: 22,
+    version: 30,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -64,16 +74,23 @@ function defaultState() {
 
     cashBalance: START_BALANCE,
     equity: START_BALANCE,
-    peakEquity: START_BALANCE,
 
     leverage: 3,
+    dynamicLeverage: 3,
+
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
     marginUsed: 0,
     liquidationFlag: false,
 
+    volatilityScore: 0,
+
+    regime: "NEUTRAL",
+
     lastPrices: {},
     positions: {},
+
+    correlationMatrix: {},
 
     timeframes: {
       micro: [],
@@ -86,11 +103,6 @@ function defaultState() {
       score: 0,
     },
 
-    regime: {
-      name: "UNDEFINED",
-      volatility: 0,
-    },
-
     trades: [],
     orders: [],
     lastError: null,
@@ -99,7 +111,9 @@ function defaultState() {
 
 const STATES = new Map();
 
-/* ================= PERSIST ================= */
+/* =========================================================
+   LOAD / SAVE
+========================================================= */
 
 function load(tenantId) {
   if (STATES.has(tenantId)) return STATES.get(tenantId);
@@ -132,22 +146,73 @@ function save(tenantId) {
   } catch {}
 }
 
+/* =========================================================
+   FLAG REFRESH
+========================================================= */
+
 function refreshFlags(state) {
   state.enabled = envTrue("LIVE_TRADING_ENABLED");
-  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
+  state.execute =
+    state.enabled && envTrue("LIVE_TRADING_EXECUTE");
 
   if (!state.enabled) state.mode = "live-disabled";
   else if (state.execute) state.mode = "live-executing";
   else state.mode = "live-armed";
 }
 
-/* ================= EQUITY + MARGIN ================= */
+/* =========================================================
+   VOLATILITY ENGINE
+========================================================= */
+
+function updateVolatility(state, price) {
+  const last = state.lastPrices._last;
+  if (!last) {
+    state.lastPrices._last = price;
+    return;
+  }
+
+  const change = Math.abs(price - last) / last;
+  state.volatilityScore =
+    state.volatilityScore * 0.9 + change * 0.1;
+
+  state.lastPrices._last = price;
+}
+
+/* =========================================================
+   REGIME DETECTION
+========================================================= */
+
+function detectRegime(state) {
+  if (state.volatilityScore > 0.01)
+    state.regime = "EXPANSION";
+  else if (state.volatilityScore < 0.003)
+    state.regime = "COMPRESSION";
+  else state.regime = "NEUTRAL";
+}
+
+/* =========================================================
+   DYNAMIC LEVERAGE
+========================================================= */
+
+function updateDynamicLeverage(state) {
+  if (state.regime === "EXPANSION")
+    state.dynamicLeverage = clamp(2, 1, 5);
+  else if (state.regime === "COMPRESSION")
+    state.dynamicLeverage = clamp(4, 1, 5);
+  else state.dynamicLeverage = 3;
+}
+
+/* =========================================================
+   EQUITY + MARGIN
+========================================================= */
 
 function recalcEquity(state) {
   let unrealized = 0;
   let exposure = 0;
 
-  for (const [symbol, pos] of Object.entries(state.positions)) {
+  for (const [symbol, pos] of Object.entries(
+    state.positions
+  )) {
     const price = state.lastPrices[symbol];
     if (!price || !pos.qty) continue;
 
@@ -156,83 +221,31 @@ function recalcEquity(state) {
   }
 
   state.equity = state.cashBalance + unrealized;
-  state.marginUsed = exposure * state.initialMarginPct;
-
-  state.peakEquity = Math.max(state.peakEquity, state.equity);
+  state.marginUsed =
+    exposure * state.initialMarginPct;
 }
 
 function maintenanceRequired(state) {
   return state.marginUsed * state.maintenanceMarginPct;
 }
 
-/* ================= POSITION APPLY ================= */
-
-function applyFill(state, { symbol, side, price, qty }) {
-  state.positions[symbol] = state.positions[symbol] || {
-    qty: 0,
-    avgEntry: 0,
-    realizedPnL: 0,
-  };
-
-  const pos = state.positions[symbol];
-  const signedQty = side === "BUY" ? qty : -qty;
-  const newQty = pos.qty + signedQty;
-
-  if (
-    pos.qty === 0 ||
-    Math.sign(pos.qty) === Math.sign(newQty)
-  ) {
-    const totalCost =
-      pos.avgEntry * pos.qty + price * signedQty;
-
-    pos.qty = newQty;
-    pos.avgEntry =
-      pos.qty !== 0 ? totalCost / pos.qty : 0;
-
-  } else {
-    const closingQty = Math.min(
-      Math.abs(pos.qty),
-      Math.abs(signedQty)
-    );
-
-    const pnl =
-      (price - pos.avgEntry) *
-      closingQty *
-      Math.sign(pos.qty);
-
-    pos.realizedPnL += pnl;
-    state.cashBalance += pnl;
-
-    state.trades.push({
-      ts: Date.now(),
-      symbol,
-      qty: closingQty,
-      entry: pos.avgEntry,
-      exit: price,
-      profit: pnl,
-    });
-
-    pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0 ? price : 0;
-  }
-
-  recalcEquity(state);
-}
-
-/* ================= AUTO LIQUIDATION ================= */
+/* =========================================================
+   AUTO LIQUIDATION
+========================================================= */
 
 async function autoLiquidate(tenantId, state) {
   state.liquidationFlag = true;
 
-  for (const [symbol, pos] of Object.entries(state.positions)) {
+  for (const [symbol, pos] of Object.entries(
+    state.positions
+  )) {
     if (!pos.qty) continue;
 
     const side = pos.qty > 0 ? "SELL" : "BUY";
     const qty = Math.abs(pos.qty);
-    const price = state.lastPrices[symbol];
 
     try {
-      const result = await exchangeRouter.routeLiveOrder({
+      await exchangeRouter.routeLiveOrder({
         tenantId,
         symbol,
         side,
@@ -240,85 +253,128 @@ async function autoLiquidate(tenantId, state) {
         forceClose: true,
       });
 
-      if (result?.ok) {
-        applyFill(state, { symbol, side, price, qty });
-      }
-
+      state.positions[symbol] = {
+        qty: 0,
+        avgEntry: 0,
+        realizedPnL: 0,
+      };
     } catch (err) {
-      state.lastError = String(err?.message || err);
+      state.lastError = String(
+        err?.message || err
+      );
     }
   }
 
   recalcEquity(state);
 }
 
-/* ================= TIMEFRAME ENGINE ================= */
+/* =========================================================
+   CORRELATION ENGINE
+========================================================= */
 
-function updateTimeframes(state, price) {
-  const tf = state.timeframes;
+function correlationAllowed(state, symbol) {
+  for (const s of Object.keys(state.positions)) {
+    if (s === symbol) continue;
 
-  tf.micro.push(price);
-  tf.short.push(price);
-  tf.medium.push(price);
+    const corr =
+      state.correlationMatrix[`${s}_${symbol}`] ||
+      0;
 
-  if (tf.micro.length > 20)
-    tf.micro = tf.micro.slice(-20);
-
-  if (tf.short.length > 100)
-    tf.short = tf.short.slice(-100);
-
-  if (tf.medium.length > 400)
-    tf.medium = tf.medium.slice(-400);
+    if (corr > MAX_SYMBOL_CORRELATION)
+      return false;
+  }
+  return true;
 }
 
-function ema(values, length) {
-  if (values.length < length) return null;
+/* =========================================================
+   TICK
+========================================================= */
 
-  const k = 2 / (length + 1);
-  let emaVal = values[0];
+async function tick(
+  tenantId,
+  symbol,
+  price,
+  ts = Date.now()
+) {
+  const state = load(tenantId);
+  if (!state.running) return;
 
-  for (let i = 1; i < values.length; i++) {
-    emaVal = values[i] * k + emaVal * (1 - k);
+  refreshFlags(state);
+
+  state.lastPrices[symbol] = price;
+
+  updateVolatility(state, price);
+  detectRegime(state);
+  updateDynamicLeverage(state);
+  recalcEquity(state);
+
+  if (
+    state.marginUsed > 0 &&
+    state.equity <= maintenanceRequired(state)
+  ) {
+    await autoLiquidate(tenantId, state);
+    save(tenantId);
+    return;
   }
 
-  return emaVal;
+  const plan = makeDecision({
+    tenantId,
+    symbol,
+    last: price,
+    paper: state,
+  });
+
+  if (
+    !state.enabled ||
+    plan.action === "WAIT" ||
+    !correlationAllowed(state, symbol)
+  ) {
+    save(tenantId);
+    return;
+  }
+
+  if (!state.execute) {
+    save(tenantId);
+    return;
+  }
+
+  try {
+    const result =
+      await exchangeRouter.routeLiveOrder({
+        tenantId,
+        symbol,
+        side: plan.action,
+        riskPct:
+          plan.riskPct *
+          (state.dynamicLeverage / state.leverage),
+        price,
+        ts,
+      });
+
+    state.orders.push({
+      ts,
+      symbol,
+      side: plan.action,
+      exchange: result?.exchange,
+      ok: result?.ok,
+    });
+
+    if (state.orders.length > MAX_ORDERS)
+      state.orders =
+        state.orders.slice(-MAX_ORDERS);
+
+  } catch (err) {
+    state.lastError = String(
+      err?.message || err
+    );
+  }
+
+  save(tenantId);
 }
 
-function fuseSignals(state) {
-  const tf = state.timeframes;
-  if (tf.medium.length < 50) return;
-
-  const microMomentum =
-    tf.micro[tf.micro.length - 1] - tf.micro[0];
-
-  const shortFast = ema(tf.short, 20);
-  const shortSlow = ema(tf.short, 50);
-
-  const medFast = ema(tf.medium, 50);
-  const medSlow = ema(tf.medium, 200);
-
-  let score = 0;
-
-  if (microMomentum > 0) score += 0.5;
-  if (microMomentum < 0) score -= 0.5;
-
-  if (shortFast > shortSlow) score += 1;
-  if (shortFast < shortSlow) score -= 1;
-
-  if (medFast > medSlow) score += 1.5;
-  if (medFast < medSlow) score -= 1.5;
-
-  state.fusedSignal.score = score;
-
-  if (score > 1)
-    state.fusedSignal.direction = "BUY";
-  else if (score < -1)
-    state.fusedSignal.direction = "SELL";
-  else
-    state.fusedSignal.direction = "NEUTRAL";
-}
-
-/* ================= LIFECYCLE ================= */
+/* =========================================================
+   LIFECYCLE
+========================================================= */
 
 function start(tenantId) {
   const state = load(tenantId);
@@ -333,108 +389,9 @@ function stop(tenantId) {
   save(tenantId);
 }
 
-/* ================= TICK ================= */
-
-async function tick(tenantId, symbol, price, ts = Date.now()) {
-  const state = load(tenantId);
-  if (!state.running) return;
-
-  refreshFlags(state);
-
-  state.lastPrices[symbol] = price;
-
-  updateTimeframes(state, price);
-  fuseSignals(state);
-  recalcEquity(state);
-
-  // Auto liquidation
-  if (
-    state.marginUsed > 0 &&
-    state.equity <= maintenanceRequired(state)
-  ) {
-    await autoLiquidate(tenantId, state);
-    save(tenantId);
-    return;
-  }
-
-  // Strategy decision
-  const plan = makeDecision({
-    tenantId,
-    symbol,
-    last: price,
-    paper: state,
-  });
-
-  if (!state.enabled || plan.action === "WAIT") {
-    save(tenantId);
-    return;
-  }
-
-  // Regime Adjustment
-  const regime = regimeEngine.evaluate(state);
-  state.regime.name = regime.regime;
-  state.regime.volatility = regime.volatility || 0;
-
-  const adjustedRisk =
-    plan.riskPct * (regime.riskMultiplier || 1);
-
-  const proposedNotional =
-    adjustedRisk * state.equity;
-
-  // Capital Governor Check
-  const capitalCheck = capitalGovernor.evaluate(state, {
-    symbol,
-    proposedNotional,
-  });
-
-  if (!capitalCheck.allow) {
-    save(tenantId);
-    return;
-  }
-
-  if (!state.execute) {
-    save(tenantId);
-    return;
-  }
-
-  try {
-    const result = await exchangeRouter.routeLiveOrder({
-      tenantId,
-      symbol,
-      side: plan.action,
-      riskPct: adjustedRisk,
-      price,
-      ts,
-    });
-
-    if (result?.ok && result?.result?.order?.filledQty) {
-      applyFill(state, {
-        symbol,
-        side: plan.action,
-        price,
-        qty: result.result.order.filledQty,
-      });
-    }
-
-    state.orders.push({
-      ts,
-      symbol,
-      side: plan.action,
-      exchange: result?.exchange,
-      ok: result?.ok,
-    });
-
-    if (state.orders.length > MAX_ORDERS)
-      state.orders = state.orders.slice(-MAX_ORDERS);
-
-  } catch (err) {
-    state.lastError = String(err?.message || err);
-  }
-
-  save(tenantId);
-}
-
-/* ================= SNAPSHOT ================= */
+/* =========================================================
+   SNAPSHOT
+========================================================= */
 
 function snapshot(tenantId) {
   const state = load(tenantId);
@@ -443,17 +400,18 @@ function snapshot(tenantId) {
   return {
     ok: true,
     mode: state.mode,
+    regime: state.regime,
+    volatility: state.volatilityScore,
+    leverage: state.dynamicLeverage,
     cash: state.cashBalance,
     equity: state.equity,
-    peakEquity: state.peakEquity,
-    leverage: state.leverage,
     marginUsed: state.marginUsed,
-    maintenanceRequired: maintenanceRequired(state),
+    maintenanceRequired:
+      maintenanceRequired(state),
     liquidation: state.liquidationFlag,
-    fusedSignal: state.fusedSignal,
-    regime: state.regime,
     positions: state.positions,
-    routerHealth: exchangeRouter.getHealth(),
+    routerHealth:
+      exchangeRouter.getHealth(),
   };
 }
 
