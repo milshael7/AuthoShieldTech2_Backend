@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 15 — Institutional Adaptive Leverage Engine
-// Dynamic Volatility Scaling • Cross Margin • Auto Liquidation
-// Router Integrated • Circuit Protected
+// Phase 16 — Institutional Portfolio Netting Engine
+// Adaptive Leverage • Cross Margin • Portfolio Beta Control
+// Correlation-Aware Exposure Engine
 
 const fs = require("fs");
 const path = require("path");
@@ -20,7 +20,10 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
+
 const MAX_POSITION_PER_SYMBOL_PCT = 0.4;
+const MAX_TOTAL_EXPOSURE_PCT = 1.5; // 150% gross
+const MAX_NET_DIRECTIONAL_PCT = 0.75; // 75% directional bias cap
 
 const MAX_LEVERAGE = 5;
 const MIN_LEVERAGE = 1;
@@ -53,7 +56,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 15,
+    version: 16,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -65,7 +68,6 @@ function defaultState() {
     cashBalance: START_BALANCE,
     equity: START_BALANCE,
 
-    leverage: 3,
     dynamicLeverage: 3,
     volatility: 0.002,
 
@@ -79,6 +81,9 @@ function defaultState() {
     lastPrices: {},
     positions: {},
 
+    grossExposure: 0,
+    netExposure: 0,
+
     trades: [],
     orders: [],
     lastError: null,
@@ -87,49 +92,7 @@ function defaultState() {
 
 const STATES = new Map();
 
-/* ================= PERSIST ================= */
-
-function load(tenantId) {
-  if (STATES.has(tenantId)) return STATES.get(tenantId);
-
-  let state = defaultState();
-  const file = statePath(tenantId);
-
-  try {
-    if (fs.existsSync(file)) {
-      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-      state = { ...state, ...raw };
-    }
-  } catch {}
-
-  STATES.set(tenantId, state);
-  return state;
-}
-
-function save(tenantId) {
-  const state = STATES.get(tenantId);
-  if (!state) return;
-
-  state.updatedAt = nowIso();
-
-  try {
-    fs.writeFileSync(
-      statePath(tenantId),
-      JSON.stringify(state, null, 2)
-    );
-  } catch {}
-}
-
-function refreshFlags(state) {
-  state.enabled = envTrue("LIVE_TRADING_ENABLED");
-  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
-
-  if (!state.enabled) state.mode = "live-disabled";
-  else if (state.execute) state.mode = "live-executing";
-  else state.mode = "live-armed";
-}
-
-/* ================= VOLATILITY ================= */
+/* ================= CORE CALCS ================= */
 
 function updateVolatility(state, symbol, price) {
   const last = state.lastPrices[symbol];
@@ -139,60 +102,42 @@ function updateVolatility(state, symbol, price) {
   }
 
   const change = Math.abs(price - last) / last;
-
-  state.volatility =
-    state.volatility * 0.9 + change * 0.1;
-
+  state.volatility = state.volatility * 0.9 + change * 0.1;
   state.lastPrices[symbol] = price;
 }
-
-/* ================= DYNAMIC LEVERAGE ================= */
 
 function updateDynamicLeverage(state) {
   const vol = state.volatility;
 
-  // Low volatility → increase leverage
-  if (vol < 0.003) {
-    state.dynamicLeverage = MAX_LEVERAGE;
-  }
-  // Medium volatility
-  else if (vol < 0.01) {
-    state.dynamicLeverage = 3;
-  }
-  // High volatility
-  else if (vol < 0.02) {
-    state.dynamicLeverage = 2;
-  }
-  // Extreme volatility
-  else {
-    state.dynamicLeverage = MIN_LEVERAGE;
-  }
-
-  state.dynamicLeverage = clamp(
-    state.dynamicLeverage,
-    MIN_LEVERAGE,
-    MAX_LEVERAGE
-  );
+  if (vol < 0.003) state.dynamicLeverage = MAX_LEVERAGE;
+  else if (vol < 0.01) state.dynamicLeverage = 3;
+  else if (vol < 0.02) state.dynamicLeverage = 2;
+  else state.dynamicLeverage = MIN_LEVERAGE;
 
   state.initialMarginPct = 1 / state.dynamicLeverage;
 }
 
-/* ================= EQUITY ENGINE ================= */
-
-function recalcEquity(state) {
+function recalcPortfolio(state) {
   let unrealized = 0;
-  let exposure = 0;
+  let gross = 0;
+  let net = 0;
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
     const price = state.lastPrices[symbol];
     if (!price || !pos.qty) continue;
 
+    const exposure = pos.qty * price;
+
     unrealized += (price - pos.avgEntry) * pos.qty;
-    exposure += Math.abs(pos.qty * price);
+    gross += Math.abs(exposure);
+    net += exposure;
   }
 
+  state.grossExposure = gross;
+  state.netExposure = net;
+
   state.equity = state.cashBalance + unrealized;
-  state.marginUsed = exposure * state.initialMarginPct;
+  state.marginUsed = gross * state.initialMarginPct;
 }
 
 function maintenanceRequired(state) {
@@ -205,7 +150,6 @@ function applyFill(state, { symbol, side, price, qty }) {
   state.positions[symbol] = state.positions[symbol] || {
     qty: 0,
     avgEntry: 0,
-    realizedPnL: 0,
   };
 
   const pos = state.positions[symbol];
@@ -217,67 +161,13 @@ function applyFill(state, { symbol, side, price, qty }) {
       pos.avgEntry * pos.qty + price * signedQty;
 
     pos.qty = newQty;
-    pos.avgEntry =
-      pos.qty !== 0 ? totalCost / pos.qty : 0;
+    pos.avgEntry = pos.qty !== 0 ? totalCost / pos.qty : 0;
   } else {
-    const closingQty = Math.min(
-      Math.abs(pos.qty),
-      Math.abs(signedQty)
-    );
-
-    const pnl =
-      (price - pos.avgEntry) *
-      closingQty *
-      Math.sign(pos.qty);
-
-    pos.realizedPnL += pnl;
-    state.cashBalance += pnl;
-
-    state.trades.push({
-      ts: Date.now(),
-      symbol,
-      qty: closingQty,
-      entry: pos.avgEntry,
-      exit: price,
-      profit: pnl,
-    });
-
     pos.qty = newQty;
-
-    if (pos.qty === 0) pos.avgEntry = 0;
-    else pos.avgEntry = price;
+    pos.avgEntry = price;
   }
 
-  recalcEquity(state);
-}
-
-/* ================= AUTO LIQUIDATION ================= */
-
-async function autoLiquidate(tenantId, state) {
-  state.liquidationFlag = true;
-
-  for (const [symbol, pos] of Object.entries(state.positions)) {
-    if (!pos.qty) continue;
-
-    const side = pos.qty > 0 ? "SELL" : "BUY";
-    const qty = Math.abs(pos.qty);
-
-    await exchangeRouter.routeLiveOrder({
-      tenantId,
-      symbol,
-      side,
-      qty,
-      forceClose: true,
-    });
-
-    state.positions[symbol] = {
-      qty: 0,
-      avgEntry: 0,
-      realizedPnL: 0,
-    };
-  }
-
-  recalcEquity(state);
+  recalcPortfolio(state);
 }
 
 /* ================= TICK ================= */
@@ -290,14 +180,13 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, symbol, price);
   updateDynamicLeverage(state);
-
-  recalcEquity(state);
+  recalcPortfolio(state);
 
   if (
     state.marginUsed > 0 &&
     state.equity <= maintenanceRequired(state)
   ) {
-    await autoLiquidate(tenantId, state);
+    state.liquidationFlag = true;
     save(tenantId);
     return;
   }
@@ -319,10 +208,41 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
+  /* ================= PORTFOLIO NETTING ================= */
+
+  const totalExposureLimit =
+    state.equity * MAX_TOTAL_EXPOSURE_PCT;
+
+  if (state.grossExposure >= totalExposureLimit) {
+    save(tenantId);
+    return;
+  }
+
+  const directionalCap =
+    state.equity * MAX_NET_DIRECTIONAL_PCT;
+
+  let directionalBiasFactor = 1;
+
+  if (
+    plan.action === "BUY" &&
+    state.netExposure > directionalCap
+  ) {
+    directionalBiasFactor = 0.3;
+  }
+
+  if (
+    plan.action === "SELL" &&
+    state.netExposure < -directionalCap
+  ) {
+    directionalBiasFactor = 0.3;
+  }
+
+  const riskCapital =
+    state.equity * plan.riskPct * directionalBiasFactor;
+
   const maxSymbolExposure =
     state.equity * MAX_POSITION_PER_SYMBOL_PCT;
 
-  const riskCapital = state.equity * plan.riskPct;
   const positionValue = clamp(
     riskCapital * state.dynamicLeverage,
     0,
@@ -354,9 +274,8 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       ts,
       symbol,
       side: plan.action,
-      exchange: result?.exchange,
       ok: result?.ok,
-      leverage: state.dynamicLeverage,
+      exchange: result?.exchange,
     });
 
     if (state.orders.length > MAX_ORDERS) {
@@ -371,19 +290,44 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
   save(tenantId);
 }
 
-/* ================= LIFECYCLE ================= */
+/* ================= PERSIST ================= */
 
-function start(tenantId) {
-  const state = load(tenantId);
-  state.running = true;
-  refreshFlags(state);
-  save(tenantId);
+function load(tenantId) {
+  if (STATES.has(tenantId)) return STATES.get(tenantId);
+
+  let state = defaultState();
+  const file = statePath(tenantId);
+
+  try {
+    if (fs.existsSync(file)) {
+      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      state = { ...state, ...raw };
+    }
+  } catch {}
+
+  STATES.set(tenantId, state);
+  return state;
 }
 
-function stop(tenantId) {
-  const state = load(tenantId);
-  state.running = false;
-  save(tenantId);
+function save(tenantId) {
+  const state = STATES.get(tenantId);
+  if (!state) return;
+  state.updatedAt = nowIso();
+  try {
+    fs.writeFileSync(
+      statePath(tenantId),
+      JSON.stringify(state, null, 2)
+    );
+  } catch {}
+}
+
+function refreshFlags(state) {
+  state.enabled = envTrue("LIVE_TRADING_ENABLED");
+  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
+
+  if (!state.enabled) state.mode = "live-disabled";
+  else if (state.execute) state.mode = "live-executing";
+  else state.mode = "live-armed";
 }
 
 /* ================= SNAPSHOT ================= */
@@ -394,13 +338,12 @@ function snapshot(tenantId) {
 
   return {
     ok: true,
-    mode: state.mode,
-    cash: state.cashBalance,
     equity: state.equity,
-    dynamicLeverage: state.dynamicLeverage,
+    grossExposure: state.grossExposure,
+    netExposure: state.netExposure,
+    leverage: state.dynamicLeverage,
     volatility: state.volatility,
     marginUsed: state.marginUsed,
-    maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
     circuitBreaker: state.circuitBreaker,
     positions: state.positions,
@@ -409,8 +352,8 @@ function snapshot(tenantId) {
 }
 
 module.exports = {
-  start,
-  stop,
+  start: (id) => { const s = load(id); s.running = true; save(id); },
+  stop: (id) => { const s = load(id); s.running = false; save(id); },
   tick,
   snapshot,
 };
