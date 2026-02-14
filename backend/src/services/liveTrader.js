@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 9.1 — Institutional Live Engine (Hardened)
-// Strategy → Risk → Portfolio → Execution Abstraction
-// Adapter Ready • Multi-Layer Protected • Tenant Safe
+// Phase 10 — Institutional Live Engine (Router Integrated)
+// Strategy → Risk → Portfolio → ExchangeRouter
+// Failover Ready • Circuit Protected • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -9,6 +9,7 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
+const exchangeRouter = require("./exchangeRouter");
 
 /* ================= CONFIG ================= */
 
@@ -21,6 +22,7 @@ const LIVE_REFERENCE_BALANCE = Number(
 );
 
 const MAX_INTENTS = 200;
+const MAX_ORDERS = 500;
 
 /* ================= ENV FLAGS ================= */
 
@@ -71,7 +73,7 @@ function validAction(a) {
 
 function defaultState() {
   return {
-    version: 9.1,
+    version: 10,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -108,6 +110,7 @@ function defaultState() {
     trades: [],
     intents: [],
     orders: [],
+    executionAudit: [],
     lastError: null,
   };
 }
@@ -196,7 +199,7 @@ function stop(tenantId) {
 
 /* ================= TICK ================= */
 
-function tick(tenantId, symbol, price, ts = Date.now()) {
+async function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
@@ -210,7 +213,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
-  /* ========= 1️⃣ GLOBAL RISK ========= */
+  /* ========= RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -229,7 +232,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 2️⃣ STRATEGY ========= */
+  /* ========= STRATEGY ========= */
 
   const plan = makeDecision({
     tenantId,
@@ -252,7 +255,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 3️⃣ PORTFOLIO ========= */
+  /* ========= PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -266,3 +269,103 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     save(tenantId);
     return;
   }
+
+  /* ========= INTENT ========= */
+
+  const adjustedRisk = clamp(
+    portfolioCheck.adjustedRiskPct *
+      (risk.riskMultiplier || 1),
+    0.001,
+    0.05
+  );
+
+  const intent = {
+    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    ts,
+    symbol,
+    side: plan.action,
+    confidence: plan.confidence,
+    edge: plan.edge,
+    riskPct: adjustedRisk,
+    reason: plan.reason,
+    executed: false,
+  };
+
+  state.intents.push(intent);
+  if (state.intents.length > MAX_INTENTS) {
+    state.intents = state.intents.slice(-MAX_INTENTS);
+  }
+
+  /* ========= EXECUTION ROUTER ========= */
+
+  if (state.execute) {
+    try {
+      const result = await exchangeRouter.routeLiveOrder({
+        tenantId,
+        symbol,
+        side: plan.action,
+        riskPct: adjustedRisk,
+        price: p,
+        ts,
+      });
+
+      intent.executed = true;
+      intent.executionResult = result;
+
+      state.orders.push({
+        ts,
+        symbol,
+        side: plan.action,
+        exchange: result?.exchange || null,
+        ok: result?.ok || false,
+        result,
+      });
+
+      if (state.orders.length > MAX_ORDERS) {
+        state.orders = state.orders.slice(-MAX_ORDERS);
+      }
+
+      state.executionAudit.push({
+        ts,
+        symbol,
+        side: plan.action,
+        exchange: result?.exchange,
+        ok: result?.ok,
+      });
+
+    } catch (err) {
+      state.lastError = String(err?.message || err);
+    }
+  }
+
+  save(tenantId);
+}
+
+/* ================= SNAPSHOT ================= */
+
+function snapshot(tenantId) {
+  const state = load(tenantId);
+  refreshFlags(state);
+
+  return {
+    ok: true,
+    running: state.running,
+    enabled: state.enabled,
+    execute: state.execute,
+    mode: state.mode,
+    stats: state.stats,
+    equity: state.equity,
+    intents: state.intents.slice(-50),
+    orders: state.orders.slice(-50),
+    executionAudit: state.executionAudit.slice(-50),
+    lastError: state.lastError,
+    routerHealth: exchangeRouter.getHealth(),
+  };
+}
+
+module.exports = {
+  start,
+  stop,
+  tick,
+  snapshot,
+};
