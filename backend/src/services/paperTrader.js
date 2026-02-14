@@ -1,5 +1,5 @@
 // backend/src/services/paperTrader.js
-// Phase 9 — Institutional Paper Engine
+// Phase 9.1 — Institutional Paper Engine (Stability Upgrade)
 // Strategy → Risk → Portfolio → ExecutionEngine
 // Fully Adaptive • Multi-Layer Protected • Tenant Safe
 
@@ -137,7 +137,9 @@ function updateVolatility(state, price) {
     return;
   }
 
-  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+  const change =
+    Math.abs(price - state.lastPrice) /
+    state.lastPrice;
 
   state.volatility = clamp(
     state.volatility * 0.9 + change * 0.1,
@@ -184,7 +186,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   updateVolatility(state, price);
   updateEquity(state);
 
-  /* ========= 1️⃣ RISK ========= */
+  /* ========= 1️⃣ GLOBAL RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -224,7 +226,42 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason;
 
-  /* ========= 3️⃣ PORTFOLIO ========= */
+  /* ========= 3️⃣ EXIT FIRST ========= */
+
+  if (
+    (plan.action === "SELL" || plan.action === "CLOSE") &&
+    state.position
+  ) {
+    const result = executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action: plan.action,
+      price,
+      riskPct: 0,
+      state,
+      ts,
+    });
+
+    if (result?.narration) {
+      narrate(
+        tenantId,
+        result.narration.text,
+        result.narration.meta
+      );
+    }
+
+    save(tenantId);
+    return;
+  }
+
+  /* ========= 4️⃣ ENTRY ONLY IF BUY ========= */
+
+  if (plan.action !== "BUY" || state.position) {
+    save(tenantId);
+    return;
+  }
+
+  /* ========= 5️⃣ PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -239,7 +276,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 4️⃣ EXECUTION ENGINE ========= */
+  /* ========= 6️⃣ EXECUTION ========= */
 
   const adjustedRisk = clamp(
     portfolioCheck.adjustedRiskPct *
@@ -251,7 +288,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const result = executionEngine.executePaperOrder({
     tenantId,
     symbol,
-    action: plan.action,
+    action: "BUY",
     price,
     riskPct: adjustedRisk,
     state,
@@ -259,7 +296,11 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   });
 
   if (result?.narration) {
-    narrate(tenantId, result.narration.text, result.narration.meta);
+    narrate(
+      tenantId,
+      result.narration.text,
+      result.narration.meta
+    );
   }
 
   save(tenantId);
