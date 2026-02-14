@@ -1,11 +1,13 @@
 // backend/src/services/liveTrader.js
-// Phase 4 FINAL
+// Phase 5 FINAL
 // Fully aligned with Adaptive StrategyEngine + tradeBrain
+// RiskManager integrated
 // Execution still locked (adapter required)
 
 const fs = require("fs");
 const path = require("path");
 const { makeDecision } = require("./tradeBrain");
+const riskManager = require("./riskManager");
 
 /* ================= CONFIG ================= */
 
@@ -60,7 +62,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 5,
+    version: 6,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -80,7 +82,6 @@ function defaultState() {
       lastReason: "not_started",
     },
 
-    // unified brain structure
     learnStats: {
       ticksSeen: 0,
       confidence: 0,
@@ -93,10 +94,10 @@ function defaultState() {
       lossesToday: 0,
       halted: false,
       haltReason: null,
+      coolingUntil: 0,
     },
 
-    trades: [], // 🔥 required for adaptive learning
-
+    trades: [],
     intents: [],
     orders: [],
     lastError: null,
@@ -137,6 +138,7 @@ function save(tenantId) {
   if (!state) return;
 
   state.updatedAt = nowIso();
+
   try {
     fs.writeFileSync(
       statePath(tenantId),
@@ -204,6 +206,23 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
+  // 🔒 Risk evaluation BEFORE trading
+  const risk = riskManager.evaluate(tenantId, state);
+
+  state.limits.halted = risk.halted;
+  state.limits.haltReason = risk.haltReason || null;
+  state.limits.coolingUntil = risk.coolingUntil || 0;
+
+  if (risk.halted) {
+    save(tenantId);
+    return;
+  }
+
+  if (Date.now() < (risk.coolingUntil || 0)) {
+    save(tenantId);
+    return;
+  }
+
   // 🔥 Unified adaptive decision
   const plan = makeDecision({
     tenantId,
@@ -222,13 +241,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
 
   if (state.enabled && plan.action !== "WAIT") {
+    const adjustedRisk =
+      plan.riskPct * (risk.riskMultiplier || 1);
+
     const intent = {
-      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      id: `${Date.now()}_${Math.random()
+        .toString(16)
+        .slice(2)}`,
       ts,
       symbol,
       side: plan.action,
       confidence: plan.confidence,
       edge: plan.edge,
+      riskPct: adjustedRisk,
       reason: plan.reason,
       executed: false,
     };
@@ -242,12 +267,12 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
         note: "Execution adapter not wired.",
       };
 
-      // placeholder trade log for adaptive feedback
+      // placeholder trade record for adaptive learning
       state.trades.push({
         time: ts,
         symbol,
         type: plan.action,
-        profit: 0, // will be real when adapter connected
+        profit: 0,
       });
 
       state.trades = state.trades.slice(-200);
