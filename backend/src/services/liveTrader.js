@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 14 — Institutional Live Engine
-// Cross Margin • Dynamic Leverage • Fill Engine • Auto Liquidation
-// Router Integrated • Production Structured
+// Phase 15 — Institutional Adaptive Leverage Engine
+// Dynamic Volatility Scaling • Cross Margin • Auto Liquidation
+// Router Integrated • Circuit Protected
 
 const fs = require("fs");
 const path = require("path");
@@ -20,7 +20,10 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
-const MAX_POSITION_PER_SYMBOL_PCT = 0.4; // 40% of equity cap
+const MAX_POSITION_PER_SYMBOL_PCT = 0.4;
+
+const MAX_LEVERAGE = 5;
+const MIN_LEVERAGE = 1;
 
 /* ================= HELPERS ================= */
 
@@ -50,7 +53,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 14,
+    version: 15,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -63,6 +66,9 @@ function defaultState() {
     equity: START_BALANCE,
 
     leverage: 3,
+    dynamicLeverage: 3,
+    volatility: 0.002,
+
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
 
@@ -121,6 +127,54 @@ function refreshFlags(state) {
   if (!state.enabled) state.mode = "live-disabled";
   else if (state.execute) state.mode = "live-executing";
   else state.mode = "live-armed";
+}
+
+/* ================= VOLATILITY ================= */
+
+function updateVolatility(state, symbol, price) {
+  const last = state.lastPrices[symbol];
+  if (!last) {
+    state.lastPrices[symbol] = price;
+    return;
+  }
+
+  const change = Math.abs(price - last) / last;
+
+  state.volatility =
+    state.volatility * 0.9 + change * 0.1;
+
+  state.lastPrices[symbol] = price;
+}
+
+/* ================= DYNAMIC LEVERAGE ================= */
+
+function updateDynamicLeverage(state) {
+  const vol = state.volatility;
+
+  // Low volatility → increase leverage
+  if (vol < 0.003) {
+    state.dynamicLeverage = MAX_LEVERAGE;
+  }
+  // Medium volatility
+  else if (vol < 0.01) {
+    state.dynamicLeverage = 3;
+  }
+  // High volatility
+  else if (vol < 0.02) {
+    state.dynamicLeverage = 2;
+  }
+  // Extreme volatility
+  else {
+    state.dynamicLeverage = MIN_LEVERAGE;
+  }
+
+  state.dynamicLeverage = clamp(
+    state.dynamicLeverage,
+    MIN_LEVERAGE,
+    MAX_LEVERAGE
+  );
+
+  state.initialMarginPct = 1 / state.dynamicLeverage;
 }
 
 /* ================= EQUITY ENGINE ================= */
@@ -190,11 +244,8 @@ function applyFill(state, { symbol, side, price, qty }) {
 
     pos.qty = newQty;
 
-    if (pos.qty === 0) {
-      pos.avgEntry = 0;
-    } else {
-      pos.avgEntry = price;
-    }
+    if (pos.qty === 0) pos.avgEntry = 0;
+    else pos.avgEntry = price;
   }
 
   recalcEquity(state);
@@ -211,23 +262,19 @@ async function autoLiquidate(tenantId, state) {
     const side = pos.qty > 0 ? "SELL" : "BUY";
     const qty = Math.abs(pos.qty);
 
-    try {
-      await exchangeRouter.routeLiveOrder({
-        tenantId,
-        symbol,
-        side,
-        qty,
-        forceClose: true,
-      });
+    await exchangeRouter.routeLiveOrder({
+      tenantId,
+      symbol,
+      side,
+      qty,
+      forceClose: true,
+    });
 
-      state.positions[symbol] = {
-        qty: 0,
-        avgEntry: 0,
-        realizedPnL: 0,
-      };
-    } catch (err) {
-      state.lastError = String(err?.message || err);
-    }
+    state.positions[symbol] = {
+      qty: 0,
+      avgEntry: 0,
+      realizedPnL: 0,
+    };
   }
 
   recalcEquity(state);
@@ -241,7 +288,9 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   refreshFlags(state);
 
-  state.lastPrices[symbol] = price;
+  updateVolatility(state, symbol, price);
+  updateDynamicLeverage(state);
+
   recalcEquity(state);
 
   if (
@@ -275,7 +324,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   const riskCapital = state.equity * plan.riskPct;
   const positionValue = clamp(
-    riskCapital * state.leverage,
+    riskCapital * state.dynamicLeverage,
     0,
     maxSymbolExposure
   );
@@ -299,8 +348,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
         price,
         qty,
       });
-    } else {
-      state.lastError = result?.error;
     }
 
     state.orders.push({
@@ -309,6 +356,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       side: plan.action,
       exchange: result?.exchange,
       ok: result?.ok,
+      leverage: state.dynamicLeverage,
     });
 
     if (state.orders.length > MAX_ORDERS) {
@@ -349,7 +397,8 @@ function snapshot(tenantId) {
     mode: state.mode,
     cash: state.cashBalance,
     equity: state.equity,
-    leverage: state.leverage,
+    dynamicLeverage: state.dynamicLeverage,
+    volatility: state.volatility,
     marginUsed: state.marginUsed,
     maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
