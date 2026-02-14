@@ -1,9 +1,11 @@
 // backend/src/services/liveTrader.js
-// Live Trading Engine — Phase 2 (Brain Aligned, Execution Locked)
+// Live Trading Engine — Phase 2 FINAL
+// Architecture: liveTrader → tradeBrain → strategyEngine
+// Execution still locked (adapter required)
 
 const fs = require("fs");
 const path = require("path");
-const { buildDecision } = require("./strategyEngine");
+const { makeDecision } = require("./tradeBrain");
 
 /* ================= CONFIG ================= */
 
@@ -50,15 +52,11 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function dayKey(ts) {
-  return new Date(ts).toISOString().slice(0, 10);
-}
-
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
-    version: 2,
+    version: 3,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -67,10 +65,7 @@ function defaultState() {
     execute: false,
     mode: "live-disabled",
 
-    dayKey: dayKey(Date.now()),
-
     lastPrice: null,
-    volatility: 0.002,
 
     stats: {
       ticksSeen: 0,
@@ -133,22 +128,6 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
-/* ================= CORE ================= */
-
-function updateVolatility(state, price) {
-  if (!state.lastPrice) {
-    state.lastPrice = price;
-    return;
-  }
-
-  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
-
-  state.volatility =
-    state.volatility * 0.9 + change * 0.1;
-
-  state.lastPrice = price;
-}
-
 /* ================= LIFECYCLE ================= */
 
 function start(tenantId) {
@@ -176,21 +155,24 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   if (!Number.isFinite(p)) return;
 
   state.stats.ticksSeen++;
-  updateVolatility(state, p);
+  state.lastPrice = p;
 
-  const plan = buildDecision({
+  // 🔥 USE UNIFIED BRAIN
+  const plan = makeDecision({
     symbol,
-    price: p,
-    volatility: state.volatility,
-    limits: {},
+    last: p,
+    paper: {
+      learnStats: {},
+      limits: {},
+      config: {},
+    },
   });
 
   state.stats.lastDecision = plan.action;
   state.stats.confidence = plan.confidence;
   state.stats.edge = plan.edge;
-  state.stats.lastReason = plan.reason;
+  state.stats.lastReason = plan.blockedReason || plan.action;
 
-  // Log intent only if armed
   if (state.enabled && plan.action !== "WAIT") {
     const intent = {
       id: `${Date.now()}_${Math.random()
@@ -201,7 +183,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       side: plan.action,
       confidence: plan.confidence,
       edge: plan.edge,
-      reason: plan.reason,
+      reason: plan.blockedReason || plan.action,
       executed: false,
     };
 
