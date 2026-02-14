@@ -1,8 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 5 FINAL
-// Fully aligned with Adaptive StrategyEngine + tradeBrain
-// RiskManager integrated
-// Execution still locked (adapter required)
+// Phase 6 — Institutional Live Engine
+// Fully Adaptive • RiskManager Correctly Integrated • Tenant Safe
+// Execution adapter still required
 
 const fs = require("fs");
 const path = require("path");
@@ -62,7 +61,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 6,
+    version: 7,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -73,6 +72,7 @@ function defaultState() {
 
     lastPrice: null,
     volatility: 0.002,
+    equity: LIVE_REFERENCE_BALANCE,
 
     stats: {
       ticksSeen: 0,
@@ -90,11 +90,9 @@ function defaultState() {
     },
 
     limits: {
-      tradesToday: 0,
-      lossesToday: 0,
       halted: false,
       haltReason: null,
-      coolingUntil: 0,
+      cooling: false,
     },
 
     trades: [],
@@ -119,8 +117,8 @@ const STATES = new Map();
 function load(tenantId) {
   if (STATES.has(tenantId)) return STATES.get(tenantId);
 
-  const file = statePath(tenantId);
   let state = defaultState();
+  const file = statePath(tenantId);
 
   try {
     if (fs.existsSync(file)) {
@@ -206,24 +204,27 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
-  // 🔒 Risk evaluation BEFORE trading
-  const risk = riskManager.evaluate(tenantId, state);
+  /* ======== RISK EVALUATION (CORRECT SHAPE) ======== */
+
+  const risk = riskManager.evaluate({
+    tenantId,
+    equity: state.equity,
+    volatility: state.volatility,
+    trades: state.trades,
+    ts,
+  });
 
   state.limits.halted = risk.halted;
   state.limits.haltReason = risk.haltReason || null;
-  state.limits.coolingUntil = risk.coolingUntil || 0;
+  state.limits.cooling = risk.cooling;
 
-  if (risk.halted) {
+  if (risk.halted || risk.cooling) {
     save(tenantId);
     return;
   }
 
-  if (Date.now() < (risk.coolingUntil || 0)) {
-    save(tenantId);
-    return;
-  }
+  /* ======== DECISION ======== */
 
-  // 🔥 Unified adaptive decision
   const plan = makeDecision({
     tenantId,
     symbol,
@@ -241,8 +242,11 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
 
   if (state.enabled && plan.action !== "WAIT") {
-    const adjustedRisk =
-      plan.riskPct * (risk.riskMultiplier || 1);
+    const adjustedRisk = clamp(
+      plan.riskPct * (risk.riskMultiplier || 1),
+      0.001,
+      0.05
+    );
 
     const intent = {
       id: `${Date.now()}_${Math.random()
