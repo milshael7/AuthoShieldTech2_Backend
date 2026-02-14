@@ -100,8 +100,7 @@ app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
 app.use(tenantMiddleware);
 
 /* =========================================================
-   GLOBAL TENANT ENGINE REGISTRATION
-   (CRITICAL: Must run BEFORE routes)
+   TENANT ENGINE REGISTRY
 ========================================================= */
 
 const ACTIVE_TENANTS = new Set();
@@ -114,9 +113,11 @@ function registerTenant(tenantId) {
 
   paperTrader.start?.(tenantId);
   liveTrader.start?.(tenantId);
+
+  console.log("[engine] registered tenant:", tenantId);
 }
 
-// 🔥 REGISTER TENANT IMMEDIATELY AFTER TENANT MIDDLEWARE
+/* Auto-register tenant on first authenticated request */
 app.use((req, res, next) => {
   const tenantId = req.tenant?.id || req.tenantId;
   if (tenantId) registerTenant(tenantId);
@@ -168,7 +169,7 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
-   KRAKEN FEED
+   KRAKEN FEED (GLOBAL TICK ROUTER)
 ========================================================= */
 
 let krakenStop = null;
@@ -179,6 +180,8 @@ try {
 
     onTick: (tick) => {
       last[tick.symbol] = tick.price;
+
+      if (ACTIVE_TENANTS.size === 0) return;
 
       for (const tenantId of ACTIVE_TENANTS) {
         paperTrader.tick(
