@@ -1,7 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 16 — Institutional Portfolio Netting Engine
-// Adaptive Leverage • Cross Margin • Portfolio Beta Control
-// Correlation-Aware Exposure Engine
+// Phase 17 — Liquidity-Aware Institutional Engine
+// Portfolio Netting + Dynamic Leverage + Liquidity Throttle
 
 const fs = require("fs");
 const path = require("path");
@@ -21,9 +20,9 @@ const START_BALANCE = Number(
 
 const MAX_ORDERS = 500;
 
+const MAX_TOTAL_EXPOSURE_PCT = 1.5;
+const MAX_NET_DIRECTIONAL_PCT = 0.75;
 const MAX_POSITION_PER_SYMBOL_PCT = 0.4;
-const MAX_TOTAL_EXPOSURE_PCT = 1.5; // 150% gross
-const MAX_NET_DIRECTIONAL_PCT = 0.75; // 75% directional bias cap
 
 const MAX_LEVERAGE = 5;
 const MIN_LEVERAGE = 1;
@@ -56,7 +55,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 16,
+    version: 17,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -70,6 +69,7 @@ function defaultState() {
 
     dynamicLeverage: 3,
     volatility: 0.002,
+    acceleration: 0,
 
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
@@ -92,7 +92,7 @@ function defaultState() {
 
 const STATES = new Map();
 
-/* ================= CORE CALCS ================= */
+/* ================= MARKET METRICS ================= */
 
 function updateVolatility(state, symbol, price) {
   const last = state.lastPrices[symbol];
@@ -101,8 +101,10 @@ function updateVolatility(state, symbol, price) {
     return;
   }
 
-  const change = Math.abs(price - last) / last;
-  state.volatility = state.volatility * 0.9 + change * 0.1;
+  const change = (price - last) / last;
+  state.volatility = state.volatility * 0.9 + Math.abs(change) * 0.1;
+  state.acceleration = state.acceleration * 0.9 + change * 0.1;
+
   state.lastPrices[symbol] = price;
 }
 
@@ -116,6 +118,26 @@ function updateDynamicLeverage(state) {
 
   state.initialMarginPct = 1 / state.dynamicLeverage;
 }
+
+/* ================= LIQUIDITY MODEL ================= */
+
+function computeLiquidityFactor(state) {
+  const vol = state.volatility;
+  const accel = Math.abs(state.acceleration);
+
+  let factor = 1;
+
+  if (vol > 0.02) factor *= 0.4;
+  else if (vol > 0.01) factor *= 0.6;
+  else if (vol > 0.005) factor *= 0.8;
+
+  if (accel > 0.01) factor *= 0.6;
+  else if (accel > 0.005) factor *= 0.8;
+
+  return clamp(factor, 0.2, 1);
+}
+
+/* ================= PORTFOLIO CALC ================= */
 
 function recalcPortfolio(state) {
   let unrealized = 0;
@@ -135,13 +157,8 @@ function recalcPortfolio(state) {
 
   state.grossExposure = gross;
   state.netExposure = net;
-
   state.equity = state.cashBalance + unrealized;
   state.marginUsed = gross * state.initialMarginPct;
-}
-
-function maintenanceRequired(state) {
-  return state.marginUsed * state.maintenanceMarginPct;
 }
 
 /* ================= POSITION ENGINE ================= */
@@ -184,7 +201,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   if (
     state.marginUsed > 0 &&
-    state.equity <= maintenanceRequired(state)
+    state.equity <= state.marginUsed * state.maintenanceMarginPct
   ) {
     state.liquidationFlag = true;
     save(tenantId);
@@ -208,48 +225,40 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ================= PORTFOLIO NETTING ================= */
-
-  const totalExposureLimit =
-    state.equity * MAX_TOTAL_EXPOSURE_PCT;
-
-  if (state.grossExposure >= totalExposureLimit) {
+  if (state.grossExposure >= state.equity * MAX_TOTAL_EXPOSURE_PCT) {
     save(tenantId);
     return;
   }
 
-  const directionalCap =
-    state.equity * MAX_NET_DIRECTIONAL_PCT;
+  /* ================= LIQUIDITY ADJUSTMENT ================= */
 
-  let directionalBiasFactor = 1;
+  const liquidityFactor = computeLiquidityFactor(state);
 
-  if (
-    plan.action === "BUY" &&
-    state.netExposure > directionalCap
-  ) {
-    directionalBiasFactor = 0.3;
-  }
+  const directionalCap = state.equity * MAX_NET_DIRECTIONAL_PCT;
 
-  if (
-    plan.action === "SELL" &&
-    state.netExposure < -directionalCap
-  ) {
-    directionalBiasFactor = 0.3;
-  }
+  let directionalFactor = 1;
 
-  const riskCapital =
-    state.equity * plan.riskPct * directionalBiasFactor;
+  if (plan.action === "BUY" && state.netExposure > directionalCap)
+    directionalFactor = 0.3;
 
-  const maxSymbolExposure =
-    state.equity * MAX_POSITION_PER_SYMBOL_PCT;
+  if (plan.action === "SELL" && state.netExposure < -directionalCap)
+    directionalFactor = 0.3;
 
-  const positionValue = clamp(
-    riskCapital * state.dynamicLeverage,
+  const adjustedRisk =
+    plan.riskPct * liquidityFactor * directionalFactor;
+
+  const positionValue =
+    state.equity *
+    adjustedRisk *
+    state.dynamicLeverage;
+
+  const cappedPositionValue = clamp(
+    positionValue,
     0,
-    maxSymbolExposure
+    state.equity * MAX_POSITION_PER_SYMBOL_PCT
   );
 
-  const qty = positionValue / price;
+  const qty = cappedPositionValue / price;
 
   try {
     const result = await exchangeRouter.routeLiveOrder({
@@ -278,9 +287,8 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       exchange: result?.exchange,
     });
 
-    if (state.orders.length > MAX_ORDERS) {
+    if (state.orders.length > MAX_ORDERS)
       state.orders = state.orders.slice(-MAX_ORDERS);
-    }
 
   } catch (err) {
     state.lastError = String(err?.message || err);
@@ -314,20 +322,13 @@ function save(tenantId) {
   if (!state) return;
   state.updatedAt = nowIso();
   try {
-    fs.writeFileSync(
-      statePath(tenantId),
-      JSON.stringify(state, null, 2)
-    );
+    fs.writeFileSync(statePath(tenantId), JSON.stringify(state, null, 2));
   } catch {}
 }
 
 function refreshFlags(state) {
   state.enabled = envTrue("LIVE_TRADING_ENABLED");
   state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
-
-  if (!state.enabled) state.mode = "live-disabled";
-  else if (state.execute) state.mode = "live-executing";
-  else state.mode = "live-armed";
 }
 
 /* ================= SNAPSHOT ================= */
@@ -343,6 +344,7 @@ function snapshot(tenantId) {
     netExposure: state.netExposure,
     leverage: state.dynamicLeverage,
     volatility: state.volatility,
+    liquidityFactor: computeLiquidityFactor(state),
     marginUsed: state.marginUsed,
     liquidation: state.liquidationFlag,
     circuitBreaker: state.circuitBreaker,
