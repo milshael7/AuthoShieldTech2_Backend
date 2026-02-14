@@ -1,133 +1,154 @@
 // backend/src/services/adapters/binanceAdapter.js
-// Phase 10 — Binance Execution Adapter
-// Live REST integration ready
-// Safe by default • Dry-run capable • Signed request support scaffolded
+// Phase 10 — Binance Adapter (Institutional Grade Skeleton)
+// Router compatible • Signed request scaffold • Sandbox safe
 
 const crypto = require("crypto");
-const fetch = require("node-fetch");
 
-const BINANCE_BASE =
-  process.env.BINANCE_BASE_URL || "https://api.binance.com";
+/* =========================================================
+   CONFIG (ENV will be wired later)
+========================================================= */
 
-const API_KEY = process.env.BINANCE_API_KEY || null;
-const API_SECRET = process.env.BINANCE_API_SECRET || null;
-
-const DRY_RUN =
-  String(process.env.EXECUTION_DRY_RUN || "true")
-    .toLowerCase()
-    .trim() !== "false";
+const CONFIG = Object.freeze({
+  name: "binance",
+  sandbox: true, // default safe mode
+});
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
-function requireKeys() {
-  if (!API_KEY || !API_SECRET) {
-    throw new Error("Binance API keys missing.");
-  }
+function safeNum(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function sign(query) {
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function buildOrderId() {
+  return `binance_${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}`;
+}
+
+function signQuery(secret, queryString) {
+  if (!secret) return null;
   return crypto
-    .createHmac("sha256", API_SECRET)
-    .update(query)
+    .createHmac("sha256", secret)
+    .update(queryString)
     .digest("hex");
 }
 
-function buildQuery(params = {}) {
-  return Object.entries(params)
-    .filter(([_, v]) => v !== undefined && v !== null)
-    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-    .join("&");
+/* =========================================================
+   PARAM NORMALIZATION
+========================================================= */
+
+function normalizeParams(params = {}) {
+  return {
+    symbol: String(params.symbol || "").toUpperCase(),
+    side: String(params.side || "").toUpperCase(),
+    qty: safeNum(params.qty, 0),
+    price: safeNum(params.price, 0),
+    riskPct: safeNum(params.riskPct, 0),
+    type: "MARKET", // default
+    clientOrderId: params.clientOrderId || buildOrderId(),
+  };
 }
 
 /* =========================================================
-   EXECUTE LIVE ORDER
+   EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
-  const {
-    symbol,
-    side,
-    riskPct,
-    equity,
-  } = params;
+  const startedAt = Date.now();
 
-  if (!symbol || !side) {
-    throw new Error("Missing symbol or side.");
-  }
+  const order = normalizeParams(params);
 
-  if (DRY_RUN) {
+  if (!order.symbol || !order.side || !order.qty) {
     return {
-      mode: "dry-run",
-      exchange: "binance",
-      symbol,
-      side,
-      simulated: true,
-      ts: Date.now(),
+      ok: false,
+      exchange: CONFIG.name,
+      error: "Invalid order parameters",
     };
   }
 
-  requireKeys();
+  /* =====================================================
+     SANDBOX MODE (SAFE DEFAULT)
+  ===================================================== */
 
-  if (!Number.isFinite(equity) || !Number.isFinite(riskPct)) {
-    throw new Error("Invalid equity or riskPct.");
+  if (CONFIG.sandbox) {
+    return buildResponse({
+      order,
+      status: "SIMULATED",
+      filledQty: order.qty,
+      avgPrice: order.price,
+      latencyMs: Date.now() - startedAt,
+    });
   }
 
-  const notional = equity * riskPct;
+  /*
+    PRODUCTION FLOW (NOT ENABLED YET)
+    -------------------------------------------------------
+    1. Build query string
+    2. Sign with secret
+    3. Send HTTPS request
+    4. Normalize response
+  */
 
-  if (notional <= 0) {
-    throw new Error("Notional too small.");
+  try {
+    throw new Error("Live Binance execution not implemented.");
+  } catch (err) {
+    return {
+      ok: false,
+      exchange: CONFIG.name,
+      error: err.message || "Execution failure",
+    };
   }
+}
 
-  const quantity = notional; 
-  // NOTE:
-  // In production, you MUST convert notional to lot-size-adjusted quantity.
-  // This is intentionally simplified scaffold logic.
+/* =========================================================
+   RESPONSE BUILDER
+========================================================= */
 
-  const timestamp = Date.now();
-
-  const orderParams = {
-    symbol,
-    side,
-    type: "MARKET",
-    quantity,
-    timestamp,
-  };
-
-  const query = buildQuery(orderParams);
-  const signature = sign(query);
-
-  const finalQuery = `${query}&signature=${signature}`;
-
-  const response = await fetch(
-    `${BINANCE_BASE}/api/v3/order`,
-    {
-      method: "POST",
-      headers: {
-        "X-MBX-APIKEY": API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: finalQuery,
-    }
-  );
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Binance error: ${text}`);
-  }
-
-  const data = await response.json();
-
+function buildResponse({
+  order,
+  status,
+  filledQty,
+  avgPrice,
+  latencyMs,
+}) {
   return {
-    mode: "live",
-    exchange: "binance",
-    symbol,
-    side,
-    orderId: data.orderId,
-    status: data.status,
-    raw: data,
-    ts: Date.now(),
+    ok: true,
+    exchange: CONFIG.name,
+
+    order: {
+      symbol: order.symbol,
+      side: order.side,
+      requestedQty: order.qty,
+      filledQty,
+      avgPrice,
+      status,
+      clientOrderId: order.clientOrderId,
+    },
+
+    metrics: {
+      latencyMs,
+      timestamp: nowIso(),
+    },
+  };
+}
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+function health() {
+  return {
+    ok: true,
+    exchange: CONFIG.name,
+    sandbox: CONFIG.sandbox,
+    time: nowIso(),
   };
 }
 
@@ -137,4 +158,5 @@ async function executeLiveOrder(params = {}) {
 
 module.exports = {
   executeLiveOrder,
+  health,
 };
