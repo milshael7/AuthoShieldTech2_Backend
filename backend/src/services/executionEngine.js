@@ -1,8 +1,9 @@
 // backend/src/services/executionEngine.js
-// Phase 9.5 — Institutional Execution Engine
-// Partial Fills • Slippage Bands • Latency Simulation
-// Execution Audit Trail • Fill Quality Metrics
-// Unified for Paper + Future Live Adapter
+// Phase 10 — Institutional Execution Engine
+// Paper + Live Unified Layer
+// Partial Fills • Slippage • Routing • Audit Trail • Adapter Safe
+
+const exchangeRouter = require("./exchangeRouter");
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -23,6 +24,10 @@ const CONFIG = Object.freeze({
   minPartialFillPct: 0.4,
 
   simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 15),
+
+  liveDryRun: String(process.env.LIVE_DRY_RUN || "true")
+    .toLowerCase()
+    .trim() !== "false",
 });
 
 /* =========================================================
@@ -79,8 +84,28 @@ function buildExecutionId() {
     .slice(2)}`;
 }
 
+function pushAudit(state, record) {
+  state.executionAudit = state.executionAudit || [];
+  state.executionAudit.push({
+    ts: Date.now(),
+    ...record,
+  });
+
+  state.executionAudit =
+    state.executionAudit.slice(-500);
+}
+
+function narration(text, meta) {
+  return {
+    narration: {
+      text,
+      meta,
+    },
+  };
+}
+
 /* =========================================================
-   CORE PAPER EXECUTION
+   PAPER EXECUTION
 ========================================================= */
 
 function executePaperOrder({
@@ -141,7 +166,7 @@ function executePaperOrder({
     recalcEquity(state);
 
     pushAudit(state, {
-      type: "ENTRY",
+      type: "PAPER_ENTRY",
       symbol,
       qty,
       price: slippedPrice,
@@ -151,12 +176,7 @@ function executePaperOrder({
 
     return narration(
       `Entered ${symbol} at ${slippedPrice.toFixed(2)}`,
-      {
-        action: "BUY",
-        qty,
-        slippedPrice,
-        executionId,
-      }
+      { action: "BUY", qty, executionId }
     );
   }
 
@@ -207,7 +227,7 @@ function executePaperOrder({
     recalcEquity(state);
 
     pushAudit(state, {
-      type: "EXIT",
+      type: "PAPER_EXIT",
       symbol,
       qty,
       price: slippedPrice,
@@ -219,11 +239,7 @@ function executePaperOrder({
       `Closed ${symbol}. ${
         pnl >= 0 ? "Profit" : "Loss"
       } ${pnl.toFixed(2)}`,
-      {
-        action: "CLOSE",
-        pnl,
-        executionId,
-      }
+      { action: "CLOSE", pnl, executionId }
     );
   }
 
@@ -231,27 +247,48 @@ function executePaperOrder({
 }
 
 /* =========================================================
-   AUDIT TRAIL
+   LIVE EXECUTION (ROUTED)
 ========================================================= */
 
-function pushAudit(state, record) {
-  state.executionAudit = state.executionAudit || [];
-  state.executionAudit.push({
-    ts: Date.now(),
-    ...record,
-  });
+async function executeLiveOrder(params = {}) {
+  const executionId = buildExecutionId();
 
-  state.executionAudit =
-    state.executionAudit.slice(-500);
-}
+  if (CONFIG.liveDryRun) {
+    return {
+      ok: true,
+      dryRun: true,
+      executionId,
+      note: "LIVE_DRY_RUN enabled — no exchange call made.",
+    };
+  }
 
-function narration(text, meta) {
-  return {
-    narration: {
-      text,
-      meta,
-    },
-  };
+  try {
+    const routed = await exchangeRouter.routeLiveOrder({
+      ...params,
+      executionId,
+    });
+
+    if (!routed.ok) {
+      return {
+        ok: false,
+        executionId,
+        error: routed.error,
+      };
+    }
+
+    return {
+      ok: true,
+      executionId,
+      exchange: routed.exchange,
+      result: routed.result,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      executionId,
+      error: String(err?.message || err),
+    };
+  }
 }
 
 /* =========================================================
@@ -260,4 +297,5 @@ function narration(text, meta) {
 
 module.exports = {
   executePaperOrder,
+  executeLiveOrder,
 };
