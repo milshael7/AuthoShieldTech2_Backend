@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 23 — Institutional Live Engine
-// Symbol-Isolated MTF + Margin Ratio Engine
-// Cross Margin + Tiered Liquidation Model
+// Phase 24 — Institutional Live Engine
+// Volatility-Adaptive Leverage + Margin Ratio Engine
+// Cross Margin • Tiered Liquidation • Risk Compression
 
 const fs = require("fs");
 const path = require("path");
@@ -23,8 +23,13 @@ const MAX_ORDERS = 500;
 
 /* === Margin Risk Buffers === */
 
-const LIQUIDATION_BUFFER = 1.15;  // warning zone
-const CRITICAL_BUFFER = 1.02;     // near liquidation
+const LIQUIDATION_BUFFER = 1.15;
+const CRITICAL_BUFFER = 1.02;
+
+/* === Volatility Thresholds === */
+
+const LOW_VOL = 0.003;
+const HIGH_VOL = 0.02;
 
 /* ================= HELPERS ================= */
 
@@ -50,7 +55,7 @@ function envTrue(name) {
 
 function defaultState() {
   return {
-    version: 23,
+    version: 24,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -63,21 +68,20 @@ function defaultState() {
     equity: START_BALANCE,
 
     leverage: 3,
+    dynamicLeverage: 3,
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
-    marginUsed: 0,
 
+    marginUsed: 0,
     marginRatio: Infinity,
     marginWarning: false,
     marginCritical: false,
-    liquidationFlag: false,
     liquidationCount: 0,
+
+    volatility: 0.005,
 
     lastPrices: {},
     positions: {},
-
-    timeframes: {},
-    fusedSignals: {},
 
     trades: [],
     orders: [],
@@ -129,6 +133,42 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
+/* ================= VOLATILITY ENGINE ================= */
+
+function updateVolatility(state, symbol, price) {
+  const prev = state.lastPrices[symbol];
+  if (!prev) return;
+
+  const change = Math.abs(price - prev) / prev;
+
+  state.volatility =
+    state.volatility * 0.9 + change * 0.1;
+}
+
+/* ================= LEVERAGE ENGINE ================= */
+
+function updateDynamicLeverage(state) {
+  let baseLeverage = 3;
+
+  if (state.volatility < LOW_VOL)
+    baseLeverage = 5;
+
+  if (state.volatility > HIGH_VOL)
+    baseLeverage = 1.5;
+
+  if (state.marginWarning)
+    baseLeverage *= 0.75;
+
+  if (state.marginCritical)
+    baseLeverage *= 0.5;
+
+  if (state.liquidationCount > 0)
+    baseLeverage *= 0.7;
+
+  state.dynamicLeverage = Math.max(1, baseLeverage);
+  state.initialMarginPct = 1 / state.dynamicLeverage;
+}
+
 /* ================= EQUITY + MARGIN ================= */
 
 function recalcEquity(state) {
@@ -146,10 +186,13 @@ function recalcEquity(state) {
   state.equity = state.cashBalance + unrealized;
   state.marginUsed = exposure * state.initialMarginPct;
 
-  const maintenance = state.marginUsed * state.maintenanceMarginPct;
+  const maintenance =
+    state.marginUsed * state.maintenanceMarginPct;
 
   state.marginRatio =
-    maintenance > 0 ? state.equity / maintenance : Infinity;
+    maintenance > 0
+      ? state.equity / maintenance
+      : Infinity;
 
   state.marginWarning =
     state.marginRatio <= LIQUIDATION_BUFFER;
@@ -158,14 +201,9 @@ function recalcEquity(state) {
     state.marginRatio <= CRITICAL_BUFFER;
 }
 
-function maintenanceRequired(state) {
-  return state.marginUsed * state.maintenanceMarginPct;
-}
-
 /* ================= AUTO LIQUIDATION ================= */
 
 async function autoLiquidate(tenantId, state) {
-  state.liquidationFlag = true;
   state.liquidationCount++;
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
@@ -176,13 +214,14 @@ async function autoLiquidate(tenantId, state) {
     const price = state.lastPrices[symbol];
 
     try {
-      const result = await exchangeRouter.routeLiveOrder({
-        tenantId,
-        symbol,
-        side,
-        qty,
-        forceClose: true,
-      });
+      const result =
+        await exchangeRouter.routeLiveOrder({
+          tenantId,
+          symbol,
+          side,
+          qty,
+          forceClose: true,
+        });
 
       if (result?.ok) {
         const pnl =
@@ -212,7 +251,6 @@ async function autoLiquidate(tenantId, state) {
     }
   }
 
-  state.liquidationFlag = false;
   recalcEquity(state);
 }
 
@@ -239,11 +277,13 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   refreshFlags(state);
 
+  updateVolatility(state, symbol, price);
+
   state.lastPrices[symbol] = price;
 
-  recalcEquity(state);
+  updateDynamicLeverage(state);
 
-  /* === HARD LIQUIDATION === */
+  recalcEquity(state);
 
   if (state.marginRatio <= 1) {
     await autoLiquidate(tenantId, state);
@@ -269,14 +309,15 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
   }
 
   try {
-    const result = await exchangeRouter.routeLiveOrder({
-      tenantId,
-      symbol,
-      side: plan.action,
-      riskPct: plan.riskPct,
-      price,
-      ts,
-    });
+    const result =
+      await exchangeRouter.routeLiveOrder({
+        tenantId,
+        symbol,
+        side: plan.action,
+        riskPct: plan.riskPct,
+        price,
+        ts,
+      });
 
     state.orders.push({
       ts,
@@ -306,11 +347,13 @@ function snapshot(tenantId) {
     ok: true,
     mode: state.mode,
     equity: state.equity,
+    dynamicLeverage: state.dynamicLeverage,
     marginUsed: state.marginUsed,
     marginRatio: state.marginRatio,
     warning: state.marginWarning,
     critical: state.marginCritical,
     liquidationCount: state.liquidationCount,
+    volatility: state.volatility,
     positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
