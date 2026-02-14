@@ -1,11 +1,15 @@
 // backend/src/services/paperTrader.js
-// Phase 5 — Institutional Paper Engine
-// Fully Adaptive • RiskManager Correctly Integrated • Tenant Safe
+// Phase 6 — Institutional Paper Engine
+// Strategy → Risk → Portfolio → Execution
+// Fully Adaptive • Multi-Layer Protected • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
+
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
+const portfolioManager = require("./portfolioManager");
+
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
@@ -194,6 +198,7 @@ function openPosition(state, tenantId, symbol, price, riskPct) {
 
   narrate(tenantId, `Entered ${symbol} at ${price}`, {
     action: "BUY",
+    usd,
   });
 }
 
@@ -247,7 +252,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   updateVolatility(state, price);
   updateEquity(state, price);
 
-  /* ======== RISK EVALUATION (CORRECT SHAPE) ======== */
+  /* ========= 1️⃣ GLOBAL RISK LAYER ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -271,7 +276,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ======== DECISION ======== */
+  /* ========= 2️⃣ STRATEGY DECISION ========= */
 
   const plan = makeDecision({
     tenantId,
@@ -285,22 +290,46 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason;
 
-  if (plan.action === "BUY" && !state.position) {
-    const adjustedRisk = clamp(
-      plan.riskPct * (risk.riskMultiplier || 1),
-      0.001,
-      0.05
-    );
+  if (plan.action !== "BUY" || state.position) {
+    if (
+      (plan.action === "SELL" || plan.action === "CLOSE") &&
+      state.position
+    ) {
+      closePosition(state, tenantId, price, plan.reason);
+    }
 
-    openPosition(state, tenantId, symbol, price, adjustedRisk);
+    save(tenantId);
+    return;
   }
 
-  if (
-    (plan.action === "SELL" || plan.action === "CLOSE") &&
-    state.position
-  ) {
-    closePosition(state, tenantId, price, plan.reason || "signal");
+  /* ========= 3️⃣ PORTFOLIO LAYER ========= */
+
+  const portfolioCheck = portfolioManager.evaluate({
+    tenantId,
+    symbol,
+    equity: state.equity,
+    proposedRiskPct: plan.riskPct,
+    paperState: state,
+  });
+
+  if (!portfolioCheck.allow) {
+    narrate(tenantId, `Trade blocked: ${portfolioCheck.reason}`, {
+      action: "BLOCKED",
+    });
+    save(tenantId);
+    return;
   }
+
+  /* ========= 4️⃣ FINAL EXECUTION ========= */
+
+  const adjustedRisk = clamp(
+    portfolioCheck.adjustedRiskPct *
+      (risk.riskMultiplier || 1),
+    0.001,
+    0.05
+  );
+
+  openPosition(state, tenantId, symbol, price, adjustedRisk);
 
   save(tenantId);
 }
@@ -323,7 +352,9 @@ function start() {}
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
   save(tenantId);
+
   riskManager.resetTenant(tenantId);
+  portfolioManager.resetTenant(tenantId);
 }
 
 module.exports = {
