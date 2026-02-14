@@ -1,6 +1,6 @@
 // backend/src/services/krakenFeed.js
-// Phase 9 — Institutional Market Data Engine (Upgraded)
-// Self-healing • Watchdog+ • Symbol stale guard • Telemetry enabled
+// Enterprise Market Data Engine
+// Self-healing • Ping/Pong • Env-driven symbols • Kill-switch
 // Emits: { type:'tick', symbol, price, ts }
 
 const WebSocket = require("ws");
@@ -11,16 +11,48 @@ const WebSocket = require("ws");
 
 const URL = "wss://ws.kraken.com";
 
-const STALE_TIMEOUT_MS = 20000;
+const FEED_ENABLED =
+  String(process.env.KRAKEN_FEED_ENABLED || "true")
+    .toLowerCase() !== "false";
+
+const STALE_TIMEOUT_MS = Number(
+  process.env.KRAKEN_STALE_TIMEOUT_MS || 20000
+);
+
 const WATCHDOG_INTERVAL = 5000;
+const PING_INTERVAL = 15000;
 
 const MAX_BACKOFF_MS = 20000;
 const BASE_BACKOFF_MS = 1500;
 
 const MAX_MESSAGE_SIZE = 1_000_000;
-
 const EMIT_INTERVAL = 250;
 const MAX_TICKS_PER_SECOND = 1000;
+
+/* =========================================================
+   SYMBOL CONFIG (ENV DRIVEN)
+========================================================= */
+
+function getPairs() {
+  const raw = String(
+    process.env.KRAKEN_PAIRS ||
+      "XBT/USD,ETH/USD,SOL/USD,XRP/USD"
+  );
+
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function buildMap(pairs) {
+  const map = {};
+  for (const p of pairs) {
+    const base = p.split("/")[0];
+    map[p] = base.replace("XBT", "BTC") + "USDT";
+  }
+  return map;
+}
 
 /* =========================================================
    PUBLIC START
@@ -28,36 +60,22 @@ const MAX_TICKS_PER_SECOND = 1000;
 
 function startKrakenFeed({ onTick, onStatus }) {
 
-  const PAIRS = [
-    "XBT/USD",
-    "ETH/USD",
-    "SOL/USD",
-    "XRP/USD",
-    "ADA/USD",
-    "DOT/USD",
-    "LINK/USD",
-    "LTC/USD",
-    "BCH/USD",
-    "XLM/USD",
-  ];
+  if (!FEED_ENABLED) {
+    onStatus && onStatus("disabled");
+    return {
+      stop() {},
+      getMetrics() { return { disabled: true }; },
+    };
+  }
 
-  const MAP = {
-    "XBT/USD": "BTCUSDT",
-    "ETH/USD": "ETHUSDT",
-    "SOL/USD": "SOLUSDT",
-    "XRP/USD": "XRPUSDT",
-    "ADA/USD": "ADAUSDT",
-    "DOT/USD": "DOTUSDT",
-    "LINK/USD": "LINKUSDT",
-    "LTC/USD": "LTCUSDT",
-    "BCH/USD": "BCHUSDT",
-    "XLM/USD": "XLMUSDT",
-  };
+  const PAIRS = getPairs();
+  const MAP = buildMap(PAIRS);
 
   let ws = null;
   let closedByUs = false;
   let reconnectTimer = null;
   let watchdog = null;
+  let pingTimer = null;
 
   let backoffMs = BASE_BACKOFF_MS;
   let lastMsgAt = 0;
@@ -73,8 +91,8 @@ function startKrakenFeed({ onTick, onStatus }) {
     connects: 0,
     reconnects: 0,
     ticks: 0,
-    lastTickAt: 0,
     staleEvents: 0,
+    pingsSent: 0,
   };
 
   /* ================= HELPERS ================= */
@@ -86,8 +104,8 @@ function startKrakenFeed({ onTick, onStatus }) {
   function clearTimers() {
     if (watchdog) clearInterval(watchdog);
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    watchdog = null;
-    reconnectTimer = null;
+    if (pingTimer) clearInterval(pingTimer);
+    watchdog = reconnectTimer = pingTimer = null;
   }
 
   function cleanupSocket() {
@@ -116,7 +134,10 @@ function startKrakenFeed({ onTick, onStatus }) {
     safeStatus(`reconnecting:${reason || "unknown"}`);
 
     const wait = jitter(backoffMs);
-    backoffMs = Math.min(Math.floor(backoffMs * 1.5), MAX_BACKOFF_MS);
+    backoffMs = Math.min(
+      Math.floor(backoffMs * 1.5),
+      MAX_BACKOFF_MS
+    );
 
     clearTimers();
     reconnectTimer = setTimeout(connect, wait);
@@ -142,15 +163,25 @@ function startKrakenFeed({ onTick, onStatus }) {
 
       safeStatus("connected");
 
-      try {
-        ws.send(
-          JSON.stringify({
-            event: "subscribe",
-            pair: PAIRS,
-            subscription: { name: "ticker" },
-          })
-        );
-      } catch {}
+      ws.send(
+        JSON.stringify({
+          event: "subscribe",
+          pair: PAIRS,
+          subscription: { name: "ticker" },
+        })
+      );
+
+      /* ---- Heartbeat Ping ---- */
+      pingTimer = setInterval(() => {
+        try {
+          ws.ping();
+          metrics.pingsSent++;
+        } catch {}
+      }, PING_INTERVAL);
+    });
+
+    ws.on("pong", () => {
+      lastMsgAt = Date.now();
     });
 
     ws.on("message", (buf) => {
@@ -161,36 +192,33 @@ function startKrakenFeed({ onTick, onStatus }) {
       let msg;
       try {
         msg = JSON.parse(buf.toString());
-      } catch {
-        return;
-      }
+      } catch { return; }
 
-      if (msg && typeof msg === "object" && !Array.isArray(msg)) return;
       if (!Array.isArray(msg)) return;
 
       const data = msg[1];
-      const pair = typeof msg[3] === "string" ? msg[3] : null;
+      const pair = msg[3];
       if (!data || !pair) return;
 
-      const lastStr = data?.c?.[0];
-      const price = Number(lastStr);
+      const price = Number(data?.c?.[0]);
       if (!Number.isFinite(price)) return;
 
       const symbol = MAP[pair] || pair;
       const now = Date.now();
 
-      /* ---- Tick Rate Guard ---- */
       resetTickCounter();
       ticksThisSecond++;
       if (ticksThisSecond > MAX_TICKS_PER_SECOND) return;
 
-      /* ---- Emit Throttle ---- */
-      if (lastEmit[symbol] && now - lastEmit[symbol] < EMIT_INTERVAL) return;
+      if (
+        lastEmit[symbol] &&
+        now - lastEmit[symbol] < EMIT_INTERVAL
+      ) return;
+
       lastEmit[symbol] = now;
+      lastSymbolTick[symbol] = now;
 
       metrics.ticks++;
-      metrics.lastTickAt = now;
-      lastSymbolTick[symbol] = now;
 
       try {
         onTick &&
@@ -210,7 +238,7 @@ function startKrakenFeed({ onTick, onStatus }) {
 
     ws.on("error", () => {
       safeStatus("error");
-      try { ws && ws.terminate(); } catch {}
+      try { ws.terminate(); } catch {}
     });
 
     /* ================= WATCHDOG ================= */
@@ -220,23 +248,12 @@ function startKrakenFeed({ onTick, onStatus }) {
 
       const now = Date.now();
 
-      /* ---- Global Stale ---- */
       if (now - lastMsgAt > STALE_TIMEOUT_MS) {
         metrics.staleEvents++;
         safeStatus("stale_global");
-        try { ws && ws.terminate(); } catch {}
-        return;
+        try { ws.terminate(); } catch {}
       }
 
-      /* ---- Per Symbol Stale ---- */
-      for (const s of Object.keys(lastSymbolTick)) {
-        if (now - lastSymbolTick[s] > STALE_TIMEOUT_MS) {
-          metrics.staleEvents++;
-          safeStatus(`stale_symbol:${s}`);
-        }
-      }
-
-      /* ---- Reset Backoff if Stable ---- */
       if (connectedAt && now - connectedAt > 60000) {
         backoffMs = BASE_BACKOFF_MS;
       }
@@ -248,7 +265,7 @@ function startKrakenFeed({ onTick, onStatus }) {
 
   connect();
 
-  /* ================= PUBLIC API ================= */
+  /* ================= API ================= */
 
   return {
     stop() {
@@ -262,7 +279,9 @@ function startKrakenFeed({ onTick, onStatus }) {
     getMetrics() {
       return {
         ...metrics,
-        uptimeMs: Date.now() - connectedAt,
+        uptimeMs: connectedAt
+          ? Date.now() - connectedAt
+          : 0,
       };
     },
   };
