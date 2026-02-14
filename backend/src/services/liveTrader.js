@@ -1,12 +1,14 @@
 // backend/src/services/liveTrader.js
-// Phase 6 — Institutional Live Engine
-// Fully Adaptive • RiskManager Correctly Integrated • Tenant Safe
-// Execution adapter still required
+// Phase 7 — Institutional Live Engine
+// Strategy → Risk → Portfolio → Execution Intent
+// Multi-Layer Protected • Tenant Safe • Adapter Ready
 
 const fs = require("fs");
 const path = require("path");
+
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
+const portfolioManager = require("./portfolioManager");
 
 /* ================= CONFIG ================= */
 
@@ -21,7 +23,9 @@ const LIVE_REFERENCE_BALANCE = Number(
 /* ================= ENV FLAGS ================= */
 
 function envTrue(name) {
-  const v = String(process.env[name] || "").toLowerCase().trim();
+  const v = String(process.env[name] || "")
+    .toLowerCase()
+    .trim();
   return v === "true" || v === "1" || v === "yes";
 }
 
@@ -61,7 +65,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 7,
+    version: 8,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -79,7 +83,7 @@ function defaultState() {
       lastDecision: "WAIT",
       confidence: 0,
       edge: 0,
-      lastReason: "not_started",
+      lastReason: "boot",
     },
 
     learnStats: {
@@ -122,7 +126,9 @@ function load(tenantId) {
 
   try {
     if (fs.existsSync(file)) {
-      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const raw = JSON.parse(
+        fs.readFileSync(file, "utf-8")
+      );
       state = { ...state, ...raw };
     }
   } catch {}
@@ -162,7 +168,9 @@ function updateVolatility(state, price) {
     return;
   }
 
-  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+  const change =
+    Math.abs(price - state.lastPrice) /
+    state.lastPrice;
 
   state.volatility = clamp(
     state.volatility * 0.9 + change * 0.1,
@@ -204,7 +212,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
-  /* ======== RISK EVALUATION (CORRECT SHAPE) ======== */
+  /* ========= 1️⃣ GLOBAL RISK LAYER ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -223,7 +231,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ======== DECISION ======== */
+  /* ========= 2️⃣ STRATEGY ========= */
 
   const plan = makeDecision({
     tenantId,
@@ -241,46 +249,68 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
 
-  if (state.enabled && plan.action !== "WAIT") {
-    const adjustedRisk = clamp(
-      plan.riskPct * (risk.riskMultiplier || 1),
-      0.001,
-      0.05
-    );
+  if (!state.enabled || plan.action === "WAIT") {
+    save(tenantId);
+    return;
+  }
 
-    const intent = {
-      id: `${Date.now()}_${Math.random()
-        .toString(16)
-        .slice(2)}`,
-      ts,
-      symbol,
-      side: plan.action,
-      confidence: plan.confidence,
-      edge: plan.edge,
-      riskPct: adjustedRisk,
-      reason: plan.reason,
-      executed: false,
+  /* ========= 3️⃣ PORTFOLIO LAYER ========= */
+
+  const portfolioCheck = portfolioManager.evaluate({
+    tenantId,
+    symbol,
+    equity: state.equity,
+    proposedRiskPct: plan.riskPct,
+    paperState: state,
+  });
+
+  if (!portfolioCheck.allow) {
+    save(tenantId);
+    return;
+  }
+
+  /* ========= 4️⃣ FINAL INTENT ========= */
+
+  const adjustedRisk = clamp(
+    portfolioCheck.adjustedRiskPct *
+      (risk.riskMultiplier || 1),
+    0.001,
+    0.05
+  );
+
+  const intent = {
+    id: `${Date.now()}_${Math.random()
+      .toString(16)
+      .slice(2)}`,
+    ts,
+    symbol,
+    side: plan.action,
+    confidence: plan.confidence,
+    edge: plan.edge,
+    riskPct: adjustedRisk,
+    reason: plan.reason,
+    executed: false,
+  };
+
+  state.intents.push(intent);
+  state.intents = state.intents.slice(-200);
+
+  /* ========= 5️⃣ EXECUTION ADAPTER (STILL LOCKED) ========= */
+
+  if (state.execute) {
+    intent.execution = {
+      status: "adapter_missing",
+      note: "Execution adapter not wired.",
     };
 
-    state.intents.push(intent);
-    state.intents = state.intents.slice(-200);
+    state.trades.push({
+      time: ts,
+      symbol,
+      type: plan.action,
+      profit: 0,
+    });
 
-    if (state.execute) {
-      intent.execution = {
-        status: "adapter_missing",
-        note: "Execution adapter not wired.",
-      };
-
-      // placeholder trade record for adaptive learning
-      state.trades.push({
-        time: ts,
-        symbol,
-        type: plan.action,
-        profit: 0,
-      });
-
-      state.trades = state.trades.slice(-200);
-    }
+    state.trades = state.trades.slice(-200);
   }
 
   save(tenantId);
