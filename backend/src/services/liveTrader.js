@@ -1,6 +1,7 @@
 // backend/src/services/liveTrader.js
-// Live Trading Engine — Phase 2 FINAL
+// Phase 3 FINAL
 // Architecture: liveTrader → tradeBrain → strategyEngine
+// Proper state-fed decision system
 // Execution still locked (adapter required)
 
 const fs = require("fs");
@@ -48,6 +49,10 @@ function safeNum(x, fallback = null) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -56,7 +61,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 3,
+    version: 4,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -66,6 +71,7 @@ function defaultState() {
     mode: "live-disabled",
 
     lastPrice: null,
+    volatility: 0.002,
 
     stats: {
       ticksSeen: 0,
@@ -75,11 +81,30 @@ function defaultState() {
       lastReason: "not_started",
     },
 
+    // mirror paper-style structure for unified brain
+    learnStats: {
+      ticksSeen: 0,
+      confidence: 0,
+      decision: "WAIT",
+      trendEdge: 0,
+    },
+
+    limits: {
+      tradesToday: 0,
+      lossesToday: 0,
+      halted: false,
+      haltReason: null,
+    },
+
     intents: [],
     orders: [],
     lastError: null,
 
     config: {
+      baselinePct: 0.01,
+      maxPct: 0.02,
+      slPct: 0.005,
+      tpPct: 0.01,
       LIVE_REFERENCE_BALANCE,
     },
   };
@@ -128,6 +153,25 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
+/* ================= VOLATILITY MODEL ================= */
+
+function updateVolatility(state, price) {
+  if (!state.lastPrice) {
+    state.lastPrice = price;
+    return;
+  }
+
+  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+
+  state.volatility = clamp(
+    state.volatility * 0.9 + change * 0.1,
+    0.0001,
+    0.05
+  );
+
+  state.lastPrice = price;
+}
+
 /* ================= LIFECYCLE ================= */
 
 function start(tenantId) {
@@ -155,23 +199,26 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   if (!Number.isFinite(p)) return;
 
   state.stats.ticksSeen++;
-  state.lastPrice = p;
+  state.learnStats.ticksSeen++;
 
-  // 🔥 USE UNIFIED BRAIN
+  updateVolatility(state, p);
+
+  // ✅ FULL CONTEXT FED INTO BRAIN
   const plan = makeDecision({
+    tenantId,
     symbol,
     last: p,
-    paper: {
-      learnStats: {},
-      limits: {},
-      config: {},
-    },
+    paper: state, // unified structure
   });
 
   state.stats.lastDecision = plan.action;
   state.stats.confidence = plan.confidence;
   state.stats.edge = plan.edge;
-  state.stats.lastReason = plan.blockedReason || plan.action;
+  state.stats.lastReason = plan.blockedReason || plan.reason;
+
+  state.learnStats.decision = plan.action;
+  state.learnStats.confidence = plan.confidence;
+  state.learnStats.trendEdge = plan.edge;
 
   if (state.enabled && plan.action !== "WAIT") {
     const intent = {
@@ -183,7 +230,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       side: plan.action,
       confidence: plan.confidence,
       edge: plan.edge,
-      reason: plan.blockedReason || plan.action,
+      reason: plan.blockedReason || plan.reason,
       executed: false,
     };
 
