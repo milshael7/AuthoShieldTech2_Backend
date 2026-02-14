@@ -1,12 +1,10 @@
 // backend/src/routes/ai.routes.js
-// STEP 34 — AuthoDev 6.5 SOC-Grade AI Audit Trail
-// Secure • Tenant-aware • Non-blocking • Compliance-ready
+// AI Routes — TENANT SAFE + AUTH REQUIRED + SOC ALIGNED (FINAL)
 
 const express = require("express");
 const router = express.Router();
 
-// ❌ REMOVED: const fetch = require("node-fetch");
-// ✅ Node 22 has native global fetch
+const { authRequired } = require("../middleware/auth");
 
 const {
   addMemory,
@@ -28,27 +26,24 @@ function safeJsonParse(str) {
   }
 }
 
-/* ================= AI AUDIT (WRITE-ONLY) ================= */
+/* ================= AI AUDIT ================= */
 
 function auditAI({ req, kind, model }) {
   try {
     const tenant = req?.tenant || {};
+    const user = req?.user || {};
 
     const record = {
       ts: new Date().toISOString(),
-
       tenantId: tenant.id || null,
-      userId: tenant.userId || null,
-      role: tenant.role || null,
-
+      userId: user.id || null,
+      role: user.role || null,
       route: req.originalUrl,
       method: req.method,
-
       ai: {
         kind,
         model: model || null,
       },
-
       context: {
         room: req.body?.context?.room || null,
         page: req.body?.context?.page || null,
@@ -62,7 +57,7 @@ function auditAI({ req, kind, model }) {
   }
 }
 
-/* ================= LOCAL INTELLIGENCE ================= */
+/* ================= LOCAL FALLBACK ================= */
 
 function localReply(message) {
   const low = message.toLowerCase();
@@ -75,7 +70,7 @@ function localReply(message) {
   ) {
     return {
       reply:
-        "I can help with your security or platform usage, but I can’t access or discuss internal system details.",
+        "I can help with your security or platform usage, but I can’t access internal system details.",
       speakText:
         "I can help with your security or platform usage, but I can’t access internal system details.",
       meta: { kind: "restricted" },
@@ -89,17 +84,18 @@ function localReply(message) {
   ) {
     return {
       reply:
-        "I’m active and monitoring your environment. Ask me about security posture, alerts, or activity.",
-      speakText: "I’m active and monitoring your environment.",
+        "I’m active and monitoring your environment. Ask me about trading, posture, or alerts.",
+      speakText:
+        "I’m active and monitoring your environment.",
       meta: { kind: "local_status" },
     };
   }
 
   return {
     reply:
-      "You can ask me about security posture, alerts, trading behavior, or anything on this page.",
+      "You can ask me about trading performance, security posture, or platform activity.",
     speakText:
-      "You can ask me about security posture or activity.",
+      "You can ask me about trading or platform activity.",
     meta: { kind: "local_help" },
   };
 }
@@ -123,9 +119,6 @@ Rules:
 - Never reference other companies or backend systems
 - Never guess missing data
 - Be clear, professional, and calm
-
-Known facts:
-${personality.platformFacts.join("\n")}
 `;
 
   const user = `
@@ -190,44 +183,48 @@ Respond ONLY with JSON:
 
 /* ================= ROUTE ================= */
 
-router.post("/chat", async (req, res) => {
-  try {
-    const tenantId = req.tenant?.id;
-    if (!tenantId) {
-      return res.status(400).json({ ok: false });
-    }
-
-    const message = cleanStr(req.body?.message, 8000);
-    const context = req.body?.context || {};
-
-    let out = null;
-
+router.post(
+  "/chat",
+  authRequired,
+  async (req, res) => {
     try {
-      out = await openaiReply({ tenantId, message, context });
-    } catch {
-      out = null;
-    }
+      const tenantId = req.tenant?.id;
+      if (!tenantId) {
+        return res.status(400).json({ ok: false });
+      }
 
-    if (!out) out = localReply(message);
+      const message = cleanStr(req.body?.message, 8000);
+      const context = req.body?.context || {};
 
-    auditAI({
-      req,
-      kind: out.meta?.kind || "unknown",
-      model: out.meta?.model,
-    });
+      let out = null;
 
-    if (message.toLowerCase().includes("i prefer")) {
-      addMemory({
-        tenantId,
-        type: "preference",
-        text: message.slice(0, 800),
+      try {
+        out = await openaiReply({ tenantId, message, context });
+      } catch {
+        out = null;
+      }
+
+      if (!out) out = localReply(message);
+
+      auditAI({
+        req,
+        kind: out.meta?.kind || "local",
+        model: out.meta?.model,
       });
-    }
 
-    return res.json({ ok: true, ...out });
-  } catch {
-    return res.status(500).json({ ok: false });
+      if (message.toLowerCase().includes("i prefer")) {
+        addMemory({
+          tenantId,
+          type: "preference",
+          text: message.slice(0, 800),
+        });
+      }
+
+      return res.json({ ok: true, ...out });
+    } catch {
+      return res.status(500).json({ ok: false });
+    }
   }
-});
+);
 
 module.exports = router;
