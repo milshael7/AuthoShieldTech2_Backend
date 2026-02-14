@@ -1,12 +1,12 @@
 // backend/src/services/strategyEngine.js
-// Phase 3 — Rule Engine + Adaptive Learning + Performance Feedback
-// TRUE self-adjusting thresholds (per tenant)
+// Phase 4 — True Adaptive Strategy Engine
+// Multi-Tenant Safe + Stable Learning + Controlled Feedback
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 /* =========================================================
    BASE CONFIG (STATIC FLOOR VALUES)
-   ========================================================= */
+========================================================= */
 
 const BASE_CONFIG = Object.freeze({
   minConfidence: Number(process.env.TRADE_MIN_CONF || 0.62),
@@ -19,51 +19,48 @@ const BASE_CONFIG = Object.freeze({
 });
 
 /* =========================================================
-   LEARNING MEMORY (IN-MEMORY PER PROCESS)
-   Can be persisted later if needed
-   ========================================================= */
+   LEARNING STORE (ISOLATED PER TENANT)
+========================================================= */
 
-const LEARNING = new Map(); // tenantId -> learning state
+const LEARNING = new Map(); // tenantId -> learning object
 
 function getLearningState(tenantId) {
-  if (!LEARNING.has(tenantId)) {
-    LEARNING.set(tenantId, {
+  const key = tenantId || "__default__";
+
+  if (!LEARNING.has(key)) {
+    LEARNING.set(key, {
       edgeMultiplier: 1,
       confidenceMultiplier: 1,
       lastWinRate: 0.5,
+      lastEvaluatedTradeCount: 0,
       lastUpdated: Date.now(),
     });
   }
-  return LEARNING.get(tenantId);
+
+  return LEARNING.get(key);
 }
 
 /* =========================================================
    EDGE MODEL
-   ========================================================= */
+========================================================= */
 
-function computeEdge(context = {}) {
-  const price = Number(context.price);
-  const lastPrice = Number(context.lastPrice);
-  const volatility = Number(context.volatility || 0.002);
-
+function computeEdge({ price, lastPrice, volatility }) {
   if (!Number.isFinite(price) || !Number.isFinite(lastPrice)) {
     return 0;
   }
 
+  const vol = volatility || 0.002;
   const momentum = (price - lastPrice) / lastPrice;
-  const normalized = momentum / (volatility || 0.001);
+  const normalized = momentum / (vol || 0.001);
 
   return clamp(normalized, -0.02, 0.02);
 }
 
 /* =========================================================
    CONFIDENCE MODEL
-   ========================================================= */
+========================================================= */
 
-function computeConfidence(context = {}) {
-  const edge = Number(context.edge || 0);
-  const ticksSeen = Number(context.ticksSeen || 0);
-
+function computeConfidence({ edge, ticksSeen }) {
   if (ticksSeen < 50) return 0.4;
 
   const base = Math.abs(edge) * 8;
@@ -71,15 +68,20 @@ function computeConfidence(context = {}) {
 }
 
 /* =========================================================
-   PERFORMANCE FEEDBACK (REAL LEARNING)
-   ========================================================= */
+   STABLE PERFORMANCE ADAPTATION
+========================================================= */
 
 function adaptFromPerformance(tenantId, paperState) {
-  if (!paperState?.trades || paperState.trades.length < 10) return;
+  if (!tenantId || !paperState?.trades) return;
 
   const learning = getLearningState(tenantId);
+  const trades = paperState.trades;
 
-  const recent = paperState.trades.slice(-20);
+  // Prevent constant re-adaptation
+  if (trades.length === learning.lastEvaluatedTradeCount) return;
+  if (trades.length < 10) return;
+
+  const recent = trades.slice(-20);
   const wins = recent.filter(t => t.profit > 0).length;
   const losses = recent.filter(t => t.profit <= 0).length;
 
@@ -89,28 +91,40 @@ function adaptFromPerformance(tenantId, paperState) {
   const winRate = wins / total;
   learning.lastWinRate = winRate;
 
-  // If performance degrading → tighten filters
+  /* ---- tighten if degrading ---- */
   if (winRate < 0.45) {
-    learning.edgeMultiplier = clamp(learning.edgeMultiplier * 1.1, 1, 2);
-    learning.confidenceMultiplier = clamp(learning.confidenceMultiplier * 1.05, 1, 1.5);
+    learning.edgeMultiplier =
+      clamp(learning.edgeMultiplier * 1.08, 1, 2);
+
+    learning.confidenceMultiplier =
+      clamp(learning.confidenceMultiplier * 1.05, 1, 1.5);
   }
 
-  // If performance strong → slightly relax
+  /* ---- relax if strong ---- */
   if (winRate > 0.65) {
-    learning.edgeMultiplier = clamp(learning.edgeMultiplier * 0.95, 0.7, 1.5);
-    learning.confidenceMultiplier = clamp(learning.confidenceMultiplier * 0.97, 0.7, 1.3);
+    learning.edgeMultiplier =
+      clamp(learning.edgeMultiplier * 0.96, 0.7, 1.5);
+
+    learning.confidenceMultiplier =
+      clamp(learning.confidenceMultiplier * 0.97, 0.7, 1.3);
   }
 
+  learning.lastEvaluatedTradeCount = trades.length;
   learning.lastUpdated = Date.now();
 }
 
 /* =========================================================
-   RULE EVALUATION (WITH ADAPTIVE THRESHOLDS)
-   ========================================================= */
+   RULE EVALUATION
+========================================================= */
 
-function evaluateRules(ctx = {}) {
-  const { price, edge, confidence, limits, tenantId, paperState } = ctx;
-
+function evaluateRules({
+  tenantId,
+  price,
+  edge,
+  confidence,
+  limits,
+  paperState,
+}) {
   const learning = getLearningState(tenantId);
 
   adaptFromPerformance(tenantId, paperState);
@@ -149,10 +163,10 @@ function evaluateRules(ctx = {}) {
 
 /* =========================================================
    RISK MODEL
-   ========================================================= */
+========================================================= */
 
-function adjustRisk(ctx = {}) {
-  const lossesToday = Number(ctx.limits?.lossesToday || 0);
+function adjustRisk({ limits }) {
+  const lossesToday = Number(limits?.lossesToday || 0);
 
   if (lossesToday >= 2) {
     return BASE_CONFIG.baseRiskPct;
@@ -167,7 +181,7 @@ function adjustRisk(ctx = {}) {
 
 /* =========================================================
    FINAL DECISION BUILDER
-   ========================================================= */
+========================================================= */
 
 function buildDecision(context = {}) {
   const {
@@ -185,11 +199,11 @@ function buildDecision(context = {}) {
   const confidence = computeConfidence({ edge, ticksSeen });
 
   const ruleResult = evaluateRules({
+    tenantId,
     price,
     edge,
     confidence,
     limits,
-    tenantId,
     paperState,
   });
 
