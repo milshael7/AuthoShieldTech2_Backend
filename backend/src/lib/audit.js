@@ -1,17 +1,11 @@
 // backend/src/lib/audit.js
-// Central Audit Writer — ENTERPRISE SAFE + BACKWARD COMPATIBLE
-//
-// Guarantees:
-// - Never throws
-// - Safe schema
-// - Backward compatible with older routes using `audit()`
-// - Hard capped storage
+// Central Audit Writer — HARDENED & BACKWARD COMPATIBLE
 
 const crypto = require("crypto");
 const { updateDb } = require("./db");
 
 /**
- * Core writer
+ * Internal writer
  */
 function writeAudit(input = {}) {
   try {
@@ -19,23 +13,13 @@ function writeAudit(input = {}) {
       id: crypto.randomUUID(),
       ts: Date.now(),
 
-      actorId: String(input.actorId || input.actor || "system"),
-      role: String(input.role || "system"),
+      actorId: input.actorId || input.actor || "system",
+      role: input.role || null,
       action: String(input.action || "UNKNOWN"),
 
-      targetType: input.targetType
-        ? String(input.targetType)
-        : null,
-
-      targetId: input.targetId
-        ? String(input.targetId)
-        : input.target
-        ? String(input.target)
-        : null,
-
-      companyId: input.companyId
-        ? String(input.companyId)
-        : null,
+      targetType: input.targetType || null,
+      targetId: input.targetId || input.target || null,
+      companyId: input.companyId || null,
 
       metadata:
         input.metadata && typeof input.metadata === "object"
@@ -49,7 +33,7 @@ function writeAudit(input = {}) {
       if (!Array.isArray(db.audit)) db.audit = [];
       db.audit.push(record);
 
-      // Hard cap to prevent uncontrolled growth
+      // Hard cap: keep last 10,000 events
       if (db.audit.length > 10_000) {
         db.audit = db.audit.slice(-10_000);
       }
@@ -65,12 +49,10 @@ function writeAudit(input = {}) {
 }
 
 /**
- * Backward-compatible alias
- * Many routes import: const { audit } = require(...)
+ * 🔥 Backward compatibility alias
+ * Old routes use: audit(...)
  */
-function audit(input = {}) {
-  return writeAudit(input);
-}
+const audit = writeAudit;
 
 module.exports = {
   writeAudit,
