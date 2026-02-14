@@ -2,7 +2,7 @@
 // PHASE 1 UPGRADE — Rule Engine + Strategy Engine + Adaptive Hooks
 
 const aiBrain = require("./aiBrain");
-const strategyEngine = require("./strategyEngine");
+const { buildDecision } = require("./strategyEngine");
 
 /* ---------------- SAFETY CONSTANTS ---------------- */
 
@@ -48,10 +48,12 @@ function makeDecision(context = {}) {
 
   /* ---------------- STRATEGY ENGINE (RULE BASED CORE) ---------------- */
 
-  const strategyView = strategyEngine.evaluate({
+  const strategyView = buildDecision({
     symbol,
-    last,
-    paper,
+    price: last,
+    edge: learn.trendEdge || 0,
+    confidence: learn.confidence || 0,
+    limits,
   });
 
   let action = strategyView.action;
@@ -69,7 +71,6 @@ function makeDecision(context = {}) {
         aiView.action &&
         ALLOWED_ACTIONS.has(aiView.action.toUpperCase())
       ) {
-        // AI can only bias, not override safety
         confidence = Math.max(confidence, safeNum(aiView.confidence, 0));
         edge = Math.max(edge, safeNum(aiView.edge, 0));
       }
