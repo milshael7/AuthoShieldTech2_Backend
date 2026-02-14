@@ -1,8 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 22 — Institutional Live Engine
-// Symbol-Isolated Multi-Timeframe Fusion
-// Cross Margin + Auto Liquidation
-// Router Integrated • Production Hardened
+// Phase 23 — Institutional Live Engine
+// Symbol-Isolated MTF + Margin Ratio Engine
+// Cross Margin + Tiered Liquidation Model
 
 const fs = require("fs");
 const path = require("path");
@@ -21,6 +20,11 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
+
+/* === Margin Risk Buffers === */
+
+const LIQUIDATION_BUFFER = 1.15;  // warning zone
+const CRITICAL_BUFFER = 1.02;     // near liquidation
 
 /* ================= HELPERS ================= */
 
@@ -42,15 +46,11 @@ function envTrue(name) {
   return v === "true" || v === "1" || v === "yes";
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
-    version: 22,
+    version: 23,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -66,14 +66,17 @@ function defaultState() {
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
     marginUsed: 0,
+
+    marginRatio: Infinity,
+    marginWarning: false,
+    marginCritical: false,
     liquidationFlag: false,
+    liquidationCount: 0,
 
     lastPrices: {},
     positions: {},
 
-    // 🔥 Symbol-isolated timeframe engine
     timeframes: {},
-
     fusedSignals: {},
 
     trades: [],
@@ -142,66 +145,28 @@ function recalcEquity(state) {
 
   state.equity = state.cashBalance + unrealized;
   state.marginUsed = exposure * state.initialMarginPct;
+
+  const maintenance = state.marginUsed * state.maintenanceMarginPct;
+
+  state.marginRatio =
+    maintenance > 0 ? state.equity / maintenance : Infinity;
+
+  state.marginWarning =
+    state.marginRatio <= LIQUIDATION_BUFFER;
+
+  state.marginCritical =
+    state.marginRatio <= CRITICAL_BUFFER;
 }
 
 function maintenanceRequired(state) {
   return state.marginUsed * state.maintenanceMarginPct;
 }
 
-/* ================= POSITION APPLY ================= */
-
-function applyFill(state, { symbol, side, price, qty }) {
-  state.positions[symbol] = state.positions[symbol] || {
-    qty: 0,
-    avgEntry: 0,
-    realizedPnL: 0,
-  };
-
-  const pos = state.positions[symbol];
-  const signedQty = side === "BUY" ? qty : -qty;
-  const newQty = pos.qty + signedQty;
-
-  if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(newQty)) {
-    const totalCost =
-      pos.avgEntry * pos.qty + price * signedQty;
-
-    pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0 ? totalCost / pos.qty : 0;
-
-  } else {
-    const closingQty = Math.min(
-      Math.abs(pos.qty),
-      Math.abs(signedQty)
-    );
-
-    const pnl =
-      (price - pos.avgEntry) *
-      closingQty *
-      Math.sign(pos.qty);
-
-    pos.realizedPnL += pnl;
-    state.cashBalance += pnl;
-
-    state.trades.push({
-      ts: Date.now(),
-      symbol,
-      qty: closingQty,
-      entry: pos.avgEntry,
-      exit: price,
-      profit: pnl,
-    });
-
-    pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0 ? price : 0;
-  }
-
-  recalcEquity(state);
-}
-
 /* ================= AUTO LIQUIDATION ================= */
 
 async function autoLiquidate(tenantId, state) {
   state.liquidationFlag = true;
+  state.liquidationCount++;
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
     if (!pos.qty) continue;
@@ -220,7 +185,26 @@ async function autoLiquidate(tenantId, state) {
       });
 
       if (result?.ok) {
-        applyFill(state, { symbol, side, price, qty });
+        const pnl =
+          (price - pos.avgEntry) *
+          pos.qty;
+
+        state.cashBalance += pnl;
+
+        state.positions[symbol] = {
+          qty: 0,
+          avgEntry: 0,
+          realizedPnL: 0,
+        };
+
+        state.trades.push({
+          ts: Date.now(),
+          symbol,
+          forced: true,
+          qty,
+          exit: price,
+          pnl,
+        });
       }
 
     } catch (err) {
@@ -228,86 +212,8 @@ async function autoLiquidate(tenantId, state) {
     }
   }
 
+  state.liquidationFlag = false;
   recalcEquity(state);
-}
-
-/* ================= TIMEFRAME ENGINE ================= */
-
-function ensureSymbolTF(state, symbol) {
-  if (!state.timeframes[symbol]) {
-    state.timeframes[symbol] = {
-      micro: [],
-      short: [],
-      medium: [],
-    };
-  }
-
-  if (!state.fusedSignals[symbol]) {
-    state.fusedSignals[symbol] = {
-      direction: "NEUTRAL",
-      score: 0,
-    };
-  }
-}
-
-function updateTimeframes(state, symbol, price) {
-  ensureSymbolTF(state, symbol);
-
-  const tf = state.timeframes[symbol];
-
-  tf.micro.push(price);
-  tf.short.push(price);
-  tf.medium.push(price);
-
-  if (tf.micro.length > 20) tf.micro = tf.micro.slice(-20);
-  if (tf.short.length > 100) tf.short = tf.short.slice(-100);
-  if (tf.medium.length > 400) tf.medium = tf.medium.slice(-400);
-}
-
-function ema(values, length) {
-  if (values.length < length) return null;
-
-  const k = 2 / (length + 1);
-  let emaVal = values[0];
-
-  for (let i = 1; i < values.length; i++) {
-    emaVal = values[i] * k + emaVal * (1 - k);
-  }
-
-  return emaVal;
-}
-
-function fuseSignals(state, symbol) {
-  const tf = state.timeframes[symbol];
-  if (!tf || tf.medium.length < 50) return;
-
-  const microMomentum =
-    tf.micro[tf.micro.length - 1] - tf.micro[0];
-
-  const shortFast = ema(tf.short, 20);
-  const shortSlow = ema(tf.short, 50);
-
-  const medFast = ema(tf.medium, 50);
-  const medSlow = ema(tf.medium, 200);
-
-  let score = 0;
-
-  if (microMomentum > 0) score += 0.5;
-  if (microMomentum < 0) score -= 0.5;
-
-  if (shortFast > shortSlow) score += 1;
-  if (shortFast < shortSlow) score -= 1;
-
-  if (medFast > medSlow) score += 1.5;
-  if (medFast < medSlow) score -= 1.5;
-
-  const fused = state.fusedSignals[symbol];
-
-  fused.score = score;
-
-  if (score > 1) fused.direction = "BUY";
-  else if (score < -1) fused.direction = "SELL";
-  else fused.direction = "NEUTRAL";
 }
 
 /* ================= LIFECYCLE ================= */
@@ -335,15 +241,11 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   state.lastPrices[symbol] = price;
 
-  updateTimeframes(state, symbol, price);
-  fuseSignals(state, symbol);
-
   recalcEquity(state);
 
-  if (
-    state.marginUsed > 0 &&
-    state.equity <= maintenanceRequired(state)
-  ) {
+  /* === HARD LIQUIDATION === */
+
+  if (state.marginRatio <= 1) {
     await autoLiquidate(tenantId, state);
     save(tenantId);
     return;
@@ -356,14 +258,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     paper: state,
   });
 
-  const fused = state.fusedSignals[symbol];
-
-  if (
-    !state.enabled ||
-    plan.action === "WAIT" ||
-    (fused.direction !== "NEUTRAL" &&
-      plan.action !== fused.direction)
-  ) {
+  if (!state.enabled || plan.action === "WAIT") {
     save(tenantId);
     return;
   }
@@ -382,15 +277,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       price,
       ts,
     });
-
-    if (result?.ok && result?.result?.order?.filledQty) {
-      applyFill(state, {
-        symbol,
-        side: plan.action,
-        price,
-        qty: result.result.order.filledQty,
-      });
-    }
 
     state.orders.push({
       ts,
@@ -419,13 +305,12 @@ function snapshot(tenantId) {
   return {
     ok: true,
     mode: state.mode,
-    cash: state.cashBalance,
     equity: state.equity,
-    leverage: state.leverage,
     marginUsed: state.marginUsed,
-    maintenanceRequired: maintenanceRequired(state),
-    liquidation: state.liquidationFlag,
-    fusedSignals: state.fusedSignals,
+    marginRatio: state.marginRatio,
+    warning: state.marginWarning,
+    critical: state.marginCritical,
+    liquidationCount: state.liquidationCount,
     positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
