@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 21 — Institutional Live Engine
+// Phase 22 — Institutional Live Engine
+// Symbol-Isolated Multi-Timeframe Fusion
 // Cross Margin + Auto Liquidation
-// Multi-Timeframe Fusion Engine
 // Router Integrated • Production Hardened
 
 const fs = require("fs");
@@ -50,7 +50,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 21,
+    version: 22,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -71,17 +71,10 @@ function defaultState() {
     lastPrices: {},
     positions: {},
 
-    /* === Multi-Timeframe === */
-    timeframes: {
-      micro: [],
-      short: [],
-      medium: [],
-    },
+    // 🔥 Symbol-isolated timeframe engine
+    timeframes: {},
 
-    fusedSignal: {
-      direction: "NEUTRAL",
-      score: 0,
-    },
+    fusedSignals: {},
 
     trades: [],
     orders: [],
@@ -168,16 +161,12 @@ function applyFill(state, { symbol, side, price, qty }) {
   const signedQty = side === "BUY" ? qty : -qty;
   const newQty = pos.qty + signedQty;
 
-  if (
-    pos.qty === 0 ||
-    Math.sign(pos.qty) === Math.sign(newQty)
-  ) {
+  if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(newQty)) {
     const totalCost =
       pos.avgEntry * pos.qty + price * signedQty;
 
     pos.qty = newQty;
-    pos.avgEntry =
-      pos.qty !== 0 ? totalCost / pos.qty : 0;
+    pos.avgEntry = pos.qty !== 0 ? totalCost / pos.qty : 0;
 
   } else {
     const closingQty = Math.min(
@@ -244,21 +233,35 @@ async function autoLiquidate(tenantId, state) {
 
 /* ================= TIMEFRAME ENGINE ================= */
 
-function updateTimeframes(state, price) {
-  const tf = state.timeframes;
+function ensureSymbolTF(state, symbol) {
+  if (!state.timeframes[symbol]) {
+    state.timeframes[symbol] = {
+      micro: [],
+      short: [],
+      medium: [],
+    };
+  }
+
+  if (!state.fusedSignals[symbol]) {
+    state.fusedSignals[symbol] = {
+      direction: "NEUTRAL",
+      score: 0,
+    };
+  }
+}
+
+function updateTimeframes(state, symbol, price) {
+  ensureSymbolTF(state, symbol);
+
+  const tf = state.timeframes[symbol];
 
   tf.micro.push(price);
   tf.short.push(price);
   tf.medium.push(price);
 
-  if (tf.micro.length > 20)
-    tf.micro = tf.micro.slice(-20);
-
-  if (tf.short.length > 100)
-    tf.short = tf.short.slice(-100);
-
-  if (tf.medium.length > 400)
-    tf.medium = tf.medium.slice(-400);
+  if (tf.micro.length > 20) tf.micro = tf.micro.slice(-20);
+  if (tf.short.length > 100) tf.short = tf.short.slice(-100);
+  if (tf.medium.length > 400) tf.medium = tf.medium.slice(-400);
 }
 
 function ema(values, length) {
@@ -274,13 +277,12 @@ function ema(values, length) {
   return emaVal;
 }
 
-function fuseSignals(state) {
-  const tf = state.timeframes;
-  if (tf.medium.length < 50) return;
+function fuseSignals(state, symbol) {
+  const tf = state.timeframes[symbol];
+  if (!tf || tf.medium.length < 50) return;
 
   const microMomentum =
-    tf.micro[tf.micro.length - 1] -
-    tf.micro[0];
+    tf.micro[tf.micro.length - 1] - tf.micro[0];
 
   const shortFast = ema(tf.short, 20);
   const shortSlow = ema(tf.short, 50);
@@ -299,14 +301,13 @@ function fuseSignals(state) {
   if (medFast > medSlow) score += 1.5;
   if (medFast < medSlow) score -= 1.5;
 
-  state.fusedSignal.score = score;
+  const fused = state.fusedSignals[symbol];
 
-  if (score > 1)
-    state.fusedSignal.direction = "BUY";
-  else if (score < -1)
-    state.fusedSignal.direction = "SELL";
-  else
-    state.fusedSignal.direction = "NEUTRAL";
+  fused.score = score;
+
+  if (score > 1) fused.direction = "BUY";
+  else if (score < -1) fused.direction = "SELL";
+  else fused.direction = "NEUTRAL";
 }
 
 /* ================= LIFECYCLE ================= */
@@ -334,8 +335,8 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   state.lastPrices[symbol] = price;
 
-  updateTimeframes(state, price);
-  fuseSignals(state);
+  updateTimeframes(state, symbol, price);
+  fuseSignals(state, symbol);
 
   recalcEquity(state);
 
@@ -355,11 +356,13 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     paper: state,
   });
 
+  const fused = state.fusedSignals[symbol];
+
   if (
     !state.enabled ||
     plan.action === "WAIT" ||
-    (state.fusedSignal.direction !== "NEUTRAL" &&
-      plan.action !== state.fusedSignal.direction)
+    (fused.direction !== "NEUTRAL" &&
+      plan.action !== fused.direction)
   ) {
     save(tenantId);
     return;
@@ -422,7 +425,7 @@ function snapshot(tenantId) {
     marginUsed: state.marginUsed,
     maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
-    fusedSignal: state.fusedSignal,
+    fusedSignals: state.fusedSignals,
     positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
