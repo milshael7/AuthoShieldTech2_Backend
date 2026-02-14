@@ -1,7 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 3 FINAL
-// Architecture: liveTrader → tradeBrain → strategyEngine
-// Proper state-fed decision system
+// Phase 4 FINAL
+// Fully aligned with Adaptive StrategyEngine + tradeBrain
 // Execution still locked (adapter required)
 
 const fs = require("fs");
@@ -61,7 +60,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 4,
+    version: 5,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -81,7 +80,7 @@ function defaultState() {
       lastReason: "not_started",
     },
 
-    // mirror paper-style structure for unified brain
+    // unified brain structure
     learnStats: {
       ticksSeen: 0,
       confidence: 0,
@@ -95,6 +94,8 @@ function defaultState() {
       halted: false,
       haltReason: null,
     },
+
+    trades: [], // 🔥 required for adaptive learning
 
     intents: [],
     orders: [],
@@ -153,7 +154,7 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
-/* ================= VOLATILITY MODEL ================= */
+/* ================= VOLATILITY ================= */
 
 function updateVolatility(state, price) {
   if (!state.lastPrice) {
@@ -203,18 +204,18 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
-  // ✅ FULL CONTEXT FED INTO BRAIN
+  // 🔥 Unified adaptive decision
   const plan = makeDecision({
     tenantId,
     symbol,
     last: p,
-    paper: state, // unified structure
+    paper: state,
   });
 
   state.stats.lastDecision = plan.action;
   state.stats.confidence = plan.confidence;
   state.stats.edge = plan.edge;
-  state.stats.lastReason = plan.blockedReason || plan.reason;
+  state.stats.lastReason = plan.reason;
 
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
@@ -222,15 +223,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   if (state.enabled && plan.action !== "WAIT") {
     const intent = {
-      id: `${Date.now()}_${Math.random()
-        .toString(16)
-        .slice(2)}`,
-      ts: Date.now(),
+      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      ts,
       symbol,
       side: plan.action,
       confidence: plan.confidence,
       edge: plan.edge,
-      reason: plan.blockedReason || plan.reason,
+      reason: plan.reason,
       executed: false,
     };
 
@@ -242,6 +241,16 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
         status: "adapter_missing",
         note: "Execution adapter not wired.",
       };
+
+      // placeholder trade log for adaptive feedback
+      state.trades.push({
+        time: ts,
+        symbol,
+        type: plan.action,
+        profit: 0, // will be real when adapter connected
+      });
+
+      state.trades = state.trades.slice(-200);
     }
   }
 
@@ -262,6 +271,7 @@ function snapshot(tenantId) {
     mode: state.mode,
     stats: state.stats,
     intents: state.intents.slice(-50),
+    trades: state.trades.slice(-50),
     lastError: state.lastError,
     config: {
       LIVE_TRADING_ENABLED: state.enabled,
