@@ -1,5 +1,5 @@
 // backend/src/services/paperTrader.js
-// Phase 6 — Institutional Paper Engine
+// Phase 6.5 — Institutional Paper Engine (Corrected)
 // Strategy → Risk → Portfolio → Execution
 // Fully Adaptive • Multi-Layer Protected • Tenant Safe
 
@@ -9,7 +9,6 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
-
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
@@ -246,19 +245,23 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
+  state.lastPrice = price; // 🔥 critical fix
+
   resetDaily(state, ts);
 
   state.learnStats.ticksSeen++;
   updateVolatility(state, price);
   updateEquity(state, price);
 
-  /* ========= 1️⃣ GLOBAL RISK LAYER ========= */
+  /* ========= 1️⃣ GLOBAL RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
     equity: state.equity,
+    realizedNet: state.realized.net,
     volatility: state.volatility,
     trades: state.trades,
+    limits: state.limits,
     ts,
   });
 
@@ -276,7 +279,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 2️⃣ STRATEGY DECISION ========= */
+  /* ========= 2️⃣ STRATEGY ========= */
 
   const plan = makeDecision({
     tenantId,
@@ -290,19 +293,23 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason;
 
-  if (plan.action !== "BUY" || state.position) {
-    if (
-      (plan.action === "SELL" || plan.action === "CLOSE") &&
-      state.position
-    ) {
-      closePosition(state, tenantId, price, plan.reason);
-    }
+  /* ========= 3️⃣ EXIT LOGIC ========= */
 
+  if (
+    (plan.action === "SELL" || plan.action === "CLOSE") &&
+    state.position
+  ) {
+    closePosition(state, tenantId, price, plan.reason);
     save(tenantId);
     return;
   }
 
-  /* ========= 3️⃣ PORTFOLIO LAYER ========= */
+  if (plan.action !== "BUY" || state.position) {
+    save(tenantId);
+    return;
+  }
+
+  /* ========= 4️⃣ PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -320,7 +327,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 4️⃣ FINAL EXECUTION ========= */
+  /* ========= 5️⃣ FINAL EXECUTION ========= */
 
   const adjustedRisk = clamp(
     portfolioCheck.adjustedRiskPct *
@@ -338,6 +345,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
 function snapshot(tenantId) {
   const state = load(tenantId);
+
   return {
     ...state,
     unrealizedPnL: state.position
