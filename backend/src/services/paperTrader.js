@@ -1,40 +1,23 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine — TENANT SAFE (FINAL)
-//
-// Guarantees:
-// - One isolated state per tenant
-// - Deterministic execution
-// - AI narration scoped by tenant
-// - Safe persistence (no cross-company bleed)
+// Paper Trading Engine — Phase 2 (Rule + Learning Integrated)
 
 const fs = require("fs");
 const path = require("path");
-const { makeDecision } = require("./tradeBrain");
+const { buildDecision } = require("./strategyEngine");
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
-const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
+const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200);
 
 const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
-const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
-const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
-const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
-
-const MAX_TRADES_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
-const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
-
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
 
+const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
+
 /* ================= HELPERS ================= */
-
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-
-function dayKey(ts) {
-  return new Date(ts).toISOString().slice(0, 10);
-}
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -43,6 +26,14 @@ function ensureDir(p) {
 function statePath(tenantId) {
   ensureDir(BASE_PATH);
   return path.join(BASE_PATH, `paper_${tenantId}.json`);
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function dayKey(ts) {
+  return new Date(ts).toISOString().slice(0, 10);
 }
 
 function narrate(tenantId, text, meta = {}) {
@@ -65,32 +56,47 @@ function defaultState() {
     equity: START_BAL,
     peakEquity: START_BAL,
 
-    realized: { wins: 0, losses: 0, net: 0 },
-    costs: { fees: 0, slippage: 0, spread: 0 },
+    realized: {
+      wins: 0,
+      losses: 0,
+      net: 0,
+      grossProfit: 0,
+      grossLoss: 0,
+    },
+
+    costs: {
+      feePaid: 0,
+    },
 
     position: null,
+    trades: [],
+
+    lastPrice: null,
     lastPriceBySymbol: {},
+
+    volatility: 0.002,
 
     learnStats: {
       ticksSeen: 0,
       confidence: 0,
       decision: "WAIT",
       lastReason: "boot",
+      trendEdge: 0,
     },
 
     limits: {
       dayKey: dayKey(Date.now()),
       tradesToday: 0,
+      lossesToday: 0,
       halted: false,
       haltReason: null,
-      lastTradeTs: 0,
     },
   };
 }
 
 const STATES = new Map();
 
-/* ================= PERSISTENCE ================= */
+/* ================= PERSIST ================= */
 
 function load(tenantId) {
   const file = statePath(tenantId);
@@ -112,20 +118,27 @@ function load(tenantId) {
 function save(tenantId) {
   const state = STATES.get(tenantId);
   if (!state) return;
-
   try {
     fs.writeFileSync(statePath(tenantId), JSON.stringify(state, null, 2));
   } catch {}
 }
 
-/* ================= CORE LOGIC ================= */
+/* ================= CORE ================= */
 
-function resetDayIfNeeded(state, ts) {
-  const dk = dayKey(ts);
-  if (state.limits.dayKey !== dk) {
-    state.limits.dayKey = dk;
-    state.limits.tradesToday = 0;
+function updateVolatility(state, price) {
+  if (!state.lastPrice) {
+    state.lastPrice = price;
+    return;
   }
+
+  const change = Math.abs(price - state.lastPrice) / state.lastPrice;
+  state.volatility = clamp(
+    state.volatility * 0.9 + change * 0.1,
+    0.0001,
+    0.05
+  );
+
+  state.lastPrice = price;
 }
 
 function updateEquity(state, price) {
@@ -136,59 +149,49 @@ function updateEquity(state, price) {
   } else {
     state.equity = state.cashBalance;
   }
-  state.peakEquity = Math.max(state.peakEquity, state.equity);
-}
 
-function checkDrawdown(state, tenantId) {
-  if (state.limits.halted) return;
+  state.peakEquity = Math.max(state.peakEquity, state.equity);
 
   const dd = (state.peakEquity - state.equity) / state.peakEquity;
   if (dd >= MAX_DRAWDOWN_PCT) {
     state.limits.halted = true;
     state.limits.haltReason = "max_drawdown";
-
-    narrate(
-      tenantId,
-      `Trading halted. Drawdown exceeded ${(MAX_DRAWDOWN_PCT * 100).toFixed(0)}%.`,
-      { equity: state.equity }
-    );
   }
 }
 
-function canTrade(state, ts) {
-  if (state.limits.halted) return false;
-  if (state.limits.tradesToday >= MAX_TRADES_DAY) return false;
-  if (ts - state.limits.lastTradeTs < COOLDOWN_MS) return false;
-  return true;
+function resetDaily(state, ts) {
+  const dk = dayKey(ts);
+  if (dk !== state.limits.dayKey) {
+    state.limits.dayKey = dk;
+    state.limits.tradesToday = 0;
+    state.limits.lossesToday = 0;
+  }
 }
 
 /* ================= EXECUTION ================= */
 
 function openPosition(state, tenantId, symbol, price, riskPct) {
-  const usd = clamp(state.cashBalance * riskPct, 25, state.cashBalance - 10);
+  const usd = clamp(state.cashBalance * riskPct, 50, state.cashBalance * 0.5);
   if (usd <= 0) return;
 
-  const spread = price * (SPREAD_BP / 10000);
-  const slippage = price * (SLIPPAGE_BP / 10000);
-  const fill = price + spread + slippage;
-
-  const qty = usd / fill;
+  const qty = usd / price;
   const fee = usd * FEE_RATE;
 
   state.cashBalance -= usd + fee;
-  state.costs.fees += fee;
-  state.costs.spread += spread * qty;
-  state.costs.slippage += slippage * qty;
+  state.costs.feePaid += fee;
 
-  state.position = { symbol, entry: fill, qty, ts: Date.now() };
+  state.position = {
+    symbol,
+    entry: price,
+    qty,
+    ts: Date.now(),
+  };
+
   state.limits.tradesToday++;
-  state.limits.lastTradeTs = Date.now();
 
-  narrate(
-    tenantId,
-    `Entered ${symbol} at ${fill.toFixed(2)}.`,
-    { symbol, action: "BUY", entry: fill }
-  );
+  narrate(tenantId, `Entered ${symbol} at ${price}`, {
+    action: "BUY",
+  });
 }
 
 function closePosition(state, tenantId, price, reason) {
@@ -200,16 +203,30 @@ function closePosition(state, tenantId, price, reason) {
   const pnl = gross - fee;
 
   state.cashBalance += pos.qty * price - fee;
-  state.costs.fees += fee;
+  state.costs.feePaid += fee;
   state.realized.net += pnl;
 
-  if (pnl > 0) state.realized.wins++;
-  else state.realized.losses++;
+  if (pnl > 0) {
+    state.realized.wins++;
+    state.realized.grossProfit += pnl;
+  } else {
+    state.realized.losses++;
+    state.realized.grossLoss += Math.abs(pnl);
+    state.limits.lossesToday++;
+  }
+
+  state.trades.push({
+    time: Date.now(),
+    symbol: pos.symbol,
+    type: "CLOSE",
+    profit: pnl,
+    exitReason: reason,
+  });
 
   narrate(
     tenantId,
-    `Closed ${pos.symbol}. ${pnl >= 0 ? "Profit" : "Loss"}: ${pnl.toFixed(2)}.`,
-    { symbol: pos.symbol, action: "CLOSE", pnl, reason }
+    `Closed ${pos.symbol}. ${pnl >= 0 ? "Profit" : "Loss"} ${pnl.toFixed(2)}`,
+    { action: "CLOSE", pnl }
   );
 
   state.position = null;
@@ -221,29 +238,32 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
-  resetDayIfNeeded(state, ts);
-  state.lastPriceBySymbol[symbol] = price;
-  state.learnStats.ticksSeen++;
+  resetDaily(state, ts);
 
+  state.learnStats.ticksSeen++;
+  updateVolatility(state, price);
   updateEquity(state, price);
-  checkDrawdown(state, tenantId);
 
   if (state.learnStats.ticksSeen < WARMUP_TICKS) {
     save(tenantId);
     return;
   }
 
-  const plan = makeDecision({
+  const plan = buildDecision({
     symbol,
-    last: price,
-    paper: state,
+    price,
+    lastPrice: state.lastPrice,
+    volatility: state.volatility,
+    ticksSeen: state.learnStats.ticksSeen,
+    limits: state.limits,
   });
 
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
-  state.learnStats.lastReason = plan.blockedReason || plan.action;
+  state.learnStats.trendEdge = plan.edge;
+  state.learnStats.lastReason = plan.reason;
 
-  if (!canTrade(state, ts)) {
+  if (state.limits.halted) {
     save(tenantId);
     return;
   }
@@ -254,10 +274,9 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   if (
     (plan.action === "SELL" || plan.action === "CLOSE") &&
-    state.position &&
-    state.position.symbol === symbol
+    state.position
   ) {
-    closePosition(state, tenantId, price, plan.action);
+    closePosition(state, tenantId, price, plan.reason);
   }
 
   save(tenantId);
@@ -270,16 +289,13 @@ function snapshot(tenantId) {
   return {
     ...state,
     unrealizedPnL: state.position
-      ? (state.lastPriceBySymbol[state.position.symbol] -
-          state.position.entry) *
+      ? (state.lastPrice - state.position.entry) *
         state.position.qty
       : 0,
   };
 }
 
-function start() {
-  // no-op (kept for compatibility)
-}
+function start() {}
 
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
