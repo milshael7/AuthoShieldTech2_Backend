@@ -1,6 +1,9 @@
 // backend/src/services/strategyEngine.js
-// Phase 4 — True Adaptive Strategy Engine
-// Multi-Tenant Safe + Stable Learning + Controlled Feedback
+// Phase 5 — Persistent Adaptive Strategy Engine
+// Multi-Tenant Safe + Disk-Persisted Learning + Stable Feedback
+
+const fs = require("fs");
+const path = require("path");
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -19,25 +22,85 @@ const BASE_CONFIG = Object.freeze({
 });
 
 /* =========================================================
-   LEARNING STORE (ISOLATED PER TENANT)
+   LEARNING PERSISTENCE CONFIG
 ========================================================= */
 
-const LEARNING = new Map(); // tenantId -> learning object
+const LEARNING_VERSION = 1;
 
-function getLearningState(tenantId) {
+const LEARNING_DIR =
+  process.env.STRATEGY_LEARNING_DIR ||
+  path.join("/tmp", "strategy_learning");
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function learningPath(tenantId) {
+  ensureDir(LEARNING_DIR);
+  const key = tenantId || "__default__";
+  return path.join(LEARNING_DIR, `learning_${key}.json`);
+}
+
+/* =========================================================
+   DEFAULT LEARNING STATE
+========================================================= */
+
+function defaultLearning() {
+  return {
+    version: LEARNING_VERSION,
+    edgeMultiplier: 1,
+    confidenceMultiplier: 1,
+    lastWinRate: 0.5,
+    lastEvaluatedTradeCount: 0,
+    lastUpdated: Date.now(),
+  };
+}
+
+const LEARNING_CACHE = new Map();
+
+/* =========================================================
+   LOAD / SAVE LEARNING
+========================================================= */
+
+function loadLearning(tenantId) {
   const key = tenantId || "__default__";
 
-  if (!LEARNING.has(key)) {
-    LEARNING.set(key, {
-      edgeMultiplier: 1,
-      confidenceMultiplier: 1,
-      lastWinRate: 0.5,
-      lastEvaluatedTradeCount: 0,
-      lastUpdated: Date.now(),
-    });
+  if (LEARNING_CACHE.has(key)) {
+    return LEARNING_CACHE.get(key);
   }
 
-  return LEARNING.get(key);
+  const file = learningPath(key);
+  let state = defaultLearning();
+
+  try {
+    if (fs.existsSync(file)) {
+      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      state = { ...state, ...raw };
+
+      // version migration safeguard
+      if (state.version !== LEARNING_VERSION) {
+        state = defaultLearning();
+      }
+    }
+  } catch {
+    state = defaultLearning();
+  }
+
+  LEARNING_CACHE.set(key, state);
+  return state;
+}
+
+function saveLearning(tenantId) {
+  const key = tenantId || "__default__";
+  const state = LEARNING_CACHE.get(key);
+  if (!state) return;
+
+  try {
+    fs.writeFileSync(
+      learningPath(key),
+      JSON.stringify(state, null, 2)
+    );
+  } catch {}
 }
 
 /* =========================================================
@@ -74,10 +137,9 @@ function computeConfidence({ edge, ticksSeen }) {
 function adaptFromPerformance(tenantId, paperState) {
   if (!tenantId || !paperState?.trades) return;
 
-  const learning = getLearningState(tenantId);
+  const learning = loadLearning(tenantId);
   const trades = paperState.trades;
 
-  // Prevent constant re-adaptation
   if (trades.length === learning.lastEvaluatedTradeCount) return;
   if (trades.length < 10) return;
 
@@ -111,6 +173,8 @@ function adaptFromPerformance(tenantId, paperState) {
 
   learning.lastEvaluatedTradeCount = trades.length;
   learning.lastUpdated = Date.now();
+
+  saveLearning(tenantId);
 }
 
 /* =========================================================
@@ -125,7 +189,7 @@ function evaluateRules({
   limits,
   paperState,
 }) {
-  const learning = getLearningState(tenantId);
+  const learning = loadLearning(tenantId);
 
   adaptFromPerformance(tenantId, paperState);
 
@@ -216,7 +280,7 @@ function buildDecision(context = {}) {
     confidence,
     edge,
     riskPct,
-    learning: getLearningState(tenantId),
+    learning: loadLearning(tenantId),
     ts: Date.now(),
   };
 }
