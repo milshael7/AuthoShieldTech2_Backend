@@ -1,8 +1,9 @@
 // backend/src/services/portfolioManager.js
-// Phase 9 — Institutional Portfolio Engine
-// Multi-Position Tracking • Sector Buckets • Exposure Smoothing
-// Correlation Memory • Capital Velocity Control
-// Tenant Safe
+// Phase 22 — Institutional Portfolio Engine
+// Cross-Margin Aware • Multi-Position Book
+// Correlation Cluster Control • Sector Allocation
+// Capital Velocity Limiter • Leverage-Safe Exposure Model
+// Tenant Safe • Paper + Live Compatible
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -16,8 +17,11 @@ const CONFIG = Object.freeze({
   correlationCutoff: Number(process.env.PORTFOLIO_CORRELATION_CUTOFF || 0.8),
   minCapitalBufferPct: Number(process.env.PORTFOLIO_MIN_BUFFER || 0.1),
 
-  maxCapitalVelocityPct: Number(process.env.PORTFOLIO_MAX_VELOCITY || 0.5), // 50% per 5 min
+  maxCapitalVelocityPct: Number(process.env.PORTFOLIO_MAX_VELOCITY || 0.5),
   velocityWindowMs: Number(process.env.PORTFOLIO_VELOCITY_WINDOW || 300000),
+
+  maxSectorExposurePct: Number(process.env.PORTFOLIO_MAX_SECTOR || 0.6),
+  maxMarginUtilizationPct: Number(process.env.PORTFOLIO_MAX_MARGIN_UTIL || 0.7),
 });
 
 /* =========================================================
@@ -31,12 +35,17 @@ function getState(tenantId) {
 
   if (!PORTFOLIO.has(key)) {
     PORTFOLIO.set(key, {
-      version: 9,
+      version: 22,
+
       capital: 0,
       exposureBySymbol: {},
       exposureBySector: {},
       totalExposure: 0,
-      capitalDeployments: [], // velocity tracking
+
+      grossExposure: 0,
+      netExposure: 0,
+
+      capitalDeployments: [],
       lastUpdated: Date.now(),
     });
   }
@@ -45,7 +54,7 @@ function getState(tenantId) {
 }
 
 /* =========================================================
-   SECTOR MODEL (Lightweight)
+   SECTOR MODEL
 ========================================================= */
 
 function getSector(symbol) {
@@ -57,11 +66,14 @@ function getSector(symbol) {
   if (symbol.includes("SOL") || symbol.includes("ADA"))
     return "layer1";
 
+  if (symbol.includes("XRP") || symbol.includes("XLM"))
+    return "payments";
+
   return "alt";
 }
 
 /* =========================================================
-   CORRELATION MODEL (Memory Enhanced)
+   CORRELATION MODEL
 ========================================================= */
 
 function estimateCorrelation(symbolA, symbolB) {
@@ -77,41 +89,48 @@ function estimateCorrelation(symbolA, symbolB) {
 }
 
 /* =========================================================
-   EXPOSURE CALCULATION
+   EXPOSURE REBUILD (Multi-Position Aware)
 ========================================================= */
 
-function recalcExposureFromState(paperState, state) {
+function recalcExposureFromState(tradingState, state) {
   state.exposureBySymbol = {};
   state.exposureBySector = {};
   state.totalExposure = 0;
+  state.grossExposure = 0;
+  state.netExposure = 0;
 
-  if (!paperState?.position || !paperState?.lastPrice) return;
+  if (!tradingState?.positions) return;
 
-  const pos = paperState.position;
-  const notional = Math.abs(pos.qty * paperState.lastPrice);
-  const sector = getSector(pos.symbol);
+  for (const [symbol, pos] of Object.entries(tradingState.positions)) {
+    if (!pos?.qty || !tradingState.lastPrices?.[symbol]) continue;
 
-  state.exposureBySymbol[pos.symbol] = notional;
-  state.exposureBySector[sector] =
-    (state.exposureBySector[sector] || 0) + notional;
+    const price = tradingState.lastPrices[symbol];
+    const notional = Math.abs(pos.qty * price);
 
-  state.totalExposure = notional;
+    state.exposureBySymbol[symbol] = notional;
+
+    const sector = getSector(symbol);
+    state.exposureBySector[sector] =
+      (state.exposureBySector[sector] || 0) + notional;
+
+    state.totalExposure += notional;
+    state.grossExposure += notional;
+    state.netExposure += pos.qty * price;
+  }
 }
 
 /* =========================================================
-   CAPITAL VELOCITY CONTROL
+   CAPITAL VELOCITY
 ========================================================= */
 
 function checkVelocity(state, projectedNotional, ts) {
   const windowStart = ts - CONFIG.velocityWindowMs;
 
   state.capitalDeployments =
-    state.capitalDeployments.filter(
-      d => d.ts >= windowStart
-    );
+    state.capitalDeployments.filter(d => d.ts >= windowStart);
 
-  const deployedRecently = state.capitalDeployments
-    .reduce((a, b) => a + b.amount, 0);
+  const deployedRecently =
+    state.capitalDeployments.reduce((a, b) => a + b.amount, 0);
 
   if (
     deployedRecently + projectedNotional >
@@ -138,6 +157,7 @@ function evaluate({
   equity,
   proposedRiskPct,
   paperState,
+  marginUsed = 0,
   ts = Date.now(),
 }) {
   const state = getState(tenantId);
@@ -146,31 +166,26 @@ function evaluate({
 
   recalcExposureFromState(paperState, state);
 
-  const projectedNotional =
-    state.capital * clamp(proposedRiskPct || 0, 0, 1);
+  const riskPct = clamp(proposedRiskPct || 0, 0, 1);
+  const projectedNotional = state.capital * riskPct;
 
-  const projectedTotal =
-    state.totalExposure + projectedNotional;
-
+  const projectedTotal = state.totalExposure + projectedNotional;
   const projectedAsset =
-    (state.exposureBySymbol[symbol] || 0) +
-    projectedNotional;
+    (state.exposureBySymbol[symbol] || 0) + projectedNotional;
 
   const sector = getSector(symbol);
   const projectedSector =
-    (state.exposureBySector[sector] || 0) +
-    projectedNotional;
+    (state.exposureBySector[sector] || 0) + projectedNotional;
 
-  const capitalBuffer =
-    state.capital * CONFIG.minCapitalBufferPct;
+  const capitalBuffer = state.capital * CONFIG.minCapitalBufferPct;
 
-  /* ---------------- Buffer Guard ---------------- */
+  /* ================= BUFFER ================= */
 
   if (state.capital - projectedTotal <= capitalBuffer) {
     return reject("Capital buffer protection");
   }
 
-  /* ---------------- Total Exposure ---------------- */
+  /* ================= TOTAL EXPOSURE ================= */
 
   if (
     projectedTotal >=
@@ -179,7 +194,7 @@ function evaluate({
     return reject("Max portfolio exposure reached");
   }
 
-  /* ---------------- Single Asset ---------------- */
+  /* ================= SINGLE ASSET ================= */
 
   if (
     projectedAsset >=
@@ -188,20 +203,19 @@ function evaluate({
     return reject("Single asset cap reached");
   }
 
-  /* ---------------- Sector Cap (Implicit 60%) ---------------- */
+  /* ================= SECTOR ================= */
 
   if (
     projectedSector >=
-    state.capital * 0.6
+    state.capital * CONFIG.maxSectorExposurePct
   ) {
     return reject("Sector exposure cap reached");
   }
 
-  /* ---------------- Correlation Guard ---------------- */
+  /* ================= CORRELATION ================= */
 
   for (const existing of Object.keys(state.exposureBySymbol)) {
-    const exposure = state.exposureBySymbol[existing];
-    if (!exposure || existing === symbol) continue;
+    if (!state.exposureBySymbol[existing]) continue;
 
     const corr = estimateCorrelation(existing, symbol);
 
@@ -210,7 +224,17 @@ function evaluate({
     }
   }
 
-  /* ---------------- Capital Velocity ---------------- */
+  /* ================= MARGIN UTILIZATION ================= */
+
+  if (
+    marginUsed > 0 &&
+    marginUsed / state.capital >
+      CONFIG.maxMarginUtilizationPct
+  ) {
+    return reject("Margin utilization too high");
+  }
+
+  /* ================= VELOCITY ================= */
 
   if (!checkVelocity(state, projectedNotional, ts)) {
     return reject("Capital velocity exceeded");
@@ -222,7 +246,7 @@ function evaluate({
     allow: true,
     reason: "Approved",
     adjustedRiskPct: clamp(
-      proposedRiskPct,
+      riskPct,
       0,
       CONFIG.maxSingleAssetPct
     ),
