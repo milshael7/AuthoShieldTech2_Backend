@@ -1,13 +1,20 @@
 // backend/src/middleware/tenant.js
-// AutoDev 6.5 — Enterprise Tenant Isolation Core (HARDENED)
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v2)
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
 }
 
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
+
 function resolveFromSubdomain(req) {
-  const host = clean(req.hostname || req.headers.host);
+  let host = req.hostname || req.headers.host;
   if (!host) return null;
+
+  // Remove port if present
+  host = String(host).split(":")[0];
 
   const parts = host.split(".");
   if (parts.length < 3) return null;
@@ -23,7 +30,7 @@ function tenantMiddleware(req, res, next) {
     });
   }
 
-  const role = String(req.user.role || "").toLowerCase();
+  const role = normRole(req.user.role);
   const isAdmin = role === "admin";
 
   let companyId = null;
@@ -37,13 +44,16 @@ function tenantMiddleware(req, res, next) {
     resolvedFrom = "auth";
   }
 
-  // 2️⃣ Admin-only override
-  if (!companyId && isAdmin && req.headers["x-company-id"]) {
-    companyId = clean(req.headers["x-company-id"], 50);
-    resolvedFrom = "admin-header";
+  // 2️⃣ Admin-only override header
+  if (!companyId && isAdmin) {
+    const headerCompany = req.headers["x-company-id"];
+    if (headerCompany) {
+      companyId = clean(headerCompany, 50);
+      resolvedFrom = "admin-header";
+    }
   }
 
-  // 3️⃣ Subdomain (optional future usage)
+  // 3️⃣ Subdomain (optional)
   if (!companyId) {
     const sub = resolveFromSubdomain(req);
     if (sub) {
@@ -97,7 +107,7 @@ function tenantMiddleware(req, res, next) {
     resolvedFrom,
   };
 
-  next();
+  return next();
 }
 
 module.exports = tenantMiddleware;
