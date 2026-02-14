@@ -1,7 +1,7 @@
 // backend/src/services/portfolioManager.js
-// Phase 7 — Institutional Portfolio Engine
-// Multi-Asset Exposure Control • Correlation Control • Capital Allocation Layer
-// Sits ABOVE strategyEngine & riskManager
+// Phase 8 — Institutional Portfolio Engine (Upgraded)
+// Multi-Asset Exposure • Projected Exposure Model • Correlation Control
+// Fully Compatible with PaperTrader + LiveTrader
 // Tenant Safe
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -11,10 +11,10 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 ========================================================= */
 
 const CONFIG = Object.freeze({
-  maxTotalExposurePct: Number(process.env.PORTFOLIO_MAX_TOTAL_EXPOSURE || 0.8), // 80% capital deployed max
-  maxSingleAssetPct: Number(process.env.PORTFOLIO_MAX_SINGLE_ASSET || 0.3),     // 30% per asset
+  maxTotalExposurePct: Number(process.env.PORTFOLIO_MAX_TOTAL_EXPOSURE || 0.8),
+  maxSingleAssetPct: Number(process.env.PORTFOLIO_MAX_SINGLE_ASSET || 0.3),
   correlationCutoff: Number(process.env.PORTFOLIO_CORRELATION_CUTOFF || 0.8),
-  minCapitalBufferPct: Number(process.env.PORTFOLIO_MIN_BUFFER || 0.1),         // 10% reserve
+  minCapitalBufferPct: Number(process.env.PORTFOLIO_MIN_BUFFER || 0.1),
 });
 
 /* =========================================================
@@ -39,38 +39,36 @@ function getState(tenantId) {
 }
 
 /* =========================================================
-   CORRELATION MODEL (LIGHTWEIGHT PLACEHOLDER)
-   In future: rolling correlation matrix
+   CORRELATION MODEL (Lightweight placeholder)
 ========================================================= */
 
 function estimateCorrelation(symbolA, symbolB) {
   if (!symbolA || !symbolB) return 0;
   if (symbolA === symbolB) return 1;
 
-  // crude crypto sector clustering
   const majors = ["BTCUSDT", "ETHUSDT"];
   if (majors.includes(symbolA) && majors.includes(symbolB)) return 0.9;
 
-  return 0.6; // default moderate correlation
+  return 0.6;
 }
 
 /* =========================================================
    EXPOSURE CALCULATION
 ========================================================= */
 
-function calculateExposure(paperState) {
+function calculateExposureFromState(paperState) {
   if (!paperState) return 0;
 
   if (!paperState.position) return 0;
 
   const pos = paperState.position;
-  const notional = pos.qty * paperState.lastPrice;
+  if (!paperState.lastPrice || !pos.qty) return 0;
 
-  return Math.abs(notional);
+  return Math.abs(pos.qty * paperState.lastPrice);
 }
 
 /* =========================================================
-   CORE EVALUATION
+   CORE EVALUATION (PROJECTED MODEL)
 ========================================================= */
 
 function evaluate({
@@ -84,7 +82,7 @@ function evaluate({
 
   state.capital = equity || state.capital;
 
-  const currentExposure = calculateExposure(paperState);
+  const currentExposure = calculateExposureFromState(paperState);
   state.exposureBySymbol[symbol] = currentExposure;
 
   const totalExposure = Object.values(state.exposureBySymbol)
@@ -92,11 +90,18 @@ function evaluate({
 
   state.totalExposure = totalExposure;
 
+  const projectedNotional =
+    state.capital * clamp(proposedRiskPct || 0, 0, 1);
+
+  const projectedTotalExposure = totalExposure + projectedNotional;
+  const projectedAssetExposure =
+    (state.exposureBySymbol[symbol] || 0) + projectedNotional;
+
   const capitalBuffer = state.capital * CONFIG.minCapitalBufferPct;
 
-  /* ---------------- Capital Guard ---------------- */
+  /* ---------------- Capital Buffer Guard ---------------- */
 
-  if (state.capital - totalExposure <= capitalBuffer) {
+  if (state.capital - projectedTotalExposure <= capitalBuffer) {
     return {
       allow: false,
       reason: "Capital buffer protection",
@@ -107,7 +112,7 @@ function evaluate({
   /* ---------------- Total Exposure Guard ---------------- */
 
   if (
-    totalExposure >=
+    projectedTotalExposure >=
     state.capital * CONFIG.maxTotalExposurePct
   ) {
     return {
@@ -119,10 +124,8 @@ function evaluate({
 
   /* ---------------- Single Asset Guard ---------------- */
 
-  const assetExposure = state.exposureBySymbol[symbol] || 0;
-
   if (
-    assetExposure >=
+    projectedAssetExposure >=
     state.capital * CONFIG.maxSingleAssetPct
   ) {
     return {
@@ -134,15 +137,11 @@ function evaluate({
 
   /* ---------------- Correlation Guard ---------------- */
 
-  for (const existingSymbol of Object.keys(
-    state.exposureBySymbol
-  )) {
-    if (!state.exposureBySymbol[existingSymbol]) continue;
+  for (const existingSymbol of Object.keys(state.exposureBySymbol)) {
+    const exposure = state.exposureBySymbol[existingSymbol];
+    if (!exposure || existingSymbol === symbol) continue;
 
-    const corr = estimateCorrelation(
-      existingSymbol,
-      symbol
-    );
+    const corr = estimateCorrelation(existingSymbol, symbol);
 
     if (corr >= CONFIG.correlationCutoff) {
       return {
