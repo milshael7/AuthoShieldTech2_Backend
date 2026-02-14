@@ -1,5 +1,7 @@
 // backend/src/routes/trading.routes.js
-// Trading Routes — PHASE 2 ALIGNED + SAFE
+// Phase 10 — Institutional Trading Control API
+// Paper + Live + Risk + Portfolio + AI Telemetry
+// Multi-Layer Protected • Tenant Safe
 
 const express = require("express");
 const router = express.Router();
@@ -9,12 +11,17 @@ const { audit } = require("../lib/audit");
 
 const paperTrader = require("../services/paperTrader");
 const liveTrader = require("../services/liveTrader");
+const riskManager = require("../services/riskManager");
+const portfolioManager = require("../services/portfolioManager");
+const aiBrain = require("../services/aiBrain");
 
 // ---------------- ROLES ----------------
 const ADMIN = "Admin";
 const MANAGER = "Manager";
 
-/* ================= PUBLIC ================= */
+/* =========================================================
+   PUBLIC
+========================================================= */
 
 router.get("/symbols", (req, res) => {
   return res.json({
@@ -23,11 +30,15 @@ router.get("/symbols", (req, res) => {
   });
 });
 
-/* ================= PROTECTED ================= */
+/* =========================================================
+   PROTECTED
+========================================================= */
 
 router.use(authRequired);
 
-/* ================= PAPER ================= */
+/* =========================================================
+   PAPER
+========================================================= */
 
 router.get(
   "/paper/snapshot",
@@ -63,7 +74,9 @@ router.post(
   }
 );
 
-/* ================= LIVE ================= */
+/* =========================================================
+   LIVE
+========================================================= */
 
 router.get(
   "/live/snapshot",
@@ -79,11 +92,105 @@ router.get(
   }
 );
 
-/*
-  NOTE:
-  Phase 2 liveTrader does NOT support pushSignal.
-  It auto-generates decisions from ticks only.
-  So we intentionally remove /live/signal endpoint.
-*/
+/* =========================================================
+   RISK TELEMETRY
+========================================================= */
+
+router.get(
+  "/risk/snapshot",
+  requireRole(ADMIN, MANAGER),
+  (req, res) => {
+    const tenantId = req.tenant.id;
+
+    const paper = paperTrader.snapshot(tenantId);
+
+    const risk = riskManager.evaluate({
+      tenantId,
+      equity: paper.equity,
+      volatility: paper.volatility,
+      trades: paper.trades,
+      ts: Date.now(),
+    });
+
+    return res.json({
+      ok: true,
+      tenantId,
+      risk,
+    });
+  }
+);
+
+/* =========================================================
+   PORTFOLIO TELEMETRY
+========================================================= */
+
+router.get(
+  "/portfolio/snapshot",
+  requireRole(ADMIN, MANAGER),
+  (req, res) => {
+    const tenantId = req.tenant.id;
+
+    const paper = paperTrader.snapshot(tenantId);
+
+    const portfolio = portfolioManager.evaluate({
+      tenantId,
+      symbol: paper.position?.symbol || "N/A",
+      equity: paper.equity,
+      proposedRiskPct: 0,
+      paperState: paper,
+    });
+
+    return res.json({
+      ok: true,
+      tenantId,
+      portfolio,
+    });
+  }
+);
+
+/* =========================================================
+   AI BRAIN SNAPSHOT
+========================================================= */
+
+router.get(
+  "/ai/snapshot",
+  requireRole(ADMIN, MANAGER),
+  (req, res) => {
+    return res.json({
+      ok: true,
+      snapshot: aiBrain.getSnapshot(),
+    });
+  }
+);
+
+/* =========================================================
+   SYSTEM HEALTH
+========================================================= */
+
+router.get(
+  "/system/health",
+  requireRole(ADMIN),
+  (req, res) => {
+    const tenantId = req.tenant.id;
+
+    const paper = paperTrader.snapshot(tenantId);
+    const live = liveTrader.snapshot(tenantId);
+
+    return res.json({
+      ok: true,
+      tenantId,
+      health: {
+        paperRunning: paper.running,
+        liveRunning: live.running,
+        liveMode: live.mode,
+        paperEquity: paper.equity,
+        liveEquity: live.stats?.equity || null,
+        halted: paper.limits?.halted || false,
+      },
+    });
+  }
+);
+
+/* ========================================================= */
 
 module.exports = router;
