@@ -18,19 +18,27 @@ const { startKrakenFeed } = require("./services/krakenFeed");
 const securityRoutes = require("./routes/security.routes");
 
 /* =========================================================
-   ENV CHECKS
+   SAFE BOOT + ENV CHECKS
 ========================================================= */
 
 function requireEnv(name) {
   if (!process.env[name]) {
-    console.error(`Missing required env var: ${name}`);
+    console.error(`[BOOT] Missing required env var: ${name}`);
     process.exit(1);
   }
 }
 
+function bootLog(msg) {
+  console.log(`[BOOT] ${msg}`);
+}
+
+bootLog("Initializing AutoShield Backend...");
+
 ensureDb();
 requireEnv("JWT_SECRET");
 users.ensureAdminFromEnv();
+
+bootLog("Environment OK");
 
 /* =========================================================
    EXPRESS APP
@@ -76,13 +84,16 @@ const authLimiter = rateLimit({
 });
 
 /* =========================================================
-   HEALTH
+   HEALTH + SYSTEM STATUS
 ========================================================= */
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     name: "autoshield-tech-backend",
+    uptime: process.uptime(),
+    memory: process.memoryUsage().rss,
+    activeTenants: ACTIVE_TENANTS.size,
     time: new Date().toISOString(),
   });
 });
@@ -117,7 +128,6 @@ function registerTenant(tenantId) {
   console.log("[engine] registered tenant:", tenantId);
 }
 
-/* Auto-register tenant on first authenticated request */
 app.use((req, res, next) => {
   const tenantId = req.tenant?.id || req.tenantId;
   if (tenantId) registerTenant(tenantId);
@@ -147,6 +157,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws/market" });
 
 let last = {};
+let lastTickTs = Date.now();
 
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
@@ -180,45 +191,70 @@ try {
 
     onTick: (tick) => {
       last[tick.symbol] = tick.price;
+      lastTickTs = Date.now();
 
       if (ACTIVE_TENANTS.size === 0) return;
 
       for (const tenantId of ACTIVE_TENANTS) {
-        paperTrader.tick(
-          tenantId,
-          tick.symbol,
-          tick.price,
-          tick.ts
-        );
+        try {
+          paperTrader.tick(
+            tenantId,
+            tick.symbol,
+            tick.price,
+            tick.ts
+          );
 
-        liveTrader.tick(
-          tenantId,
-          tick.symbol,
-          tick.price,
-          tick.ts
-        );
+          liveTrader.tick(
+            tenantId,
+            tick.symbol,
+            tick.price,
+            tick.ts
+          );
+        } catch (err) {
+          console.error("[engine tick error]", err);
+        }
       }
 
       broadcast({ type: "tick", ...tick });
     },
   });
+
+  bootLog("Kraken feed started");
 } catch (e) {
   console.error("Failed to start Kraken feed:", e);
 }
 
 /* =========================================================
-   ERROR HANDLER
+   GLOBAL ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
-  if (err && String(err.message || "").toLowerCase().includes("cors")) {
+  console.error("[HTTP ERROR]", err);
+
+  if (err?.message?.toLowerCase()?.includes("cors")) {
     return res.status(403).json({
       ok: false,
       error: "CORS blocked",
       detail: err.message,
     });
   }
-  return next(err);
+
+  return res.status(500).json({
+    ok: false,
+    error: "Internal server error",
+  });
+});
+
+/* =========================================================
+   PROCESS CRASH PROTECTION
+========================================================= */
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[UNHANDLED REJECTION]", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
 });
 
 /* =========================================================
@@ -227,20 +263,28 @@ app.use((err, req, res, next) => {
 
 const port = process.env.PORT || 5000;
 
-server.listen(port, () =>
-  console.log("AutoShield Tech backend running on", port)
-);
+server.listen(port, () => {
+  bootLog(`Backend running on port ${port}`);
+});
 
 /* =========================================================
-   SHUTDOWN
+   GRACEFUL SHUTDOWN
 ========================================================= */
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 function shutdown() {
-  console.log("Shutting down...");
+  console.log("[shutdown] Closing services...");
+
   try { krakenStop && krakenStop.stop(); } catch {}
   try { wss.close(); } catch {}
-  try { server.close(() => process.exit(0)); } catch { process.exit(1); }
+  try {
+    server.close(() => {
+      console.log("[shutdown] Complete");
+      process.exit(0);
+    });
+  } catch {
+    process.exit(1);
+  }
 }
