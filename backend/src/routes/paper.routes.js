@@ -1,36 +1,50 @@
 // backend/src/routes/paper.routes.js
-// Paper endpoints — TENANT SAFE + ENGINE ALIGNED
+// Paper Engine API — Institutional Hardened
+// Auth Required • Tenant Safe • Engine Aligned
 
 const express = require("express");
 const router = express.Router();
 
+const { authRequired } = require("../middleware/auth");
 const paperTrader = require("../services/paperTrader");
 
-/* ================= KEY GATE ================= */
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
+
+router.use(authRequired);
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function getTenantId(req) {
+  return req.tenant?.id || null;
+}
 
 function resetAllowed(req) {
   const key = String(process.env.PAPER_RESET_KEY || "").trim();
+
+  // If no key configured → allow
   if (!key) return true;
+
   const sent = String(req.headers["x-reset-key"] || "").trim();
   return !!sent && sent === key;
 }
 
-/* ================= TENANT HELPER ================= */
-
-function getTenantId(req) {
-  return req.tenant?.id || req.tenantId || null;
-}
-
-/* ================= ROUTES ================= */
+/* =========================================================
+   STATUS
+========================================================= */
 
 // GET /api/paper/status
 router.get("/status", (req, res) => {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(400).json({
         ok: false,
-        error: "Missing tenant context.",
+        error: "Missing tenant context",
       });
     }
 
@@ -41,6 +55,7 @@ router.get("/status", (req, res) => {
       snapshot,
       time: new Date().toISOString(),
     });
+
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -49,22 +64,26 @@ router.get("/status", (req, res) => {
   }
 });
 
+/* =========================================================
+   RESET
+========================================================= */
+
 // POST /api/paper/reset
 router.post("/reset", (req, res) => {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(400).json({
         ok: false,
-        error: "Missing tenant context.",
+        error: "Missing tenant context",
       });
     }
 
     if (!resetAllowed(req)) {
       return res.status(403).json({
         ok: false,
-        error:
-          "Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY).",
+        error: "Reset blocked. Invalid or missing x-reset-key.",
       });
     }
 
@@ -72,10 +91,11 @@ router.post("/reset", (req, res) => {
 
     return res.json({
       ok: true,
-      message: "Paper trader reset complete.",
+      message: "Paper trader reset complete",
       snapshot: paperTrader.snapshot(tenantId),
       time: new Date().toISOString(),
     });
+
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -84,14 +104,19 @@ router.post("/reset", (req, res) => {
   }
 });
 
+/* =========================================================
+   CONFIG VIEW (READ-ONLY)
+========================================================= */
+
 // GET /api/paper/config
 router.get("/config", (req, res) => {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(400).json({
         ok: false,
-        error: "Missing tenant context.",
+        error: "Missing tenant context",
       });
     }
 
@@ -113,10 +138,10 @@ router.get("/config", (req, res) => {
     return res.json({
       ok: true,
       config,
-      owner: config,
-      limits: snap.limits || {},
+      limits: snap?.limits || {},
       time: new Date().toISOString(),
     });
+
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -125,12 +150,16 @@ router.get("/config", (req, res) => {
   }
 });
 
+/* =========================================================
+   CONFIG UPDATE BLOCK
+========================================================= */
+
 // POST /api/paper/config
 router.post("/config", (req, res) => {
   return res.status(409).json({
     ok: false,
     error:
-      "Runtime config updates are not supported. Set PAPER_* env variables and restart the server.",
+      "Runtime config updates are not supported. Set PAPER_* env variables and restart.",
   });
 });
 
