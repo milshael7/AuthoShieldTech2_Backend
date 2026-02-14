@@ -1,8 +1,9 @@
 // backend/src/routes/ai.routes.js
-// Phase 2 — Hardened AI Route
-// Tenant Safe • Auth Required • Abuse Protected • Circuit Guarded
+// Enterprise AI Route — Tenant-Isolated + Circuit Protected
+// Auth Required • Prompt Guarded • Abuse Protected • Production Safe
 
 const express = require("express");
+const fetch = require("node-fetch"); // 🔒 Explicit import
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
@@ -20,11 +21,20 @@ const MAX_FAILURES_BEFORE_COOLDOWN = 5;
 const FAILURE_COOLDOWN_MS = 60000;
 
 /* =========================================================
-   FAILURE CIRCUIT BREAKER (PER PROCESS)
+   TENANT CIRCUIT BREAKER
 ========================================================= */
 
-let failureCount = 0;
-let failureCooldownUntil = 0;
+const CIRCUIT = new Map();
+
+function getCircuit(tenantId) {
+  if (!CIRCUIT.has(tenantId)) {
+    CIRCUIT.set(tenantId, {
+      failures: 0,
+      cooldownUntil: 0,
+    });
+  }
+  return CIRCUIT.get(tenantId);
+}
 
 /* =========================================================
    HELPERS
@@ -35,27 +45,8 @@ function cleanStr(v, max = MAX_MESSAGE_LEN) {
 }
 
 function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
-}
-
-function isCoolingDown() {
-  return Date.now() < failureCooldownUntil;
-}
-
-function registerFailure() {
-  failureCount++;
-  if (failureCount >= MAX_FAILURES_BEFORE_COOLDOWN) {
-    failureCooldownUntil = Date.now() + FAILURE_COOLDOWN_MS;
-    failureCount = 0;
-  }
-}
-
-function registerSuccess() {
-  failureCount = 0;
+  try { return JSON.parse(str); }
+  catch { return null; }
 }
 
 function detectPromptInjection(text) {
@@ -69,11 +60,23 @@ function detectPromptInjection(text) {
 }
 
 function sanitizeOutput(str) {
-  return cleanStr(str.replace(/<\/?script>/gi, ""), 12000);
+  return cleanStr(
+    String(str || "").replace(/<\/?script>/gi, ""),
+    12000
+  );
+}
+
+function sanitizeContext(ctx) {
+  try {
+    const s = JSON.stringify(ctx);
+    return JSON.parse(s.slice(0, MAX_CONTEXT_SIZE));
+  } catch {
+    return {};
+  }
 }
 
 /* =========================================================
-   AUDIT LOG
+   AUDIT
 ========================================================= */
 
 function auditAI({ req, kind, model }) {
@@ -86,7 +89,6 @@ function auditAI({ req, kind, model }) {
         userId: req?.user?.id || null,
         role: req?.user?.role || null,
         route: req.originalUrl,
-        method: req.method,
         ai: { kind, model },
       })
     );
@@ -97,12 +99,12 @@ function auditAI({ req, kind, model }) {
    LOCAL FALLBACK
 ========================================================= */
 
-function localReply(message) {
+function localReply() {
   return {
     reply:
-      "I can help with trading performance, security posture, or platform activity.",
+      "I can assist with trading performance, security posture, or system metrics.",
     speakText:
-      "I can help with trading or platform activity.",
+      "I can assist with trading or system metrics.",
     meta: { kind: "local" },
   };
 }
@@ -112,7 +114,11 @@ function localReply(message) {
 ========================================================= */
 
 async function openaiReply({ tenantId, message, context }) {
-  if (isCoolingDown()) return null;
+  const circuit = getCircuit(tenantId);
+
+  if (Date.now() < circuit.cooldownUntil) {
+    return null;
+  }
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
@@ -136,12 +142,14 @@ Rules:
 - Stay calm and professional
 `;
 
+  const safeContext = sanitizeContext(context);
+
   const user = `
 Message:
 ${message}
 
 Context:
-${JSON.stringify(context).slice(0, MAX_CONTEXT_SIZE)}
+${JSON.stringify(safeContext)}
 
 Recent memory:
 ${memory.map((m) => `- ${m.text}`).join("\n")}
@@ -191,7 +199,8 @@ Respond ONLY with JSON:
       throw new Error("Invalid JSON reply");
     }
 
-    registerSuccess();
+    // ✅ Success reset
+    circuit.failures = 0;
 
     return {
       reply: sanitizeOutput(parsed.reply),
@@ -201,7 +210,14 @@ Respond ONLY with JSON:
       meta: { kind: "openai", model },
     };
   } catch {
-    registerFailure();
+    circuit.failures++;
+
+    if (circuit.failures >= MAX_FAILURES_BEFORE_COOLDOWN) {
+      circuit.cooldownUntil =
+        Date.now() + FAILURE_COOLDOWN_MS;
+      circuit.failures = 0;
+    }
+
     return null;
   } finally {
     clearTimeout(timeout);
@@ -228,10 +244,8 @@ router.post("/chat", authRequired, async (req, res) => {
     if (detectPromptInjection(message)) {
       return res.json({
         ok: true,
-        reply:
-          "I cannot process that request.",
-        speakText:
-          "I cannot process that request.",
+        reply: "I cannot process that request.",
+        speakText: "I cannot process that request.",
         meta: { kind: "blocked" },
       });
     }
@@ -244,7 +258,7 @@ router.post("/chat", authRequired, async (req, res) => {
       context,
     });
 
-    if (!out) out = localReply(message);
+    if (!out) out = localReply();
 
     auditAI({
       req,
