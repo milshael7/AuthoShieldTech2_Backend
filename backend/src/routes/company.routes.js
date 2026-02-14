@@ -1,9 +1,6 @@
 // backend/src/routes/company.routes.js
-// Company Room API (members + notifications)
-//
-// ✅ Company role can manage members in their own company
-// ✅ Admin can view/manage any company (via ?companyId or body.companyId)
-// ✅ Safe scoping: cannot read or mutate outside company scope
+// Company Room API — Institutional Hardened
+// Scoped Isolation • Admin Override Safe • Production Ready
 
 const express = require("express");
 const router = express.Router();
@@ -15,38 +12,56 @@ const { listNotifications, markRead } = require("../lib/notify");
 
 router.use(authRequired);
 
-// ---------------- helpers ----------------
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function safeStr(v, max = 120) {
   const s = String(v || "").trim();
   return s ? s.slice(0, max) : "";
 }
 
-// Resolve company scope for this request
-function getCompanyId(req) {
-  const role = req.user?.role;
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
 
-  // Admin can inspect any company (explicit override)
-  if (role === users.ROLES.ADMIN) {
+/*
+   Resolve company scope safely
+*/
+function resolveCompanyId(req) {
+  const role = normRole(req.user?.role);
+  const isAdmin = role === normRole(users.ROLES.ADMIN);
+
+  // Admin override
+  if (isAdmin) {
     const fromQuery = safeStr(req.query.companyId, 100);
     const fromBody = safeStr(req.body?.companyId, 100);
-    return fromQuery || fromBody || safeStr(req.user.companyId, 100) || null;
+    const fromToken = safeStr(req.user.companyId, 100);
+
+    return fromQuery || fromBody || fromToken || null;
   }
 
-  // Company users: only their assigned company
+  // Company users limited to assigned company
   return safeStr(req.user.companyId, 100) || null;
 }
 
 function requireCompany(req, res) {
-  const companyId = getCompanyId(req);
+  const companyId = resolveCompanyId(req);
+
   if (!companyId) {
-    res.status(400).json({ error: "No company assigned" });
+    res.status(400).json({
+      ok: false,
+      error: "Company context missing",
+    });
     return null;
   }
+
   return companyId;
 }
 
-// ---------------- routes ----------------
+/* =========================================================
+   COMPANY PROFILE
+========================================================= */
 
 // GET /api/company/me
 router.get(
@@ -59,15 +74,28 @@ router.get(
 
       const c = companies.getCompany(companyId);
       if (!c) {
-        return res.status(404).json({ error: "Company not found" });
+        return res.status(404).json({
+          ok: false,
+          error: "Company not found",
+        });
       }
 
-      return res.json(c);
+      return res.json({
+        ok: true,
+        company: c,
+      });
     } catch (e) {
-      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || String(e),
+      });
     }
   }
 );
+
+/* =========================================================
+   NOTIFICATIONS
+========================================================= */
 
 // GET /api/company/notifications
 router.get(
@@ -78,9 +106,15 @@ router.get(
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
-      return res.json(listNotifications({ companyId }));
+      return res.json({
+        ok: true,
+        notifications: listNotifications({ companyId }) || [],
+      });
     } catch (e) {
-      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || String(e),
+      });
     }
   }
 );
@@ -96,21 +130,37 @@ router.post(
 
       const id = safeStr(req.params.id, 100);
       if (!id) {
-        return res.status(400).json({ error: "Missing notification id" });
+        return res.status(400).json({
+          ok: false,
+          error: "Missing notification id",
+        });
       }
 
-      // Scope enforced here
       const n = markRead(id, null, companyId);
+
       if (!n) {
-        return res.status(404).json({ error: "Not found" });
+        return res.status(404).json({
+          ok: false,
+          error: "Notification not found",
+        });
       }
 
-      return res.json(n);
+      return res.json({
+        ok: true,
+        notification: n,
+      });
     } catch (e) {
-      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || String(e),
+      });
     }
   }
 );
+
+/* =========================================================
+   MEMBER MANAGEMENT
+========================================================= */
 
 // POST /api/company/members/add
 router.post(
@@ -123,14 +173,27 @@ router.post(
 
       const userId = safeStr(req.body?.userId, 100);
       if (!userId) {
-        return res.status(400).json({ error: "Missing userId" });
+        return res.status(400).json({
+          ok: false,
+          error: "Missing userId",
+        });
       }
 
-      return res.json(
-        companies.addMember(companyId, userId, req.user.id)
+      const result = companies.addMember(
+        companyId,
+        userId,
+        req.user.id
       );
+
+      return res.json({
+        ok: true,
+        result,
+      });
     } catch (e) {
-      return res.status(400).json({ error: e?.message || String(e) });
+      return res.status(400).json({
+        ok: false,
+        error: e?.message || String(e),
+      });
     }
   }
 );
@@ -146,14 +209,27 @@ router.post(
 
       const userId = safeStr(req.body?.userId, 100);
       if (!userId) {
-        return res.status(400).json({ error: "Missing userId" });
+        return res.status(400).json({
+          ok: false,
+          error: "Missing userId",
+        });
       }
 
-      return res.json(
-        companies.removeMember(companyId, userId, req.user.id)
+      const result = companies.removeMember(
+        companyId,
+        userId,
+        req.user.id
       );
+
+      return res.json({
+        ok: true,
+        result,
+      });
     } catch (e) {
-      return res.status(400).json({ error: e?.message || String(e) });
+      return res.status(400).json({
+        ok: false,
+        error: e?.message || String(e),
+      });
     }
   }
 );
