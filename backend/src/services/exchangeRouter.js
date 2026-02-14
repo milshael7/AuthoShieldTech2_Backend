@@ -1,6 +1,7 @@
 // backend/src/services/exchangeRouter.js
-// Phase 11 — Self-Optimizing Institutional Exchange Router
-// Dynamic Ranking • Latency Scoring • Circuit Breaker • Failover
+// Phase 15 — Liquidation-Aware Institutional Smart Router
+// Dynamic Ranking • Latency Scoring • Circuit Breaker
+// Liquidation Priority Routing • Timeout Protection
 // Adapter-Agnostic • Production Hardened
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -18,6 +19,10 @@ const CONFIG = Object.freeze({
   cooldownMs: Number(process.env.EXECUTION_FAILURE_COOLDOWN || 60_000),
 
   metricsWindow: Number(process.env.EXECUTION_METRICS_WINDOW || 50),
+
+  executionTimeoutMs: Number(process.env.EXECUTION_TIMEOUT_MS || 8000),
+
+  liquidationLatencyWeight: 0.6, // prioritizes speed in liquidation
 });
 
 /* =========================================================
@@ -48,6 +53,7 @@ function getAdapterState(name) {
         total: 0,
         success: 0,
         latencySamples: [],
+        partialFills: 0,
       },
     });
   }
@@ -68,7 +74,7 @@ function markFailure(name, err) {
   }
 }
 
-function markSuccess(name, latencyMs) {
+function markSuccess(name, latencyMs, result = {}) {
   const state = getAdapterState(name);
 
   state.failures = 0;
@@ -80,10 +86,15 @@ function markSuccess(name, latencyMs) {
 
   if (Number.isFinite(latencyMs)) {
     state.metrics.latencySamples.push(latencyMs);
-
     if (state.metrics.latencySamples.length > CONFIG.metricsWindow) {
       state.metrics.latencySamples =
         state.metrics.latencySamples.slice(-CONFIG.metricsWindow);
+    }
+  }
+
+  if (result?.filledQty && result?.requestedQty) {
+    if (result.filledQty < result.requestedQty) {
+      state.metrics.partialFills++;
     }
   }
 }
@@ -100,22 +111,22 @@ function adapterAvailable(name) {
 
 function avgLatency(samples = []) {
   if (!samples.length) return 9999;
-  return (
-    samples.reduce((a, b) => a + b, 0) / samples.length
-  );
+  return samples.reduce((a, b) => a + b, 0) / samples.length;
 }
 
-function scoreAdapter(name) {
+function scoreAdapter(name, { forceClose } = {}) {
   const state = getAdapterState(name);
   const { total, success, latencySamples } = state.metrics;
 
-  const successRate =
-    total > 0 ? success / total : 1;
+  const successRate = total > 0 ? success / total : 1;
+  const latencyScore = 1 / clamp(avgLatency(latencySamples), 1, 10_000);
 
-  const latencyScore =
-    1 / clamp(avgLatency(latencySamples), 1, 10_000);
+  if (forceClose) {
+    // During liquidation: prioritize speed more heavily
+    return successRate * (1 - CONFIG.liquidationLatencyWeight) +
+           latencyScore * CONFIG.liquidationLatencyWeight;
+  }
 
-  // Weighted score
   return successRate * 0.7 + latencyScore * 0.3;
 }
 
@@ -123,7 +134,7 @@ function scoreAdapter(name) {
    ROUTE ORDER (DYNAMIC RANKING)
 ========================================================= */
 
-function getRouteOrder() {
+function getRouteOrder(context = {}) {
   const base = [
     CONFIG.primary,
     CONFIG.secondary,
@@ -132,7 +143,22 @@ function getRouteOrder() {
 
   return base
     .filter((name) => ADAPTERS[name])
-    .sort((a, b) => scoreAdapter(b) - scoreAdapter(a));
+    .sort((a, b) =>
+      scoreAdapter(b, context) - scoreAdapter(a, context)
+    );
+}
+
+/* =========================================================
+   TIMEOUT WRAPPER
+========================================================= */
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Execution timeout")), ms)
+    ),
+  ]);
 }
 
 /* =========================================================
@@ -140,7 +166,9 @@ function getRouteOrder() {
 ========================================================= */
 
 async function routeLiveOrder(params = {}) {
-  const route = getRouteOrder();
+  const { forceClose } = params;
+
+  const route = getRouteOrder({ forceClose });
 
   for (const exchange of route) {
     if (!adapterAvailable(exchange)) continue;
@@ -158,10 +186,15 @@ async function routeLiveOrder(params = {}) {
       markAttempt(exchange);
 
       const start = Date.now();
-      const result = await adapter.executeLiveOrder(params);
+
+      const result = await withTimeout(
+        adapter.executeLiveOrder(params),
+        CONFIG.executionTimeoutMs
+      );
+
       const latency = Date.now() - start;
 
-      markSuccess(exchange, latency);
+      markSuccess(exchange, latency, result);
 
       return {
         ok: true,
@@ -199,6 +232,7 @@ function getHealth() {
           ? metrics.success / metrics.total
           : 1,
       avgLatencyMs: avgLatency(metrics.latencySamples),
+      partialFills: metrics.partialFills,
     };
   }
 
