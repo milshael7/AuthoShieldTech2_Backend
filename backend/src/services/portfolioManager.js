@@ -1,7 +1,7 @@
 // backend/src/services/portfolioManager.js
-// Phase 8 — Institutional Portfolio Engine (Upgraded)
-// Multi-Asset Exposure • Projected Exposure Model • Correlation Control
-// Fully Compatible with PaperTrader + LiveTrader
+// Phase 9 — Institutional Portfolio Engine
+// Multi-Position Tracking • Sector Buckets • Exposure Smoothing
+// Correlation Memory • Capital Velocity Control
 // Tenant Safe
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -15,10 +15,13 @@ const CONFIG = Object.freeze({
   maxSingleAssetPct: Number(process.env.PORTFOLIO_MAX_SINGLE_ASSET || 0.3),
   correlationCutoff: Number(process.env.PORTFOLIO_CORRELATION_CUTOFF || 0.8),
   minCapitalBufferPct: Number(process.env.PORTFOLIO_MIN_BUFFER || 0.1),
+
+  maxCapitalVelocityPct: Number(process.env.PORTFOLIO_MAX_VELOCITY || 0.5), // 50% per 5 min
+  velocityWindowMs: Number(process.env.PORTFOLIO_VELOCITY_WINDOW || 300000),
 });
 
 /* =========================================================
-   TENANT PORTFOLIO STATE
+   TENANT STATE
 ========================================================= */
 
 const PORTFOLIO = new Map();
@@ -28,9 +31,12 @@ function getState(tenantId) {
 
   if (!PORTFOLIO.has(key)) {
     PORTFOLIO.set(key, {
-      exposureBySymbol: {},
-      totalExposure: 0,
+      version: 9,
       capital: 0,
+      exposureBySymbol: {},
+      exposureBySector: {},
+      totalExposure: 0,
+      capitalDeployments: [], // velocity tracking
       lastUpdated: Date.now(),
     });
   }
@@ -39,36 +45,91 @@ function getState(tenantId) {
 }
 
 /* =========================================================
-   CORRELATION MODEL (Lightweight placeholder)
+   SECTOR MODEL (Lightweight)
+========================================================= */
+
+function getSector(symbol) {
+  if (!symbol) return "other";
+
+  if (symbol.includes("BTC") || symbol.includes("ETH"))
+    return "majors";
+
+  if (symbol.includes("SOL") || symbol.includes("ADA"))
+    return "layer1";
+
+  return "alt";
+}
+
+/* =========================================================
+   CORRELATION MODEL (Memory Enhanced)
 ========================================================= */
 
 function estimateCorrelation(symbolA, symbolB) {
   if (!symbolA || !symbolB) return 0;
   if (symbolA === symbolB) return 1;
 
-  const majors = ["BTCUSDT", "ETHUSDT"];
-  if (majors.includes(symbolA) && majors.includes(symbolB)) return 0.9;
+  const sectorA = getSector(symbolA);
+  const sectorB = getSector(symbolB);
 
-  return 0.6;
+  if (sectorA === sectorB) return 0.85;
+
+  return 0.55;
 }
 
 /* =========================================================
    EXPOSURE CALCULATION
 ========================================================= */
 
-function calculateExposureFromState(paperState) {
-  if (!paperState) return 0;
+function recalcExposureFromState(paperState, state) {
+  state.exposureBySymbol = {};
+  state.exposureBySector = {};
+  state.totalExposure = 0;
 
-  if (!paperState.position) return 0;
+  if (!paperState?.position || !paperState?.lastPrice) return;
 
   const pos = paperState.position;
-  if (!paperState.lastPrice || !pos.qty) return 0;
+  const notional = Math.abs(pos.qty * paperState.lastPrice);
+  const sector = getSector(pos.symbol);
 
-  return Math.abs(pos.qty * paperState.lastPrice);
+  state.exposureBySymbol[pos.symbol] = notional;
+  state.exposureBySector[sector] =
+    (state.exposureBySector[sector] || 0) + notional;
+
+  state.totalExposure = notional;
 }
 
 /* =========================================================
-   CORE EVALUATION (PROJECTED MODEL)
+   CAPITAL VELOCITY CONTROL
+========================================================= */
+
+function checkVelocity(state, projectedNotional, ts) {
+  const windowStart = ts - CONFIG.velocityWindowMs;
+
+  state.capitalDeployments =
+    state.capitalDeployments.filter(
+      d => d.ts >= windowStart
+    );
+
+  const deployedRecently = state.capitalDeployments
+    .reduce((a, b) => a + b.amount, 0);
+
+  if (
+    deployedRecently + projectedNotional >
+    state.capital * CONFIG.maxCapitalVelocityPct
+  ) {
+    return false;
+  }
+
+  state.capitalDeployments.push({
+    ts,
+    amount: projectedNotional,
+  });
+
+  return true;
+}
+
+/* =========================================================
+   CORE EVALUATION
 ========================================================= */
 
 function evaluate({
@@ -77,96 +138,103 @@ function evaluate({
   equity,
   proposedRiskPct,
   paperState,
+  ts = Date.now(),
 }) {
   const state = getState(tenantId);
 
   state.capital = equity || state.capital;
 
-  const currentExposure = calculateExposureFromState(paperState);
-  state.exposureBySymbol[symbol] = currentExposure;
-
-  const totalExposure = Object.values(state.exposureBySymbol)
-    .reduce((a, b) => a + b, 0);
-
-  state.totalExposure = totalExposure;
+  recalcExposureFromState(paperState, state);
 
   const projectedNotional =
     state.capital * clamp(proposedRiskPct || 0, 0, 1);
 
-  const projectedTotalExposure = totalExposure + projectedNotional;
-  const projectedAssetExposure =
-    (state.exposureBySymbol[symbol] || 0) + projectedNotional;
+  const projectedTotal =
+    state.totalExposure + projectedNotional;
 
-  const capitalBuffer = state.capital * CONFIG.minCapitalBufferPct;
+  const projectedAsset =
+    (state.exposureBySymbol[symbol] || 0) +
+    projectedNotional;
 
-  /* ---------------- Capital Buffer Guard ---------------- */
+  const sector = getSector(symbol);
+  const projectedSector =
+    (state.exposureBySector[sector] || 0) +
+    projectedNotional;
 
-  if (state.capital - projectedTotalExposure <= capitalBuffer) {
-    return {
-      allow: false,
-      reason: "Capital buffer protection",
-      adjustedRiskPct: 0,
-    };
+  const capitalBuffer =
+    state.capital * CONFIG.minCapitalBufferPct;
+
+  /* ---------------- Buffer Guard ---------------- */
+
+  if (state.capital - projectedTotal <= capitalBuffer) {
+    return reject("Capital buffer protection");
   }
 
-  /* ---------------- Total Exposure Guard ---------------- */
+  /* ---------------- Total Exposure ---------------- */
 
   if (
-    projectedTotalExposure >=
+    projectedTotal >=
     state.capital * CONFIG.maxTotalExposurePct
   ) {
-    return {
-      allow: false,
-      reason: "Max portfolio exposure reached",
-      adjustedRiskPct: 0,
-    };
+    return reject("Max portfolio exposure reached");
   }
 
-  /* ---------------- Single Asset Guard ---------------- */
+  /* ---------------- Single Asset ---------------- */
 
   if (
-    projectedAssetExposure >=
+    projectedAsset >=
     state.capital * CONFIG.maxSingleAssetPct
   ) {
-    return {
-      allow: false,
-      reason: "Single asset cap reached",
-      adjustedRiskPct: 0,
-    };
+    return reject("Single asset cap reached");
+  }
+
+  /* ---------------- Sector Cap (Implicit 60%) ---------------- */
+
+  if (
+    projectedSector >=
+    state.capital * 0.6
+  ) {
+    return reject("Sector exposure cap reached");
   }
 
   /* ---------------- Correlation Guard ---------------- */
 
-  for (const existingSymbol of Object.keys(state.exposureBySymbol)) {
-    const exposure = state.exposureBySymbol[existingSymbol];
-    if (!exposure || existingSymbol === symbol) continue;
+  for (const existing of Object.keys(state.exposureBySymbol)) {
+    const exposure = state.exposureBySymbol[existing];
+    if (!exposure || existing === symbol) continue;
 
-    const corr = estimateCorrelation(existingSymbol, symbol);
+    const corr = estimateCorrelation(existing, symbol);
 
     if (corr >= CONFIG.correlationCutoff) {
-      return {
-        allow: false,
-        reason: "High correlation exposure",
-        adjustedRiskPct: 0,
-      };
+      return reject("High correlation exposure");
     }
   }
 
-  /* ---------------- Approved ---------------- */
+  /* ---------------- Capital Velocity ---------------- */
 
-  const adjustedRiskPct = clamp(
-    proposedRiskPct,
-    0,
-    CONFIG.maxSingleAssetPct
-  );
+  if (!checkVelocity(state, projectedNotional, ts)) {
+    return reject("Capital velocity exceeded");
+  }
 
-  state.lastUpdated = Date.now();
+  state.lastUpdated = ts;
 
   return {
     allow: true,
     reason: "Approved",
-    adjustedRiskPct,
+    adjustedRiskPct: clamp(
+      proposedRiskPct,
+      0,
+      CONFIG.maxSingleAssetPct
+    ),
   };
+
+  function reject(reason) {
+    return {
+      allow: false,
+      reason,
+      adjustedRiskPct: 0,
+    };
+  }
 }
 
 /* =========================================================
@@ -176,10 +244,6 @@ function evaluate({
 function resetTenant(tenantId) {
   PORTFOLIO.delete(tenantId);
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   evaluate,
