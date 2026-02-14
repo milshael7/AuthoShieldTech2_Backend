@@ -1,17 +1,26 @@
 // backend/src/services/adapters/krakenAdapter.js
-// Phase 10 — Kraken Institutional Adapter
-// Router compatible • HMAC signing scaffold • Sandbox safe
-// Advanced trade-ready skeleton (REST v1 style signing model)
+// Phase 16 — Kraken Smart Institutional Adapter
+// Router Compatible • Risk-Based Qty • Liquidation Aware
+// Partial Fills • Slippage Model • Sandbox Safe
 
 const crypto = require("crypto");
 
 /* =========================================================
-   CONFIG (ENV wired later)
+   CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
   name: "kraken",
-  sandbox: true, // safe by default
+  sandbox: true,
+
+  baseSlippagePct: 0.0007,
+  liquidationSlippagePct: 0.0018,
+
+  partialFillProbability: 0.32,
+  minPartialFillPct: 0.35,
+
+  simulatedLatencyMin: 25,
+  simulatedLatencyMax: 70,
 });
 
 /* =========================================================
@@ -27,41 +36,44 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function randomBetween(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function simulateLatency() {
+  return randomBetween(
+    CONFIG.simulatedLatencyMin,
+    CONFIG.simulatedLatencyMax
+  );
+}
+
+function simulateSlippage(price, side, forceClose) {
+  const slip = forceClose
+    ? CONFIG.liquidationSlippagePct
+    : CONFIG.baseSlippagePct;
+
+  if (side === "BUY") return price * (1 + slip);
+  return price * (1 - slip);
+}
+
+function simulatePartialFill(qty, forceClose) {
+  if (forceClose) return qty;
+
+  if (Math.random() > CONFIG.partialFillProbability)
+    return qty;
+
+  const pct = randomBetween(CONFIG.minPartialFillPct, 0.9);
+  return qty * pct;
+}
+
 function buildOrderId() {
   return `kraken_${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}`;
 }
 
-/*
-  Kraken signing format (REST private endpoints):
-  signature = HMAC_SHA512(secret, path + SHA256(nonce + postData))
-*/
-function signRequest(secret, path, nonce, body) {
-  if (!secret) return null;
-
-  const postData = new URLSearchParams(body).toString();
-  const message = nonce + postData;
-
-  const hash = crypto
-    .createHash("sha256")
-    .update(message)
-    .digest();
-
-  const hmac = crypto.createHmac(
-    "sha512",
-    Buffer.from(secret, "base64")
-  );
-
-  const signature = hmac
-    .update(path + hash)
-    .digest("base64");
-
-  return signature;
-}
-
 /* =========================================================
-   PARAM NORMALIZATION
+   NORMALIZATION
 ========================================================= */
 
 function normalizeParams(params = {}) {
@@ -71,9 +83,24 @@ function normalizeParams(params = {}) {
     qty: safeNum(params.qty, 0),
     price: safeNum(params.price, 0),
     riskPct: safeNum(params.riskPct, 0),
-    type: "MARKET",
+    forceClose: !!params.forceClose,
     clientOrderId: params.clientOrderId || buildOrderId(),
   };
+}
+
+/* =========================================================
+   QTY DERIVATION
+========================================================= */
+
+function deriveQty(order) {
+  if (order.qty > 0) return order.qty;
+
+  if (order.riskPct > 0 && order.price > 0) {
+    const notional = 10_000 * order.riskPct;
+    return notional / order.price;
+  }
+
+  return 0;
 }
 
 /* =========================================================
@@ -82,10 +109,11 @@ function normalizeParams(params = {}) {
 
 async function executeLiveOrder(params = {}) {
   const startedAt = Date.now();
-
   const order = normalizeParams(params);
 
-  if (!order.symbol || !order.side || !order.qty) {
+  const requestedQty = deriveQty(order);
+
+  if (!order.symbol || !order.side || !requestedQty) {
     return {
       ok: false,
       exchange: CONFIG.name,
@@ -94,28 +122,46 @@ async function executeLiveOrder(params = {}) {
   }
 
   /* =====================================================
-     SANDBOX MODE (SAFE DEFAULT)
+     SANDBOX EXECUTION
   ===================================================== */
 
   if (CONFIG.sandbox) {
-    return buildResponse({
-      order,
-      status: "SIMULATED",
-      filledQty: order.qty,
-      avgPrice: order.price,
-      latencyMs: Date.now() - startedAt,
-    });
+    const latency = simulateLatency();
+
+    const slippedPrice = simulateSlippage(
+      order.price,
+      order.side,
+      order.forceClose
+    );
+
+    const filledQty = simulatePartialFill(
+      requestedQty,
+      order.forceClose
+    );
+
+    return {
+      ok: true,
+      exchange: CONFIG.name,
+      latencyMs: latency,
+
+      result: {
+        symbol: order.symbol,
+        side: order.side,
+        requestedQty,
+        filledQty,
+        avgPrice: slippedPrice,
+        status: order.forceClose
+          ? "LIQUIDATION_FILL"
+          : "SIMULATED_FILL",
+        clientOrderId: order.clientOrderId,
+        timestamp: nowIso(),
+      },
+    };
   }
 
-  /*
-    PRODUCTION FLOW (NOT ENABLED YET)
-    -------------------------------------------------------
-    1. Build nonce
-    2. Construct request body
-    3. Create signature
-    4. Send HTTPS POST to Kraken private endpoint
-    5. Normalize response
-  */
+  /* =====================================================
+     PRODUCTION FLOW (future wiring)
+  ===================================================== */
 
   try {
     throw new Error("Live Kraken execution not implemented.");
@@ -126,38 +172,6 @@ async function executeLiveOrder(params = {}) {
       error: err.message || "Execution failure",
     };
   }
-}
-
-/* =========================================================
-   RESPONSE BUILDER
-========================================================= */
-
-function buildResponse({
-  order,
-  status,
-  filledQty,
-  avgPrice,
-  latencyMs,
-}) {
-  return {
-    ok: true,
-    exchange: CONFIG.name,
-
-    order: {
-      symbol: order.symbol,
-      side: order.side,
-      requestedQty: order.qty,
-      filledQty,
-      avgPrice,
-      status,
-      clientOrderId: order.clientOrderId,
-    },
-
-    metrics: {
-      latencyMs,
-      timestamp: nowIso(),
-    },
-  };
 }
 
 /* =========================================================
