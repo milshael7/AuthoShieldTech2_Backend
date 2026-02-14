@@ -100,6 +100,30 @@ app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
 app.use(tenantMiddleware);
 
 /* =========================================================
+   GLOBAL TENANT ENGINE REGISTRATION
+   (CRITICAL: Must run BEFORE routes)
+========================================================= */
+
+const ACTIVE_TENANTS = new Set();
+
+function registerTenant(tenantId) {
+  if (!tenantId) return;
+  if (ACTIVE_TENANTS.has(tenantId)) return;
+
+  ACTIVE_TENANTS.add(tenantId);
+
+  paperTrader.start?.(tenantId);
+  liveTrader.start?.(tenantId);
+}
+
+// 🔥 REGISTER TENANT IMMEDIATELY AFTER TENANT MIDDLEWARE
+app.use((req, res, next) => {
+  const tenantId = req.tenant?.id || req.tenantId;
+  if (tenantId) registerTenant(tenantId);
+  next();
+});
+
+/* =========================================================
    TENANT ROUTES
 ========================================================= */
 
@@ -133,29 +157,15 @@ function broadcast(obj) {
 }
 
 wss.on("connection", (ws) => {
-  ws.send(JSON.stringify({
-    type: "hello",
-    symbols: Object.keys(last),
-    last,
-    ts: Date.now(),
-  }));
+  ws.send(
+    JSON.stringify({
+      type: "hello",
+      symbols: Object.keys(last),
+      last,
+      ts: Date.now(),
+    })
+  );
 });
-
-/* =========================================================
-   GLOBAL TICK ROUTER (MULTI-TENANT SAFE)
-========================================================= */
-
-const ACTIVE_TENANTS = new Set();
-
-function registerTenant(tenantId) {
-  if (!tenantId) return;
-  if (ACTIVE_TENANTS.has(tenantId)) return;
-
-  ACTIVE_TENANTS.add(tenantId);
-
-  paperTrader.start?.(tenantId);
-  liveTrader.start?.(tenantId);
-}
 
 /* =========================================================
    KRAKEN FEED
@@ -171,8 +181,19 @@ try {
       last[tick.symbol] = tick.price;
 
       for (const tenantId of ACTIVE_TENANTS) {
-        paperTrader.tick(tenantId, tick.symbol, tick.price, tick.ts);
-        liveTrader.tick(tenantId, tick.symbol, tick.price, tick.ts);
+        paperTrader.tick(
+          tenantId,
+          tick.symbol,
+          tick.price,
+          tick.ts
+        );
+
+        liveTrader.tick(
+          tenantId,
+          tick.symbol,
+          tick.price,
+          tick.ts
+        );
       }
 
       broadcast({ type: "tick", ...tick });
@@ -181,16 +202,6 @@ try {
 } catch (e) {
   console.error("Failed to start Kraken feed:", e);
 }
-
-/* =========================================================
-   TENANT AUTO-REGISTRATION MIDDLEWARE
-========================================================= */
-
-app.use((req, res, next) => {
-  const tenantId = req.tenant?.id || req.tenantId;
-  if (tenantId) registerTenant(tenantId);
-  next();
-});
 
 /* =========================================================
    ERROR HANDLER
