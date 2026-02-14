@@ -1,21 +1,18 @@
 // backend/src/services/tradeBrain.js
-// Phase 3 — Master Brain
-// paperTrader → tradeBrain → strategyEngine
-// Adaptive thresholds + Safety enforcement + AI bias overlay
+// Phase 4 — Unified Brain (Paper + Live)
+// Properly wired to Adaptive StrategyEngine
 
 const aiBrain = require("./aiBrain");
 const { buildDecision } = require("./strategyEngine");
 
-/* ================= CONFIG ================= */
+/* ---------------- SAFETY CONSTANTS ---------------- */
 
-const BASE_MIN_CONF = Number(process.env.TRADE_MIN_CONF || 0.62);
-const BASE_MIN_EDGE = Number(process.env.TRADE_MIN_EDGE || 0.0007);
 const MAX_TRADES_PER_DAY = Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
 const MAX_LOSS_STREAK = Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
 
 const ALLOWED_ACTIONS = new Set(["WAIT", "BUY", "SELL", "CLOSE"]);
 
-/* ================= HELPERS ================= */
+/* ---------------- HELPERS ---------------- */
 
 function safeNum(x, fallback = 0) {
   const n = Number(x);
@@ -26,10 +23,10 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/* ================= CORE ================= */
+/* ---------------- CORE DECISION ---------------- */
 
 function makeDecision(context = {}) {
-  const tenantId = context.tenantId || null;
+  const tenantId = context.tenantId || "__default__";
   const symbol = String(context.symbol || "BTCUSDT");
   const last = safeNum(context.last, NaN);
 
@@ -41,36 +38,37 @@ function makeDecision(context = {}) {
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  /* ================= STRATEGY ENGINE ================= */
+  /* =====================================================
+     🔥 STRATEGY ENGINE (TRUE ADAPTIVE CORE)
+  ===================================================== */
 
   const strategyView = buildDecision({
+    tenantId,
     symbol,
     price: last,
     lastPrice: paper.lastPrice,
     volatility: paper.volatility,
     ticksSeen: learn.ticksSeen,
     limits,
+    paperState: paper,
   });
 
   let action = strategyView.action;
   let confidence = strategyView.confidence;
   let edge = strategyView.edge;
-  let reason = strategyView.reason || "";
+  let blockedReason = strategyView.reason || "";
 
-  /* ================= AI SOFT OVERLAY ================= */
+  /* =====================================================
+     🤖 AI OVERLAY (SOFT — NEVER BREAKS SAFETY)
+  ===================================================== */
 
   try {
     if (typeof aiBrain.decide === "function") {
-      const aiView = aiBrain.decide({
-        tenantId,
-        symbol,
-        last,
-        paper,
-      }) || {};
+      const aiView = aiBrain.decide({ symbol, last, paper }) || {};
 
       if (
         aiView.action &&
-        ALLOWED_ACTIONS.has(String(aiView.action).toUpperCase())
+        ALLOWED_ACTIONS.has(aiView.action.toUpperCase())
       ) {
         confidence = Math.max(confidence, safeNum(aiView.confidence, 0));
         edge = Math.max(edge, safeNum(aiView.edge, 0));
@@ -78,15 +76,9 @@ function makeDecision(context = {}) {
     }
   } catch {}
 
-  /* ================= ADAPTIVE SAFETY ================= */
-
-  const dynamicMinConf =
-    lossesToday >= 2 ? BASE_MIN_CONF + 0.05 : BASE_MIN_CONF;
-
-  const dynamicMinEdge =
-    lossesToday >= 2 ? BASE_MIN_EDGE * 1.4 : BASE_MIN_EDGE;
-
-  let blockedReason = "";
+  /* =====================================================
+     🛑 HARD SAFETY GATES
+  ===================================================== */
 
   if (!Number.isFinite(last)) {
     action = "WAIT";
@@ -100,15 +92,11 @@ function makeDecision(context = {}) {
   } else if (lossesToday >= MAX_LOSS_STREAK) {
     action = "WAIT";
     blockedReason = "Loss streak protection.";
-  } else if (confidence < dynamicMinConf) {
-    action = "WAIT";
-    blockedReason = "Confidence below adaptive threshold.";
-  } else if (Math.abs(edge) < dynamicMinEdge) {
-    action = "WAIT";
-    blockedReason = "Edge below adaptive threshold.";
   }
 
-  /* ================= RISK MODEL ================= */
+  /* =====================================================
+     💰 RISK MODEL
+  ===================================================== */
 
   const baselinePct = clamp(
     safeNum(config.baselinePct, 0.01),
@@ -147,8 +135,8 @@ function makeDecision(context = {}) {
     riskPct,
     slPct,
     tpPct,
-    reason,
-    blockedReason,
+    reason: blockedReason,
+    learning: strategyView.learning, // expose adaptive state
     ts: Date.now(),
   };
 }
