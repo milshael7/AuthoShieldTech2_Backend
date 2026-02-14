@@ -1,6 +1,6 @@
 // backend/src/services/krakenFeed.js
-// Phase 2 — Hardened Institutional Feed Layer
-// Self-healing • Watchdog protected • Backoff jitter • Stable reconnection
+// Phase 9 — Institutional Market Data Engine (Upgraded)
+// Self-healing • Watchdog+ • Symbol stale guard • Telemetry enabled
 // Emits: { type:'tick', symbol, price, ts }
 
 const WebSocket = require("ws");
@@ -10,17 +10,24 @@ const WebSocket = require("ws");
 ========================================================= */
 
 const URL = "wss://ws.kraken.com";
+
 const STALE_TIMEOUT_MS = 20000;
 const WATCHDOG_INTERVAL = 5000;
+
 const MAX_BACKOFF_MS = 20000;
 const BASE_BACKOFF_MS = 1500;
+
 const MAX_MESSAGE_SIZE = 1_000_000;
+
+const EMIT_INTERVAL = 250;
+const MAX_TICKS_PER_SECOND = 1000;
 
 /* =========================================================
    PUBLIC START
 ========================================================= */
 
 function startKrakenFeed({ onTick, onStatus }) {
+
   const PAIRS = [
     "XBT/USD",
     "ETH/USD",
@@ -57,7 +64,18 @@ function startKrakenFeed({ onTick, onStatus }) {
   let connectedAt = 0;
 
   const lastEmit = Object.create(null);
-  const EMIT_INTERVAL = 250;
+  const lastSymbolTick = Object.create(null);
+
+  let ticksThisSecond = 0;
+  let lastSecond = Math.floor(Date.now() / 1000);
+
+  const metrics = {
+    connects: 0,
+    reconnects: 0,
+    ticks: 0,
+    lastTickAt: 0,
+    staleEvents: 0,
+  };
 
   /* ================= HELPERS ================= */
 
@@ -81,11 +99,20 @@ function startKrakenFeed({ onTick, onStatus }) {
     return ms + Math.floor(Math.random() * 300);
   }
 
+  function resetTickCounter() {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (nowSec !== lastSecond) {
+      lastSecond = nowSec;
+      ticksThisSecond = 0;
+    }
+  }
+
   /* ================= RECONNECT ================= */
 
   function scheduleReconnect(reason) {
     if (closedByUs) return;
 
+    metrics.reconnects++;
     safeStatus(`reconnecting:${reason || "unknown"}`);
 
     const wait = jitter(backoffMs);
@@ -108,6 +135,7 @@ function startKrakenFeed({ onTick, onStatus }) {
     });
 
     ws.on("open", () => {
+      metrics.connects++;
       connectedAt = Date.now();
       lastMsgAt = Date.now();
       backoffMs = BASE_BACKOFF_MS;
@@ -137,7 +165,6 @@ function startKrakenFeed({ onTick, onStatus }) {
         return;
       }
 
-      // Ignore system / heartbeat objects
       if (msg && typeof msg === "object" && !Array.isArray(msg)) return;
       if (!Array.isArray(msg)) return;
 
@@ -152,8 +179,18 @@ function startKrakenFeed({ onTick, onStatus }) {
       const symbol = MAP[pair] || pair;
       const now = Date.now();
 
+      /* ---- Tick Rate Guard ---- */
+      resetTickCounter();
+      ticksThisSecond++;
+      if (ticksThisSecond > MAX_TICKS_PER_SECOND) return;
+
+      /* ---- Emit Throttle ---- */
       if (lastEmit[symbol] && now - lastEmit[symbol] < EMIT_INTERVAL) return;
       lastEmit[symbol] = now;
+
+      metrics.ticks++;
+      metrics.lastTickAt = now;
+      lastSymbolTick[symbol] = now;
 
       try {
         onTick &&
@@ -183,18 +220,27 @@ function startKrakenFeed({ onTick, onStatus }) {
 
       const now = Date.now();
 
-      // stale feed detection
+      /* ---- Global Stale ---- */
       if (now - lastMsgAt > STALE_TIMEOUT_MS) {
-        safeStatus("stale");
+        metrics.staleEvents++;
+        safeStatus("stale_global");
         try { ws && ws.terminate(); } catch {}
         return;
       }
 
-      // connection sanity check
+      /* ---- Per Symbol Stale ---- */
+      for (const s of Object.keys(lastSymbolTick)) {
+        if (now - lastSymbolTick[s] > STALE_TIMEOUT_MS) {
+          metrics.staleEvents++;
+          safeStatus(`stale_symbol:${s}`);
+        }
+      }
+
+      /* ---- Reset Backoff if Stable ---- */
       if (connectedAt && now - connectedAt > 60000) {
-        // reset backoff if stable for 60s+
         backoffMs = BASE_BACKOFF_MS;
       }
+
     }, WATCHDOG_INTERVAL);
   }
 
@@ -211,6 +257,13 @@ function startKrakenFeed({ onTick, onStatus }) {
       try { ws && ws.close(); } catch {}
       cleanupSocket();
       safeStatus("stopped");
+    },
+
+    getMetrics() {
+      return {
+        ...metrics,
+        uptimeMs: Date.now() - connectedAt,
+      };
     },
   };
 }
