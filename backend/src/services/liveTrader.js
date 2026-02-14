@@ -1,6 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 17 — Liquidity-Aware Institutional Engine
-// Portfolio Netting + Dynamic Leverage + Liquidity Throttle
+// Phase 18 — Regime-Aware Institutional Engine
+// Liquidity + Dynamic Leverage + Market Regime Intelligence
 
 const fs = require("fs");
 const path = require("path");
@@ -21,11 +21,7 @@ const START_BALANCE = Number(
 const MAX_ORDERS = 500;
 
 const MAX_TOTAL_EXPOSURE_PCT = 1.5;
-const MAX_NET_DIRECTIONAL_PCT = 0.75;
 const MAX_POSITION_PER_SYMBOL_PCT = 0.4;
-
-const MAX_LEVERAGE = 5;
-const MIN_LEVERAGE = 1;
 
 /* ================= HELPERS ================= */
 
@@ -55,34 +51,30 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 17,
+    version: 18,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
     running: false,
     enabled: false,
     execute: false,
-    mode: "live-disabled",
 
     cashBalance: START_BALANCE,
     equity: START_BALANCE,
 
-    dynamicLeverage: 3,
     volatility: 0.002,
     acceleration: 0,
+    regime: "LOW_VOL",
 
-    initialMarginPct: 1 / 3,
-    maintenanceMarginPct: 0.25,
+    dynamicLeverage: 3,
+    grossExposure: 0,
+    netExposure: 0,
 
     marginUsed: 0,
     liquidationFlag: false,
-    circuitBreaker: false,
 
     lastPrices: {},
     positions: {},
-
-    grossExposure: 0,
-    netExposure: 0,
 
     trades: [],
     orders: [],
@@ -92,9 +84,9 @@ function defaultState() {
 
 const STATES = new Map();
 
-/* ================= MARKET METRICS ================= */
+/* ================= REGIME ENGINE ================= */
 
-function updateVolatility(state, symbol, price) {
+function updateMarketMetrics(state, symbol, price) {
   const last = state.lastPrices[symbol];
   if (!last) {
     state.lastPrices[symbol] = price;
@@ -102,42 +94,44 @@ function updateVolatility(state, symbol, price) {
   }
 
   const change = (price - last) / last;
+
   state.volatility = state.volatility * 0.9 + Math.abs(change) * 0.1;
   state.acceleration = state.acceleration * 0.9 + change * 0.1;
 
   state.lastPrices[symbol] = price;
 }
 
-function updateDynamicLeverage(state) {
-  const vol = state.volatility;
-
-  if (vol < 0.003) state.dynamicLeverage = MAX_LEVERAGE;
-  else if (vol < 0.01) state.dynamicLeverage = 3;
-  else if (vol < 0.02) state.dynamicLeverage = 2;
-  else state.dynamicLeverage = MIN_LEVERAGE;
-
-  state.initialMarginPct = 1 / state.dynamicLeverage;
-}
-
-/* ================= LIQUIDITY MODEL ================= */
-
-function computeLiquidityFactor(state) {
+function classifyRegime(state) {
   const vol = state.volatility;
   const accel = Math.abs(state.acceleration);
 
-  let factor = 1;
-
-  if (vol > 0.02) factor *= 0.4;
-  else if (vol > 0.01) factor *= 0.6;
-  else if (vol > 0.005) factor *= 0.8;
-
-  if (accel > 0.01) factor *= 0.6;
-  else if (accel > 0.005) factor *= 0.8;
-
-  return clamp(factor, 0.2, 1);
+  if (vol > 0.025) return "PANIC";
+  if (vol > 0.01 && accel > 0.003) return "TRENDING";
+  if (vol < 0.003) return "LOW_VOL";
+  return "RANGING";
 }
 
-/* ================= PORTFOLIO CALC ================= */
+function regimeRiskMultiplier(regime) {
+  switch (regime) {
+    case "TRENDING": return 1.2;
+    case "RANGING": return 0.7;
+    case "PANIC": return 0.3;
+    case "LOW_VOL": return 1.0;
+    default: return 1;
+  }
+}
+
+function regimeLeverageCap(regime) {
+  switch (regime) {
+    case "PANIC": return 1;
+    case "RANGING": return 2;
+    case "TRENDING": return 4;
+    case "LOW_VOL": return 5;
+    default: return 3;
+  }
+}
+
+/* ================= PORTFOLIO ================= */
 
 function recalcPortfolio(state) {
   let unrealized = 0;
@@ -158,7 +152,6 @@ function recalcPortfolio(state) {
   state.grossExposure = gross;
   state.netExposure = net;
   state.equity = state.cashBalance + unrealized;
-  state.marginUsed = gross * state.initialMarginPct;
 }
 
 /* ================= POSITION ENGINE ================= */
@@ -191,22 +184,14 @@ function applyFill(state, { symbol, side, price, qty }) {
 
 async function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
-  if (!state.running || state.circuitBreaker) return;
+  if (!state.running) return;
 
   refreshFlags(state);
 
-  updateVolatility(state, symbol, price);
-  updateDynamicLeverage(state);
-  recalcPortfolio(state);
+  updateMarketMetrics(state, symbol, price);
+  state.regime = classifyRegime(state);
 
-  if (
-    state.marginUsed > 0 &&
-    state.equity <= state.marginUsed * state.maintenanceMarginPct
-  ) {
-    state.liquidationFlag = true;
-    save(tenantId);
-    return;
-  }
+  recalcPortfolio(state);
 
   const plan = makeDecision({
     tenantId,
@@ -230,22 +215,18 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ================= LIQUIDITY ADJUSTMENT ================= */
+  /* ================= REGIME ADJUSTMENTS ================= */
 
-  const liquidityFactor = computeLiquidityFactor(state);
+  const riskMultiplier = regimeRiskMultiplier(state.regime);
+  const leverageCap = regimeLeverageCap(state.regime);
 
-  const directionalCap = state.equity * MAX_NET_DIRECTIONAL_PCT;
+  state.dynamicLeverage = clamp(
+    state.dynamicLeverage,
+    1,
+    leverageCap
+  );
 
-  let directionalFactor = 1;
-
-  if (plan.action === "BUY" && state.netExposure > directionalCap)
-    directionalFactor = 0.3;
-
-  if (plan.action === "SELL" && state.netExposure < -directionalCap)
-    directionalFactor = 0.3;
-
-  const adjustedRisk =
-    plan.riskPct * liquidityFactor * directionalFactor;
+  const adjustedRisk = plan.riskPct * riskMultiplier;
 
   const positionValue =
     state.equity *
@@ -285,6 +266,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       side: plan.action,
       ok: result?.ok,
       exchange: result?.exchange,
+      regime: state.regime,
     });
 
     if (state.orders.length > MAX_ORDERS)
@@ -292,7 +274,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   } catch (err) {
     state.lastError = String(err?.message || err);
-    state.circuitBreaker = true;
   }
 
   save(tenantId);
@@ -340,14 +321,11 @@ function snapshot(tenantId) {
   return {
     ok: true,
     equity: state.equity,
-    grossExposure: state.grossExposure,
-    netExposure: state.netExposure,
+    regime: state.regime,
     leverage: state.dynamicLeverage,
     volatility: state.volatility,
-    liquidityFactor: computeLiquidityFactor(state),
-    marginUsed: state.marginUsed,
-    liquidation: state.liquidationFlag,
-    circuitBreaker: state.circuitBreaker,
+    grossExposure: state.grossExposure,
+    netExposure: state.netExposure,
     positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
