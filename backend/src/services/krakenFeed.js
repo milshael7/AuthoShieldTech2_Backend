@@ -1,13 +1,26 @@
 // backend/src/services/krakenFeed.js
-// Kraken Public WebSocket feed (prices only, no keys)
-// Emits: { type:'tick', symbol:'BTCUSDT', price:Number, ts:Number }
+// Phase 2 — Hardened Institutional Feed Layer
+// Self-healing • Watchdog protected • Backoff jitter • Stable reconnection
+// Emits: { type:'tick', symbol, price, ts }
 
 const WebSocket = require("ws");
 
-function startKrakenFeed({ onTick, onStatus }) {
-  const URL = "wss://ws.kraken.com";
+/* =========================================================
+   CONFIG
+========================================================= */
 
-  // Kraken USD pairs (public)
+const URL = "wss://ws.kraken.com";
+const STALE_TIMEOUT_MS = 20000;
+const WATCHDOG_INTERVAL = 5000;
+const MAX_BACKOFF_MS = 20000;
+const BASE_BACKOFF_MS = 1500;
+const MAX_MESSAGE_SIZE = 1_000_000;
+
+/* =========================================================
+   PUBLIC START
+========================================================= */
+
+function startKrakenFeed({ onTick, onStatus }) {
   const PAIRS = [
     "XBT/USD",
     "ETH/USD",
@@ -21,7 +34,6 @@ function startKrakenFeed({ onTick, onStatus }) {
     "XLM/USD",
   ];
 
-  // Internal normalization (kept as USDT internally on purpose)
   const MAP = {
     "XBT/USD": "BTCUSDT",
     "ETH/USD": "ETHUSDT",
@@ -37,60 +49,70 @@ function startKrakenFeed({ onTick, onStatus }) {
 
   let ws = null;
   let closedByUs = false;
-
   let reconnectTimer = null;
-  let backoffMs = 1500;
-
-  let lastMsgAt = 0;
   let watchdog = null;
 
-  // Throttle per symbol (ms)
+  let backoffMs = BASE_BACKOFF_MS;
+  let lastMsgAt = 0;
+  let connectedAt = 0;
+
   const lastEmit = Object.create(null);
-  const EMIT_INTERVAL = 250; // max 4 ticks/sec per symbol
+  const EMIT_INTERVAL = 250;
+
+  /* ================= HELPERS ================= */
 
   function safeStatus(s) {
-    try {
-      onStatus && onStatus(s);
-    } catch {}
+    try { onStatus && onStatus(s); } catch {}
   }
 
   function clearTimers() {
-    try { if (watchdog) clearInterval(watchdog); } catch {}
+    if (watchdog) clearInterval(watchdog);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     watchdog = null;
-
-    try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch {}
     reconnectTimer = null;
   }
 
   function cleanupSocket() {
-    try {
-      if (ws) ws.removeAllListeners();
-    } catch {}
+    try { ws && ws.removeAllListeners(); } catch {}
     ws = null;
   }
 
-  function scheduleReconnect() {
+  function jitter(ms) {
+    return ms + Math.floor(Math.random() * 300);
+  }
+
+  /* ================= RECONNECT ================= */
+
+  function scheduleReconnect(reason) {
     if (closedByUs) return;
 
-    safeStatus("reconnecting");
-    const wait = backoffMs;
-    backoffMs = Math.min(Math.floor(backoffMs * 1.4), 15000);
+    safeStatus(`reconnecting:${reason || "unknown"}`);
+
+    const wait = jitter(backoffMs);
+    backoffMs = Math.min(Math.floor(backoffMs * 1.5), MAX_BACKOFF_MS);
 
     clearTimers();
     reconnectTimer = setTimeout(connect, wait);
   }
+
+  /* ================= CONNECT ================= */
 
   function connect() {
     clearTimers();
     cleanupSocket();
 
     safeStatus("connecting");
-    ws = new WebSocket(URL);
+
+    ws = new WebSocket(URL, {
+      maxPayload: MAX_MESSAGE_SIZE,
+    });
 
     ws.on("open", () => {
-      safeStatus("connected");
-      backoffMs = 1500;
+      connectedAt = Date.now();
       lastMsgAt = Date.now();
+      backoffMs = BASE_BACKOFF_MS;
+
+      safeStatus("connected");
 
       try {
         ws.send(
@@ -106,6 +128,8 @@ function startKrakenFeed({ onTick, onStatus }) {
     ws.on("message", (buf) => {
       lastMsgAt = Date.now();
 
+      if (!buf || buf.length > MAX_MESSAGE_SIZE) return;
+
       let msg;
       try {
         msg = JSON.parse(buf.toString());
@@ -113,7 +137,7 @@ function startKrakenFeed({ onTick, onStatus }) {
         return;
       }
 
-      // Ignore non-data events (heartbeat, systemStatus, subscribeStatus)
+      // Ignore system / heartbeat objects
       if (msg && typeof msg === "object" && !Array.isArray(msg)) return;
       if (!Array.isArray(msg)) return;
 
@@ -128,7 +152,6 @@ function startKrakenFeed({ onTick, onStatus }) {
       const symbol = MAP[pair] || pair;
       const now = Date.now();
 
-      // Throttle per symbol
       if (lastEmit[symbol] && now - lastEmit[symbol] < EMIT_INTERVAL) return;
       lastEmit[symbol] = now;
 
@@ -145,38 +168,49 @@ function startKrakenFeed({ onTick, onStatus }) {
 
     ws.on("close", () => {
       safeStatus("closed");
-      if (!closedByUs) scheduleReconnect();
+      if (!closedByUs) scheduleReconnect("close");
     });
 
     ws.on("error", () => {
       safeStatus("error");
-      try {
-        ws && ws.terminate();
-      } catch {}
+      try { ws && ws.terminate(); } catch {}
     });
 
-    // Watchdog: force reconnect if silent for 20s
+    /* ================= WATCHDOG ================= */
+
     watchdog = setInterval(() => {
       if (closedByUs) return;
-      if (Date.now() - lastMsgAt > 20000) {
+
+      const now = Date.now();
+
+      // stale feed detection
+      if (now - lastMsgAt > STALE_TIMEOUT_MS) {
         safeStatus("stale");
-        try {
-          ws && ws.terminate();
-        } catch {}
+        try { ws && ws.terminate(); } catch {}
+        return;
       }
-    }, 5000);
+
+      // connection sanity check
+      if (connectedAt && now - connectedAt > 60000) {
+        // reset backoff if stable for 60s+
+        backoffMs = BASE_BACKOFF_MS;
+      }
+    }, WATCHDOG_INTERVAL);
   }
 
+  /* ================= START ================= */
+
   connect();
+
+  /* ================= PUBLIC API ================= */
 
   return {
     stop() {
       closedByUs = true;
-      try {
-        ws && ws.close();
-      } catch {}
       clearTimers();
+      try { ws && ws.close(); } catch {}
       cleanupSocket();
+      safeStatus("stopped");
     },
   };
 }
