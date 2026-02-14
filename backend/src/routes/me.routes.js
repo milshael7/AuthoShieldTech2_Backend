@@ -1,16 +1,6 @@
 // backend/src/routes/me.routes.js
-// Me endpoints — Individual user scope (HARDENED)
-//
-// Covers:
-// - User notifications (self-only)
-// - Mark notification read (scoped)
-// - Create AutoProtect project (eligibility enforced)
-//
-// Guarantees:
-// - Auth required
-// - Tenant-safe
-// - AutoProtect rules respected
-// - Audited actions
+// Me Endpoints — Institutional Hardened
+// Individual Scope • Tenant Safe • AutoProtect Guarded • Audited
 
 const express = require("express");
 const router = express.Router();
@@ -23,32 +13,44 @@ const { createProject } = require("../autoprotect/autoprotect.service");
 
 router.use(authRequired);
 
-/* ================= HELPERS ================= */
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function cleanStr(v, max = 200) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-function canUseAutoProtect(user) {
-  // Company accounts NEVER get AutoProtect here
-  if (user.role === users.ROLES.COMPANY) return false;
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
 
-  // Managers/Admin handled elsewhere — Me route is Individual
-  if (user.role !== users.ROLES.INDIVIDUAL) return false;
+function canUseAutoProtect(user) {
+  const role = normRole(user.role);
+
+  // Only Individual accounts allowed here
+  if (role !== normRole(users.ROLES.INDIVIDUAL)) {
+    return false;
+  }
 
   return users.getAutoprotect(user);
 }
 
-/* ================= ROUTES ================= */
+/* =========================================================
+   NOTIFICATIONS
+========================================================= */
 
 // GET /api/me/notifications
 router.get("/notifications", (req, res) => {
   try {
-    return res.json(
-      listNotifications({
-        userId: req.user.id,
-      })
-    );
+    const notifications = listNotifications({
+      userId: req.user.id,
+    }) || [];
+
+    return res.json({
+      ok: true,
+      notifications,
+    });
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -61,16 +63,27 @@ router.get("/notifications", (req, res) => {
 router.post("/notifications/:id/read", (req, res) => {
   try {
     const id = cleanStr(req.params.id, 100);
+
     if (!id) {
-      return res.status(400).json({ error: "Missing notification id" });
+      return res.status(400).json({
+        ok: false,
+        error: "Missing notification id",
+      });
     }
 
     const n = markRead(id, req.user.id);
+
     if (!n) {
-      return res.status(404).json({ error: "Not found" });
+      return res.status(404).json({
+        ok: false,
+        error: "Notification not found",
+      });
     }
 
-    return res.json(n);
+    return res.json({
+      ok: true,
+      notification: n,
+    });
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -79,34 +92,45 @@ router.post("/notifications/:id/read", (req, res) => {
   }
 });
 
+/* =========================================================
+   AUTOPROTECT PROJECT CREATION
+========================================================= */
+
 // POST /api/me/projects
-// Create AutoProtect project (Individual only, paid only)
 router.post("/projects", (req, res) => {
   try {
     const user = req.user;
 
     if (!canUseAutoProtect(user)) {
       return res.status(403).json({
+        ok: false,
         error: "AutoProtect not enabled for this account",
         hint: "Upgrade required",
       });
     }
 
     const body = req.body || {};
-    const title = cleanStr(body.title, 200);
 
+    const title = cleanStr(body.title, 200);
     const issue = body.issue || {};
+
     const issueType = cleanStr(issue.type, 100);
     const details = cleanStr(issue.details, 2000);
 
     if (!title) {
-      return res.status(400).json({ error: "Missing title" });
-    }
-    if (!issueType) {
-      return res.status(400).json({ error: "Missing issue.type" });
+      return res.status(400).json({
+        ok: false,
+        error: "Missing title",
+      });
     }
 
-    // 🔒 Company context is locked to user
+    if (!issueType) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing issue.type",
+      });
+    }
+
     const companyId = user.companyId || null;
 
     const project = createProject({
@@ -119,7 +143,6 @@ router.post("/projects", (req, res) => {
       },
     });
 
-    // 🔒 Audit trail
     audit({
       actorId: user.id,
       action: "AUTOPROTECT_PROJECT_CREATED",
@@ -131,9 +154,14 @@ router.post("/projects", (req, res) => {
       },
     });
 
-    return res.status(201).json(project);
+    return res.status(201).json({
+      ok: true,
+      project,
+    });
+
   } catch (e) {
     return res.status(400).json({
+      ok: false,
       error: e?.message || String(e),
     });
   }
