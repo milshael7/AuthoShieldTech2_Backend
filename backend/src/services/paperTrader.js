@@ -1,6 +1,6 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine — Phase 4
-// Fully Adaptive • RiskManager Integrated • Tenant Safe
+// Phase 5 — Institutional Paper Engine
+// Fully Adaptive • RiskManager Correctly Integrated • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -88,7 +88,7 @@ function defaultState() {
       lossesToday: 0,
       halted: false,
       haltReason: null,
-      coolingUntil: 0,
+      cooling: false,
     },
   };
 }
@@ -247,20 +247,21 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   updateVolatility(state, price);
   updateEquity(state, price);
 
-  // 🔒 Risk Evaluation BEFORE trading
-  const risk = riskManager.evaluate(tenantId, state);
+  /* ======== RISK EVALUATION (CORRECT SHAPE) ======== */
 
-  // Sync halt / cooling to state
+  const risk = riskManager.evaluate({
+    tenantId,
+    equity: state.equity,
+    volatility: state.volatility,
+    trades: state.trades,
+    ts,
+  });
+
   state.limits.halted = risk.halted;
   state.limits.haltReason = risk.haltReason || null;
-  state.limits.coolingUntil = risk.coolingUntil || 0;
+  state.limits.cooling = risk.cooling;
 
-  if (risk.halted) {
-    save(tenantId);
-    return;
-  }
-
-  if (Date.now() < (risk.coolingUntil || 0)) {
+  if (risk.halted || risk.cooling) {
     save(tenantId);
     return;
   }
@@ -269,6 +270,8 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     save(tenantId);
     return;
   }
+
+  /* ======== DECISION ======== */
 
   const plan = makeDecision({
     tenantId,
@@ -280,10 +283,15 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
-  state.learnStats.lastReason = plan.reason || plan.blockedReason;
+  state.learnStats.lastReason = plan.reason;
 
   if (plan.action === "BUY" && !state.position) {
-    const adjustedRisk = plan.riskPct * (risk.riskMultiplier || 1);
+    const adjustedRisk = clamp(
+      plan.riskPct * (risk.riskMultiplier || 1),
+      0.001,
+      0.05
+    );
+
     openPosition(state, tenantId, symbol, price, adjustedRisk);
   }
 
@@ -315,6 +323,7 @@ function start() {}
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
   save(tenantId);
+  riskManager.resetTenant(tenantId);
 }
 
 module.exports = {
