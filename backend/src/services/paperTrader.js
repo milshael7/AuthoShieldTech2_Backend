@@ -1,10 +1,11 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine — Phase 3
-// Fully Adaptive • Tenant Safe • StrategyEngine Integrated
+// Paper Trading Engine — Phase 4
+// Fully Adaptive • RiskManager Integrated • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
 const { makeDecision } = require("./tradeBrain");
+const riskManager = require("./riskManager");
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
@@ -15,8 +16,6 @@ const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
 
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
-
-const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
 /* ================= HELPERS ================= */
 
@@ -89,6 +88,7 @@ function defaultState() {
       lossesToday: 0,
       halted: false,
       haltReason: null,
+      coolingUntil: 0,
     },
   };
 }
@@ -98,11 +98,11 @@ const STATES = new Map();
 /* ================= PERSIST ================= */
 
 function load(tenantId) {
-  const file = statePath(tenantId);
-
   if (STATES.has(tenantId)) return STATES.get(tenantId);
 
   let state = defaultState();
+  const file = statePath(tenantId);
+
   try {
     if (fs.existsSync(file)) {
       const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -117,8 +117,12 @@ function load(tenantId) {
 function save(tenantId) {
   const state = STATES.get(tenantId);
   if (!state) return;
+
   try {
-    fs.writeFileSync(statePath(tenantId), JSON.stringify(state, null, 2));
+    fs.writeFileSync(
+      statePath(tenantId),
+      JSON.stringify(state, null, 2)
+    );
   } catch {}
 }
 
@@ -151,12 +155,6 @@ function updateEquity(state, price) {
   }
 
   state.peakEquity = Math.max(state.peakEquity, state.equity);
-
-  const dd = (state.peakEquity - state.equity) / state.peakEquity;
-  if (dd >= MAX_DRAWDOWN_PCT) {
-    state.limits.halted = true;
-    state.limits.haltReason = "max_drawdown";
-  }
 }
 
 function resetDaily(state, ts) {
@@ -171,7 +169,12 @@ function resetDaily(state, ts) {
 /* ================= EXECUTION ================= */
 
 function openPosition(state, tenantId, symbol, price, riskPct) {
-  const usd = clamp(state.cashBalance * riskPct, 50, state.cashBalance * 0.5);
+  const usd = clamp(
+    state.cashBalance * riskPct,
+    50,
+    state.cashBalance * 0.5
+  );
+
   if (usd <= 0) return;
 
   const qty = usd / price;
@@ -223,13 +226,13 @@ function closePosition(state, tenantId, price, reason) {
     exitReason: reason,
   });
 
+  state.position = null;
+
   narrate(
     tenantId,
     `Closed ${pos.symbol}. ${pnl >= 0 ? "Profit" : "Loss"} ${pnl.toFixed(2)}`,
     { action: "CLOSE", pnl }
   );
-
-  state.position = null;
 }
 
 /* ================= TICK ================= */
@@ -243,6 +246,24 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.ticksSeen++;
   updateVolatility(state, price);
   updateEquity(state, price);
+
+  // 🔒 Risk Evaluation BEFORE trading
+  const risk = riskManager.evaluate(tenantId, state);
+
+  // Sync halt / cooling to state
+  state.limits.halted = risk.halted;
+  state.limits.haltReason = risk.haltReason || null;
+  state.limits.coolingUntil = risk.coolingUntil || 0;
+
+  if (risk.halted) {
+    save(tenantId);
+    return;
+  }
+
+  if (Date.now() < (risk.coolingUntil || 0)) {
+    save(tenantId);
+    return;
+  }
 
   if (state.learnStats.ticksSeen < WARMUP_TICKS) {
     save(tenantId);
@@ -261,13 +282,9 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason || plan.blockedReason;
 
-  if (state.limits.halted) {
-    save(tenantId);
-    return;
-  }
-
   if (plan.action === "BUY" && !state.position) {
-    openPosition(state, tenantId, symbol, price, plan.riskPct);
+    const adjustedRisk = plan.riskPct * (risk.riskMultiplier || 1);
+    openPosition(state, tenantId, symbol, price, adjustedRisk);
   }
 
   if (
