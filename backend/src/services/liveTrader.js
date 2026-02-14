@@ -1,6 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 13B — Institutional Live Engine
-// Cross Margin + Auto Liquidation Engine
+// Phase 14 — Institutional Live Engine
+// Cross Margin • Dynamic Leverage • Fill Engine • Auto Liquidation
+// Router Integrated • Production Structured
 
 const fs = require("fs");
 const path = require("path");
@@ -19,6 +20,7 @@ const START_BALANCE = Number(
 );
 
 const MAX_ORDERS = 500;
+const MAX_POSITION_PER_SYMBOL_PCT = 0.4; // 40% of equity cap
 
 /* ================= HELPERS ================= */
 
@@ -40,11 +42,15 @@ function envTrue(name) {
   return v === "true" || v === "1" || v === "yes";
 }
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
-    version: 13.2,
+    version: 14,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -59,8 +65,10 @@ function defaultState() {
     leverage: 3,
     initialMarginPct: 1 / 3,
     maintenanceMarginPct: 0.25,
+
     marginUsed: 0,
     liquidationFlag: false,
+    circuitBreaker: false,
 
     lastPrices: {},
     positions: {},
@@ -115,7 +123,7 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
-/* ================= EQUITY + MARGIN ================= */
+/* ================= EQUITY ENGINE ================= */
 
 function recalcEquity(state) {
   let unrealized = 0;
@@ -137,6 +145,61 @@ function maintenanceRequired(state) {
   return state.marginUsed * state.maintenanceMarginPct;
 }
 
+/* ================= POSITION ENGINE ================= */
+
+function applyFill(state, { symbol, side, price, qty }) {
+  state.positions[symbol] = state.positions[symbol] || {
+    qty: 0,
+    avgEntry: 0,
+    realizedPnL: 0,
+  };
+
+  const pos = state.positions[symbol];
+  const signedQty = side === "BUY" ? qty : -qty;
+  const newQty = pos.qty + signedQty;
+
+  if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(newQty)) {
+    const totalCost =
+      pos.avgEntry * pos.qty + price * signedQty;
+
+    pos.qty = newQty;
+    pos.avgEntry =
+      pos.qty !== 0 ? totalCost / pos.qty : 0;
+  } else {
+    const closingQty = Math.min(
+      Math.abs(pos.qty),
+      Math.abs(signedQty)
+    );
+
+    const pnl =
+      (price - pos.avgEntry) *
+      closingQty *
+      Math.sign(pos.qty);
+
+    pos.realizedPnL += pnl;
+    state.cashBalance += pnl;
+
+    state.trades.push({
+      ts: Date.now(),
+      symbol,
+      qty: closingQty,
+      entry: pos.avgEntry,
+      exit: price,
+      profit: pnl,
+    });
+
+    pos.qty = newQty;
+
+    if (pos.qty === 0) {
+      pos.avgEntry = 0;
+    } else {
+      pos.avgEntry = price;
+    }
+  }
+
+  recalcEquity(state);
+}
+
 /* ================= AUTO LIQUIDATION ================= */
 
 async function autoLiquidate(tenantId, state) {
@@ -147,10 +210,9 @@ async function autoLiquidate(tenantId, state) {
 
     const side = pos.qty > 0 ? "SELL" : "BUY";
     const qty = Math.abs(pos.qty);
-    const price = state.lastPrices[symbol];
 
     try {
-      const result = await exchangeRouter.routeLiveOrder({
+      await exchangeRouter.routeLiveOrder({
         tenantId,
         symbol,
         side,
@@ -158,25 +220,11 @@ async function autoLiquidate(tenantId, state) {
         forceClose: true,
       });
 
-      if (result?.ok) {
-        state.cashBalance +=
-          (price - pos.avgEntry) * pos.qty;
-
-        state.trades.push({
-          ts: Date.now(),
-          symbol,
-          forced: true,
-          qty,
-          exit: price,
-        });
-
-        state.positions[symbol] = {
-          qty: 0,
-          avgEntry: 0,
-          realizedPnL: 0,
-        };
-      }
-
+      state.positions[symbol] = {
+        qty: 0,
+        avgEntry: 0,
+        realizedPnL: 0,
+      };
     } catch (err) {
       state.lastError = String(err?.message || err);
     }
@@ -185,26 +233,11 @@ async function autoLiquidate(tenantId, state) {
   recalcEquity(state);
 }
 
-/* ================= LIFECYCLE ================= */
-
-function start(tenantId) {
-  const state = load(tenantId);
-  state.running = true;
-  refreshFlags(state);
-  save(tenantId);
-}
-
-function stop(tenantId) {
-  const state = load(tenantId);
-  state.running = false;
-  save(tenantId);
-}
-
 /* ================= TICK ================= */
 
 async function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
-  if (!state.running) return;
+  if (!state.running || state.circuitBreaker) return;
 
   refreshFlags(state);
 
@@ -237,15 +270,38 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
+  const maxSymbolExposure =
+    state.equity * MAX_POSITION_PER_SYMBOL_PCT;
+
+  const riskCapital = state.equity * plan.riskPct;
+  const positionValue = clamp(
+    riskCapital * state.leverage,
+    0,
+    maxSymbolExposure
+  );
+
+  const qty = positionValue / price;
+
   try {
     const result = await exchangeRouter.routeLiveOrder({
       tenantId,
       symbol,
       side: plan.action,
-      riskPct: plan.riskPct,
+      qty,
       price,
       ts,
     });
+
+    if (result?.ok) {
+      applyFill(state, {
+        symbol,
+        side: plan.action,
+        price,
+        qty,
+      });
+    } else {
+      state.lastError = result?.error;
+    }
 
     state.orders.push({
       ts,
@@ -261,8 +317,24 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   } catch (err) {
     state.lastError = String(err?.message || err);
+    state.circuitBreaker = true;
   }
 
+  save(tenantId);
+}
+
+/* ================= LIFECYCLE ================= */
+
+function start(tenantId) {
+  const state = load(tenantId);
+  state.running = true;
+  refreshFlags(state);
+  save(tenantId);
+}
+
+function stop(tenantId) {
+  const state = load(tenantId);
+  state.running = false;
   save(tenantId);
 }
 
@@ -281,6 +353,7 @@ function snapshot(tenantId) {
     marginUsed: state.marginUsed,
     maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
+    circuitBreaker: state.circuitBreaker,
     positions: state.positions,
     routerHealth: exchangeRouter.getHealth(),
   };
