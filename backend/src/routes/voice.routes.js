@@ -1,9 +1,9 @@
 // backend/src/routes/voice.routes.js
 // Enterprise Voice TTS Bridge
+// Node 18+ Native Fetch Compatible
 // Secure • Tenant-isolated • Rate-limited • Timeout Protected • Audited
 
 const express = require("express");
-const fetch = require("node-fetch"); // 🔒 Explicit import
 const rateLimit = require("express-rate-limit");
 const router = express.Router();
 
@@ -32,11 +32,7 @@ const voiceLimiter = rateLimit({
   max: Number(process.env.VOICE_RATELIMIT_MAX || 60),
   standardHeaders: true,
   legacyHeaders: false,
-
-  keyGenerator: (req) => {
-    // 🔒 Rate limit per user instead of IP
-    return req.user?.id || req.ip;
-  },
+  keyGenerator: (req) => req.user?.id || req.ip,
 });
 
 /* =========================================================
@@ -94,6 +90,13 @@ router.get("/status", (req, res) => {
 
 router.post("/tts", async (req, res) => {
   try {
+    if (typeof fetch !== "function") {
+      return res.status(500).json({
+        ok: false,
+        error: "Global fetch not available (Node < 18?)",
+      });
+    }
+
     const provider = (process.env.VOICE_PROVIDER || "")
       .trim()
       .toLowerCase();
@@ -170,9 +173,7 @@ router.post("/tts", async (req, res) => {
       });
     }
 
-    const buf = Buffer.from(
-      await r.arrayBuffer()
-    );
+    const buf = Buffer.from(await r.arrayBuffer());
 
     auditVoice({
       req,
