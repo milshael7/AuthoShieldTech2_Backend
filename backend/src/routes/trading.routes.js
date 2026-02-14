@@ -1,5 +1,5 @@
 // backend/src/routes/trading.routes.js
-// Trading Routes — ENGINE ALIGNED + TENANT SAFE (FINAL)
+// Trading Routes — PHASE 2 ALIGNED + SAFE
 
 const express = require("express");
 const router = express.Router();
@@ -79,39 +79,11 @@ router.get(
   }
 );
 
-router.post(
-  "/live/signal",
-  requireRole(ADMIN),
-  async (req, res) => {
-    try {
-      const tenantId = req.tenant.id;
-      const signal = req.body || {};
-
-      const result = await liveTrader.pushSignal(
-        tenantId,
-        signal
-      );
-
-      audit({
-        actorId: req.user.id,
-        action: "LIVE_TRADING_SIGNAL",
-        targetType: "TradingSignal",
-        targetId: signal.symbol || "unknown",
-        companyId: tenantId,
-        metadata: {
-          mode: "live",
-          side: signal.side || "unknown",
-        },
-      });
-
-      return res.json(result);
-    } catch (e) {
-      return res.status(500).json({
-        ok: false,
-        error: e?.message || "Live trading error",
-      });
-    }
-  }
-);
+/*
+  NOTE:
+  Phase 2 liveTrader does NOT support pushSignal.
+  It auto-generates decisions from ticks only.
+  So we intentionally remove /live/signal endpoint.
+*/
 
 module.exports = router;
