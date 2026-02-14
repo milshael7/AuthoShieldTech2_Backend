@@ -1,5 +1,5 @@
 // backend/src/services/executionEngine.js
-// Phase 9 — Institutional Execution Engine
+// Phase 9.1 — Institutional Execution Engine (Hardened)
 // Handles paper execution logic
 // Unified execution layer for Paper + Future Live Adapter
 
@@ -11,8 +11,36 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 const CONFIG = Object.freeze({
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
-  slippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005), // 0.05%
+  slippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005),
+  minOrderUsd: 50,
+  maxCapitalFraction: 0.5,
 });
+
+/* =========================================================
+   INTERNAL HELPERS
+========================================================= */
+
+function recalcEquity(state) {
+  if (!state) return;
+
+  if (state.position && state.lastPrice) {
+    state.equity =
+      state.cashBalance +
+      (state.lastPrice - state.position.entry) *
+        state.position.qty;
+  } else {
+    state.equity = state.cashBalance;
+  }
+
+  state.peakEquity = Math.max(
+    state.peakEquity || 0,
+    state.equity
+  );
+}
+
+function validAction(a) {
+  return a === "BUY" || a === "SELL" || a === "CLOSE";
+}
 
 /* =========================================================
    CORE PAPER EXECUTION
@@ -28,19 +56,28 @@ function executePaperOrder({
   ts = Date.now(),
 }) {
   if (!state) return null;
+  if (!validAction(action)) return null;
+  if (!Number.isFinite(price) || price <= 0) return null;
 
   /* ================= ENTRY ================= */
 
-  if (action === "BUY" && !state.position) {
-    const usd = clamp(
-      state.cashBalance * riskPct,
-      50,
-      state.cashBalance * 0.5
+  if (action === "BUY") {
+    if (state.position) return null;
+
+    const safeRisk = clamp(
+      Number(riskPct) || 0,
+      0,
+      CONFIG.maxCapitalFraction
     );
 
-    if (usd <= 0) return null;
+    const usd = clamp(
+      state.cashBalance * safeRisk,
+      CONFIG.minOrderUsd,
+      state.cashBalance * CONFIG.maxCapitalFraction
+    );
 
-    // apply slippage against trader
+    if (!Number.isFinite(usd) || usd <= 0) return null;
+
     const slippedPrice =
       price * (1 + CONFIG.slippagePct);
 
@@ -57,7 +94,10 @@ function executePaperOrder({
       ts,
     };
 
-    state.limits.tradesToday++;
+    state.limits.tradesToday =
+      (state.limits.tradesToday || 0) + 1;
+
+    recalcEquity(state);
 
     return {
       narration: {
@@ -68,6 +108,7 @@ function executePaperOrder({
           action: "BUY",
           usd,
           slippedPrice,
+          qty,
         },
       },
     };
@@ -75,10 +116,9 @@ function executePaperOrder({
 
   /* ================= EXIT ================= */
 
-  if (
-    (action === "SELL" || action === "CLOSE") &&
-    state.position
-  ) {
+  if (action === "SELL" || action === "CLOSE") {
+    if (!state.position) return null;
+
     const pos = state.position;
 
     const slippedPrice =
@@ -105,7 +145,8 @@ function executePaperOrder({
     } else {
       state.realized.losses++;
       state.realized.grossLoss += Math.abs(pnl);
-      state.limits.lossesToday++;
+      state.limits.lossesToday =
+        (state.limits.lossesToday || 0) + 1;
     }
 
     state.trades.push({
@@ -120,6 +161,8 @@ function executePaperOrder({
 
     state.position = null;
 
+    recalcEquity(state);
+
     return {
       narration: {
         text: `Closed ${symbol}. ${
@@ -128,6 +171,7 @@ function executePaperOrder({
         meta: {
           action: "CLOSE",
           pnl,
+          slippedPrice,
         },
       },
     };
