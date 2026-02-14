@@ -1,17 +1,18 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine — Phase 2 (Rule + Learning Integrated)
+// Paper Trading Engine — Phase 2 FINAL
+// Proper Architecture: paperTrader → tradeBrain → strategyEngine
 
 const fs = require("fs");
 const path = require("path");
-const { buildDecision } = require("./strategyEngine");
+const { makeDecision } = require("./tradeBrain");
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200);
-
 const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
+
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
 
@@ -72,7 +73,6 @@ function defaultState() {
     trades: [],
 
     lastPrice: null,
-    lastPriceBySymbol: {},
 
     volatility: 0.002,
 
@@ -249,19 +249,16 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  const plan = buildDecision({
+  const plan = makeDecision({
     symbol,
-    price,
-    lastPrice: state.lastPrice,
-    volatility: state.volatility,
-    ticksSeen: state.learnStats.ticksSeen,
-    limits: state.limits,
+    last: price,
+    paper: state,
   });
 
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
-  state.learnStats.lastReason = plan.reason;
+  state.learnStats.lastReason = plan.blockedReason || plan.action;
 
   if (state.limits.halted) {
     save(tenantId);
@@ -276,7 +273,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     (plan.action === "SELL" || plan.action === "CLOSE") &&
     state.position
   ) {
-    closePosition(state, tenantId, price, plan.reason);
+    closePosition(state, tenantId, price, plan.blockedReason || "signal");
   }
 
   save(tenantId);
