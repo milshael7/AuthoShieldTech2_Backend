@@ -1,6 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 19 — Adaptive Capital Intelligence Engine
-// Regime + Router + Cross Margin + Performance Scaling
+// Phase 20 — Reinforcement Execution Optimizer
+// Regime + Performance + Signal Intelligence
 
 const fs = require("fs");
 const path = require("path");
@@ -20,6 +20,7 @@ const START_BALANCE = Number(
 
 const MAX_ORDERS = 500;
 const PERFORMANCE_WINDOW = 20;
+const SIGNAL_WINDOW = 50;
 
 /* ================= HELPERS ================= */
 
@@ -49,7 +50,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 19,
+    version: 20,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -73,8 +74,11 @@ function defaultState() {
     performance: {
       recentTrades: [],
       winRate: 0.5,
-      equitySlope: 0,
       score: 0.5,
+    },
+
+    signalIntelligence: {
+      stats: {}, // keyed by signalKey
     },
 
     lastPrices: {},
@@ -88,7 +92,46 @@ function defaultState() {
 
 const STATES = new Map();
 
-/* ================= PERFORMANCE ENGINE ================= */
+/* ================= SIGNAL INTELLIGENCE ================= */
+
+function buildSignalKey(symbol, regime, side) {
+  return `${symbol}_${regime}_${side}`;
+}
+
+function updateSignalStats(state, signalKey, pnl) {
+  const intel = state.signalIntelligence;
+
+  intel.stats[signalKey] =
+    intel.stats[signalKey] || {
+      trades: [],
+      winRate: 0.5,
+      score: 1,
+    };
+
+  const entry = intel.stats[signalKey];
+
+  entry.trades.push(pnl);
+  if (entry.trades.length > SIGNAL_WINDOW)
+    entry.trades = entry.trades.slice(-SIGNAL_WINDOW);
+
+  const wins = entry.trades.filter(p => p > 0).length;
+  entry.winRate =
+    entry.trades.length > 0
+      ? wins / entry.trades.length
+      : 0.5;
+
+  const avgPnL =
+    entry.trades.reduce((a, b) => a + b, 0) /
+    Math.max(entry.trades.length, 1);
+
+  let score =
+    entry.winRate * 0.6 +
+    clamp(avgPnL / 1000, -1, 1) * 0.4;
+
+  entry.score = clamp(score, 0.3, 1.7);
+}
+
+/* ================= PERFORMANCE ================= */
 
 function updatePerformance(state, pnl) {
   const perf = state.performance;
@@ -103,24 +146,11 @@ function updatePerformance(state, pnl) {
       ? wins / perf.recentTrades.length
       : 0.5;
 
-  const drawdown =
-    (state.peakEquity - state.equity) /
-    Math.max(state.peakEquity, 1);
-
-  const slope =
-    (state.equity - state.peakEquity * 0.95) /
-    state.peakEquity;
-
-  perf.equitySlope = slope;
-
-  let score = perf.winRate * 0.6 + (1 - drawdown) * 0.4;
-
-  if (slope < -0.05) score *= 0.5;
-
-  perf.score = clamp(score, 0.2, 1.5);
+  let score = perf.winRate;
+  perf.score = clamp(score, 0.3, 1.5);
 }
 
-/* ================= REGIME ENGINE ================= */
+/* ================= REGIME ================= */
 
 function updateMarketMetrics(state, symbol, price) {
   const last = state.lastPrices[symbol];
@@ -201,9 +231,8 @@ function applyFill(state, { symbol, side, price, qty }) {
       pos.avgEntry * pos.qty + price * signedQty;
 
     pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0
-      ? totalCost / pos.qty
-      : 0;
+    pos.avgEntry =
+      pos.qty !== 0 ? totalCost / pos.qty : 0;
   } else {
     const closingQty = Math.min(
       Math.abs(pos.qty),
@@ -219,6 +248,12 @@ function applyFill(state, { symbol, side, price, qty }) {
     state.trades.push({ symbol, pnl });
 
     updatePerformance(state, pnl);
+
+    const signalKey =
+      state.lastSignalKey || null;
+
+    if (signalKey)
+      updateSignalStats(state, signalKey, pnl);
 
     pos.qty = newQty;
     pos.avgEntry = price;
@@ -257,13 +292,25 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
+  const signalKey = buildSignalKey(
+    symbol,
+    state.regime,
+    plan.action
+  );
+
+  state.lastSignalKey = signalKey;
+
   const regimeMult = regimeMultiplier(state.regime);
   const performanceMult = state.performance.score;
+
+  const signalScore =
+    state.signalIntelligence.stats[signalKey]?.score || 1;
 
   const finalRisk =
     plan.riskPct *
     regimeMult *
-    performanceMult;
+    performanceMult *
+    signalScore;
 
   const positionValue =
     state.equity *
@@ -297,6 +344,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       side: plan.action,
       regime: state.regime,
       perfScore: state.performance.score,
+      signalScore,
       ok: result?.ok,
     });
 
@@ -355,6 +403,7 @@ function snapshot(tenantId) {
     regime: state.regime,
     performanceScore: state.performance.score,
     winRate: state.performance.winRate,
+    signalIntelligence: state.signalIntelligence.stats,
     grossExposure: state.grossExposure,
     netExposure: state.netExposure,
     routerHealth: exchangeRouter.getHealth(),
