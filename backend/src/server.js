@@ -15,12 +15,11 @@ const paperTrader = require("./services/paperTrader");
 const liveTrader = require("./services/liveTrader");
 const { startKrakenFeed } = require("./services/krakenFeed");
 
-// ✅ Security Routes
 const securityRoutes = require("./routes/security.routes");
 
-// =========================================================
-// ENV CHECKS
-// =========================================================
+/* =========================================================
+   ENV CHECKS
+========================================================= */
 
 function requireEnv(name) {
   if (!process.env[name]) {
@@ -33,16 +32,16 @@ ensureDb();
 requireEnv("JWT_SECRET");
 users.ensureAdminFromEnv();
 
-// =========================================================
-// EXPRESS APP
-// =========================================================
+/* =========================================================
+   EXPRESS APP
+========================================================= */
 
 const app = express();
 app.set("trust proxy", 1);
 
-// =========================================================
-// CORS
-// =========================================================
+/* =========================================================
+   CORS
+========================================================= */
 
 const allowlist = (process.env.CORS_ORIGINS || "")
   .split(",")
@@ -61,17 +60,13 @@ app.use(
   })
 );
 
-// =========================================================
-// SECURITY MIDDLEWARE
-// =========================================================
+/* =========================================================
+   SECURITY
+========================================================= */
 
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
-
-// =========================================================
-// RATE LIMIT
-// =========================================================
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -80,9 +75,9 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// =========================================================
-// HEALTH CHECK
-// =========================================================
+/* =========================================================
+   HEALTH
+========================================================= */
 
 app.get("/health", (req, res) => {
   res.json({
@@ -92,21 +87,21 @@ app.get("/health", (req, res) => {
   });
 });
 
-// =========================================================
-// AUTH ROUTES (NO TENANT)
-// =========================================================
+/* =========================================================
+   AUTH ROUTES (NO TENANT)
+========================================================= */
 
 app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
 
-// =========================================================
-// TENANT CONTEXT STARTS
-// =========================================================
+/* =========================================================
+   TENANT CONTEXT
+========================================================= */
 
 app.use(tenantMiddleware);
 
-// =========================================================
-// TENANT ROUTES
-// =========================================================
+/* =========================================================
+   TENANT ROUTES
+========================================================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/manager", require("./routes/manager.routes"));
@@ -117,61 +112,68 @@ app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/voice", require("./routes/voice.routes"));
 app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
-
-// ❌ REMOVE if unused — prevents confusion
-// app.use("/api/posture", require("./routes/posture.routes"));
-
-// ✅ SECURITY (SOC + Score Engine)
 app.use("/api/security", securityRoutes);
 
-// =========================================================
-// SERVER + WEBSOCKET
-// =========================================================
+/* =========================================================
+   SERVER + WEBSOCKET
+========================================================= */
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws/market" });
 
-let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
+let last = {};
 
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
   wss.clients.forEach((client) => {
     if (client.readyState === 1) {
-      try {
-        client.send(payload);
-      } catch {}
+      try { client.send(payload); } catch {}
     }
   });
 }
 
 wss.on("connection", (ws) => {
-  ws.send(
-    JSON.stringify({
-      type: "hello",
-      symbols: Object.keys(last),
-      last,
-      ts: Date.now(),
-    })
-  );
+  ws.send(JSON.stringify({
+    type: "hello",
+    symbols: Object.keys(last),
+    last,
+    ts: Date.now(),
+  }));
 });
 
-// =========================================================
-// START TRADING ENGINES
-// =========================================================
+/* =========================================================
+   GLOBAL TICK ROUTER (MULTI-TENANT SAFE)
+========================================================= */
 
-paperTrader.start();
-liveTrader.start();
+const ACTIVE_TENANTS = new Set();
+
+function registerTenant(tenantId) {
+  if (!tenantId) return;
+  if (ACTIVE_TENANTS.has(tenantId)) return;
+
+  ACTIVE_TENANTS.add(tenantId);
+
+  paperTrader.start?.(tenantId);
+  liveTrader.start?.(tenantId);
+}
+
+/* =========================================================
+   KRAKEN FEED
+========================================================= */
 
 let krakenStop = null;
 
 try {
   krakenStop = startKrakenFeed({
     onStatus: (s) => console.log("[kraken]", s),
+
     onTick: (tick) => {
       last[tick.symbol] = tick.price;
 
-      paperTrader.tick(tick.symbol, tick.price, tick.ts);
-      liveTrader.tick(tick.symbol, tick.price, tick.ts);
+      for (const tenantId of ACTIVE_TENANTS) {
+        paperTrader.tick(tenantId, tick.symbol, tick.price, tick.ts);
+        liveTrader.tick(tenantId, tick.symbol, tick.price, tick.ts);
+      }
 
       broadcast({ type: "tick", ...tick });
     },
@@ -180,9 +182,19 @@ try {
   console.error("Failed to start Kraken feed:", e);
 }
 
-// =========================================================
-// ERROR HANDLER
-// =========================================================
+/* =========================================================
+   TENANT AUTO-REGISTRATION MIDDLEWARE
+========================================================= */
+
+app.use((req, res, next) => {
+  const tenantId = req.tenant?.id || req.tenantId;
+  if (tenantId) registerTenant(tenantId);
+  next();
+});
+
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
 
 app.use((err, req, res, next) => {
   if (err && String(err.message || "").toLowerCase().includes("cors")) {
@@ -195,9 +207,9 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-// =========================================================
-// START SERVER
-// =========================================================
+/* =========================================================
+   START SERVER
+========================================================= */
 
 const port = process.env.PORT || 5000;
 
@@ -205,24 +217,16 @@ server.listen(port, () =>
   console.log("AutoShield Tech backend running on", port)
 );
 
-// =========================================================
-// GRACEFUL SHUTDOWN
-// =========================================================
+/* =========================================================
+   SHUTDOWN
+========================================================= */
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 function shutdown() {
   console.log("Shutting down...");
-  try {
-    krakenStop && krakenStop.stop();
-  } catch {}
-  try {
-    wss.close();
-  } catch {}
-  try {
-    server.close(() => process.exit(0));
-  } catch {
-    process.exit(1);
-  }
+  try { krakenStop && krakenStop.stop(); } catch {}
+  try { wss.close(); } catch {}
+  try { server.close(() => process.exit(0)); } catch { process.exit(1); }
 }
