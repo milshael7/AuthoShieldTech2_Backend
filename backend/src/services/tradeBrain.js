@@ -1,6 +1,7 @@
 // backend/src/services/tradeBrain.js
-// Phase 4 — Unified Brain (Paper + Live)
-// Properly wired to Adaptive StrategyEngine
+// Phase 4 — Unified Brain Layer
+// Bridges paper/live trader → strategyEngine
+// Fully Adaptive + Tenant Safe
 
 const aiBrain = require("./aiBrain");
 const { buildDecision } = require("./strategyEngine");
@@ -19,33 +20,29 @@ function safeNum(x, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
 /* ---------------- CORE DECISION ---------------- */
 
 function makeDecision(context = {}) {
-  const tenantId = context.tenantId || "__default__";
-  const symbol = String(context.symbol || "BTCUSDT");
-  const last = safeNum(context.last, NaN);
+  const {
+    tenantId,
+    symbol = "BTCUSDT",
+    last,
+    paper = {},
+  } = context;
 
-  const paper = context.paper || {};
-  const learn = paper.learnStats || {};
+  const price = safeNum(last, NaN);
   const limits = paper.limits || {};
-  const config = paper.config || {};
+  const learn = paper.learnStats || {};
 
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  /* =====================================================
-     🔥 STRATEGY ENGINE (TRUE ADAPTIVE CORE)
-  ===================================================== */
+  /* ================= STRATEGY ENGINE ================= */
 
   const strategyView = buildDecision({
     tenantId,
     symbol,
-    price: last,
+    price,
     lastPrice: paper.lastPrice,
     volatility: paper.volatility,
     ticksSeen: learn.ticksSeen,
@@ -56,11 +53,9 @@ function makeDecision(context = {}) {
   let action = strategyView.action;
   let confidence = strategyView.confidence;
   let edge = strategyView.edge;
-  let blockedReason = strategyView.reason || "";
+  let reason = strategyView.reason;
 
-  /* =====================================================
-     🤖 AI OVERLAY (SOFT — NEVER BREAKS SAFETY)
-  ===================================================== */
+  /* ================= AI OVERLAY (SOFT BIAS ONLY) ================= */
 
   try {
     if (typeof aiBrain.decide === "function") {
@@ -76,67 +71,30 @@ function makeDecision(context = {}) {
     }
   } catch {}
 
-  /* =====================================================
-     🛑 HARD SAFETY GATES
-  ===================================================== */
+  /* ================= HARD SAFETY GATES ================= */
 
-  if (!Number.isFinite(last)) {
+  if (!Number.isFinite(price)) {
     action = "WAIT";
-    blockedReason = "Missing price.";
+    reason = "Missing price.";
   } else if (limits.halted) {
     action = "WAIT";
-    blockedReason = "System halted.";
+    reason = "System halted.";
   } else if (tradesToday >= MAX_TRADES_PER_DAY) {
     action = "WAIT";
-    blockedReason = "Daily trade limit reached.";
+    reason = "Daily trade limit reached.";
   } else if (lossesToday >= MAX_LOSS_STREAK) {
     action = "WAIT";
-    blockedReason = "Loss streak protection.";
+    reason = "Loss streak protection.";
   }
-
-  /* =====================================================
-     💰 RISK MODEL
-  ===================================================== */
-
-  const baselinePct = clamp(
-    safeNum(config.baselinePct, 0.01),
-    0.001,
-    0.02
-  );
-
-  const maxPct = clamp(
-    safeNum(config.maxPct, 0.03),
-    baselinePct,
-    0.05
-  );
-
-  const riskPct =
-    lossesToday >= 2
-      ? baselinePct
-      : clamp(baselinePct * 2, baselinePct, maxPct);
-
-  const slPct = clamp(
-    safeNum(config.slPct, 0.005),
-    0.002,
-    0.02
-  );
-
-  const tpPct = clamp(
-    safeNum(config.tpPct, 0.01),
-    slPct,
-    0.05
-  );
 
   return {
     symbol,
     action,
     confidence: action === "WAIT" ? 0 : confidence,
     edge: action === "WAIT" ? 0 : edge,
-    riskPct,
-    slPct,
-    tpPct,
-    reason: blockedReason,
-    learning: strategyView.learning, // expose adaptive state
+    riskPct: strategyView.riskPct,
+    reason,
+    learning: strategyView.learning,
     ts: Date.now(),
   };
 }
