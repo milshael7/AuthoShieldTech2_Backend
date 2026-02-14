@@ -1,13 +1,12 @@
 // backend/src/services/liveTrader.js
-// Phase 11.5 — Institutional Live Engine
-// Spot Position Book + Real-Time Equity Engine
+// Phase 12 — Institutional Live Engine
+// Bi-Directional Margin Engine (Long + Short)
+// Real-Time Equity • Net Position Book
 
 const fs = require("fs");
 const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
-const riskManager = require("./riskManager");
-const portfolioManager = require("./portfolioManager");
 const exchangeRouter = require("./exchangeRouter");
 
 /* ================= CONFIG ================= */
@@ -33,10 +32,6 @@ function statePath(tenantId) {
   return path.join(BASE_PATH, `live_${tenantId}.json`);
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -50,7 +45,7 @@ function envTrue(name) {
 
 function defaultState() {
   return {
-    version: 11.5,
+    version: 12,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -64,7 +59,8 @@ function defaultState() {
 
     lastPrices: {},
 
-    positions: {}, // symbol → { qty, avgEntry, realizedPnL }
+    // qty can be negative (short)
+    positions: {},
 
     trades: [],
     orders: [],
@@ -123,7 +119,7 @@ function recalcEquity(state) {
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
     const price = state.lastPrices[symbol];
-    if (!price) continue;
+    if (!price || !pos.qty) continue;
 
     unrealized += (price - pos.avgEntry) * pos.qty;
   }
@@ -131,7 +127,7 @@ function recalcEquity(state) {
   state.equity = state.cashBalance + unrealized;
 }
 
-/* ================= POSITION APPLY ================= */
+/* ================= APPLY FILL ================= */
 
 function applyFill(state, { symbol, side, price, qty }) {
   state.positions[symbol] = state.positions[symbol] || {
@@ -142,24 +138,39 @@ function applyFill(state, { symbol, side, price, qty }) {
 
   const pos = state.positions[symbol];
 
-  if (side === "BUY") {
+  const signedQty = side === "BUY" ? qty : -qty;
+
+  const newQty = pos.qty + signedQty;
+
+  // Case 1 — Same direction (adding)
+  if (
+    pos.qty === 0 ||
+    Math.sign(pos.qty) === Math.sign(newQty)
+  ) {
     const totalCost =
-      pos.avgEntry * pos.qty + price * qty;
+      pos.avgEntry * pos.qty + price * signedQty;
 
-    pos.qty += qty;
-    pos.avgEntry = totalCost / pos.qty;
+    pos.qty = newQty;
+    pos.avgEntry = pos.qty !== 0
+      ? totalCost / pos.qty
+      : 0;
 
-    state.cashBalance -= price * qty;
-  }
+  } else {
+    // Case 2 — Reducing or flipping
 
-  if (side === "SELL") {
-    const closingQty = Math.min(qty, pos.qty);
-    const pnl = (price - pos.avgEntry) * closingQty;
+    const closingQty = Math.min(
+      Math.abs(pos.qty),
+      Math.abs(signedQty)
+    );
 
-    pos.qty -= closingQty;
+    const pnl =
+      (price - pos.avgEntry) *
+      closingQty *
+      Math.sign(pos.qty);
+
     pos.realizedPnL += pnl;
 
-    state.cashBalance += price * closingQty;
+    state.cashBalance += pnl;
 
     state.trades.push({
       ts: Date.now(),
@@ -170,7 +181,13 @@ function applyFill(state, { symbol, side, price, qty }) {
       profit: pnl,
     });
 
-    if (pos.qty <= 0) delete state.positions[symbol];
+    pos.qty = newQty;
+
+    if (pos.qty === 0) {
+      pos.avgEntry = 0;
+    } else {
+      pos.avgEntry = price; // flipped side reset
+    }
   }
 
   recalcEquity(state);
