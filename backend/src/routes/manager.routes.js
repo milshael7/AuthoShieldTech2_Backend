@@ -1,7 +1,6 @@
 // backend/src/routes/manager.routes.js
-// Manager Room API (read-only)
-// ✅ Admin can see everything Manager sees
-// ✅ Safe limits + filtering + stable responses
+// Manager Room API — Institutional Hardened (Read-Only)
+// Admin inherits access
 
 const express = require("express");
 const router = express.Router();
@@ -13,14 +12,23 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { listNotifications } = require("../lib/notify");
 
-// ---------------- Role safety ----------------
+/* =========================================================
+   ROLE SAFETY
+========================================================= */
+
 const MANAGER = users?.ROLES?.MANAGER || "Manager";
 
-// ---------------- Middleware ----------------
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
+
 router.use(authRequired);
 router.use(requireRole(MANAGER, { adminAlso: true }));
 
-// ---------------- Helpers ----------------
+/* =========================================================
+   HELPERS
+========================================================= */
+
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
   if (!Number.isFinite(x)) return fallback;
@@ -32,52 +40,96 @@ function safeStr(v, maxLen = 120) {
   return s ? s.slice(0, maxLen) : "";
 }
 
-// ---------------- Routes ----------------
+/* =========================================================
+   OVERVIEW
+========================================================= */
 
 // GET /api/manager/overview
 router.get("/overview", (req, res) => {
   try {
     const db = readDb();
+
     return res.json({
-      users: db.users?.length || 0,
-      companies: db.companies?.length || 0,
-      auditEvents: db.audit?.length || 0,
-      notifications: db.notifications?.length || 0,
+      ok: true,
+      overview: {
+        users: db.users?.length || 0,
+        companies: db.companies?.length || 0,
+        auditEvents: db.audit?.length || 0,
+        notifications: db.notifications?.length || 0,
+      },
       time: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
-// GET /api/manager/users (read-only)
+/* =========================================================
+   USERS (READ-ONLY)
+========================================================= */
+
+// GET /api/manager/users
 router.get("/users", (req, res) => {
   try {
-    return res.json(users.listUsers());
+    return res.json({
+      ok: true,
+      users: users.listUsers(),
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
-// GET /api/manager/companies (read-only)
+/* =========================================================
+   COMPANIES (READ-ONLY)
+========================================================= */
+
+// GET /api/manager/companies
 router.get("/companies", (req, res) => {
   try {
-    return res.json(companies.listCompanies());
+    return res.json({
+      ok: true,
+      companies: companies.listCompanies(),
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
+
+/* =========================================================
+   NOTIFICATIONS
+========================================================= */
 
 // GET /api/manager/notifications
 router.get("/notifications", (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 1, 1000, 200);
     const all = listNotifications({}) || [];
-    return res.json(all.slice(0, limit));
+
+    return res.json({
+      ok: true,
+      notifications: all.slice(0, limit),
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
+
+/* =========================================================
+   AUDIT
+========================================================= */
 
 // GET /api/manager/audit
 router.get("/audit", (req, res) => {
@@ -95,15 +147,24 @@ router.get("/audit", (req, res) => {
         (ev) => String(ev.actorId || "") === actorId
       );
     }
+
     if (actionQ) {
       items = items.filter((ev) =>
-        String(ev.action || "").toLowerCase().includes(actionQ)
+        String(ev.action || "")
+          .toLowerCase()
+          .includes(actionQ)
       );
     }
 
-    return res.json(items.slice(0, limit));
+    return res.json({
+      ok: true,
+      audit: items.slice(0, limit),
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
