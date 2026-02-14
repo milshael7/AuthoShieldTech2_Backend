@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 7 — Institutional Live Engine
-// Strategy → Risk → Portfolio → Execution Intent
-// Multi-Layer Protected • Tenant Safe • Adapter Ready
+// Phase 9 — Institutional Live Engine
+// Strategy → Risk → Portfolio → Execution Abstraction
+// Adapter Ready • Multi-Layer Protected • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -9,6 +9,7 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
+const executionEngine = require("./executionEngine");
 
 /* ================= CONFIG ================= */
 
@@ -65,7 +66,7 @@ function nowIso() {
 
 function defaultState() {
   return {
-    version: 8,
+    version: 9,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -212,7 +213,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   updateVolatility(state, p);
 
-  /* ========= 1️⃣ GLOBAL RISK LAYER ========= */
+  /* ========= 1️⃣ GLOBAL RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -254,7 +255,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 3️⃣ PORTFOLIO LAYER ========= */
+  /* ========= 3️⃣ PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -269,7 +270,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 4️⃣ FINAL INTENT ========= */
+  /* ========= 4️⃣ EXECUTION ABSTRACTION ========= */
 
   const adjustedRisk = clamp(
     portfolioCheck.adjustedRiskPct *
@@ -295,7 +296,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.intents.push(intent);
   state.intents = state.intents.slice(-200);
 
-  /* ========= 5️⃣ EXECUTION ADAPTER (STILL LOCKED) ========= */
+  /* ========= 5️⃣ ADAPTER (LOCKED) ========= */
 
   if (state.execute) {
     intent.execution = {
@@ -303,14 +304,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       note: "Execution adapter not wired.",
     };
 
-    state.trades.push({
-      time: ts,
-      symbol,
-      type: plan.action,
-      profit: 0,
-    });
-
-    state.trades = state.trades.slice(-200);
+    // future: executionEngine.executeLiveOrder(...)
   }
 
   save(tenantId);
