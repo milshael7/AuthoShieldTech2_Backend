@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 12 — Institutional Live Engine
-// Bi-Directional Margin Engine (Long + Short)
-// Real-Time Equity • Net Position Book
+// Phase 13A — Institutional Live Engine
+// Cross Margin (Fixed Leverage)
+// Long + Short • Real-Time Equity • Margin + Liquidation Control
 
 const fs = require("fs");
 const path = require("path");
@@ -45,7 +45,7 @@ function envTrue(name) {
 
 function defaultState() {
   return {
-    version: 12,
+    version: 13.1,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -57,9 +57,13 @@ function defaultState() {
     cashBalance: START_BALANCE,
     equity: START_BALANCE,
 
-    lastPrices: {},
+    leverage: 3,
+    initialMarginPct: 1 / 3,
+    maintenanceMarginPct: 0.25,
+    marginUsed: 0,
+    liquidationFlag: false,
 
-    // qty can be negative (short)
+    lastPrices: {},
     positions: {},
 
     trades: [],
@@ -112,19 +116,47 @@ function refreshFlags(state) {
   else state.mode = "live-armed";
 }
 
-/* ================= EQUITY ENGINE ================= */
+/* ================= EQUITY + MARGIN ================= */
 
 function recalcEquity(state) {
   let unrealized = 0;
+  let notionalExposure = 0;
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
     const price = state.lastPrices[symbol];
     if (!price || !pos.qty) continue;
 
     unrealized += (price - pos.avgEntry) * pos.qty;
+    notionalExposure += Math.abs(pos.qty * price);
   }
 
   state.equity = state.cashBalance + unrealized;
+  state.marginUsed = notionalExposure * state.initialMarginPct;
+}
+
+function checkLiquidation(state) {
+  if (state.marginUsed === 0) return;
+
+  const maintenanceRequired =
+    state.marginUsed * state.maintenanceMarginPct;
+
+  if (state.equity <= maintenanceRequired) {
+    state.liquidationFlag = true;
+  }
+}
+
+function buyingPower(state) {
+  return Math.max(
+    (state.equity * state.leverage) - state.marginUsed,
+    0
+  );
+}
+
+function checkMarginBeforeOrder(state, symbol, side, price, riskPct) {
+  const capital = state.equity;
+  const proposedNotional = capital * riskPct * state.leverage;
+
+  return proposedNotional <= buyingPower(state);
 }
 
 /* ================= APPLY FILL ================= */
@@ -137,12 +169,9 @@ function applyFill(state, { symbol, side, price, qty }) {
   };
 
   const pos = state.positions[symbol];
-
   const signedQty = side === "BUY" ? qty : -qty;
-
   const newQty = pos.qty + signedQty;
 
-  // Case 1 — Same direction (adding)
   if (
     pos.qty === 0 ||
     Math.sign(pos.qty) === Math.sign(newQty)
@@ -151,13 +180,10 @@ function applyFill(state, { symbol, side, price, qty }) {
       pos.avgEntry * pos.qty + price * signedQty;
 
     pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0
-      ? totalCost / pos.qty
-      : 0;
+    pos.avgEntry =
+      pos.qty !== 0 ? totalCost / pos.qty : 0;
 
   } else {
-    // Case 2 — Reducing or flipping
-
     const closingQty = Math.min(
       Math.abs(pos.qty),
       Math.abs(signedQty)
@@ -169,7 +195,6 @@ function applyFill(state, { symbol, side, price, qty }) {
       Math.sign(pos.qty);
 
     pos.realizedPnL += pnl;
-
     state.cashBalance += pnl;
 
     state.trades.push({
@@ -183,14 +208,12 @@ function applyFill(state, { symbol, side, price, qty }) {
 
     pos.qty = newQty;
 
-    if (pos.qty === 0) {
-      pos.avgEntry = 0;
-    } else {
-      pos.avgEntry = price; // flipped side reset
-    }
+    if (pos.qty === 0) pos.avgEntry = 0;
+    else pos.avgEntry = price;
   }
 
   recalcEquity(state);
+  checkLiquidation(state);
 }
 
 /* ================= LIFECYCLE ================= */
@@ -218,6 +241,12 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   state.lastPrices[symbol] = price;
   recalcEquity(state);
+  checkLiquidation(state);
+
+  if (state.liquidationFlag) {
+    save(tenantId);
+    return;
+  }
 
   const plan = makeDecision({
     tenantId,
@@ -232,6 +261,17 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
   }
 
   if (!state.execute) {
+    save(tenantId);
+    return;
+  }
+
+  if (!checkMarginBeforeOrder(
+        state,
+        symbol,
+        plan.action,
+        price,
+        plan.riskPct
+      )) {
     save(tenantId);
     return;
   }
@@ -285,6 +325,10 @@ function snapshot(tenantId) {
     mode: state.mode,
     cash: state.cashBalance,
     equity: state.equity,
+    leverage: state.leverage,
+    marginUsed: state.marginUsed,
+    liquidation: state.liquidationFlag,
+    buyingPower: buyingPower(state),
     positions: state.positions,
     orders: state.orders.slice(-50),
     routerHealth: exchangeRouter.getHealth(),
