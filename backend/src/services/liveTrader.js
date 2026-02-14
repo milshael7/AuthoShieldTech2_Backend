@@ -1,5 +1,5 @@
 // backend/src/services/liveTrader.js
-// Phase 9 — Institutional Live Engine
+// Phase 9.1 — Institutional Live Engine (Hardened)
 // Strategy → Risk → Portfolio → Execution Abstraction
 // Adapter Ready • Multi-Layer Protected • Tenant Safe
 
@@ -9,7 +9,6 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
-const executionEngine = require("./executionEngine");
 
 /* ================= CONFIG ================= */
 
@@ -20,6 +19,8 @@ const BASE_PATH =
 const LIVE_REFERENCE_BALANCE = Number(
   process.env.LIVE_START_BALANCE || 0
 );
+
+const MAX_INTENTS = 200;
 
 /* ================= ENV FLAGS ================= */
 
@@ -62,11 +63,15 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function validAction(a) {
+  return a === "BUY" || a === "SELL" || a === "CLOSE";
+}
+
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
-    version: 9,
+    version: 9.1,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -104,14 +109,6 @@ function defaultState() {
     intents: [],
     orders: [],
     lastError: null,
-
-    config: {
-      baselinePct: 0.01,
-      maxPct: 0.02,
-      slPct: 0.005,
-      tpPct: 0.01,
-      LIVE_REFERENCE_BALANCE,
-    },
   };
 }
 
@@ -250,7 +247,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
 
-  if (!state.enabled || plan.action === "WAIT") {
+  if (!state.enabled || !validAction(plan.action) || plan.action === "WAIT") {
     save(tenantId);
     return;
   }
@@ -270,7 +267,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 4️⃣ EXECUTION ABSTRACTION ========= */
+  /* ========= 4️⃣ INTENT CREATION ========= */
 
   const adjustedRisk = clamp(
     portfolioCheck.adjustedRiskPct *
@@ -294,17 +291,18 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   };
 
   state.intents.push(intent);
-  state.intents = state.intents.slice(-200);
 
-  /* ========= 5️⃣ ADAPTER (LOCKED) ========= */
+  if (state.intents.length > MAX_INTENTS) {
+    state.intents = state.intents.slice(-MAX_INTENTS);
+  }
+
+  /* ========= 5️⃣ EXECUTION ADAPTER ========= */
 
   if (state.execute) {
     intent.execution = {
       status: "adapter_missing",
       note: "Execution adapter not wired.",
     };
-
-    // future: executionEngine.executeLiveOrder(...)
   }
 
   save(tenantId);
@@ -326,11 +324,7 @@ function snapshot(tenantId) {
     intents: state.intents.slice(-50),
     trades: state.trades.slice(-50),
     lastError: state.lastError,
-    config: {
-      LIVE_TRADING_ENABLED: state.enabled,
-      LIVE_TRADING_EXECUTE: state.execute,
-      LIVE_REFERENCE_BALANCE,
-    },
+    equity: state.equity,
   };
 }
 
