@@ -1,7 +1,6 @@
 // backend/src/services/riskManager.js
-// Phase 6 — Global Risk Control System
-// Institutional-Grade Risk Layer
-// Multi-Tenant Safe • Portfolio Aware • Volatility Aware • Self-Throttling
+// Phase 7 — Institutional Global Risk Layer
+// Stable • Recoverable • Tenant Safe • Self-Throttling
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -10,10 +9,12 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 ========================================================= */
 
 const CONFIG = Object.freeze({
-  maxDailyLossPct: Number(process.env.RISK_MAX_DAILY_LOSS_PCT || 0.04),   // 4%
-  maxDrawdownPct: Number(process.env.RISK_MAX_DRAWDOWN_PCT || 0.25),     // 25%
+  maxDailyLossPct: Number(process.env.RISK_MAX_DAILY_LOSS_PCT || 0.04),
+  maxDrawdownPct: Number(process.env.RISK_MAX_DRAWDOWN_PCT || 0.25),
+
   lossClusterSize: Number(process.env.RISK_LOSS_CLUSTER_SIZE || 3),
-  cooldownMs: Number(process.env.RISK_COOLDOWN_MS || 60_000),            // 1 min
+  cooldownMs: Number(process.env.RISK_COOLDOWN_MS || 60_000),
+
   highVolatilityCutoff: Number(process.env.RISK_VOL_HIGH || 0.015),
   lowVolatilityCutoff: Number(process.env.RISK_VOL_LOW || 0.002),
 });
@@ -33,7 +34,7 @@ function getState(tenantId) {
       haltReason: null,
 
       cooldownUntil: 0,
-      lossClusterCount: 0,
+      lastClusterTradeCount: 0,
 
       peakEquity: null,
       dailyStartEquity: null,
@@ -57,22 +58,24 @@ function dayKey(ts) {
 function evaluate({
   tenantId,
   equity,
-  realizedNet,
   volatility,
   trades = [],
-  limits = {},
   ts = Date.now(),
 }) {
   const state = getState(tenantId);
   const dk = dayKey(ts);
 
-  /* ---------------- Daily Reset ---------------- */
+  /* ---------------- DAILY RESET ---------------- */
 
   if (state.lastDayKey !== dk) {
     state.lastDayKey = dk;
     state.dailyStartEquity = equity;
-    state.lossClusterCount = 0;
+    state.cooldownUntil = 0;
+    state.halted = false;
+    state.haltReason = null;
   }
+
+  /* ---------------- PEAK TRACKING ---------------- */
 
   if (state.peakEquity == null) {
     state.peakEquity = equity;
@@ -80,7 +83,7 @@ function evaluate({
 
   state.peakEquity = Math.max(state.peakEquity, equity);
 
-  /* ---------------- Drawdown Protection ---------------- */
+  /* ---------------- DRAWDOWN PROTECTION ---------------- */
 
   const drawdown =
     state.peakEquity > 0
@@ -92,9 +95,9 @@ function evaluate({
     state.haltReason = "max_drawdown";
   }
 
-  /* ---------------- Daily Loss Limit ---------------- */
+  /* ---------------- DAILY LOSS LIMIT ---------------- */
 
-  if (state.dailyStartEquity) {
+  if (state.dailyStartEquity > 0) {
     const dailyLoss =
       (state.dailyStartEquity - equity) /
       state.dailyStartEquity;
@@ -105,33 +108,35 @@ function evaluate({
     }
   }
 
-  /* ---------------- Loss Cluster Detection ---------------- */
+  /* ---------------- LOSS CLUSTER DETECTION ---------------- */
 
-  if (trades.length >= CONFIG.lossClusterSize) {
+  if (
+    trades.length >= CONFIG.lossClusterSize &&
+    trades.length !== state.lastClusterTradeCount
+  ) {
     const recent = trades.slice(-CONFIG.lossClusterSize);
     const allLoss = recent.every(t => t.profit <= 0);
 
     if (allLoss) {
-      state.lossClusterCount++;
-      state.cooldownUntil = Date.now() + CONFIG.cooldownMs;
+      state.cooldownUntil = ts + CONFIG.cooldownMs;
     }
+
+    state.lastClusterTradeCount = trades.length;
   }
 
-  /* ---------------- Cooldown Enforcement ---------------- */
+  const cooling = ts < state.cooldownUntil;
 
-  const cooling = Date.now() < state.cooldownUntil;
-
-  /* ---------------- Volatility Regime Detection ---------------- */
+  /* ---------------- VOLATILITY REGIME ---------------- */
 
   if (volatility >= CONFIG.highVolatilityCutoff) {
-    state.riskMultiplier = 0.6; // reduce risk in chaos
+    state.riskMultiplier = 0.6;
   } else if (volatility <= CONFIG.lowVolatilityCutoff) {
-    state.riskMultiplier = 1.2; // allow slightly more in calm markets
+    state.riskMultiplier = 1.15;
   } else {
     state.riskMultiplier = 1;
   }
 
-  /* ---------------- Final Risk Status ---------------- */
+  /* ---------------- FINAL STATUS ---------------- */
 
   return {
     halted: state.halted,
@@ -149,10 +154,6 @@ function evaluate({
 function resetTenant(tenantId) {
   RISK_STATE.delete(tenantId);
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   evaluate,
