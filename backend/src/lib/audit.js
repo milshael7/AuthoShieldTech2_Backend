@@ -1,11 +1,13 @@
 // backend/src/lib/audit.js
-// Central Audit Writer — HARDENED & BACKWARD COMPATIBLE
+// Central Audit Writer — BACKWARD COMPATIBLE
+// Supports BOTH: audit() and writeAudit()
+// Never throws • Safe concurrent writes
 
 const crypto = require("crypto");
 const { updateDb } = require("./db");
 
 /**
- * Internal writer
+ * Core writer
  */
 function writeAudit(input = {}) {
   try {
@@ -13,18 +15,29 @@ function writeAudit(input = {}) {
       id: crypto.randomUUID(),
       ts: Date.now(),
 
-      actorId: input.actorId || input.actor || "system",
-      role: input.role || null,
+      actor: String(input.actor || input.actorId || "system"),
+      role: String(input.role || "system"),
       action: String(input.action || "UNKNOWN"),
 
-      targetType: input.targetType || null,
-      targetId: input.targetId || input.target || null,
-      companyId: input.companyId || null,
+      target: input.target || input.targetId
+        ? String(input.target || input.targetId)
+        : null,
+
+      targetType: input.targetType
+        ? String(input.targetType)
+        : null,
+
+      companyId: input.companyId
+        ? String(input.companyId)
+        : null,
 
       metadata:
         input.metadata && typeof input.metadata === "object"
           ? input.metadata
-          : input.detail && typeof input.detail === "object"
+          : {},
+
+      detail:
+        input.detail && typeof input.detail === "object"
           ? input.detail
           : {},
     };
@@ -33,7 +46,7 @@ function writeAudit(input = {}) {
       if (!Array.isArray(db.audit)) db.audit = [];
       db.audit.push(record);
 
-      // Hard cap: keep last 10,000 events
+      // Hard cap
       if (db.audit.length > 10_000) {
         db.audit = db.audit.slice(-10_000);
       }
@@ -49,12 +62,14 @@ function writeAudit(input = {}) {
 }
 
 /**
- * 🔥 Backward compatibility alias
- * Old routes use: audit(...)
+ * 🔁 BACKWARD COMPATIBILITY LAYER
+ * Old code calls audit({...})
  */
-const audit = writeAudit;
+function audit(input = {}) {
+  return writeAudit(input);
+}
 
 module.exports = {
   writeAudit,
-  audit,
+  audit, // ← keeps old routes working
 };
