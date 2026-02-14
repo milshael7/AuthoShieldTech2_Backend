@@ -1,7 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 13A — Institutional Live Engine
-// Cross Margin (Fixed Leverage)
-// Long + Short • Real-Time Equity • Margin + Liquidation Control
+// Phase 13B — Institutional Live Engine
+// Cross Margin + Auto Liquidation Engine
 
 const fs = require("fs");
 const path = require("path");
@@ -45,7 +44,7 @@ function envTrue(name) {
 
 function defaultState() {
   return {
-    version: 13.1,
+    version: 13.2,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -120,100 +119,70 @@ function refreshFlags(state) {
 
 function recalcEquity(state) {
   let unrealized = 0;
-  let notionalExposure = 0;
+  let exposure = 0;
 
   for (const [symbol, pos] of Object.entries(state.positions)) {
     const price = state.lastPrices[symbol];
     if (!price || !pos.qty) continue;
 
     unrealized += (price - pos.avgEntry) * pos.qty;
-    notionalExposure += Math.abs(pos.qty * price);
+    exposure += Math.abs(pos.qty * price);
   }
 
   state.equity = state.cashBalance + unrealized;
-  state.marginUsed = notionalExposure * state.initialMarginPct;
+  state.marginUsed = exposure * state.initialMarginPct;
 }
 
-function checkLiquidation(state) {
-  if (state.marginUsed === 0) return;
-
-  const maintenanceRequired =
-    state.marginUsed * state.maintenanceMarginPct;
-
-  if (state.equity <= maintenanceRequired) {
-    state.liquidationFlag = true;
-  }
+function maintenanceRequired(state) {
+  return state.marginUsed * state.maintenanceMarginPct;
 }
 
-function buyingPower(state) {
-  return Math.max(
-    (state.equity * state.leverage) - state.marginUsed,
-    0
-  );
-}
+/* ================= AUTO LIQUIDATION ================= */
 
-function checkMarginBeforeOrder(state, symbol, side, price, riskPct) {
-  const capital = state.equity;
-  const proposedNotional = capital * riskPct * state.leverage;
+async function autoLiquidate(tenantId, state) {
+  state.liquidationFlag = true;
 
-  return proposedNotional <= buyingPower(state);
-}
+  for (const [symbol, pos] of Object.entries(state.positions)) {
+    if (!pos.qty) continue;
 
-/* ================= APPLY FILL ================= */
+    const side = pos.qty > 0 ? "SELL" : "BUY";
+    const qty = Math.abs(pos.qty);
+    const price = state.lastPrices[symbol];
 
-function applyFill(state, { symbol, side, price, qty }) {
-  state.positions[symbol] = state.positions[symbol] || {
-    qty: 0,
-    avgEntry: 0,
-    realizedPnL: 0,
-  };
+    try {
+      const result = await exchangeRouter.routeLiveOrder({
+        tenantId,
+        symbol,
+        side,
+        qty,
+        forceClose: true,
+      });
 
-  const pos = state.positions[symbol];
-  const signedQty = side === "BUY" ? qty : -qty;
-  const newQty = pos.qty + signedQty;
+      if (result?.ok) {
+        state.cashBalance +=
+          (price - pos.avgEntry) * pos.qty;
 
-  if (
-    pos.qty === 0 ||
-    Math.sign(pos.qty) === Math.sign(newQty)
-  ) {
-    const totalCost =
-      pos.avgEntry * pos.qty + price * signedQty;
+        state.trades.push({
+          ts: Date.now(),
+          symbol,
+          forced: true,
+          qty,
+          exit: price,
+        });
 
-    pos.qty = newQty;
-    pos.avgEntry =
-      pos.qty !== 0 ? totalCost / pos.qty : 0;
+        state.positions[symbol] = {
+          qty: 0,
+          avgEntry: 0,
+          realizedPnL: 0,
+        };
+      }
 
-  } else {
-    const closingQty = Math.min(
-      Math.abs(pos.qty),
-      Math.abs(signedQty)
-    );
-
-    const pnl =
-      (price - pos.avgEntry) *
-      closingQty *
-      Math.sign(pos.qty);
-
-    pos.realizedPnL += pnl;
-    state.cashBalance += pnl;
-
-    state.trades.push({
-      ts: Date.now(),
-      symbol,
-      qty: closingQty,
-      entry: pos.avgEntry,
-      exit: price,
-      profit: pnl,
-    });
-
-    pos.qty = newQty;
-
-    if (pos.qty === 0) pos.avgEntry = 0;
-    else pos.avgEntry = price;
+    } catch (err) {
+      state.lastError = String(err?.message || err);
+    }
   }
 
   recalcEquity(state);
-  checkLiquidation(state);
 }
 
 /* ================= LIFECYCLE ================= */
@@ -241,9 +210,12 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   state.lastPrices[symbol] = price;
   recalcEquity(state);
-  checkLiquidation(state);
 
-  if (state.liquidationFlag) {
+  if (
+    state.marginUsed > 0 &&
+    state.equity <= maintenanceRequired(state)
+  ) {
+    await autoLiquidate(tenantId, state);
     save(tenantId);
     return;
   }
@@ -265,17 +237,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  if (!checkMarginBeforeOrder(
-        state,
-        symbol,
-        plan.action,
-        price,
-        plan.riskPct
-      )) {
-    save(tenantId);
-    return;
-  }
-
   try {
     const result = await exchangeRouter.routeLiveOrder({
       tenantId,
@@ -285,15 +246,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       price,
       ts,
     });
-
-    if (result?.ok && result?.result?.filledQty) {
-      applyFill(state, {
-        symbol,
-        side: plan.action,
-        price,
-        qty: result.result.filledQty,
-      });
-    }
 
     state.orders.push({
       ts,
@@ -327,10 +279,9 @@ function snapshot(tenantId) {
     equity: state.equity,
     leverage: state.leverage,
     marginUsed: state.marginUsed,
+    maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
-    buyingPower: buyingPower(state),
     positions: state.positions,
-    orders: state.orders.slice(-50),
     routerHealth: exchangeRouter.getHealth(),
   };
 }
