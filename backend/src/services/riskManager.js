@@ -1,7 +1,8 @@
 // backend/src/services/riskManager.js
-// Phase 9 — Institutional Predictive Risk Layer
-// Escalating Cooldowns • Rolling Drawdown • Volatility Regime Memory
-// Stable • Recoverable • Tenant Safe • Self-Throttling
+// Phase 22 — Institutional Adaptive Risk Engine
+// Cross-Margin Aware • Drawdown Reactive • Volatility Regime Memory
+// Margin Pressure Control • Liquidation Buffering
+// Tenant Safe • Paper + Live Compatible • Production Hardened
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -20,6 +21,9 @@ const CONFIG = Object.freeze({
 
   highVolatilityCutoff: Number(process.env.RISK_VOL_HIGH || 0.015),
   lowVolatilityCutoff: Number(process.env.RISK_VOL_LOW || 0.002),
+
+  maxMarginUtilization: Number(process.env.RISK_MAX_MARGIN_UTIL || 0.65),
+  liquidationBufferPct: Number(process.env.RISK_LIQ_BUFFER || 0.15),
 });
 
 /* =========================================================
@@ -33,25 +37,25 @@ function getState(tenantId) {
 
   if (!RISK_STATE.has(key)) {
     RISK_STATE.set(key, {
-      version: 9,
+      version: 22,
 
       halted: false,
       haltReason: null,
 
       cooldownUntil: 0,
       cooldownLevel: 0,
-
       lastClusterTradeCount: 0,
 
       peakEquity: null,
       rollingPeak: null,
       dailyStartEquity: null,
       firstEquitySeen: null,
-
       lastDayKey: null,
 
       riskMultiplier: 1,
       volatilityRegime: "normal",
+
+      lastMarginPressure: 0,
     });
   }
 
@@ -69,8 +73,10 @@ function dayKey(ts) {
 function evaluate({
   tenantId,
   equity,
-  volatility,
+  volatility = 0,
   trades = [],
+  marginUsed = 0,
+  maintenanceRequired = 0,
   ts = Date.now(),
 }) {
   const state = getState(tenantId);
@@ -111,8 +117,6 @@ function evaluate({
 
   state.peakEquity = Math.max(state.peakEquity, equity);
 
-  /* ================= ROLLING PEAK (SOFTER) ================= */
-
   if (state.rollingPeak == null) {
     state.rollingPeak = equity;
   }
@@ -137,7 +141,7 @@ function evaluate({
     state.haltReason = "max_drawdown";
   }
 
-  /* ================= EQUITY FLOOR FAILSAFE ================= */
+  /* ================= EQUITY FLOOR ================= */
 
   const floor =
     state.firstEquitySeen *
@@ -161,7 +165,7 @@ function evaluate({
     }
   }
 
-  /* ================= LOSS CLUSTER ESCALATION ================= */
+  /* ================= LOSS CLUSTER ================= */
 
   if (
     trades.length >= CONFIG.lossClusterSize &&
@@ -184,7 +188,7 @@ function evaluate({
 
   const cooling = ts < state.cooldownUntil;
 
-  /* ================= VOLATILITY REGIME MEMORY ================= */
+  /* ================= VOLATILITY REGIME ================= */
 
   if (volatility >= CONFIG.highVolatilityCutoff) {
     state.volatilityRegime = "high";
@@ -202,23 +206,48 @@ function evaluate({
     state.riskMultiplier = 1;
   }
 
-  /* ================= SOFT THROTTLE ================= */
+  /* ================= MARGIN PRESSURE ================= */
+
+  let marginPressure = 0;
+
+  if (marginUsed > 0 && equity > 0) {
+    marginPressure = marginUsed / equity;
+  }
+
+  state.lastMarginPressure = marginPressure;
+
+  if (marginPressure >= CONFIG.maxMarginUtilization) {
+    state.halted = true;
+    state.haltReason = "margin_utilization_limit";
+  }
+
+  /* ================= LIQUIDATION BUFFER ================= */
+
+  if (
+    maintenanceRequired > 0 &&
+    equity <= maintenanceRequired * (1 + CONFIG.liquidationBufferPct)
+  ) {
+    state.riskMultiplier *= 0.25;
+  }
+
+  /* ================= SOFT DRAWDOWN THROTTLE ================= */
 
   if (!state.halted && rollingDrawdown > 0.12) {
     state.riskMultiplier *= 0.75;
   }
 
-  /* ================= FINAL ================= */
+  /* ================= FINAL RETURN ================= */
 
   return {
     halted: state.halted,
     haltReason: state.haltReason,
     cooling,
-    riskMultiplier: clamp(state.riskMultiplier, 0.4, 1.5),
+    riskMultiplier: clamp(state.riskMultiplier, 0.2, 1.5),
     drawdown,
     rollingDrawdown,
     volatilityRegime: state.volatilityRegime,
     cooldownLevel: state.cooldownLevel,
+    marginPressure,
   };
 }
 
