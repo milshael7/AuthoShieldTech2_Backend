@@ -1,17 +1,12 @@
 // backend/src/routes/paper.routes.js
-// Paper endpoints: status + reset + config (SAFE + ENGINE-ALIGNED)
-// ✔ FULL DROP-IN REPLACEMENT
-// ✔ Matches current paperTrader implementation (Step 10)
-// ✔ No phantom methods, no crashes
-// ✔ Frontend-safe response shapes
+// Paper endpoints — TENANT SAFE + ENGINE ALIGNED
 
 const express = require("express");
 const router = express.Router();
 
 const paperTrader = require("../services/paperTrader");
 
-/* ================= KEY GATES ================= */
-// If a key is NOT set, the action is OPEN (not recommended).
+/* ================= KEY GATE ================= */
 
 function resetAllowed(req) {
   const key = String(process.env.PAPER_RESET_KEY || "").trim();
@@ -20,14 +15,30 @@ function resetAllowed(req) {
   return !!sent && sent === key;
 }
 
+/* ================= TENANT HELPER ================= */
+
+function getTenantId(req) {
+  return req.tenant?.id || req.tenantId || null;
+}
+
 /* ================= ROUTES ================= */
 
 // GET /api/paper/status
 router.get("/status", (req, res) => {
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context.",
+      });
+    }
+
+    const snapshot = paperTrader.snapshot(tenantId);
+
     return res.json({
       ok: true,
-      snapshot: paperTrader.snapshot(),
+      snapshot,
       time: new Date().toISOString(),
     });
   } catch (e) {
@@ -41,6 +52,14 @@ router.get("/status", (req, res) => {
 // POST /api/paper/reset
 router.post("/reset", (req, res) => {
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context.",
+      });
+    }
+
     if (!resetAllowed(req)) {
       return res.status(403).json({
         ok: false,
@@ -49,12 +68,12 @@ router.post("/reset", (req, res) => {
       });
     }
 
-    paperTrader.hardReset();
+    paperTrader.hardReset(tenantId);
 
     return res.json({
       ok: true,
       message: "Paper trader reset complete.",
-      snapshot: paperTrader.snapshot(),
+      snapshot: paperTrader.snapshot(tenantId),
       time: new Date().toISOString(),
     });
   } catch (e) {
@@ -65,20 +84,18 @@ router.post("/reset", (req, res) => {
   }
 });
 
-/* ================= CONFIG (READ-ONLY) ================= */
-/*
-  IMPORTANT:
-  The current paperTrader engine (Step 10) does NOT support
-  runtime config mutation. All values are ENV-driven.
-
-  This endpoint exists so the frontend can READ limits
-  without breaking, not to modify them.
-*/
-
 // GET /api/paper/config
 router.get("/config", (req, res) => {
   try {
-    const snap = paperTrader.snapshot();
+    const tenantId = getTenantId(req);
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context.",
+      });
+    }
+
+    const snap = paperTrader.snapshot(tenantId);
 
     const config = {
       startBalance: Number(process.env.PAPER_START_BALANCE || 100000),
@@ -95,8 +112,8 @@ router.get("/config", (req, res) => {
 
     return res.json({
       ok: true,
-      config,          // ✅ frontend-friendly
-      owner: config,   // ✅ backward compatible
+      config,
+      owner: config,
       limits: snap.limits || {},
       time: new Date().toISOString(),
     });
@@ -109,7 +126,6 @@ router.get("/config", (req, res) => {
 });
 
 // POST /api/paper/config
-// ❌ Disabled intentionally (engine does not support it yet)
 router.post("/config", (req, res) => {
   return res.status(409).json({
     ok: false,
