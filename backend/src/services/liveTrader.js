@@ -1,7 +1,6 @@
 // backend/src/services/liveTrader.js
-// Phase 10 — Institutional Live Engine (Router Integrated)
-// Strategy → Risk → Portfolio → ExchangeRouter
-// Failover Ready • Circuit Protected • Tenant Safe
+// Phase 11.5 — Institutional Live Engine
+// Spot Position Book + Real-Time Equity Engine
 
 const fs = require("fs");
 const path = require("path");
@@ -17,29 +16,11 @@ const BASE_PATH =
   process.env.LIVE_TRADER_STATE_DIR ||
   path.join("/tmp", "live_trader");
 
-const LIVE_REFERENCE_BALANCE = Number(
+const START_BALANCE = Number(
   process.env.LIVE_START_BALANCE || 0
 );
 
-const MAX_INTENTS = 200;
 const MAX_ORDERS = 500;
-
-/* ================= ENV FLAGS ================= */
-
-function envTrue(name) {
-  const v = String(process.env[name] || "")
-    .toLowerCase()
-    .trim();
-  return v === "true" || v === "1" || v === "yes";
-}
-
-function isEnabled() {
-  return envTrue("LIVE_TRADING_ENABLED");
-}
-
-function isExecuteEnabled() {
-  return envTrue("LIVE_TRADING_EXECUTE");
-}
 
 /* ================= HELPERS ================= */
 
@@ -52,11 +33,6 @@ function statePath(tenantId) {
   return path.join(BASE_PATH, `live_${tenantId}.json`);
 }
 
-function safeNum(x, fallback = null) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
@@ -65,15 +41,16 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function validAction(a) {
-  return a === "BUY" || a === "SELL" || a === "CLOSE";
+function envTrue(name) {
+  const v = String(process.env[name] || "").toLowerCase().trim();
+  return v === "true" || v === "1" || v === "yes";
 }
 
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
-    version: 10,
+    version: 11.5,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -82,35 +59,15 @@ function defaultState() {
     execute: false,
     mode: "live-disabled",
 
-    lastPrice: null,
-    volatility: 0.002,
-    equity: LIVE_REFERENCE_BALANCE,
+    cashBalance: START_BALANCE,
+    equity: START_BALANCE,
 
-    stats: {
-      ticksSeen: 0,
-      lastDecision: "WAIT",
-      confidence: 0,
-      edge: 0,
-      lastReason: "boot",
-    },
+    lastPrices: {},
 
-    learnStats: {
-      ticksSeen: 0,
-      confidence: 0,
-      decision: "WAIT",
-      trendEdge: 0,
-    },
-
-    limits: {
-      halted: false,
-      haltReason: null,
-      cooling: false,
-    },
+    positions: {}, // symbol → { qty, avgEntry, realizedPnL }
 
     trades: [],
-    intents: [],
     orders: [],
-    executionAudit: [],
     lastError: null,
   };
 }
@@ -127,9 +84,7 @@ function load(tenantId) {
 
   try {
     if (fs.existsSync(file)) {
-      const raw = JSON.parse(
-        fs.readFileSync(file, "utf-8")
-      );
+      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
       state = { ...state, ...raw };
     }
   } catch {}
@@ -153,33 +108,72 @@ function save(tenantId) {
 }
 
 function refreshFlags(state) {
-  state.enabled = isEnabled();
-  state.execute = state.enabled && isExecuteEnabled();
+  state.enabled = envTrue("LIVE_TRADING_ENABLED");
+  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
 
   if (!state.enabled) state.mode = "live-disabled";
   else if (state.execute) state.mode = "live-executing";
   else state.mode = "live-armed";
 }
 
-/* ================= VOLATILITY ================= */
+/* ================= EQUITY ENGINE ================= */
 
-function updateVolatility(state, price) {
-  if (!state.lastPrice) {
-    state.lastPrice = price;
-    return;
+function recalcEquity(state) {
+  let unrealized = 0;
+
+  for (const [symbol, pos] of Object.entries(state.positions)) {
+    const price = state.lastPrices[symbol];
+    if (!price) continue;
+
+    unrealized += (price - pos.avgEntry) * pos.qty;
   }
 
-  const change =
-    Math.abs(price - state.lastPrice) /
-    state.lastPrice;
+  state.equity = state.cashBalance + unrealized;
+}
 
-  state.volatility = clamp(
-    state.volatility * 0.9 + change * 0.1,
-    0.0001,
-    0.05
-  );
+/* ================= POSITION APPLY ================= */
 
-  state.lastPrice = price;
+function applyFill(state, { symbol, side, price, qty }) {
+  state.positions[symbol] = state.positions[symbol] || {
+    qty: 0,
+    avgEntry: 0,
+    realizedPnL: 0,
+  };
+
+  const pos = state.positions[symbol];
+
+  if (side === "BUY") {
+    const totalCost =
+      pos.avgEntry * pos.qty + price * qty;
+
+    pos.qty += qty;
+    pos.avgEntry = totalCost / pos.qty;
+
+    state.cashBalance -= price * qty;
+  }
+
+  if (side === "SELL") {
+    const closingQty = Math.min(qty, pos.qty);
+    const pnl = (price - pos.avgEntry) * closingQty;
+
+    pos.qty -= closingQty;
+    pos.realizedPnL += pnl;
+
+    state.cashBalance += price * closingQty;
+
+    state.trades.push({
+      ts: Date.now(),
+      symbol,
+      qty: closingQty,
+      entry: pos.avgEntry,
+      exit: price,
+      profit: pnl,
+    });
+
+    if (pos.qty <= 0) delete state.positions[symbol];
+  }
+
+  recalcEquity(state);
 }
 
 /* ================= LIFECYCLE ================= */
@@ -205,137 +199,59 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
 
   refreshFlags(state);
 
-  const p = safeNum(price, null);
-  if (!Number.isFinite(p)) return;
-
-  state.stats.ticksSeen++;
-  state.learnStats.ticksSeen++;
-
-  updateVolatility(state, p);
-
-  /* ========= RISK ========= */
-
-  const risk = riskManager.evaluate({
-    tenantId,
-    equity: state.equity,
-    volatility: state.volatility,
-    trades: state.trades,
-    ts,
-  });
-
-  state.limits.halted = risk.halted;
-  state.limits.haltReason = risk.haltReason || null;
-  state.limits.cooling = risk.cooling;
-
-  if (risk.halted || risk.cooling) {
-    save(tenantId);
-    return;
-  }
-
-  /* ========= STRATEGY ========= */
+  state.lastPrices[symbol] = price;
+  recalcEquity(state);
 
   const plan = makeDecision({
     tenantId,
     symbol,
-    last: p,
+    last: price,
     paper: state,
   });
 
-  state.stats.lastDecision = plan.action;
-  state.stats.confidence = plan.confidence;
-  state.stats.edge = plan.edge;
-  state.stats.lastReason = plan.reason;
-
-  state.learnStats.decision = plan.action;
-  state.learnStats.confidence = plan.confidence;
-  state.learnStats.trendEdge = plan.edge;
-
-  if (!state.enabled || !validAction(plan.action) || plan.action === "WAIT") {
+  if (!state.enabled || plan.action === "WAIT") {
     save(tenantId);
     return;
   }
 
-  /* ========= PORTFOLIO ========= */
-
-  const portfolioCheck = portfolioManager.evaluate({
-    tenantId,
-    symbol,
-    equity: state.equity,
-    proposedRiskPct: plan.riskPct,
-    paperState: state,
-  });
-
-  if (!portfolioCheck.allow) {
+  if (!state.execute) {
     save(tenantId);
     return;
   }
 
-  /* ========= INTENT ========= */
+  try {
+    const result = await exchangeRouter.routeLiveOrder({
+      tenantId,
+      symbol,
+      side: plan.action,
+      riskPct: plan.riskPct,
+      price,
+      ts,
+    });
 
-  const adjustedRisk = clamp(
-    portfolioCheck.adjustedRiskPct *
-      (risk.riskMultiplier || 1),
-    0.001,
-    0.05
-  );
-
-  const intent = {
-    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
-    ts,
-    symbol,
-    side: plan.action,
-    confidence: plan.confidence,
-    edge: plan.edge,
-    riskPct: adjustedRisk,
-    reason: plan.reason,
-    executed: false,
-  };
-
-  state.intents.push(intent);
-  if (state.intents.length > MAX_INTENTS) {
-    state.intents = state.intents.slice(-MAX_INTENTS);
-  }
-
-  /* ========= EXECUTION ROUTER ========= */
-
-  if (state.execute) {
-    try {
-      const result = await exchangeRouter.routeLiveOrder({
-        tenantId,
+    if (result?.ok && result?.result?.filledQty) {
+      applyFill(state, {
         symbol,
         side: plan.action,
-        riskPct: adjustedRisk,
-        price: p,
-        ts,
+        price,
+        qty: result.result.filledQty,
       });
-
-      intent.executed = true;
-      intent.executionResult = result;
-
-      state.orders.push({
-        ts,
-        symbol,
-        side: plan.action,
-        exchange: result?.exchange || null,
-        ok: result?.ok || false,
-        result,
-      });
-
-      if (state.orders.length > MAX_ORDERS) {
-        state.orders = state.orders.slice(-MAX_ORDERS);
-      }
-
-      state.executionAudit.push({
-        ts,
-        symbol,
-        side: plan.action,
-        exchange: result?.exchange,
-        ok: result?.ok,
-      });
-
-    } catch (err) {
-      state.lastError = String(err?.message || err);
     }
+
+    state.orders.push({
+      ts,
+      symbol,
+      side: plan.action,
+      exchange: result?.exchange,
+      ok: result?.ok,
+    });
+
+    if (state.orders.length > MAX_ORDERS) {
+      state.orders = state.orders.slice(-MAX_ORDERS);
+    }
+
+  } catch (err) {
+    state.lastError = String(err?.message || err);
   }
 
   save(tenantId);
@@ -349,16 +265,11 @@ function snapshot(tenantId) {
 
   return {
     ok: true,
-    running: state.running,
-    enabled: state.enabled,
-    execute: state.execute,
     mode: state.mode,
-    stats: state.stats,
+    cash: state.cashBalance,
     equity: state.equity,
-    intents: state.intents.slice(-50),
+    positions: state.positions,
     orders: state.orders.slice(-50),
-    executionAudit: state.executionAudit.slice(-50),
-    lastError: state.lastError,
     routerHealth: exchangeRouter.getHealth(),
   };
 }
