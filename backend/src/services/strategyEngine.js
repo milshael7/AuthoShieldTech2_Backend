@@ -1,6 +1,7 @@
 // backend/src/services/strategyEngine.js
-// Phase 5 — Persistent Adaptive Strategy Engine
-// Multi-Tenant Safe + Disk-Persisted Learning + Stable Feedback
+// Phase 9.5 — Institutional Regime-Aware Strategy Core
+// Persistent Learning + Regime Detection + Adaptive Weighting
+// Tenant Safe • Deterministic • Disk Persisted
 
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +9,7 @@ const path = require("path");
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 /* =========================================================
-   BASE CONFIG (STATIC FLOOR VALUES)
+   BASE CONFIG
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
@@ -19,13 +20,16 @@ const BASE_CONFIG = Object.freeze({
   maxRiskPct: Number(process.env.TRADE_MAX_RISK || 0.02),
 
   maxDailyTrades: Number(process.env.TRADE_MAX_TRADES_PER_DAY || 15),
+
+  regimeTrendEdgeBoost: 1.25,
+  regimeRangeEdgeCut: 0.75,
 });
 
 /* =========================================================
-   LEARNING PERSISTENCE CONFIG
+   LEARNING CONFIG
 ========================================================= */
 
-const LEARNING_VERSION = 1;
+const LEARNING_VERSION = 2;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
@@ -52,6 +56,7 @@ function defaultLearning() {
     confidenceMultiplier: 1,
     lastWinRate: 0.5,
     lastEvaluatedTradeCount: 0,
+    regimeMemory: "neutral",
     lastUpdated: Date.now(),
   };
 }
@@ -59,7 +64,7 @@ function defaultLearning() {
 const LEARNING_CACHE = new Map();
 
 /* =========================================================
-   LOAD / SAVE LEARNING
+   LOAD / SAVE
 ========================================================= */
 
 function loadLearning(tenantId) {
@@ -77,7 +82,6 @@ function loadLearning(tenantId) {
       const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
       state = { ...state, ...raw };
 
-      // version migration safeguard
       if (state.version !== LEARNING_VERSION) {
         state = defaultLearning();
       }
@@ -104,34 +108,75 @@ function saveLearning(tenantId) {
 }
 
 /* =========================================================
+   REGIME DETECTION
+========================================================= */
+
+function detectRegime({ price, lastPrice, volatility }) {
+  if (!lastPrice) return "neutral";
+
+  const move = Math.abs((price - lastPrice) / lastPrice);
+
+  if (volatility > 0.02 && move > 0.01) {
+    return "expansion";
+  }
+
+  if (move > volatility * 1.5) {
+    return "trend";
+  }
+
+  if (move < volatility * 0.5) {
+    return "range";
+  }
+
+  return "neutral";
+}
+
+/* =========================================================
    EDGE MODEL
 ========================================================= */
 
-function computeEdge({ price, lastPrice, volatility }) {
+function computeEdge({ price, lastPrice, volatility, regime }) {
   if (!Number.isFinite(price) || !Number.isFinite(lastPrice)) {
     return 0;
   }
 
   const vol = volatility || 0.002;
   const momentum = (price - lastPrice) / lastPrice;
-  const normalized = momentum / (vol || 0.001);
+  let normalized = momentum / (vol || 0.001);
 
-  return clamp(normalized, -0.02, 0.02);
+  if (regime === "trend") {
+    normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
+  }
+
+  if (regime === "range") {
+    normalized *= BASE_CONFIG.regimeRangeEdgeCut;
+  }
+
+  return clamp(normalized, -0.03, 0.03);
 }
 
 /* =========================================================
    CONFIDENCE MODEL
 ========================================================= */
 
-function computeConfidence({ edge, ticksSeen }) {
+function computeConfidence({ edge, ticksSeen, regime }) {
   if (ticksSeen < 50) return 0.4;
 
-  const base = Math.abs(edge) * 8;
+  let base = Math.abs(edge) * 6;
+
+  if (regime === "expansion") {
+    base *= 1.1;
+  }
+
+  if (regime === "range") {
+    base *= 0.85;
+  }
+
   return clamp(base, 0, 1);
 }
 
 /* =========================================================
-   STABLE PERFORMANCE ADAPTATION
+   PERFORMANCE ADAPTATION
 ========================================================= */
 
 function adaptFromPerformance(tenantId, paperState) {
@@ -153,19 +198,17 @@ function adaptFromPerformance(tenantId, paperState) {
   const winRate = wins / total;
   learning.lastWinRate = winRate;
 
-  /* ---- tighten if degrading ---- */
   if (winRate < 0.45) {
     learning.edgeMultiplier =
-      clamp(learning.edgeMultiplier * 1.08, 1, 2);
+      clamp(learning.edgeMultiplier * 1.06, 1, 2);
 
     learning.confidenceMultiplier =
-      clamp(learning.confidenceMultiplier * 1.05, 1, 1.5);
+      clamp(learning.confidenceMultiplier * 1.04, 1, 1.5);
   }
 
-  /* ---- relax if strong ---- */
   if (winRate > 0.65) {
     learning.edgeMultiplier =
-      clamp(learning.edgeMultiplier * 0.96, 0.7, 1.5);
+      clamp(learning.edgeMultiplier * 0.97, 0.7, 1.5);
 
     learning.confidenceMultiplier =
       clamp(learning.confidenceMultiplier * 0.97, 0.7, 1.3);
@@ -188,6 +231,7 @@ function evaluateRules({
   confidence,
   limits,
   paperState,
+  regime,
 }) {
   const learning = loadLearning(tenantId);
 
@@ -219,8 +263,8 @@ function evaluateRules({
     return { action: "WAIT", reason: "Adaptive edge filter." };
   }
 
-  if (edge > 0) return { action: "BUY", reason: "Momentum confirmed." };
-  if (edge < 0) return { action: "SELL", reason: "Momentum reversal." };
+  if (edge > 0) return { action: "BUY", reason: `Regime: ${regime}` };
+  if (edge < 0) return { action: "SELL", reason: `Regime: ${regime}` };
 
   return { action: "WAIT", reason: "No signal." };
 }
@@ -229,15 +273,19 @@ function evaluateRules({
    RISK MODEL
 ========================================================= */
 
-function adjustRisk({ limits }) {
-  const lossesToday = Number(limits?.lossesToday || 0);
+function adjustRisk({ limits, regime }) {
+  let risk = BASE_CONFIG.baseRiskPct * 2;
 
-  if (lossesToday >= 2) {
-    return BASE_CONFIG.baseRiskPct;
+  if (regime === "range") {
+    risk *= 0.7;
+  }
+
+  if (limits?.lossesToday >= 2) {
+    risk = BASE_CONFIG.baseRiskPct;
   }
 
   return clamp(
-    BASE_CONFIG.baseRiskPct * 2,
+    risk,
     BASE_CONFIG.baseRiskPct,
     BASE_CONFIG.maxRiskPct
   );
@@ -259,27 +307,45 @@ function buildDecision(context = {}) {
     paperState = null,
   } = context;
 
-  const edge = computeEdge({ price, lastPrice, volatility });
-  const confidence = computeConfidence({ edge, ticksSeen });
+  const regime = detectRegime({
+    price,
+    lastPrice,
+    volatility,
+  });
+
+  const edgeRaw = computeEdge({
+    price,
+    lastPrice,
+    volatility,
+    regime,
+  });
+
+  const confidenceRaw = computeConfidence({
+    edge: edgeRaw,
+    ticksSeen,
+    regime,
+  });
 
   const ruleResult = evaluateRules({
     tenantId,
     price,
-    edge,
-    confidence,
+    edge: edgeRaw,
+    confidence: confidenceRaw,
     limits,
     paperState,
+    regime,
   });
 
-  const riskPct = adjustRisk({ limits });
+  const riskPct = adjustRisk({ limits, regime });
 
   return {
     symbol,
     action: ruleResult.action,
     reason: ruleResult.reason,
-    confidence,
-    edge,
+    confidence: confidenceRaw,
+    edge: edgeRaw,
     riskPct,
+    regime,
     learning: loadLearning(tenantId),
     ts: Date.now(),
   };
