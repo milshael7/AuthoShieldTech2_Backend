@@ -58,6 +58,46 @@ let krakenStatus = "booting";
 let krakenConnectedAt = 0;
 
 /* =========================================================
+   ONLINE USER TRACKER (INTEGRATED)
+========================================================= */
+
+let onlineUsers = 0;
+
+const ONLINE_STATE = {
+  lastBroadcast: 0,
+  broadcastIntervalMs: 500,
+};
+
+function safeSend(client, payload) {
+  if (!client || client.readyState !== 1) return;
+  try { client.send(payload); } catch {}
+}
+
+function broadcastOnline(force = false) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    now - ONLINE_STATE.lastBroadcast <
+      ONLINE_STATE.broadcastIntervalMs
+  ) {
+    return;
+  }
+
+  ONLINE_STATE.lastBroadcast = now;
+
+  const payload = JSON.stringify({
+    type: "online",
+    online: onlineUsers,
+    ts: now,
+  });
+
+  wss.clients.forEach((client) => {
+    safeSend(client, payload);
+  });
+}
+
+/* =========================================================
    CORS
 ========================================================= */
 
@@ -104,6 +144,7 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage().rss,
     activeTenants: ACTIVE_TENANTS.size,
+    onlineUsers,
     krakenStatus,
     tickFreshnessMs: Date.now() - lastTickTs,
     time: new Date().toISOString(),
@@ -111,7 +152,7 @@ app.get("/health", (req, res) => {
 });
 
 /* =========================================================
-   SYSTEM METRICS (NEW — SECURE INTERNAL VIEW)
+   SYSTEM METRICS
 ========================================================= */
 
 app.get("/api/system/metrics", (req, res) => {
@@ -124,6 +165,7 @@ app.get("/api/system/metrics", (req, res) => {
     },
     websocket: {
       clients: wss.clients.size,
+      onlineUsers,
     },
     feed: {
       status: krakenStatus,
@@ -142,7 +184,7 @@ app.get("/api/system/metrics", (req, res) => {
 });
 
 /* =========================================================
-   AUTH ROUTES (NO TENANT)
+   AUTH ROUTES
 ========================================================= */
 
 app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
@@ -200,13 +242,17 @@ const wss = new WebSocketServer({ server, path: "/ws/market" });
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
   wss.clients.forEach((client) => {
-    if (client.readyState === 1) {
-      try { client.send(payload); } catch {}
-    }
+    safeSend(client, payload);
   });
 }
 
+/* ----- CONNECTION ----- */
+
 wss.on("connection", (ws) => {
+
+  onlineUsers++;
+  broadcastOnline(true);
+
   ws.send(
     JSON.stringify({
       type: "hello",
@@ -215,6 +261,16 @@ wss.on("connection", (ws) => {
       ts: Date.now(),
     })
   );
+
+  ws.on("close", () => {
+    onlineUsers = Math.max(onlineUsers - 1, 0);
+    broadcastOnline(true);
+  });
+
+  ws.on("error", () => {
+    onlineUsers = Math.max(onlineUsers - 1, 0);
+    broadcastOnline(true);
+  });
 });
 
 /* =========================================================
