@@ -1,7 +1,8 @@
 // backend/src/services/aiBrain.js
-// Phase 10 — Institutional AI Signal Fusion Engine
-// Conversational + Persistent + Regime-Aware Trade Bias Layer
-// Tenant Safe • Deterministic • Noise Suppressed
+// Phase 13 — Reinforcement Adaptive AI Core
+// Self-Evolving Bias Engine
+// Paper-Learning Integrated
+// Tenant Safe • Persistent • Institutional Grade
 
 const fs = require("fs");
 
@@ -14,41 +15,11 @@ const BRAIN_PATH =
 
 const MAX_HISTORY = Number(process.env.AI_BRAIN_MAX_HISTORY || 120);
 const MAX_NOTES = Number(process.env.AI_BRAIN_MAX_NOTES || 80);
-
-const MAX_REPLY_CHARS = Number(
-  process.env.AI_BRAIN_MAX_REPLY_CHARS || 1800
-);
-
-const SIGNAL_MEMORY_LIMIT = 50;
+const SIGNAL_MEMORY_LIMIT = 100;
 
 /* =========================================================
-   LOCKED WIN/LOSS MINDSET
+   UTILITIES
 ========================================================= */
-
-const MINDSET_VERSION = 3;
-
-const DEFAULT_MINDSET = {
-  version: MINDSET_VERSION,
-  title: "AutoShield Institutional Capital Doctrine",
-  summary:
-    "Primary objective is capital protection. Loss minimization overrides profit seeking.",
-  rules: [
-    "Capital preservation > profit.",
-    "Loss = system failure signal.",
-    "Do not normalize losses.",
-    "Waiting is superior to forced trades.",
-    "After degradation: tighten filters.",
-    "Signal alignment required before biasing.",
-  ],
-};
-
-/* =========================================================
-   UTILS
-========================================================= */
-
-function safeStr(v, max = 5000) {
-  return String(v ?? "").trim().slice(0, max);
-}
 
 function safeNum(v, fallback = 0) {
   const n = Number(v);
@@ -64,38 +35,51 @@ function nowIso() {
 }
 
 /* =========================================================
-   PERSISTENT BRAIN STATE
+   BRAIN STATE
 ========================================================= */
 
 function defaultBrain() {
   return {
-    version: 5,
+    version: 13,
     createdAt: nowIso(),
     updatedAt: nowIso(),
-
-    mindset: DEFAULT_MINDSET,
 
     history: [],
     notes: [],
 
-    signalMemory: [],   // recent trade signals
-    falseSignalCount: 0,
+    signalMemory: [],
+    tradeOutcomes: [],
+
+    stats: {
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      winRate: 0,
+      expectancy: 0,
+      avgWin: 0,
+      avgLoss: 0,
+    },
+
+    adaptive: {
+      biasBoost: 1,
+      confidenceBoost: 1,
+      edgeAmplifier: 1,
+      degradation: 0,
+    },
   };
 }
 
 let brain = defaultBrain();
 
+/* =========================================================
+   LOAD / SAVE
+========================================================= */
+
 function loadBrain() {
   try {
     if (!fs.existsSync(BRAIN_PATH)) return;
-
     const raw = JSON.parse(fs.readFileSync(BRAIN_PATH, "utf-8"));
-
     brain = { ...defaultBrain(), ...raw };
-
-    if (!brain.mindset || brain.mindset.version < MINDSET_VERSION) {
-      brain.mindset = DEFAULT_MINDSET;
-    }
   } catch {}
 }
 
@@ -112,35 +96,105 @@ function saveBrain() {
 loadBrain();
 
 /* =========================================================
-   MEMORY HELPERS
+   REINFORCEMENT LEARNING
 ========================================================= */
 
-function addHistory(role, text) {
-  brain.history.push({
+function recordTradeOutcome({ pnl }) {
+  const isWin = pnl > 0;
+
+  brain.tradeOutcomes.push({
     ts: Date.now(),
-    role,
-    text: safeStr(text),
+    pnl,
+    isWin,
   });
 
-  if (brain.history.length > MAX_HISTORY) {
-    brain.history = brain.history.slice(-MAX_HISTORY);
-  }
+  brain.tradeOutcomes =
+    brain.tradeOutcomes.slice(-200);
+
+  const wins = brain.tradeOutcomes.filter(t => t.isWin);
+  const losses = brain.tradeOutcomes.filter(t => !t.isWin);
+
+  brain.stats.totalTrades = brain.tradeOutcomes.length;
+  brain.stats.wins = wins.length;
+  brain.stats.losses = losses.length;
+
+  brain.stats.winRate =
+    brain.stats.totalTrades > 0
+      ? wins.length / brain.stats.totalTrades
+      : 0;
+
+  brain.stats.avgWin =
+    wins.length > 0
+      ? wins.reduce((a, b) => a + b.pnl, 0) / wins.length
+      : 0;
+
+  brain.stats.avgLoss =
+    losses.length > 0
+      ? losses.reduce((a, b) => a + Math.abs(b.pnl), 0) / losses.length
+      : 0;
+
+  brain.stats.expectancy =
+    brain.stats.winRate * brain.stats.avgWin -
+    (1 - brain.stats.winRate) * brain.stats.avgLoss;
+
+  adaptBehavior();
 
   saveBrain();
 }
 
-function addNote(text) {
-  brain.notes.push({
-    ts: Date.now(),
-    text: safeStr(text),
-  });
+function adaptBehavior() {
+  const { winRate, expectancy } = brain.stats;
 
-  if (brain.notes.length > MAX_NOTES) {
-    brain.notes = brain.notes.slice(-MAX_NOTES);
+  /* Positive expectancy scaling */
+  if (expectancy > 0) {
+    brain.adaptive.biasBoost = clamp(
+      1 + winRate * 0.5,
+      1,
+      1.6
+    );
+
+    brain.adaptive.edgeAmplifier = clamp(
+      1 + winRate * 0.4,
+      1,
+      1.5
+    );
+
+    brain.adaptive.confidenceBoost = clamp(
+      1 + winRate * 0.3,
+      1,
+      1.4
+    );
+
+    brain.adaptive.degradation = 0;
   }
 
-  saveBrain();
+  /* Negative expectancy dampening */
+  else {
+    brain.adaptive.biasBoost = clamp(
+      0.9 - Math.abs(expectancy) * 0.01,
+      0.6,
+      1
+    );
+
+    brain.adaptive.edgeAmplifier = clamp(
+      0.9 - Math.abs(expectancy) * 0.01,
+      0.6,
+      1
+    );
+
+    brain.adaptive.confidenceBoost = clamp(
+      0.85 - Math.abs(expectancy) * 0.01,
+      0.6,
+      1
+    );
+
+    brain.adaptive.degradation++;
+  }
 }
+
+/* =========================================================
+   SIGNAL MEMORY
+========================================================= */
 
 function recordSignal(result) {
   brain.signalMemory.push({
@@ -150,91 +204,41 @@ function recordSignal(result) {
     edge: result.edge,
   });
 
-  if (brain.signalMemory.length > SIGNAL_MEMORY_LIMIT) {
-    brain.signalMemory =
-      brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
-  }
+  brain.signalMemory =
+    brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
 
   saveBrain();
 }
 
 /* =========================================================
-   SIGNAL CONSISTENCY MODEL
-========================================================= */
-
-function signalConsistencyScore() {
-  if (brain.signalMemory.length < 5) return 1;
-
-  const recent = brain.signalMemory.slice(-10);
-  const buys = recent.filter(s => s.action === "BUY").length;
-  const sells = recent.filter(s => s.action === "SELL").length;
-
-  const imbalance = Math.abs(buys - sells) / 10;
-
-  return clamp(1 - imbalance * 0.5, 0.7, 1.1);
-}
-
-/* =========================================================
-   TRADE BIAS ENGINE
+   DECISION LAYER
 ========================================================= */
 
 function decide(context = {}) {
   const last = safeNum(context.last, NaN);
   const paper = context.paper || {};
   const learn = paper.learnStats || {};
-  const limits = paper.limits || {};
-  const regime = paper.regime || "neutral";
 
   if (!Number.isFinite(last)) {
     return { action: "WAIT", confidence: 0, edge: 0 };
   }
 
-  /* ---- Hard Safety ---- */
-
-  if (limits.lossesToday >= 2) {
-    return { action: "WAIT", confidence: 0.2, edge: 0 };
-  }
-
-  /* ---- Base Signal ---- */
-
   const baseEdge = safeNum(learn.trendEdge, 0);
   const baseConfidence = safeNum(learn.confidence, 0);
-
-  /* ---- Noise Suppression ---- */
 
   if (Math.abs(baseEdge) < 0.0005) {
     return { action: "WAIT", confidence: 0, edge: 0 };
   }
 
-  /* ---- Regime Bias ---- */
+  let edge =
+    baseEdge * brain.adaptive.edgeAmplifier;
 
-  let edge = baseEdge;
-  let confidence = baseConfidence;
-
-  if (regime === "trend") {
-    edge *= 1.1;
-    confidence *= 1.05;
-  }
-
-  if (regime === "range") {
-    edge *= 0.8;
-    confidence *= 0.85;
-  }
-
-  /* ---- Consistency Dampener ---- */
-
-  const consistency = signalConsistencyScore();
-  confidence *= consistency;
-
-  /* ---- False Signal Dampening ---- */
-
-  if (brain.falseSignalCount >= 3) {
-    confidence *= 0.8;
-  }
+  let confidence =
+    baseConfidence * brain.adaptive.confidenceBoost;
 
   confidence = clamp(confidence, 0, 1);
 
-  if (confidence > 0.75 && Math.abs(edge) > 0.0015) {
+  if (confidence > 0.7 && Math.abs(edge) > 0.001) {
     const action = edge > 0 ? "BUY" : "SELL";
 
     const result = {
@@ -255,77 +259,29 @@ function decide(context = {}) {
 }
 
 /* =========================================================
-   CHAT INTERFACE
+   SNAPSHOT
 ========================================================= */
-
-function mindsetText() {
-  const m = brain.mindset;
-  return [
-    `${m.title} (v${m.version})`,
-    "",
-    m.summary,
-    "",
-    ...m.rules.map((r) => `- ${r}`),
-  ].join("\n");
-}
-
-function answer(message = "") {
-  const msg = safeStr(message).toLowerCase();
-  addHistory("user", message);
-
-  if (msg.includes("mindset")) {
-    const reply = mindsetText();
-    addHistory("ai", reply);
-    return reply.slice(0, MAX_REPLY_CHARS);
-  }
-
-  if (msg.startsWith("add note:")) {
-    const note = message.split(":").slice(1).join(":").trim();
-    addNote(note);
-    const reply = "Note saved.";
-    addHistory("ai", reply);
-    return reply;
-  }
-
-  if (msg.includes("brain status")) {
-    const reply =
-      `Brain file: ${BRAIN_PATH}\n` +
-      `History: ${brain.history.length}\n` +
-      `Notes: ${brain.notes.length}\n` +
-      `Signals: ${brain.signalMemory.length}`;
-    addHistory("ai", reply);
-    return reply;
-  }
-
-  const reply =
-    "AI layer active. Monitoring signal quality and capital protection doctrine.";
-
-  addHistory("ai", reply);
-  return reply;
-}
 
 function getSnapshot() {
   return {
     ok: true,
-    updatedAt: brain.updatedAt,
-    historyCount: brain.history.length,
-    notesCount: brain.notes.length,
+    stats: brain.stats,
+    adaptive: brain.adaptive,
     signalMemory: brain.signalMemory.length,
-    mindsetVersion: brain.mindset.version,
+    tradeMemory: brain.tradeOutcomes.length,
   };
 }
+
+/* ========================================================= */
 
 function resetBrain() {
   brain = defaultBrain();
   saveBrain();
 }
 
-/* ========================================================= */
-
 module.exports = {
-  answer,
   decide,
-  addNote,
+  recordTradeOutcome,
   getSnapshot,
   resetBrain,
 };
