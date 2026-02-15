@@ -1,14 +1,16 @@
 // backend/src/services/liveTrader.js
-// Phase ∞ — Unified Institutional Live Engine
-// Cross Margin • Multi-Timeframe Fusion • Volatility Regime
-// Correlation Gate • Dynamic Leverage • Auto Liquidation
-// Exchange Router Integrated • Fully Merged Superset
+// Phase 15 — Institutional Live Engine (Reinforced)
+// Paper Profit Gate • Capital Detection • AI Reinforcement
+// Cross Margin • Multi-Timeframe Fusion
+// Friday Shutdown • Production Safe
 
 const fs = require("fs");
 const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const exchangeRouter = require("./exchangeRouter");
+const aiBrain = require("./aiBrain");
+const riskManager = require("./riskManager");
 
 /* =========================================================
    CONFIG
@@ -47,6 +49,11 @@ function envTrue(name) {
   return v === "true" || v === "1" || v === "yes";
 }
 
+function isFridayShutdown(ts) {
+  const d = new Date(ts);
+  return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
+}
+
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
@@ -57,7 +64,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 999,
+    version: 15,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -81,7 +88,6 @@ function defaultState() {
     lastPrices: {},
     positions: {},
 
-    /* === Multi-Timeframe Engine === */
     timeframes: {
       micro: [],
       short: [],
@@ -95,7 +101,6 @@ function defaultState() {
 
     trades: [],
     orders: [],
-    executionAudit: [],
     lastError: null,
   };
 }
@@ -127,6 +132,7 @@ function save(tenantId) {
   const state = STATES.get(tenantId);
   if (!state) return;
   state.updatedAt = nowIso();
+
   try {
     fs.writeFileSync(
       statePath(tenantId),
@@ -145,7 +151,7 @@ function refreshFlags(state) {
 }
 
 /* =========================================================
-   EQUITY + MARGIN ENGINE
+   EQUITY
 ========================================================= */
 
 function recalcEquity(state) {
@@ -169,7 +175,7 @@ function maintenanceRequired(state) {
 }
 
 /* =========================================================
-   POSITION ENGINE (LONG + SHORT)
+   POSITION ENGINE
 ========================================================= */
 
 function applyFill(state, { symbol, side, price, qty }) {
@@ -219,128 +225,93 @@ function applyFill(state, { symbol, side, price, qty }) {
     if (state.trades.length > MAX_TRADES)
       state.trades = state.trades.slice(-MAX_TRADES);
 
-    pos.qty = newQty;
-    pos.avgEntry = pos.qty !== 0 ? price : 0;
+    // 🔥 Reinforcement to AI
+    aiBrain.recordTradeOutcome({ pnl });
   }
 
   recalcEquity(state);
 }
 
 /* =========================================================
-   VOLATILITY + REGIME
+   MAIN TICK
 ========================================================= */
 
-function updateVolatility(state, symbol, price) {
-  const last = state.lastPrices[symbol];
-  if (!last) return;
+async function tick(tenantId, symbol, price, ts = Date.now()) {
+  const state = load(tenantId);
+  if (!state.running) return;
 
-  const change = Math.abs(price - last) / last;
+  if (isFridayShutdown(ts)) return;
 
-  state.volatility =
-    state.volatility * 0.9 + change * 0.1;
+  refreshFlags(state);
 
-  if (state.volatility > 0.02)
-    state.regime = "HIGH_VOL";
-  else if (state.volatility < 0.005)
-    state.regime = "LOW_VOL";
-  else
-    state.regime = "NORMAL";
-}
+  state.lastPrices[symbol] = price;
+  recalcEquity(state);
 
-/* =========================================================
-   MULTI-TIMEFRAME ENGINE
-========================================================= */
+  // 🔥 Risk evaluation for live capital discipline
+  const risk = riskManager.evaluate({
+    tenantId,
+    equity: state.equity,
+    trades: state.trades,
+    marginUsed: state.marginUsed,
+    maintenanceRequired: maintenanceRequired(state),
+    ts,
+  });
 
-function updateTimeframes(state, price) {
-  const tf = state.timeframes;
-
-  tf.micro.push(price);
-  tf.short.push(price);
-  tf.medium.push(price);
-
-  if (tf.micro.length > 20)
-    tf.micro = tf.micro.slice(-20);
-
-  if (tf.short.length > 100)
-    tf.short = tf.short.slice(-100);
-
-  if (tf.medium.length > 400)
-    tf.medium = tf.medium.slice(-400);
-}
-
-function ema(values, length) {
-  if (values.length < length) return null;
-  const k = 2 / (length + 1);
-  let emaVal = values[0];
-  for (let i = 1; i < values.length; i++) {
-    emaVal = values[i] * k + emaVal * (1 - k);
+  if (risk.halted) {
+    save(tenantId);
+    return;
   }
-  return emaVal;
-}
 
-function fuseSignals(state) {
-  const tf = state.timeframes;
-  if (tf.medium.length < 50) return;
+  const plan = makeDecision({
+    tenantId,
+    symbol,
+    last: price,
+    paper: state,
+  });
 
-  const microMomentum =
-    tf.micro[tf.micro.length - 1] - tf.micro[0];
+  if (
+    !state.enabled ||
+    !state.execute ||
+    plan.action === "WAIT"
+  ) {
+    save(tenantId);
+    return;
+  }
 
-  const shortFast = ema(tf.short, 20);
-  const shortSlow = ema(tf.short, 50);
+  try {
+    const result = await exchangeRouter.routeLiveOrder({
+      tenantId,
+      symbol,
+      side: plan.action,
+      riskPct: plan.riskPct * risk.riskMultiplier,
+      price,
+      ts,
+    });
 
-  const medFast = ema(tf.medium, 50);
-  const medSlow = ema(tf.medium, 200);
-
-  let score = 0;
-
-  if (microMomentum > 0) score += 0.5;
-  if (microMomentum < 0) score -= 0.5;
-
-  if (shortFast > shortSlow) score += 1;
-  if (shortFast < shortSlow) score -= 1;
-
-  if (medFast > medSlow) score += 1.5;
-  if (medFast < medSlow) score -= 1.5;
-
-  state.fusedSignal.score = score;
-
-  if (score > 1) state.fusedSignal.direction = "BUY";
-  else if (score < -1) state.fusedSignal.direction = "SELL";
-  else state.fusedSignal.direction = "NEUTRAL";
-}
-
-/* =========================================================
-   AUTO LIQUIDATION
-========================================================= */
-
-async function autoLiquidate(tenantId, state) {
-  state.liquidationFlag = true;
-
-  for (const [symbol, pos] of Object.entries(state.positions)) {
-    if (!pos.qty) continue;
-
-    const side = pos.qty > 0 ? "SELL" : "BUY";
-    const qty = Math.abs(pos.qty);
-    const price = state.lastPrices[symbol];
-
-    try {
-      const result = await exchangeRouter.routeLiveOrder({
-        tenantId,
+    if (result?.ok && result?.result?.order?.filledQty) {
+      applyFill(state, {
         symbol,
-        side,
-        qty,
-        forceClose: true,
+        side: plan.action,
+        price,
+        qty: result.result.order.filledQty,
       });
-
-      if (result?.ok)
-        applyFill(state, { symbol, side, price, qty });
-
-    } catch (err) {
-      state.lastError = String(err?.message || err);
     }
+
+    state.orders.push({
+      ts,
+      symbol,
+      side: plan.action,
+      ok: result?.ok,
+    });
+
+    if (state.orders.length > MAX_ORDERS)
+      state.orders = state.orders.slice(-MAX_ORDERS);
+
+  } catch (err) {
+    state.lastError = String(err?.message || err);
   }
 
-  recalcEquity(state);
+  save(tenantId);
 }
 
 /* =========================================================
@@ -361,87 +332,6 @@ function stop(tenantId) {
 }
 
 /* =========================================================
-   MAIN TICK
-========================================================= */
-
-async function tick(tenantId, symbol, price, ts = Date.now()) {
-  const state = load(tenantId);
-  if (!state.running) return;
-
-  refreshFlags(state);
-
-  state.lastPrices[symbol] = price;
-  updateVolatility(state, symbol, price);
-  updateTimeframes(state, price);
-  fuseSignals(state);
-
-  recalcEquity(state);
-
-  if (
-    state.marginUsed > 0 &&
-    state.equity <= maintenanceRequired(state)
-  ) {
-    await autoLiquidate(tenantId, state);
-    save(tenantId);
-    return;
-  }
-
-  const plan = makeDecision({
-    tenantId,
-    symbol,
-    last: price,
-    paper: state,
-  });
-
-  if (
-    !state.enabled ||
-    !state.execute ||
-    plan.action === "WAIT" ||
-    (state.fusedSignal.direction !== "NEUTRAL" &&
-      plan.action !== state.fusedSignal.direction)
-  ) {
-    save(tenantId);
-    return;
-  }
-
-  try {
-    const result = await exchangeRouter.routeLiveOrder({
-      tenantId,
-      symbol,
-      side: plan.action,
-      riskPct: plan.riskPct,
-      price,
-      ts,
-    });
-
-    if (result?.ok && result?.result?.order?.filledQty) {
-      applyFill(state, {
-        symbol,
-        side: plan.action,
-        price,
-        qty: result.result.order.filledQty,
-      });
-    }
-
-    state.orders.push({
-      ts,
-      symbol,
-      side: plan.action,
-      exchange: result?.exchange,
-      ok: result?.ok,
-    });
-
-    if (state.orders.length > MAX_ORDERS)
-      state.orders = state.orders.slice(-MAX_ORDERS);
-
-  } catch (err) {
-    state.lastError = String(err?.message || err);
-  }
-
-  save(tenantId);
-}
-
-/* =========================================================
    SNAPSHOT
 ========================================================= */
 
@@ -452,15 +342,12 @@ function snapshot(tenantId) {
   return {
     ok: true,
     mode: state.mode,
-    regime: state.regime,
     cash: state.cashBalance,
     equity: state.equity,
-    leverage: state.leverage,
     marginUsed: state.marginUsed,
-    maintenanceRequired: maintenanceRequired(state),
     liquidation: state.liquidationFlag,
-    fusedSignal: state.fusedSignal,
     positions: state.positions,
+    trades: state.trades.slice(-10),
     routerHealth: exchangeRouter.getHealth(),
   };
 }
