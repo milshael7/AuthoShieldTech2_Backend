@@ -1,7 +1,8 @@
 // backend/src/services/krakenFeed.js
-// Enterprise Market Data Engine
-// Self-healing • Ping/Pong • Env-driven symbols • Kill-switch
-// Emits: { type:'tick', symbol, price, ts }
+// Phase 25 — Institutional Market Data Engine
+// Self-Healing • Symbol Stale Detection • Regime Tagging
+// Volatility Pulse • Feed Health Score • AI-Ready
+// Kill-Switch • Backoff Hardened • Production Grade
 
 const WebSocket = require("ws");
 
@@ -19,6 +20,10 @@ const STALE_TIMEOUT_MS = Number(
   process.env.KRAKEN_STALE_TIMEOUT_MS || 20000
 );
 
+const SYMBOL_STALE_MS = Number(
+  process.env.KRAKEN_SYMBOL_STALE_MS || 15000
+);
+
 const WATCHDOG_INTERVAL = 5000;
 const PING_INTERVAL = 15000;
 
@@ -26,11 +31,11 @@ const MAX_BACKOFF_MS = 20000;
 const BASE_BACKOFF_MS = 1500;
 
 const MAX_MESSAGE_SIZE = 1_000_000;
-const EMIT_INTERVAL = 250;
-const MAX_TICKS_PER_SECOND = 1000;
+const EMIT_INTERVAL = 200;
+const MAX_TICKS_PER_SECOND = 1500;
 
 /* =========================================================
-   SYMBOL CONFIG (ENV DRIVEN)
+   SYMBOL CONFIG
 ========================================================= */
 
 function getPairs() {
@@ -39,10 +44,7 @@ function getPairs() {
       "XBT/USD,ETH/USD,SOL/USD,XRP/USD"
   );
 
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return raw.split(",").map(s => s.trim()).filter(Boolean);
 }
 
 function buildMap(pairs) {
@@ -55,7 +57,7 @@ function buildMap(pairs) {
 }
 
 /* =========================================================
-   PUBLIC START
+   START
 ========================================================= */
 
 function startKrakenFeed({ onTick, onStatus }) {
@@ -65,6 +67,7 @@ function startKrakenFeed({ onTick, onStatus }) {
     return {
       stop() {},
       getMetrics() { return { disabled: true }; },
+      getHealth() { return { disabled: true }; },
     };
   }
 
@@ -83,6 +86,7 @@ function startKrakenFeed({ onTick, onStatus }) {
 
   const lastEmit = Object.create(null);
   const lastSymbolTick = Object.create(null);
+  const lastSymbolPrice = Object.create(null);
 
   let ticksThisSecond = 0;
   let lastSecond = Math.floor(Date.now() / 1000);
@@ -92,10 +96,16 @@ function startKrakenFeed({ onTick, onStatus }) {
     reconnects: 0,
     ticks: 0,
     staleEvents: 0,
+    symbolStaleEvents: 0,
     pingsSent: 0,
   };
 
-  /* ================= HELPERS ================= */
+  let volatilityPulse = 0;
+  let regime = "normal";
+
+  /* =========================================================
+     HELPERS
+  ========================================================= */
 
   function safeStatus(s) {
     try { onStatus && onStatus(s); } catch {}
@@ -114,7 +124,7 @@ function startKrakenFeed({ onTick, onStatus }) {
   }
 
   function jitter(ms) {
-    return ms + Math.floor(Math.random() * 300);
+    return ms + Math.floor(Math.random() * 400);
   }
 
   function resetTickCounter() {
@@ -125,7 +135,28 @@ function startKrakenFeed({ onTick, onStatus }) {
     }
   }
 
-  /* ================= RECONNECT ================= */
+  function updateVolatility(symbol, price) {
+    const last = lastSymbolPrice[symbol];
+    if (!last) {
+      lastSymbolPrice[symbol] = price;
+      return;
+    }
+
+    const change = Math.abs(price - last) / last;
+
+    volatilityPulse =
+      volatilityPulse * 0.9 + change * 0.1;
+
+    if (volatilityPulse > 0.02) regime = "high_vol";
+    else if (volatilityPulse < 0.005) regime = "low_vol";
+    else regime = "normal";
+
+    lastSymbolPrice[symbol] = price;
+  }
+
+  /* =========================================================
+     RECONNECT
+  ========================================================= */
 
   function scheduleReconnect(reason) {
     if (closedByUs) return;
@@ -143,9 +174,12 @@ function startKrakenFeed({ onTick, onStatus }) {
     reconnectTimer = setTimeout(connect, wait);
   }
 
-  /* ================= CONNECT ================= */
+  /* =========================================================
+     CONNECT
+  ========================================================= */
 
   function connect() {
+
     clearTimers();
     cleanupSocket();
 
@@ -163,15 +197,12 @@ function startKrakenFeed({ onTick, onStatus }) {
 
       safeStatus("connected");
 
-      ws.send(
-        JSON.stringify({
-          event: "subscribe",
-          pair: PAIRS,
-          subscription: { name: "ticker" },
-        })
-      );
+      ws.send(JSON.stringify({
+        event: "subscribe",
+        pair: PAIRS,
+        subscription: { name: "ticker" },
+      }));
 
-      /* ---- Heartbeat Ping ---- */
       pingTimer = setInterval(() => {
         try {
           ws.ping();
@@ -185,6 +216,7 @@ function startKrakenFeed({ onTick, onStatus }) {
     });
 
     ws.on("message", (buf) => {
+
       lastMsgAt = Date.now();
 
       if (!buf || buf.length > MAX_MESSAGE_SIZE) return;
@@ -218,16 +250,19 @@ function startKrakenFeed({ onTick, onStatus }) {
       lastEmit[symbol] = now;
       lastSymbolTick[symbol] = now;
 
+      updateVolatility(symbol, price);
+
       metrics.ticks++;
 
       try {
-        onTick &&
-          onTick({
-            type: "tick",
-            symbol,
-            price,
-            ts: now,
-          });
+        onTick && onTick({
+          type: "tick",
+          symbol,
+          price,
+          ts: now,
+          regime,
+          volatilityPulse,
+        });
       } catch {}
     });
 
@@ -241,18 +276,34 @@ function startKrakenFeed({ onTick, onStatus }) {
       try { ws.terminate(); } catch {}
     });
 
-    /* ================= WATCHDOG ================= */
+    /* =========================================================
+       WATCHDOG
+    ========================================================= */
 
     watchdog = setInterval(() => {
+
       if (closedByUs) return;
 
       const now = Date.now();
+
+      /* ---- Global Stale ---- */
 
       if (now - lastMsgAt > STALE_TIMEOUT_MS) {
         metrics.staleEvents++;
         safeStatus("stale_global");
         try { ws.terminate(); } catch {}
       }
+
+      /* ---- Symbol Stale Detection ---- */
+
+      for (const s of Object.keys(lastSymbolTick)) {
+        if (now - lastSymbolTick[s] > SYMBOL_STALE_MS) {
+          metrics.symbolStaleEvents++;
+          safeStatus(`symbol_stale:${s}`);
+        }
+      }
+
+      /* ---- Reset Backoff After Stability ---- */
 
       if (connectedAt && now - connectedAt > 60000) {
         backoffMs = BASE_BACKOFF_MS;
@@ -261,13 +312,18 @@ function startKrakenFeed({ onTick, onStatus }) {
     }, WATCHDOG_INTERVAL);
   }
 
-  /* ================= START ================= */
+  /* =========================================================
+     START
+  ========================================================= */
 
   connect();
 
-  /* ================= API ================= */
+  /* =========================================================
+     API
+  ========================================================= */
 
   return {
+
     stop() {
       closedByUs = true;
       clearTimers();
@@ -282,6 +338,37 @@ function startKrakenFeed({ onTick, onStatus }) {
         uptimeMs: connectedAt
           ? Date.now() - connectedAt
           : 0,
+        volatilityPulse,
+        regime,
+      };
+    },
+
+    getHealth() {
+
+      const now = Date.now();
+
+      const globalHealthy =
+        now - lastMsgAt <= STALE_TIMEOUT_MS;
+
+      const symbolHealth = {};
+      for (const s of Object.keys(lastSymbolTick)) {
+        symbolHealth[s] =
+          now - lastSymbolTick[s] <= SYMBOL_STALE_MS;
+      }
+
+      const healthScore =
+        globalHealthy
+          ? 1 - Math.min(metrics.staleEvents / 20, 0.5)
+          : 0;
+
+      return {
+        connected: !!ws,
+        globalHealthy,
+        symbolHealth,
+        healthScore: Math.max(0, healthScore),
+        regime,
+        volatilityPulse,
+        metrics,
       };
     },
   };
