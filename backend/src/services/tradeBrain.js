@@ -1,8 +1,8 @@
 // backend/src/services/tradeBrain.js
-// Phase 9.5 — Institutional Cognitive Trade Core
-// Strategy + AI Overlay + Confidence Smoothing
-// Edge Momentum Model • Adaptive Throttling
-// Deterministic • Tenant Safe
+// Phase 10.5 — Adaptive Behavioral Trade Core
+// Self-Learning + Streak Intelligence + Aggression Control
+// Unified Memory (Paper + Live Shared)
+// Deterministic • Tenant Safe • Behavioral Feedback Engine
 
 const aiBrain = require("./aiBrain");
 const { buildDecision } = require("./strategyEngine");
@@ -16,13 +16,16 @@ const MAX_LOSS_STREAK =
   Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
 
 const CONFIDENCE_DECAY =
-  Number(process.env.TRADE_CONFIDENCE_DECAY || 0.85);
+  Number(process.env.TRADE_CONFIDENCE_DECAY || 0.82);
 
 const EDGE_MEMORY_DECAY =
-  Number(process.env.TRADE_EDGE_MEMORY_DECAY || 0.9);
+  Number(process.env.TRADE_EDGE_MEMORY_DECAY || 0.88);
 
 const VOL_HIGH =
   Number(process.env.TRADE_VOL_HIGH || 0.02);
+
+const MAX_RISK = 0.06;
+const MIN_RISK = 0.001;
 
 const ALLOWED_ACTIONS = new Set([
   "WAIT",
@@ -31,7 +34,7 @@ const ALLOWED_ACTIONS = new Set([
   "CLOSE",
 ]);
 
-/* ================= MEMORY (Tenant Scoped) ================= */
+/* ================= BEHAVIORAL MEMORY ================= */
 
 const BRAIN_STATE = new Map();
 
@@ -43,6 +46,14 @@ function getBrainState(tenantId) {
       smoothedConfidence: 0,
       edgeMomentum: 0,
       lastAction: "WAIT",
+
+      winStreak: 0,
+      lossStreak: 0,
+      lastRealizedNet: 0,
+
+      aggressionFactor: 1,
+      recoveryMode: false,
+      calmMode: false,
     });
   }
 
@@ -60,6 +71,54 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/* ================= PERFORMANCE TRACKER ================= */
+
+function updatePerformance(brain, paper) {
+  const realizedNet = safeNum(paper?.realized?.net, 0);
+
+  const delta = realizedNet - brain.lastRealizedNet;
+
+  if (delta > 0) {
+    brain.winStreak++;
+    brain.lossStreak = 0;
+    brain.recoveryMode = false;
+  }
+
+  else if (delta < 0) {
+    brain.lossStreak++;
+    brain.winStreak = 0;
+  }
+
+  brain.lastRealizedNet = realizedNet;
+
+  /* Aggression scaling */
+
+  if (brain.winStreak >= 2) {
+    brain.aggressionFactor = clamp(
+      brain.aggressionFactor + 0.1,
+      1,
+      1.6
+    );
+  }
+
+  if (brain.lossStreak >= 2) {
+    brain.aggressionFactor = clamp(
+      brain.aggressionFactor * 0.7,
+      0.5,
+      1
+    );
+    brain.recoveryMode = true;
+  }
+
+  if (brain.lossStreak >= MAX_LOSS_STREAK) {
+    brain.calmMode = true;
+  }
+
+  if (brain.winStreak >= 3) {
+    brain.calmMode = true; // lock profit discipline
+  }
+}
+
 /* ================= CORE DECISION ================= */
 
 function makeDecision(context = {}) {
@@ -72,6 +131,8 @@ function makeDecision(context = {}) {
 
   const brain = getBrainState(tenantId);
 
+  updatePerformance(brain, paper);
+
   const price = safeNum(last, NaN);
   const limits = paper.limits || {};
   const learn = paper.learnStats || {};
@@ -79,10 +140,9 @@ function makeDecision(context = {}) {
 
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
-
   const volatility = safeNum(paper.volatility, 0);
 
-  /* ================= STRATEGY ENGINE ================= */
+  /* ================= STRATEGY BASE ================= */
 
   const strategyView = buildDecision({
     tenantId,
@@ -112,7 +172,7 @@ function makeDecision(context = {}) {
     reason = "Position already open.";
   }
 
-  /* ================= AI OVERLAY (SOFT BOOST ONLY) ================= */
+  /* ================= AI OVERLAY ================= */
 
   try {
     if (typeof aiBrain.decide === "function") {
@@ -135,7 +195,7 @@ function makeDecision(context = {}) {
     }
   } catch {}
 
-  /* ================= CONFIDENCE SMOOTHING ================= */
+  /* ================= SMOOTHING ================= */
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * CONFIDENCE_DECAY +
@@ -143,21 +203,20 @@ function makeDecision(context = {}) {
 
   confidence = clamp(brain.smoothedConfidence, 0, 1);
 
-  /* ================= EDGE MOMENTUM MODEL ================= */
-
   brain.edgeMomentum =
     brain.edgeMomentum * EDGE_MEMORY_DECAY +
     edge * (1 - EDGE_MEMORY_DECAY);
 
   edge = clamp(brain.edgeMomentum, -1, 1);
 
-  /* ================= VOLATILITY ADAPTATION ================= */
+  /* ================= VOLATILITY DISCIPLINE ================= */
 
   if (volatility >= VOL_HIGH) {
-    confidence *= 0.8; // reduce aggression in chaos
+    confidence *= 0.75;
+    brain.calmMode = true;
   }
 
-  /* ================= HARD SAFETY GATES ================= */
+  /* ================= HARD SAFETY ================= */
 
   if (!Number.isFinite(price)) {
     action = "WAIT";
@@ -179,21 +238,31 @@ function makeDecision(context = {}) {
     reason = "Loss streak protection.";
   }
 
-  /* ================= RISK ADAPTATION ================= */
+  /* ================= BEHAVIORAL ADAPTATION ================= */
 
   let riskPct = safeNum(strategyView.riskPct, 0);
+
+  riskPct *= brain.aggressionFactor;
+
+  if (brain.calmMode) {
+    riskPct *= 0.6;
+  }
+
+  if (brain.recoveryMode) {
+    riskPct *= 0.8;
+  }
 
   if (confidence < 0.4) {
     riskPct *= 0.5;
   }
 
-  if (confidence > 0.75) {
-    riskPct *= 1.2;
+  if (confidence > 0.8) {
+    riskPct *= 1.3;
   }
 
-  riskPct = clamp(riskPct, 0.001, 0.05);
+  riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
 
-  /* ================= FINAL OUTPUT ================= */
+  /* ================= FINAL SANITY ================= */
 
   if (action === "WAIT") {
     confidence = 0;
@@ -209,6 +278,13 @@ function makeDecision(context = {}) {
     edge,
     riskPct,
     reason,
+    behavioral: {
+      winStreak: brain.winStreak,
+      lossStreak: brain.lossStreak,
+      aggressionFactor: brain.aggressionFactor,
+      recoveryMode: brain.recoveryMode,
+      calmMode: brain.calmMode,
+    },
     learning: strategyView.learning,
     ts: Date.now(),
   };
