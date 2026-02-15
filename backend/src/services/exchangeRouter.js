@@ -1,7 +1,8 @@
 // backend/src/services/exchangeRouter.js
-// Enterprise Institutional Smart Router
+// Phase 15 — Institutional Smart Execution Router
 // Dynamic Ranking • Latency Scoring • Circuit Breaker
-// Timeout Hardened • Kill Switch Enabled • Telemetry Enhanced
+// Capital Lock Detection • Runtime Kill Switch
+// Liquidation Weighted Routing • Telemetry Hardened
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -9,9 +10,19 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
    CONFIG
 ========================================================= */
 
-const EXECUTION_ENABLED =
-  String(process.env.EXECUTION_ENABLED || "true")
-    .toLowerCase() !== "false";
+function envTrue(name) {
+  const v = String(process.env[name] || "").toLowerCase().trim();
+  return v === "true" || v === "1" || v === "yes";
+}
+
+function hasApiKeys() {
+  return (
+    process.env.BINANCE_API_KEY ||
+    process.env.COINBASE_API_KEY ||
+    process.env.KRAKEN_API_KEY ||
+    process.env.CRYPTO_API_KEY
+  );
+}
 
 const CONFIG = Object.freeze({
   primary: process.env.EXECUTION_PRIMARY || "binance",
@@ -51,7 +62,6 @@ function getAdapterState(name) {
       failures: 0,
       cooldownUntil: 0,
       lastError: null,
-
       metrics: {
         totalAttempts: 0,
         success: 0,
@@ -69,8 +79,7 @@ function getAdapterState(name) {
 ========================================================= */
 
 function markAttempt(name) {
-  const state = getAdapterState(name);
-  state.metrics.totalAttempts++;
+  getAdapterState(name).metrics.totalAttempts++;
 }
 
 function markFailure(name, err, isTimeout = false) {
@@ -79,9 +88,7 @@ function markFailure(name, err, isTimeout = false) {
   state.failures++;
   state.lastError = String(err?.message || err || "unknown");
 
-  if (isTimeout) {
-    state.metrics.timeouts++;
-  }
+  if (isTimeout) state.metrics.timeouts++;
 
   if (state.failures >= CONFIG.failureThreshold) {
     state.cooldownUntil = Date.now() + CONFIG.cooldownMs;
@@ -94,7 +101,6 @@ function markSuccess(name, latencyMs, result = {}) {
   state.failures = 0;
   state.cooldownUntil = 0;
   state.lastError = null;
-
   state.metrics.success++;
 
   if (Number.isFinite(latencyMs)) {
@@ -114,8 +120,7 @@ function markSuccess(name, latencyMs, result = {}) {
 }
 
 function adapterAvailable(name) {
-  const state = getAdapterState(name);
-  return Date.now() >= state.cooldownUntil;
+  return Date.now() >= getAdapterState(name).cooldownUntil;
 }
 
 function avgLatency(samples = []) {
@@ -185,15 +190,23 @@ function withTimeout(promise, ms) {
 
 async function routeLiveOrder(params = {}) {
 
-  if (!EXECUTION_ENABLED) {
+  // 🔥 Runtime Kill Switch
+  if (envTrue("EXECUTION_KILL_SWITCH")) {
     return {
       ok: false,
-      error: "Execution globally disabled (EXECUTION_ENABLED=false)",
+      error: "Execution blocked by EXECUTION_KILL_SWITCH",
+    };
+  }
+
+  // 🔒 API Key Guard
+  if (!hasApiKeys()) {
+    return {
+      ok: false,
+      error: "No exchange API keys configured.",
     };
   }
 
   const { forceClose } = params;
-
   const route = getRouteOrder({ forceClose });
 
   for (const exchange of route) {
@@ -229,7 +242,9 @@ async function routeLiveOrder(params = {}) {
 
     } catch (err) {
       const isTimeout =
-        String(err?.message || "").toLowerCase().includes("timeout");
+        String(err?.message || "")
+          .toLowerCase()
+          .includes("timeout");
 
       markFailure(exchange, err, isTimeout);
     }
@@ -247,12 +262,6 @@ async function routeLiveOrder(params = {}) {
 
 function getHealth() {
   const out = {
-    config: {
-      executionEnabled: EXECUTION_ENABLED,
-      primary: CONFIG.primary,
-      secondary: CONFIG.secondary,
-      tertiary: CONFIG.tertiary,
-    },
     adapters: {},
   };
 
@@ -263,12 +272,10 @@ function getHealth() {
       failures: state.failures,
       cooling: Date.now() < state.cooldownUntil,
       lastError: state.lastError,
-
       successRate:
         metrics.totalAttempts > 0
           ? metrics.success / metrics.totalAttempts
           : 1,
-
       avgLatencyMs: avgLatency(metrics.latencySamples),
       partialFills: metrics.partialFills,
       timeouts: metrics.timeouts,
@@ -278,17 +285,9 @@ function getHealth() {
   return out;
 }
 
-/* =========================================================
-   RESET
-========================================================= */
-
 function reset() {
   ADAPTER_STATE.clear();
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   routeLiveOrder,
