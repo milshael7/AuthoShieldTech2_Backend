@@ -1,8 +1,8 @@
 // backend/src/services/paperTrader.js
-// Phase 12 — Adaptive Self-Learning Paper Engine
-// Aggressive + Controlled + Friday Shutdown
-// Reinforcement Layer Added
-// Fully Tenant Safe • No Breaking Changes
+// Phase 13 — Autonomous Learning Paper Engine
+// Unlimited Learning Mode • Reinforcement Metrics • Expectancy Tracking
+// Friday Shutdown • Adaptive Aggression
+// Fully Tenant Safe • Production Clean
 
 const fs = require("fs");
 const path = require("path");
@@ -17,9 +17,10 @@ const { addMemory } = require("../lib/brain");
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200);
-
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
+
+const PERFORMANCE_WINDOW = 50;
 
 /* ================= HELPERS ================= */
 
@@ -42,16 +43,14 @@ function dayKey(ts) {
 
 function isFridayShutdown(ts) {
   const d = new Date(ts);
-  const day = d.getUTCDay(); // 5 = Friday
-  const hour = d.getUTCHours();
-  return day === 5 && hour >= 20; // 20:00 UTC Friday stop
+  return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
 }
 
 function narrate(tenantId, text, meta = {}) {
   if (!text) return;
   addMemory({
     tenantId,
-    type: "trade_event",
+    type: "paper_trade_event",
     text: String(text).slice(0, 800),
     meta,
   });
@@ -75,6 +74,14 @@ function defaultState() {
       grossLoss: 0,
     },
 
+    performance: {
+      window: [],
+      winRate: 0,
+      expectancy: 0,
+      avgWin: 0,
+      avgLoss: 0,
+    },
+
     position: null,
     trades: [],
 
@@ -85,24 +92,19 @@ function defaultState() {
       ticksSeen: 0,
       confidence: 0,
       decision: "WAIT",
-      lastReason: "boot",
       trendEdge: 0,
+      lastReason: "boot",
     },
 
     adaptive: {
       winStreak: 0,
       lossStreak: 0,
       riskBoost: 1,
-      aggressionMode: false,
     },
 
     limits: {
       dayKey: dayKey(Date.now()),
       tradesToday: 0,
-      lossesToday: 0,
-      halted: false,
-      haltReason: null,
-      cooling: false,
     },
   };
 }
@@ -140,86 +142,57 @@ function save(tenantId) {
   } catch {}
 }
 
-/* ================= CORE ================= */
+/* ================= PERFORMANCE ENGINE ================= */
 
-function updateVolatility(state, price) {
-  if (!state.lastPrice) {
-    state.lastPrice = price;
-    return;
-  }
+function updatePerformanceMetrics(state, trade) {
+  if (!trade) return;
 
-  const change =
-    Math.abs(price - state.lastPrice) /
-    state.lastPrice;
+  state.performance.window.push(trade.profit);
 
-  state.volatility = clamp(
-    state.volatility * 0.9 + change * 0.1,
-    0.0001,
-    0.05
-  );
+  if (state.performance.window.length > PERFORMANCE_WINDOW)
+    state.performance.window =
+      state.performance.window.slice(-PERFORMANCE_WINDOW);
 
-  state.lastPrice = price;
+  const wins = state.performance.window.filter(p => p > 0);
+  const losses = state.performance.window.filter(p => p <= 0);
+
+  state.performance.winRate =
+    state.performance.window.length > 0
+      ? wins.length / state.performance.window.length
+      : 0;
+
+  state.performance.avgWin =
+    wins.length > 0
+      ? wins.reduce((a, b) => a + b, 0) / wins.length
+      : 0;
+
+  state.performance.avgLoss =
+    losses.length > 0
+      ? losses.reduce((a, b) => a + b, 0) / losses.length
+      : 0;
+
+  state.performance.expectancy =
+    state.performance.winRate *
+      state.performance.avgWin +
+    (1 - state.performance.winRate) *
+      state.performance.avgLoss;
 }
 
-function updateEquity(state) {
-  if (state.position && state.lastPrice) {
-    state.equity =
-      state.cashBalance +
-      (state.lastPrice - state.position.entry) *
-        state.position.qty;
-  } else {
-    state.equity = state.cashBalance;
-  }
+/* ================= ADAPTIVE ================= */
 
-  state.peakEquity = Math.max(state.peakEquity, state.equity);
-}
+function updateAdaptive(state, trade) {
+  if (!trade) return;
 
-function resetDaily(state, ts) {
-  const dk = dayKey(ts);
-  if (dk !== state.limits.dayKey) {
-    state.limits.dayKey = dk;
-    state.limits.tradesToday = 0;
-    state.limits.lossesToday = 0;
-
-    state.adaptive.winStreak = 0;
-    state.adaptive.lossStreak = 0;
-    state.adaptive.riskBoost = 1;
-    state.adaptive.aggressionMode = false;
-  }
-}
-
-/* ================= ADAPTIVE LEARNING ================= */
-
-function updateAdaptiveAfterTrade(state, tradeResult) {
-  if (!tradeResult) return;
-
-  if (tradeResult.isWin) {
+  if (trade.profit > 0) {
     state.adaptive.winStreak++;
     state.adaptive.lossStreak = 0;
-
-    if (state.adaptive.winStreak >= 2) {
-      state.adaptive.aggressionMode = true;
-      state.adaptive.riskBoost = clamp(
-        state.adaptive.riskBoost * 1.2,
-        1,
-        1.8
-      );
-    }
+    state.adaptive.riskBoost =
+      clamp(state.adaptive.riskBoost * 1.1, 1, 2);
   } else {
     state.adaptive.lossStreak++;
     state.adaptive.winStreak = 0;
-
-    state.adaptive.riskBoost = clamp(
-      state.adaptive.riskBoost * 0.6,
-      0.4,
-      1
-    );
-
-    state.adaptive.aggressionMode = false;
-
-    if (state.adaptive.lossStreak >= 2) {
-      state.limits.cooling = true;
-    }
+    state.adaptive.riskBoost =
+      clamp(state.adaptive.riskBoost * 0.7, 0.4, 1);
   }
 }
 
@@ -229,44 +202,48 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
-  if (isFridayShutdown(ts)) {
-    state.limits.halted = true;
-    state.limits.haltReason = "Friday shutdown";
-    save(tenantId);
-    return;
-  }
+  if (isFridayShutdown(ts)) return;
 
   state.lastPrice = price;
-
-  resetDaily(state, ts);
-
   state.learnStats.ticksSeen++;
-  updateVolatility(state, price);
-  updateEquity(state);
 
+  /* --- VOLATILITY --- */
+  if (state.lastPrice) {
+    const change =
+      Math.abs(price - state.lastPrice) /
+      state.lastPrice;
+
+    state.volatility =
+      state.volatility * 0.9 + change * 0.1;
+  }
+
+  /* --- EQUITY --- */
+  if (state.position) {
+    state.equity =
+      state.cashBalance +
+      (price - state.position.entry) *
+        state.position.qty;
+  } else {
+    state.equity = state.cashBalance;
+  }
+
+  state.peakEquity = Math.max(
+    state.peakEquity,
+    state.equity
+  );
+
+  /* 🔥 RISK (Paper Mode Active) */
   const risk = riskManager.evaluate({
     tenantId,
     equity: state.equity,
-    realizedNet: state.realized.net,
     volatility: state.volatility,
     trades: state.trades,
-    limits: state.limits,
     ts,
+    paperState: state,
   });
 
-  state.limits.halted = risk.halted;
-  state.limits.haltReason = risk.haltReason || null;
-  state.limits.cooling = risk.cooling;
-
-  if (risk.halted || risk.cooling) {
-    save(tenantId);
+  if (state.learnStats.ticksSeen < WARMUP_TICKS)
     return;
-  }
-
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) {
-    save(tenantId);
-    return;
-  }
 
   const plan = makeDecision({
     tenantId,
@@ -278,69 +255,61 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.decision = plan.action;
   state.learnStats.confidence = plan.confidence;
   state.learnStats.trendEdge = plan.edge;
-  state.learnStats.lastReason = plan.reason;
 
-  /* ===== EXIT ===== */
+  /* ================= EXIT ================= */
 
   if (
-    (plan.action === "SELL" || plan.action === "CLOSE") &&
+    (plan.action === "SELL" ||
+      plan.action === "CLOSE") &&
     state.position
   ) {
-    const result = executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action: plan.action,
-      price,
-      riskPct: 0,
-      state,
-      ts,
-    });
-
-    if (result?.narration) {
-      narrate(
+    const result =
+      executionEngine.executePaperOrder({
         tenantId,
-        result.narration.text,
-        result.narration.meta
-      );
-    }
+        symbol,
+        action: plan.action,
+        price,
+        riskPct: 0,
+        state,
+        ts,
+      });
 
     if (result?.result?.type === "EXIT") {
-      updateAdaptiveAfterTrade(state, result.result);
+      updatePerformanceMetrics(
+        state,
+        result.result
+      );
+      updateAdaptive(state, result.result);
     }
 
     save(tenantId);
     return;
   }
 
-  /* ===== ENTRY ===== */
+  /* ================= ENTRY ================= */
 
-  if (plan.action !== "BUY" || state.position) {
-    save(tenantId);
+  if (plan.action !== "BUY" || state.position)
     return;
-  }
 
-  const portfolioCheck = portfolioManager.evaluate({
-    tenantId,
-    symbol,
-    equity: state.equity,
-    proposedRiskPct: plan.riskPct,
-    paperState: state,
-  });
+  const portfolioCheck =
+    portfolioManager.evaluate({
+      tenantId,
+      symbol,
+      equity: state.equity,
+      proposedRiskPct: plan.riskPct,
+      paperState: state,
+    });
 
-  if (!portfolioCheck.allow) {
-    save(tenantId);
-    return;
-  }
+  if (!portfolioCheck.allow) return;
 
   let adjustedRisk =
     portfolioCheck.adjustedRiskPct *
     (risk.riskMultiplier || 1);
 
   adjustedRisk *= state.adaptive.riskBoost;
+  adjustedRisk = clamp(adjustedRisk, 0.001, 0.08);
 
-  adjustedRisk = clamp(adjustedRisk, 0.001, 0.06);
-
-  const result = executionEngine.executePaperOrder({
+  executionEngine.executePaperOrder({
     tenantId,
     symbol,
     action: "BUY",
@@ -350,18 +319,10 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     ts,
   });
 
-  if (result?.narration) {
-    narrate(
-      tenantId,
-      result.narration.text,
-      result.narration.meta
-    );
-  }
-
   save(tenantId);
 }
 
-/* ================= API ================= */
+/* ================= SNAPSHOT ================= */
 
 function snapshot(tenantId) {
   const state = load(tenantId);
@@ -369,18 +330,16 @@ function snapshot(tenantId) {
   return {
     ...state,
     unrealizedPnL: state.position
-      ? (state.lastPrice - state.position.entry) *
+      ? (state.lastPrice -
+          state.position.entry) *
         state.position.qty
       : 0,
   };
 }
 
-function start() {}
-
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
   save(tenantId);
-
   riskManager.resetTenant(tenantId);
   portfolioManager.resetTenant(tenantId);
 }
@@ -388,6 +347,5 @@ function hardReset(tenantId) {
 module.exports = {
   tick,
   snapshot,
-  start,
   hardReset,
 };
