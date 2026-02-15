@@ -1,8 +1,8 @@
 // backend/src/services/tradeBrain.js
-// Phase 10.5 — Adaptive Behavioral Trade Core
-// Self-Learning + Streak Intelligence + Aggression Control
-// Unified Memory (Paper + Live Shared)
-// Deterministic • Tenant Safe • Behavioral Feedback Engine
+// Phase 11 — Dual Mode Behavioral Core
+// Paper = Unlimited Learning
+// Live = Capital Discipline
+// Deterministic • Tenant Safe
 
 const aiBrain = require("./aiBrain");
 const { buildDecision } = require("./strategyEngine");
@@ -34,7 +34,7 @@ const ALLOWED_ACTIONS = new Set([
   "CLOSE",
 ]);
 
-/* ================= BEHAVIORAL MEMORY ================= */
+/* ================= MEMORY ================= */
 
 const BRAIN_STATE = new Map();
 
@@ -52,8 +52,6 @@ function getBrainState(tenantId) {
       lastRealizedNet: 0,
 
       aggressionFactor: 1,
-      recoveryMode: false,
-      calmMode: false,
     });
   }
 
@@ -71,17 +69,15 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/* ================= PERFORMANCE TRACKER ================= */
+/* ================= PERFORMANCE TRACKING ================= */
 
 function updatePerformance(brain, paper) {
   const realizedNet = safeNum(paper?.realized?.net, 0);
-
   const delta = realizedNet - brain.lastRealizedNet;
 
   if (delta > 0) {
     brain.winStreak++;
     brain.lossStreak = 0;
-    brain.recoveryMode = false;
   }
 
   else if (delta < 0) {
@@ -91,35 +87,26 @@ function updatePerformance(brain, paper) {
 
   brain.lastRealizedNet = realizedNet;
 
-  /* Aggression scaling */
+  /* Aggression scaling (learning behavior) */
 
   if (brain.winStreak >= 2) {
     brain.aggressionFactor = clamp(
       brain.aggressionFactor + 0.1,
       1,
-      1.6
+      1.8
     );
   }
 
   if (brain.lossStreak >= 2) {
     brain.aggressionFactor = clamp(
-      brain.aggressionFactor * 0.7,
-      0.5,
+      brain.aggressionFactor * 0.8,
+      0.6,
       1
     );
-    brain.recoveryMode = true;
-  }
-
-  if (brain.lossStreak >= MAX_LOSS_STREAK) {
-    brain.calmMode = true;
-  }
-
-  if (brain.winStreak >= 3) {
-    brain.calmMode = true; // lock profit discipline
   }
 }
 
-/* ================= CORE DECISION ================= */
+/* ================= CORE ================= */
 
 function makeDecision(context = {}) {
   const {
@@ -142,7 +129,13 @@ function makeDecision(context = {}) {
   const lossesToday = safeNum(limits.lossesToday, 0);
   const volatility = safeNum(paper.volatility, 0);
 
-  /* ================= STRATEGY BASE ================= */
+  /* 🔥 DETECT PAPER MODE */
+
+  const isPaper =
+    paper?.cashBalance !== undefined &&
+    paper?.equity !== undefined;
+
+  /* ================= STRATEGY ================= */
 
   const strategyView = buildDecision({
     tenantId,
@@ -160,7 +153,7 @@ function makeDecision(context = {}) {
   let edge = safeNum(strategyView.edge, 0);
   let reason = strategyView.reason;
 
-  /* ================= POSITION NORMALIZATION ================= */
+  /* ================= NORMALIZE ================= */
 
   if (!hasPosition && action === "SELL") {
     action = "WAIT";
@@ -209,60 +202,54 @@ function makeDecision(context = {}) {
 
   edge = clamp(brain.edgeMomentum, -1, 1);
 
-  /* ================= VOLATILITY DISCIPLINE ================= */
+  /* ================= VOLATILITY ================= */
 
   if (volatility >= VOL_HIGH) {
-    confidence *= 0.75;
-    brain.calmMode = true;
+    confidence *= isPaper ? 0.9 : 0.75;
   }
 
-  /* ================= HARD SAFETY ================= */
+  /* ================= HARD SAFETY (LIVE ONLY) ================= */
 
-  if (!Number.isFinite(price)) {
-    action = "WAIT";
-    reason = "Missing price.";
+  if (!isPaper) {
+
+    if (!Number.isFinite(price)) {
+      action = "WAIT";
+      reason = "Missing price.";
+    }
+
+    else if (limits.halted) {
+      action = "WAIT";
+      reason = "System halted.";
+    }
+
+    else if (tradesToday >= MAX_TRADES_PER_DAY) {
+      action = "WAIT";
+      reason = "Daily trade limit reached.";
+    }
+
+    else if (lossesToday >= MAX_LOSS_STREAK) {
+      action = "WAIT";
+      reason = "Loss streak protection.";
+    }
   }
 
-  else if (limits.halted) {
-    action = "WAIT";
-    reason = "System halted.";
-  }
-
-  else if (tradesToday >= MAX_TRADES_PER_DAY) {
-    action = "WAIT";
-    reason = "Daily trade limit reached.";
-  }
-
-  else if (lossesToday >= MAX_LOSS_STREAK) {
-    action = "WAIT";
-    reason = "Loss streak protection.";
-  }
-
-  /* ================= BEHAVIORAL ADAPTATION ================= */
+  /* ================= RISK ================= */
 
   let riskPct = safeNum(strategyView.riskPct, 0);
 
   riskPct *= brain.aggressionFactor;
 
-  if (brain.calmMode) {
+  if (confidence < 0.4) {
     riskPct *= 0.6;
   }
 
-  if (brain.recoveryMode) {
-    riskPct *= 0.8;
-  }
-
-  if (confidence < 0.4) {
-    riskPct *= 0.5;
-  }
-
   if (confidence > 0.8) {
-    riskPct *= 1.3;
+    riskPct *= isPaper ? 1.5 : 1.2;
   }
 
   riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
 
-  /* ================= FINAL SANITY ================= */
+  /* ================= FINAL ================= */
 
   if (action === "WAIT") {
     confidence = 0;
@@ -282,15 +269,12 @@ function makeDecision(context = {}) {
       winStreak: brain.winStreak,
       lossStreak: brain.lossStreak,
       aggressionFactor: brain.aggressionFactor,
-      recoveryMode: brain.recoveryMode,
-      calmMode: brain.calmMode,
+      mode: isPaper ? "paper-learning" : "live-capital",
     },
     learning: strategyView.learning,
     ts: Date.now(),
   };
 }
-
-/* ================= RESET ================= */
 
 function resetTenant(tenantId) {
   BRAIN_STATE.delete(tenantId);
