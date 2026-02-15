@@ -1,7 +1,8 @@
 // backend/src/services/paperTrader.js
-// Phase 9.1 — Institutional Paper Engine (Stability Upgrade)
-// Strategy → Risk → Portfolio → ExecutionEngine
-// Fully Adaptive • Multi-Layer Protected • Tenant Safe
+// Phase 12 — Adaptive Self-Learning Paper Engine
+// Aggressive + Controlled + Friday Shutdown
+// Reinforcement Layer Added
+// Fully Tenant Safe • No Breaking Changes
 
 const fs = require("fs");
 const path = require("path");
@@ -39,6 +40,13 @@ function dayKey(ts) {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
+function isFridayShutdown(ts) {
+  const d = new Date(ts);
+  const day = d.getUTCDay(); // 5 = Friday
+  const hour = d.getUTCHours();
+  return day === 5 && hour >= 20; // 20:00 UTC Friday stop
+}
+
 function narrate(tenantId, text, meta = {}) {
   if (!text) return;
   addMemory({
@@ -67,10 +75,6 @@ function defaultState() {
       grossLoss: 0,
     },
 
-    costs: {
-      feePaid: 0,
-    },
-
     position: null,
     trades: [],
 
@@ -83,6 +87,13 @@ function defaultState() {
       decision: "WAIT",
       lastReason: "boot",
       trendEdge: 0,
+    },
+
+    adaptive: {
+      winStreak: 0,
+      lossStreak: 0,
+      riskBoost: 1,
+      aggressionMode: false,
     },
 
     limits: {
@@ -169,6 +180,46 @@ function resetDaily(state, ts) {
     state.limits.dayKey = dk;
     state.limits.tradesToday = 0;
     state.limits.lossesToday = 0;
+
+    state.adaptive.winStreak = 0;
+    state.adaptive.lossStreak = 0;
+    state.adaptive.riskBoost = 1;
+    state.adaptive.aggressionMode = false;
+  }
+}
+
+/* ================= ADAPTIVE LEARNING ================= */
+
+function updateAdaptiveAfterTrade(state, tradeResult) {
+  if (!tradeResult) return;
+
+  if (tradeResult.isWin) {
+    state.adaptive.winStreak++;
+    state.adaptive.lossStreak = 0;
+
+    if (state.adaptive.winStreak >= 2) {
+      state.adaptive.aggressionMode = true;
+      state.adaptive.riskBoost = clamp(
+        state.adaptive.riskBoost * 1.2,
+        1,
+        1.8
+      );
+    }
+  } else {
+    state.adaptive.lossStreak++;
+    state.adaptive.winStreak = 0;
+
+    state.adaptive.riskBoost = clamp(
+      state.adaptive.riskBoost * 0.6,
+      0.4,
+      1
+    );
+
+    state.adaptive.aggressionMode = false;
+
+    if (state.adaptive.lossStreak >= 2) {
+      state.limits.cooling = true;
+    }
   }
 }
 
@@ -178,6 +229,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
+  if (isFridayShutdown(ts)) {
+    state.limits.halted = true;
+    state.limits.haltReason = "Friday shutdown";
+    save(tenantId);
+    return;
+  }
+
   state.lastPrice = price;
 
   resetDaily(state, ts);
@@ -185,8 +243,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.ticksSeen++;
   updateVolatility(state, price);
   updateEquity(state);
-
-  /* ========= 1️⃣ GLOBAL RISK ========= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -212,8 +268,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 2️⃣ STRATEGY ========= */
-
   const plan = makeDecision({
     tenantId,
     symbol,
@@ -226,7 +280,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state.learnStats.trendEdge = plan.edge;
   state.learnStats.lastReason = plan.reason;
 
-  /* ========= 3️⃣ EXIT FIRST ========= */
+  /* ===== EXIT ===== */
 
   if (
     (plan.action === "SELL" || plan.action === "CLOSE") &&
@@ -250,18 +304,20 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       );
     }
 
+    if (result?.result?.type === "EXIT") {
+      updateAdaptiveAfterTrade(state, result.result);
+    }
+
     save(tenantId);
     return;
   }
 
-  /* ========= 4️⃣ ENTRY ONLY IF BUY ========= */
+  /* ===== ENTRY ===== */
 
   if (plan.action !== "BUY" || state.position) {
     save(tenantId);
     return;
   }
-
-  /* ========= 5️⃣ PORTFOLIO ========= */
 
   const portfolioCheck = portfolioManager.evaluate({
     tenantId,
@@ -276,14 +332,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
-  /* ========= 6️⃣ EXECUTION ========= */
-
-  const adjustedRisk = clamp(
+  let adjustedRisk =
     portfolioCheck.adjustedRiskPct *
-      (risk.riskMultiplier || 1),
-    0.001,
-    0.05
-  );
+    (risk.riskMultiplier || 1);
+
+  adjustedRisk *= state.adaptive.riskBoost;
+
+  adjustedRisk = clamp(adjustedRisk, 0.001, 0.06);
 
   const result = executionEngine.executePaperOrder({
     tenantId,
