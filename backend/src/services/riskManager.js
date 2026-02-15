@@ -1,8 +1,9 @@
 // backend/src/services/riskManager.js
-// Phase 22 — Institutional Adaptive Risk Engine
-// Cross-Margin Aware • Drawdown Reactive • Volatility Regime Memory
-// Margin Pressure Control • Liquidation Buffering
-// Tenant Safe • Paper + Live Compatible • Production Hardened
+// Phase 23 — Dual Mode Institutional Risk Engine
+// Paper = Learning Mode (No Hard Stops)
+// Live = Capital Protection Mode
+// Drawdown Reactive • Volatility Adaptive • Margin Aware
+// Tenant Safe • Production Hardened
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -13,7 +14,6 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const CONFIG = Object.freeze({
   maxDailyLossPct: Number(process.env.RISK_MAX_DAILY_LOSS_PCT || 0.04),
   maxDrawdownPct: Number(process.env.RISK_MAX_DRAWDOWN_PCT || 0.25),
-
   equityFloorPct: Number(process.env.RISK_EQUITY_FLOOR_PCT || 0.35),
 
   lossClusterSize: Number(process.env.RISK_LOSS_CLUSTER_SIZE || 3),
@@ -37,8 +37,6 @@ function getState(tenantId) {
 
   if (!RISK_STATE.has(key)) {
     RISK_STATE.set(key, {
-      version: 22,
-
       halted: false,
       haltReason: null,
 
@@ -54,7 +52,6 @@ function getState(tenantId) {
 
       riskMultiplier: 1,
       volatilityRegime: "normal",
-
       lastMarginPressure: 0,
     });
   }
@@ -78,6 +75,7 @@ function evaluate({
   marginUsed = 0,
   maintenanceRequired = 0,
   ts = Date.now(),
+  paperState = null,
 }) {
   const state = getState(tenantId);
   const dk = dayKey(ts);
@@ -92,6 +90,12 @@ function evaluate({
     };
   }
 
+  /* 🔥 Detect Paper Mode */
+  const isPaper =
+    paperState &&
+    paperState.cashBalance !== undefined &&
+    paperState.equity !== undefined;
+
   /* ================= DAILY RESET ================= */
 
   if (state.lastDayKey !== dk) {
@@ -103,157 +107,145 @@ function evaluate({
     state.haltReason = null;
   }
 
-  /* ================= INITIAL EQUITY ================= */
+  /* ================= EQUITY TRACKING ================= */
 
-  if (state.firstEquitySeen == null) {
+  if (state.firstEquitySeen == null)
     state.firstEquitySeen = equity;
-  }
 
-  /* ================= PEAK TRACKING ================= */
-
-  if (state.peakEquity == null) {
+  if (state.peakEquity == null)
     state.peakEquity = equity;
-  }
 
   state.peakEquity = Math.max(state.peakEquity, equity);
 
-  if (state.rollingPeak == null) {
+  if (state.rollingPeak == null)
     state.rollingPeak = equity;
-  }
 
   state.rollingPeak =
     state.rollingPeak * 0.995 + equity * 0.005;
 
   const drawdown =
-    state.peakEquity > 0
-      ? (state.peakEquity - equity) / state.peakEquity
-      : 0;
+    (state.peakEquity - equity) / state.peakEquity;
 
   const rollingDrawdown =
-    state.rollingPeak > 0
-      ? (state.rollingPeak - equity) / state.rollingPeak
-      : 0;
+    (state.rollingPeak - equity) / state.rollingPeak;
 
-  /* ================= HARD DRAWDOWN ================= */
+  /* =====================================================
+     LIVE HARD STOPS ONLY
+  ===================================================== */
 
-  if (drawdown >= CONFIG.maxDrawdownPct) {
-    state.halted = true;
-    state.haltReason = "max_drawdown";
-  }
+  if (!isPaper) {
 
-  /* ================= EQUITY FLOOR ================= */
-
-  const floor =
-    state.firstEquitySeen *
-    CONFIG.equityFloorPct;
-
-  if (equity <= floor) {
-    state.halted = true;
-    state.haltReason = "equity_floor_breach";
-  }
-
-  /* ================= DAILY LOSS ================= */
-
-  if (state.dailyStartEquity > 0) {
-    const dailyLoss =
-      (state.dailyStartEquity - equity) /
-      state.dailyStartEquity;
-
-    if (dailyLoss >= CONFIG.maxDailyLossPct) {
+    if (drawdown >= CONFIG.maxDrawdownPct) {
       state.halted = true;
-      state.haltReason = "daily_loss_limit";
+      state.haltReason = "max_drawdown";
+    }
+
+    const floor =
+      state.firstEquitySeen *
+      CONFIG.equityFloorPct;
+
+    if (equity <= floor) {
+      state.halted = true;
+      state.haltReason = "equity_floor_breach";
+    }
+
+    if (state.dailyStartEquity > 0) {
+      const dailyLoss =
+        (state.dailyStartEquity - equity) /
+        state.dailyStartEquity;
+
+      if (dailyLoss >= CONFIG.maxDailyLossPct) {
+        state.halted = true;
+        state.haltReason = "daily_loss_limit";
+      }
+    }
+
+    if (
+      trades.length >= CONFIG.lossClusterSize &&
+      trades.length !== state.lastClusterTradeCount
+    ) {
+      const recent = trades.slice(-CONFIG.lossClusterSize);
+      const allLoss = recent.every(t => t.profit <= 0);
+
+      if (allLoss) {
+        state.cooldownLevel++;
+        const cooldown =
+          CONFIG.baseCooldownMs *
+          Math.pow(1.8, state.cooldownLevel - 1);
+
+        state.cooldownUntil = ts + cooldown;
+      }
+
+      state.lastClusterTradeCount = trades.length;
     }
   }
 
-  /* ================= LOSS CLUSTER ================= */
+  const cooling = !isPaper && ts < state.cooldownUntil;
 
-  if (
-    trades.length >= CONFIG.lossClusterSize &&
-    trades.length !== state.lastClusterTradeCount
-  ) {
-    const recent = trades.slice(-CONFIG.lossClusterSize);
-    const allLoss = recent.every(t => t.profit <= 0);
+  /* =====================================================
+     VOLATILITY REGIME (BOTH MODES)
+  ===================================================== */
 
-    if (allLoss) {
-      state.cooldownLevel++;
-      const cooldown =
-        CONFIG.baseCooldownMs *
-        Math.pow(1.8, state.cooldownLevel - 1);
-
-      state.cooldownUntil = ts + cooldown;
-    }
-
-    state.lastClusterTradeCount = trades.length;
-  }
-
-  const cooling = ts < state.cooldownUntil;
-
-  /* ================= VOLATILITY REGIME ================= */
-
-  if (volatility >= CONFIG.highVolatilityCutoff) {
+  if (volatility >= CONFIG.highVolatilityCutoff)
     state.volatilityRegime = "high";
-  } else if (volatility <= CONFIG.lowVolatilityCutoff) {
+  else if (volatility <= CONFIG.lowVolatilityCutoff)
     state.volatilityRegime = "low";
-  } else {
+  else
     state.volatilityRegime = "normal";
-  }
 
-  if (state.volatilityRegime === "high") {
-    state.riskMultiplier = 0.6;
-  } else if (state.volatilityRegime === "low") {
-    state.riskMultiplier = 1.2;
-  } else {
+  if (state.volatilityRegime === "high")
+    state.riskMultiplier = isPaper ? 0.8 : 0.6;
+  else if (state.volatilityRegime === "low")
+    state.riskMultiplier = isPaper ? 1.3 : 1.2;
+  else
     state.riskMultiplier = 1;
+
+  /* =====================================================
+     MARGIN PROTECTION (LIVE ONLY)
+  ===================================================== */
+
+  if (!isPaper) {
+
+    let marginPressure = 0;
+
+    if (marginUsed > 0 && equity > 0)
+      marginPressure = marginUsed / equity;
+
+    state.lastMarginPressure = marginPressure;
+
+    if (marginPressure >= CONFIG.maxMarginUtilization) {
+      state.halted = true;
+      state.haltReason = "margin_utilization_limit";
+    }
+
+    if (
+      maintenanceRequired > 0 &&
+      equity <= maintenanceRequired *
+      (1 + CONFIG.liquidationBufferPct)
+    ) {
+      state.riskMultiplier *= 0.25;
+    }
+
+    if (!state.halted && rollingDrawdown > 0.12) {
+      state.riskMultiplier *= 0.75;
+    }
   }
-
-  /* ================= MARGIN PRESSURE ================= */
-
-  let marginPressure = 0;
-
-  if (marginUsed > 0 && equity > 0) {
-    marginPressure = marginUsed / equity;
-  }
-
-  state.lastMarginPressure = marginPressure;
-
-  if (marginPressure >= CONFIG.maxMarginUtilization) {
-    state.halted = true;
-    state.haltReason = "margin_utilization_limit";
-  }
-
-  /* ================= LIQUIDATION BUFFER ================= */
-
-  if (
-    maintenanceRequired > 0 &&
-    equity <= maintenanceRequired * (1 + CONFIG.liquidationBufferPct)
-  ) {
-    state.riskMultiplier *= 0.25;
-  }
-
-  /* ================= SOFT DRAWDOWN THROTTLE ================= */
-
-  if (!state.halted && rollingDrawdown > 0.12) {
-    state.riskMultiplier *= 0.75;
-  }
-
-  /* ================= FINAL RETURN ================= */
 
   return {
-    halted: state.halted,
-    haltReason: state.haltReason,
+    halted: isPaper ? false : state.halted,
+    haltReason: isPaper ? null : state.haltReason,
     cooling,
-    riskMultiplier: clamp(state.riskMultiplier, 0.2, 1.5),
+    riskMultiplier: clamp(state.riskMultiplier, 0.3, 1.6),
     drawdown,
     rollingDrawdown,
     volatilityRegime: state.volatilityRegime,
     cooldownLevel: state.cooldownLevel,
-    marginPressure,
+    marginPressure: state.lastMarginPressure,
+    mode: isPaper ? "paper-learning" : "live-capital",
   };
 }
 
-/* =========================================================
-   RESET
-========================================================= */
+/* ========================================================= */
 
 function resetTenant(tenantId) {
   RISK_STATE.delete(tenantId);
