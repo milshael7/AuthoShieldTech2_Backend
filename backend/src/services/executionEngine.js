@@ -1,7 +1,7 @@
 // backend/src/services/executionEngine.js
-// Phase 10 — Institutional Execution Engine
+// Phase 11 — Adaptive Institutional Execution Engine
 // Paper + Live Unified Layer
-// Partial Fills • Slippage • Routing • Audit Trail • Adapter Safe
+// Now returns structured outcome for AI learning
 
 const exchangeRouter = require("./exchangeRouter");
 
@@ -25,13 +25,14 @@ const CONFIG = Object.freeze({
 
   simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 15),
 
-  liveDryRun: String(process.env.LIVE_DRY_RUN || "true")
-    .toLowerCase()
-    .trim() !== "false",
+  liveDryRun:
+    String(process.env.LIVE_DRY_RUN || "true")
+      .toLowerCase()
+      .trim() !== "false",
 });
 
 /* =========================================================
-   INTERNAL HELPERS
+   HELPERS
 ========================================================= */
 
 function randomBetween(min, max) {
@@ -44,8 +45,9 @@ function simulateSlippage(price, side) {
     CONFIG.maxSlippagePct
   );
 
-  if (side === "BUY") return price * (1 + slipPct);
-  return price * (1 - slipPct);
+  return side === "BUY"
+    ? price * (1 + slipPct)
+    : price * (1 - slipPct);
 }
 
 function simulatePartialFill(qty) {
@@ -95,15 +97,6 @@ function pushAudit(state, record) {
     state.executionAudit.slice(-500);
 }
 
-function narration(text, meta) {
-  return {
-    narration: {
-      text,
-      meta,
-    },
-  };
-}
-
 /* =========================================================
    PAPER EXECUTION
 ========================================================= */
@@ -122,7 +115,9 @@ function executePaperOrder({
 
   const executionId = buildExecutionId();
 
-  /* ================= ENTRY ================= */
+  /* =======================================================
+     ENTRY
+  ======================================================= */
 
   if (action === "BUY" && !state.position) {
     const safeRisk = clamp(
@@ -174,13 +169,25 @@ function executePaperOrder({
       executionId,
     });
 
-    return narration(
-      `Entered ${symbol} at ${slippedPrice.toFixed(2)}`,
-      { action: "BUY", qty, executionId }
-    );
+    return {
+      narration: {
+        text: `Entered ${symbol} at ${slippedPrice.toFixed(2)}`,
+        meta: { action: "BUY", qty, executionId },
+      },
+      result: {
+        type: "ENTRY",
+        symbol,
+        price: slippedPrice,
+        qty,
+        riskPct: safeRisk,
+        executionId,
+      },
+    };
   }
 
-  /* ================= EXIT ================= */
+  /* =======================================================
+     EXIT
+  ======================================================= */
 
   if (
     (action === "SELL" || action === "CLOSE") &&
@@ -201,7 +208,9 @@ function executePaperOrder({
     state.costs.feePaid += fee;
     state.realized.net += pnl;
 
-    if (pnl > 0) {
+    const isWin = pnl > 0;
+
+    if (isWin) {
       state.realized.wins++;
       state.realized.grossProfit += pnl;
     } else {
@@ -235,19 +244,31 @@ function executePaperOrder({
       executionId,
     });
 
-    return narration(
-      `Closed ${symbol}. ${
-        pnl >= 0 ? "Profit" : "Loss"
-      } ${pnl.toFixed(2)}`,
-      { action: "CLOSE", pnl, executionId }
-    );
+    return {
+      narration: {
+        text: `Closed ${symbol}. ${
+          isWin ? "Profit" : "Loss"
+        } ${pnl.toFixed(2)}`,
+        meta: { action: "CLOSE", pnl, executionId },
+      },
+      result: {
+        type: "EXIT",
+        symbol,
+        entry: pos.entry,
+        exit: slippedPrice,
+        qty,
+        pnl,
+        isWin,
+        executionId,
+      },
+    };
   }
 
   return null;
 }
 
 /* =========================================================
-   LIVE EXECUTION (ROUTED)
+   LIVE EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
@@ -258,15 +279,17 @@ async function executeLiveOrder(params = {}) {
       ok: true,
       dryRun: true,
       executionId,
-      note: "LIVE_DRY_RUN enabled — no exchange call made.",
+      note:
+        "LIVE_DRY_RUN enabled — no exchange call made.",
     };
   }
 
   try {
-    const routed = await exchangeRouter.routeLiveOrder({
-      ...params,
-      executionId,
-    });
+    const routed =
+      await exchangeRouter.routeLiveOrder({
+        ...params,
+        executionId,
+      });
 
     if (!routed.ok) {
       return {
@@ -290,10 +313,6 @@ async function executeLiveOrder(params = {}) {
     };
   }
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   executePaperOrder,
