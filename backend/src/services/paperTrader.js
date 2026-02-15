@@ -1,8 +1,10 @@
 // backend/src/services/paperTrader.js
-// Phase 13 — Autonomous Learning Paper Engine
-// Unlimited Learning Mode • Reinforcement Metrics • Expectancy Tracking
-// Friday Shutdown • Adaptive Aggression
-// Fully Tenant Safe • Production Clean
+// Phase 14 — Fully Reinforced Autonomous Paper Engine
+// Unlimited Learning Mode
+// AI Reinforcement Integrated
+// Expectancy + Adaptive Aggression
+// Friday Shutdown
+// Production Safe • Institutional Grade
 
 const fs = require("fs");
 const path = require("path");
@@ -11,6 +13,7 @@ const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
 const executionEngine = require("./executionEngine");
+const aiBrain = require("./aiBrain");
 const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
@@ -37,23 +40,9 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function dayKey(ts) {
-  return new Date(ts).toISOString().slice(0, 10);
-}
-
 function isFridayShutdown(ts) {
   const d = new Date(ts);
   return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
-}
-
-function narrate(tenantId, text, meta = {}) {
-  if (!text) return;
-  addMemory({
-    tenantId,
-    type: "paper_trade_event",
-    text: String(text).slice(0, 800),
-    meta,
-  });
 }
 
 /* ================= STATE ================= */
@@ -101,11 +90,6 @@ function defaultState() {
       lossStreak: 0,
       riskBoost: 1,
     },
-
-    limits: {
-      dayKey: dayKey(Date.now()),
-      tradesToday: 0,
-    },
   };
 }
 
@@ -142,11 +126,9 @@ function save(tenantId) {
   } catch {}
 }
 
-/* ================= PERFORMANCE ENGINE ================= */
+/* ================= PERFORMANCE ================= */
 
-function updatePerformanceMetrics(state, trade) {
-  if (!trade) return;
-
+function updatePerformance(state, trade) {
   state.performance.window.push(trade.profit);
 
   if (state.performance.window.length > PERFORMANCE_WINDOW)
@@ -157,9 +139,7 @@ function updatePerformanceMetrics(state, trade) {
   const losses = state.performance.window.filter(p => p <= 0);
 
   state.performance.winRate =
-    state.performance.window.length > 0
-      ? wins.length / state.performance.window.length
-      : 0;
+    wins.length / state.performance.window.length;
 
   state.performance.avgWin =
     wins.length > 0
@@ -181,8 +161,6 @@ function updatePerformanceMetrics(state, trade) {
 /* ================= ADAPTIVE ================= */
 
 function updateAdaptive(state, trade) {
-  if (!trade) return;
-
   if (trade.profit > 0) {
     state.adaptive.winStreak++;
     state.adaptive.lossStreak = 0;
@@ -204,20 +182,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
   if (isFridayShutdown(ts)) return;
 
+  /* --- Update price first --- */
+  const prevPrice = state.lastPrice;
   state.lastPrice = price;
   state.learnStats.ticksSeen++;
 
-  /* --- VOLATILITY --- */
-  if (state.lastPrice) {
-    const change =
-      Math.abs(price - state.lastPrice) /
-      state.lastPrice;
-
+  /* --- Volatility --- */
+  if (prevPrice) {
+    const change = Math.abs(price - prevPrice) / prevPrice;
     state.volatility =
       state.volatility * 0.9 + change * 0.1;
   }
 
-  /* --- EQUITY --- */
+  /* --- Equity --- */
   if (state.position) {
     state.equity =
       state.cashBalance +
@@ -232,14 +209,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     state.equity
   );
 
-  /* 🔥 RISK (Paper Mode Active) */
+  /* --- Risk Layer (Paper Mode Still Evaluated) --- */
   const risk = riskManager.evaluate({
     tenantId,
     equity: state.equity,
     volatility: state.volatility,
     trades: state.trades,
     ts,
-    paperState: state,
   });
 
   if (state.learnStats.ticksSeen < WARMUP_TICKS)
@@ -275,11 +251,15 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       });
 
     if (result?.result?.type === "EXIT") {
-      updatePerformanceMetrics(
-        state,
-        result.result
-      );
-      updateAdaptive(state, result.result);
+      const trade = result.result;
+
+      updatePerformance(state, trade);
+      updateAdaptive(state, trade);
+
+      // 🔥 Reinforcement loop into AI
+      aiBrain.recordTradeOutcome({
+        pnl: trade.pnl,
+      });
     }
 
     save(tenantId);
@@ -342,6 +322,7 @@ function hardReset(tenantId) {
   save(tenantId);
   riskManager.resetTenant(tenantId);
   portfolioManager.resetTenant(tenantId);
+  aiBrain.resetBrain();
 }
 
 module.exports = {
