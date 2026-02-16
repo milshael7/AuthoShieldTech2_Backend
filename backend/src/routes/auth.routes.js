@@ -1,9 +1,10 @@
 // backend/src/routes/auth.routes.js
+
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
 
-const { sign } = require('../auth/jwt');
+const { sign } = require('../lib/jwt'); // ✅ FIXED PATH (single source of truth)
 const { authRequired } = require('../middleware/auth');
 const users = require('../users/user.service');
 const { audit } = require('../lib/audit');
@@ -45,13 +46,19 @@ router.post('/login', (req, res) => {
       return res.status(500).json({ error: 'Server misconfigured (JWT_SECRET missing)' });
     }
 
+    // ✅ sign() now uses internal JWT_SECRET automatically
     const token = sign(
       { id: u.id, role: u.role, companyId: u.companyId || null },
-      process.env.JWT_SECRET,
+      null,
       '7d'
     );
 
-    audit({ actorId: u.id, action: 'LOGIN', targetType: 'Session', targetId: u.id });
+    audit({
+      actorId: u.id,
+      action: 'LOGIN',
+      targetType: 'Session',
+      targetId: u.id
+    });
 
     return res.json({
       token,
@@ -72,10 +79,8 @@ router.post('/login', (req, res) => {
 
 /**
  * --------------------
- * REFRESH SESSION (NEW)
+ * REFRESH SESSION
  * --------------------
- * Re-issues a fresh token if the current one is valid.
- * Used on page refresh / app rehydrate.
  */
 router.post('/refresh', authRequired, (req, res) => {
   try {
@@ -84,11 +89,16 @@ router.post('/refresh', authRequired, (req, res) => {
 
     const token = sign(
       { id: u.id, role: u.role, companyId: u.companyId || null },
-      process.env.JWT_SECRET,
+      null,
       '7d'
     );
 
-    audit({ actorId: u.id, action: 'TOKEN_REFRESH', targetType: 'Session', targetId: u.id });
+    audit({
+      actorId: u.id,
+      action: 'TOKEN_REFRESH',
+      targetType: 'Session',
+      targetId: u.id
+    });
 
     return res.json({
       token,
@@ -134,7 +144,12 @@ router.post('/reset-password', (req, res) => {
 
     users.setPassword(u.id, newPassword, u.id);
 
-    audit({ actorId: u.id, action: 'PASSWORD_RESET', targetType: 'User', targetId: u.id });
+    audit({
+      actorId: u.id,
+      action: 'PASSWORD_RESET',
+      targetType: 'User',
+      targetId: u.id
+    });
 
     return res.json({ ok: true });
   } catch (e) {
