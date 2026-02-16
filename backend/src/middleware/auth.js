@@ -1,7 +1,7 @@
 // backend/src/middleware/auth.js
 // JWT auth middleware used by protected routes (Admin / Manager / Company gates)
 
-const { verify } = require("../auth/jwt");
+const { verify } = require("../lib/jwt"); // ✅ FIXED PATH (single source of truth)
 
 /* ======================================================
    AUTH REQUIRED
@@ -17,7 +17,8 @@ function authRequired(req, res, next) {
   }
 
   try {
-    const payload = verify(token, process.env.JWT_SECRET);
+    // ✅ verify now uses internal JWT_SECRET from lib/jwt.js
+    const payload = verify(token);
 
     // 🔒 Hard validation of token payload
     if (
