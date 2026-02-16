@@ -1,6 +1,5 @@
-// backend/src/lib/jwt.js
-// AutoShield — Enterprise JWT Core (Unified + Hardened)
-// Access + Refresh + Backward Compatible sign()
+// backend/lib/jwt.js
+// Unified JWT Core for AutoShield
 
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -42,7 +41,7 @@ function baseSign(payload, { expiresIn, type }) {
 }
 
 /* =========================================================
-   ACCESS TOKEN (Short-lived)
+   ACCESS TOKEN
 ========================================================= */
 
 function signAccess(payload, expiresIn = "15m") {
@@ -53,7 +52,7 @@ function signAccess(payload, expiresIn = "15m") {
 }
 
 /* =========================================================
-   REFRESH TOKEN (Long-lived)
+   REFRESH TOKEN
 ========================================================= */
 
 function signRefresh(payload, expiresIn = "7d") {
@@ -64,12 +63,10 @@ function signRefresh(payload, expiresIn = "7d") {
 }
 
 /* =========================================================
-   BACKWARD COMPATIBLE SIGN (used by auth.routes.js)
-   Keeps legacy behavior working
+   BACKWARD COMPATIBLE SIGN
 ========================================================= */
 
-function sign(payload, secret, expiresIn = "7d") {
-  // Ignore secret param (we enforce env secret only)
+function sign(payload, _secretIgnored, expiresIn = "7d") {
   return signAccess(payload, expiresIn);
 }
 
