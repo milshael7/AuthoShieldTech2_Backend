@@ -1,6 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Institutional Hardened (Phase 4 Stability Lock)
-// Individual Scope • Tenant Safe • AutoProtect Guarded • Input Validated • Audited
+// Me Endpoints — Institutional Hardened (Phase 5 Integrity Lock)
 
 const express = require("express");
 const router = express.Router();
@@ -91,19 +90,25 @@ router.post("/notifications/:id/read", (req, res) => {
       });
     }
 
-    const n = markRead(id, req.user.id);
+    // Defensive check before mutation
+    const existing =
+      listNotifications({ userId: req.user.id })
+        ?.find(n => String(n.id) === id);
 
-    if (!n) {
+    if (!existing) {
       return res.status(404).json({
         ok: false,
-        error: "Notification not found",
+        error: "Notification not found or not owned by user",
       });
     }
+
+    const n = markRead(id, req.user.id);
 
     return res.json({
       ok: true,
       notification: n,
     });
+
   } catch (e) {
     return res.status(500).json({
       ok: false,
@@ -128,9 +133,14 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    const body = isObject(req.body) ? req.body : {};
+    if (!isObject(req.body)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid request body",
+      });
+    }
 
-    const title = cleanStr(body.title, 200);
+    const title = cleanStr(req.body.title, 200);
 
     if (!title) {
       return res.status(400).json({
@@ -139,15 +149,15 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    if (!isObject(body.issue)) {
+    if (!isObject(req.body.issue)) {
       return res.status(400).json({
         ok: false,
         error: "Invalid issue payload",
       });
     }
 
-    const issueType = cleanStr(body.issue.type, 100);
-    const details = cleanStr(body.issue.details, 2000);
+    const issueType = cleanStr(req.body.issue.type, 100);
+    const details = cleanStr(req.body.issue.details, 2000);
 
     if (!issueType) {
       return res.status(400).json({
@@ -174,9 +184,7 @@ router.post("/projects", (req, res) => {
       targetType: "Project",
       targetId: project.id,
       companyId,
-      metadata: {
-        issueType,
-      },
+      metadata: { issueType },
     });
 
     return res.status(201).json({
