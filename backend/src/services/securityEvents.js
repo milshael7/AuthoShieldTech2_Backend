@@ -1,12 +1,9 @@
-// backend/src/services/securityEvents.js
 // Real-Time Cybersecurity Event Engine
-// Persistent • AI-readable • Production-safe
+// Tenant-Isolated • Persistent • AI-readable • Production-safe
 
 const fs = require("fs");
 const path = require("path");
 const { addMemory } = require("../lib/brain");
-
-/* ================= CONFIG ================= */
 
 const EVENTS_PATH =
   process.env.SECURITY_EVENTS_PATH ||
@@ -32,7 +29,7 @@ function ensureDir(file) {
 let state = {
   createdAt: nowIso(),
   updatedAt: nowIso(),
-  events: [],
+  tenants: {}, // 🔐 tenant isolated
 };
 
 /* ================= LOAD / SAVE ================= */
@@ -43,33 +40,38 @@ function load() {
     if (!fs.existsSync(EVENTS_PATH)) return;
     state = JSON.parse(fs.readFileSync(EVENTS_PATH, "utf-8"));
   } catch {
-    state = { createdAt: nowIso(), updatedAt: nowIso(), events: [] };
+    state = { createdAt: nowIso(), updatedAt: nowIso(), tenants: {} };
   }
 }
 
 function save() {
   try {
     state.updatedAt = nowIso();
-    if (state.events.length > MAX_EVENTS) {
-      state.events = state.events.slice(-MAX_EVENTS);
-    }
     fs.writeFileSync(EVENTS_PATH, JSON.stringify(state, null, 2));
   } catch {}
 }
 
 load();
 
+/* ================= INTERNAL ================= */
+
+function ensureTenant(tenantId) {
+  if (!tenantId) tenantId = "global";
+
+  if (!state.tenants[tenantId]) {
+    state.tenants[tenantId] = {
+      events: [],
+      createdAt: nowIso(),
+    };
+  }
+
+  return state.tenants[tenantId];
+}
+
 /* ================= CORE ================= */
 
-/**
- * recordEvent
- * Used by:
- * - login monitoring
- * - email protection
- * - API abuse detection
- * - WAF / IDS hooks
- */
 function recordEvent({
+  tenantId,
   type,
   severity = "info",
   source,
@@ -77,6 +79,8 @@ function recordEvent({
   description,
   meta = {},
 }) {
+  const tenant = ensureTenant(tenantId);
+
   const evt = {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
     ts: Date.now(),
@@ -89,10 +93,14 @@ function recordEvent({
     meta,
   };
 
-  state.events.push(evt);
+  tenant.events.push(evt);
+
+  if (tenant.events.length > MAX_EVENTS) {
+    tenant.events = tenant.events.slice(-MAX_EVENTS);
+  }
+
   save();
 
-  // Feed AuthoDev 6.5 (NON-RESET MEMORY)
   addMemory({
     type: "site",
     text: `Security event: ${severity.toUpperCase()} — ${description}`,
@@ -102,8 +110,10 @@ function recordEvent({
   return evt;
 }
 
-function listEvents({ limit = 100, severity = null } = {}) {
-  let events = state.events.slice().reverse();
+function listEvents({ tenantId, limit = 100, severity = null } = {}) {
+  const tenant = ensureTenant(tenantId);
+
+  let events = tenant.events.slice().reverse();
 
   if (severity) {
     events = events.filter((e) => e.severity === severity);
