@@ -3,11 +3,22 @@ const { nanoid } = require("nanoid");
 const { readDb, writeDb, writeAudit: audit } = require("../lib/db");
 const { createNotification } = require("../lib/notify");
 
+/* ======================================================
+   CONSTANTS
+====================================================== */
+
 const ROLES = {
   ADMIN: "Admin",
   MANAGER: "Manager",
   COMPANY: "Company",
   INDIVIDUAL: "Individual",
+};
+
+const ROLE_RANK = {
+  [ROLES.ADMIN]: 4,
+  [ROLES.MANAGER]: 3,
+  [ROLES.COMPANY]: 2,
+  [ROLES.INDIVIDUAL]: 1,
 };
 
 const SUBSCRIPTION = {
@@ -16,6 +27,10 @@ const SUBSCRIPTION = {
   PAST_DUE: "PastDue",
   LOCKED: "Locked",
 };
+
+/* ======================================================
+   INTERNAL HELPERS
+====================================================== */
 
 function ensureArrays(db) {
   if (!Array.isArray(db.users)) db.users = [];
@@ -31,11 +46,26 @@ function sanitize(u) {
   return rest;
 }
 
-/**
- * ======================================================
- * AUTOPROTECT — SINGLE SOURCE OF TRUTH
- * ======================================================
- */
+function requireValidRole(role) {
+  const r = String(role || "").trim();
+  if (!Object.values(ROLES).includes(r)) {
+    throw new Error(`Invalid role: ${r}`);
+  }
+  return r;
+}
+
+function requireRoleAuthority(actorRole, targetRole) {
+  const actorRank = ROLE_RANK[actorRole] || 0;
+  const targetRank = ROLE_RANK[targetRole] || 0;
+
+  if (actorRank <= targetRank) {
+    throw new Error("Insufficient authority for this action");
+  }
+}
+
+/* ======================================================
+   AUTOPROTECT
+====================================================== */
 
 function getAutoprotect(u) {
   return !!(u?.autoprotectEnabled ?? u?.autoprotechEnabled);
@@ -44,15 +74,7 @@ function getAutoprotect(u) {
 function setAutoprotect(u, enabled) {
   const val = !!enabled;
   u.autoprotectEnabled = val;
-  u.autoprotechEnabled = val; // legacy mirror
-}
-
-function requireValidRole(role) {
-  const r = String(role || "").trim();
-  if (!Object.values(ROLES).includes(r)) {
-    throw new Error(`Invalid role: ${r}`);
-  }
-  return r;
+  u.autoprotechEnabled = val;
 }
 
 /* ======================================================
@@ -67,15 +89,17 @@ function ensureAdminFromEnv() {
   ensureArrays(db);
 
   const emailKey = normEmail(ADMIN_EMAIL);
+
   const exists = db.users.find(
     (u) => normEmail(u.email) === emailKey && u.role === ROLES.ADMIN
   );
+
   if (exists) return;
 
   const admin = {
     id: nanoid(),
     platformId: `AS-${nanoid(10).toUpperCase()}`,
-    email: String(ADMIN_EMAIL).trim(),
+    email: ADMIN_EMAIL.trim(),
     passwordHash: bcrypt.hashSync(String(ADMIN_PASSWORD), 10),
     role: ROLES.ADMIN,
     companyId: null,
@@ -137,6 +161,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
       : null,
     mustResetPassword: false,
     profile: typeof profile === "object" ? profile : {},
+    locked: false,
   };
 
   setAutoprotect(u, r === ROLES.ADMIN || r === ROLES.MANAGER);
@@ -149,14 +174,6 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     actorRole: u.role,
     action: "USER_CREATED",
     target: u.id,
-  });
-
-  createNotification({
-    userId: u.id,
-    severity: "info",
-    title: "Welcome",
-    message:
-      "Welcome to AutoShield Tech. Check notifications and start your first project.",
   });
 
   return sanitize(u);
@@ -179,10 +196,10 @@ function listUsers() {
 }
 
 /* ======================================================
-   UPDATE
+   UPDATE (HARDENED)
 ====================================================== */
 
-function updateUser(id, patch, actorId) {
+function updateUser(id, patch, actorId, actorRole = ROLES.ADMIN) {
   const db = readDb();
   ensureArrays(db);
 
@@ -191,14 +208,17 @@ function updateUser(id, patch, actorId) {
 
   const p = patch && typeof patch === "object" ? { ...patch } : {};
 
+  // Prevent privilege escalation
+  if (typeof p.role !== "undefined") {
+    const newRole = requireValidRole(p.role);
+    requireRoleAuthority(actorRole, u.role);
+    p.role = newRole;
+  }
+
   if (typeof p.autoprotectEnabled !== "undefined") {
     setAutoprotect(u, p.autoprotectEnabled);
     delete p.autoprotectEnabled;
     delete p.autoprotechEnabled;
-  }
-
-  if (typeof p.role !== "undefined") {
-    p.role = requireValidRole(p.role);
   }
 
   Object.assign(u, p);
@@ -206,17 +226,44 @@ function updateUser(id, patch, actorId) {
 
   audit({
     actorId,
-    actorRole: "system",
+    actorRole,
     action: "USER_UPDATED",
     target: id,
-    meta: patch,
   });
 
   return sanitize(u);
 }
 
 /* ======================================================
-   SECURITY
+   LOCK / SUSPEND
+====================================================== */
+
+function suspendUser(id, actorId, actorRole) {
+  const db = readDb();
+  ensureArrays(db);
+
+  const u = db.users.find((x) => x.id === id);
+  if (!u) throw new Error("User not found");
+
+  requireRoleAuthority(actorRole, u.role);
+
+  u.locked = true;
+  u.subscriptionStatus = SUBSCRIPTION.LOCKED;
+
+  writeDb(db);
+
+  audit({
+    actorId,
+    actorRole,
+    action: "USER_SUSPENDED",
+    target: id,
+  });
+
+  return sanitize(u);
+}
+
+/* ======================================================
+   PASSWORD / SECURITY
 ====================================================== */
 
 function rotatePlatformIdAndForceReset(id, actorId) {
@@ -228,6 +275,7 @@ function rotatePlatformIdAndForceReset(id, actorId) {
 
   u.platformId = `AS-${nanoid(10).toUpperCase()}`;
   u.mustResetPassword = true;
+
   writeDb(db);
 
   audit({
@@ -235,14 +283,6 @@ function rotatePlatformIdAndForceReset(id, actorId) {
     actorRole: "system",
     action: "USER_ROTATE_ID",
     target: id,
-  });
-
-  createNotification({
-    userId: id,
-    severity: "warn",
-    title: "Security reset required",
-    message:
-      "Your platform ID was rotated. Please reset your password before continuing.",
   });
 
   return sanitize(u);
@@ -261,6 +301,7 @@ function setPassword(id, newPassword, actorId) {
 
   u.passwordHash = bcrypt.hashSync(String(newPassword), 10);
   u.mustResetPassword = false;
+
   writeDb(db);
 
   audit({
@@ -275,11 +316,20 @@ function setPassword(id, newPassword, actorId) {
 
 function verifyPassword(user, password) {
   if (!user) return false;
+
+  if (user.locked || user.subscriptionStatus === SUBSCRIPTION.LOCKED) {
+    throw new Error("Account locked");
+  }
+
   return bcrypt.compareSync(
     String(password || ""),
     String(user.passwordHash || "")
   );
 }
+
+/* ======================================================
+   EXPORT
+====================================================== */
 
 module.exports = {
   ROLES,
@@ -289,6 +339,7 @@ module.exports = {
   findByEmail,
   listUsers,
   updateUser,
+  suspendUser,
   rotatePlatformIdAndForceReset,
   setPassword,
   verifyPassword,
