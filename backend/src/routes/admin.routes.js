@@ -1,11 +1,11 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Institutional Hardened Version
+// Admin API — Supreme Authority Version (Phase 4)
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
+const { readDb, writeDb } = require("../lib/db");
 
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
@@ -38,11 +38,27 @@ function safeLimit(v, max = 1000, fallback = 200) {
   return Math.min(n, max);
 }
 
+function audit(action, actorId, targetId, meta = {}) {
+  const db = readDb();
+  db.audit = db.audit || [];
+
+  db.audit.push({
+    id: Date.now().toString(),
+    at: new Date().toISOString(),
+    action,
+    actorId,
+    targetId,
+    meta,
+  });
+
+  writeDb(db);
+}
+
 /* =========================================================
    USERS
 ========================================================= */
 
-// GET /api/admin/users
+// GET USERS
 router.get("/users", (req, res) => {
   try {
     return res.json({
@@ -54,72 +70,46 @@ router.get("/users", (req, res) => {
   }
 });
 
-// POST /api/admin/users
-router.post("/users", (req, res) => {
+// SUSPEND USER
+router.post("/users/:id/suspend", (req, res) => {
   try {
-    const body = req.body || {};
+    const updated = users.updateUser(req.params.id, {
+      locked: true,
+    }, req.user.id);
 
-    const payload = {
-      email: cleanStr(body.email, 200),
-      role: cleanStr(body.role, 50),
-      companyId:
-        typeof body.companyId === "string"
-          ? cleanStr(body.companyId, 100) || null
-          : null,
-      password: body.password,
-    };
+    audit("ADMIN_SUSPEND_USER", req.user.id, req.params.id);
 
-    const created = users.createUser(payload);
-
-    return res.status(201).json({
-      ok: true,
-      user: created,
-    });
+    return res.json({ ok: true, user: updated });
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
-// POST /api/admin/users/:id/rotate-id
-router.post("/users/:id/rotate-id", (req, res) => {
+// REACTIVATE USER
+router.post("/users/:id/reactivate", (req, res) => {
   try {
-    const result =
-      users.rotatePlatformIdAndForceReset(
-        req.params.id,
-        req.user.id
-      );
+    const updated = users.updateUser(req.params.id, {
+      locked: false,
+    }, req.user.id);
 
-    return res.json({ ok: true, result });
+    audit("ADMIN_REACTIVATE_USER", req.user.id, req.params.id);
+
+    return res.json({ ok: true, user: updated });
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
-// POST /api/admin/users/:id/subscription
-router.post("/users/:id/subscription", (req, res) => {
+// CHANGE USER ROLE
+router.post("/users/:id/role", (req, res) => {
   try {
-    const patch = {};
-    const body = req.body || {};
+    const role = cleanStr(req.body.role, 50);
 
-    if (typeof body.subscriptionStatus === "string") {
-      patch.subscriptionStatus = cleanStr(
-        body.subscriptionStatus,
-        50
-      );
-    }
+    const updated = users.updateUser(req.params.id, {
+      role,
+    }, req.user.id);
 
-    if (typeof body.autoprotectEnabled !== "undefined") {
-      const enabled = !!body.autoprotectEnabled;
-      patch.autoprotectEnabled = enabled;
-      patch.autoprotechEnabled = enabled; // legacy support
-    }
-
-    const updated =
-      users.updateUser(
-        req.params.id,
-        patch,
-        req.user.id
-      );
+    audit("ADMIN_CHANGE_ROLE", req.user.id, req.params.id, { role });
 
     return res.json({ ok: true, user: updated });
   } catch (e) {
@@ -131,7 +121,7 @@ router.post("/users/:id/subscription", (req, res) => {
    COMPANIES
 ========================================================= */
 
-// GET /api/admin/companies
+// LIST COMPANIES
 router.get("/companies", (req, res) => {
   try {
     return res.json({
@@ -143,92 +133,16 @@ router.get("/companies", (req, res) => {
   }
 });
 
-// POST /api/admin/companies
-router.post("/companies", (req, res) => {
+// SUSPEND COMPANY
+router.post("/companies/:id/suspend", (req, res) => {
   try {
-    const body = req.body || {};
-
-    const created = companies.createCompany({
-      name: cleanStr(body.name, 200),
-      createdBy: req.user.id,
+    const updated = companies.updateCompany(req.params.id, {
+      suspended: true,
     });
 
-    return res.status(201).json({
-      ok: true,
-      company: created,
-    });
+    audit("ADMIN_SUSPEND_COMPANY", req.user.id, req.params.id);
+
+    return res.json({ ok: true, company: updated });
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
-});
-
-/* =========================================================
-   NOTIFICATIONS
-========================================================= */
-
-// GET /api/admin/notifications
-router.get("/notifications", (req, res) => {
-  try {
-    return res.json({
-      ok: true,
-      notifications: listNotifications({}),
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-/* =========================================================
-   MANAGER MIRROR
-========================================================= */
-
-// GET /api/admin/manager/overview
-router.get("/manager/overview", (req, res) => {
-  try {
-    const db = readDb();
-
-    return res.json({
-      ok: true,
-      overview: {
-        users: db.users?.length || 0,
-        companies: db.companies?.length || 0,
-        auditEvents: db.audit?.length || 0,
-        notifications: db.notifications?.length || 0,
-      },
-      time: new Date().toISOString(),
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-// GET /api/admin/manager/audit
-router.get("/manager/audit", (req, res) => {
-  try {
-    const db = readDb();
-    const limit = safeLimit(req.query.limit);
-
-    return res.json({
-      ok: true,
-      audit: (db.audit || [])
-        .slice(-limit)
-        .reverse(),
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-// GET /api/admin/manager/notifications
-router.get("/manager/notifications", (req, res) => {
-  try {
-    return res.json({
-      ok: true,
-      notifications: listNotifications({}),
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-module.exports = router;
