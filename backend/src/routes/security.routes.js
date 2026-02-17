@@ -2,24 +2,10 @@ const express = require("express");
 const router = express.Router();
 
 const { listEvents, recordEvent } = require("../services/securityEvents");
-const fs = require("fs");
-const path = require("path");
 
 /* =========================================================
-   STORAGE PATHS
-   ========================================================= */
-
-const TOOLS_PATH =
-  process.env.SECURITY_TOOLS_PATH ||
-  path.join("/tmp", "security_tools.json");
-
-const HISTORY_PATH =
-  process.env.SECURITY_HISTORY_PATH ||
-  path.join("/tmp", "security_score_history.json");
-
-/* =========================================================
-   TOOL CATALOG
-   ========================================================= */
+   TOOL CATALOG (GLOBAL DEFINITION — STATE IS TENANT)
+========================================================= */
 
 const TOOL_CATALOG = [
   { id: "edr", name: "Endpoint Detection & Response", domain: "endpoint", weight: 15 },
@@ -31,53 +17,28 @@ const TOOL_CATALOG = [
 ];
 
 /* =========================================================
-   STATE
-   ========================================================= */
+   TENANT STATE (IN MEMORY — ISOLATED)
+========================================================= */
 
-let toolState = {};
-let scoreHistory = [];
-let lastRecordedScore = null;
+const TENANT_STATE = {}; // { tenantId: { tools, history, lastScore } }
 
-/* =========================================================
-   LOAD / SAVE
-   ========================================================= */
+function ensureTenant(tenantId) {
+  if (!tenantId) tenantId = "global";
 
-function safeLoad(file, fallback) {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, "utf-8"));
-    }
-  } catch {}
-  return fallback;
+  if (!TENANT_STATE[tenantId]) {
+    TENANT_STATE[tenantId] = {
+      tools: {},
+      history: [],
+      lastScore: null,
+    };
+  }
+
+  return TENANT_STATE[tenantId];
 }
-
-function safeSave(file, data) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-  } catch {}
-}
-
-function loadAll() {
-  toolState = safeLoad(TOOLS_PATH, {});
-  scoreHistory = safeLoad(HISTORY_PATH, []);
-  lastRecordedScore = scoreHistory.length
-    ? scoreHistory[scoreHistory.length - 1].score
-    : null;
-}
-
-function saveTools() {
-  safeSave(TOOLS_PATH, toolState);
-}
-
-function saveHistory() {
-  safeSave(HISTORY_PATH, scoreHistory);
-}
-
-loadAll();
 
 /* =========================================================
    DOMAIN LABELS
-   ========================================================= */
+========================================================= */
 
 const DOMAIN_LABELS = {
   endpoint: "Endpoint Security",
@@ -89,10 +50,10 @@ const DOMAIN_LABELS = {
 };
 
 /* =========================================================
-   SCORE ENGINE
-   ========================================================= */
+   SCORE ENGINE (TENANT-AWARE)
+========================================================= */
 
-function calculateDomains() {
+function calculateDomains(tools) {
   const domains = {};
 
   TOOL_CATALOG.forEach((tool) => {
@@ -105,7 +66,7 @@ function calculateDomains() {
 
     domains[tool.domain].totalWeight += tool.weight;
 
-    if (toolState[tool.id]) {
+    if (tools[tool.id]) {
       domains[tool.domain].coverageWeight += tool.weight;
     }
   });
@@ -117,7 +78,7 @@ function calculateDomains() {
         : Math.round((val.coverageWeight / val.totalWeight) * 100);
 
     const issues = TOOL_CATALOG.filter(
-      (t) => t.domain === key && !toolState[t.id]
+      (t) => t.domain === key && !tools[t.id]
     ).length;
 
     return {
@@ -150,127 +111,88 @@ function classifyScore(score) {
   return { tier: "Critical", risk: "Severe" };
 }
 
-function calculateTrend(currentScore) {
-  if (lastRecordedScore === null) return "stable";
-  if (currentScore > lastRecordedScore) return "up";
-  if (currentScore < lastRecordedScore) return "down";
-  return "stable";
-}
-
-function calculateVolatility() {
-  if (scoreHistory.length < 5) return "low";
-
-  const lastFive = scoreHistory.slice(-5);
-  const scores = lastFive.map((e) => e.score);
-
-  const max = Math.max(...scores);
-  const min = Math.min(...scores);
-
-  const diff = max - min;
-
-  if (diff > 20) return "high";
-  if (diff > 10) return "moderate";
-  return "low";
-}
-
-/* =========================================================
-   ALERT ENGINE (NEW)
-   ========================================================= */
-
-function evaluateAlerts(currentScore) {
-  if (lastRecordedScore === null) return;
-
-  const drop = lastRecordedScore - currentScore;
-
-  // Major drop alert
-  if (drop >= 15) {
-    recordEvent({
-      type: "posture_drop",
-      severity: "critical",
-      description: `Security posture dropped by ${drop} points`,
-      meta: { previous: lastRecordedScore, current: currentScore },
-    });
-  }
-
-  // Critical threshold alert
-  if (currentScore < 40) {
-    recordEvent({
-      type: "critical_posture",
-      severity: "critical",
-      description: `Security posture is critically low (${currentScore})`,
-      meta: { score: currentScore },
-    });
-  }
-}
-
-function recordHistory(score) {
-  if (lastRecordedScore === score) return;
-
-  evaluateAlerts(score);
-
-  const entry = {
-    ts: Date.now(),
-    iso: new Date().toISOString(),
-    score,
-  };
-
-  scoreHistory.push(entry);
-
-  if (scoreHistory.length > 200) {
-    scoreHistory = scoreHistory.slice(-200);
-  }
-
-  lastRecordedScore = score;
-  saveHistory();
-}
-
 /* =========================================================
    POSTURE
-   ========================================================= */
+========================================================= */
 
 router.get("/posture", (req, res) => {
-  const domains = calculateDomains();
+  const tenantId = req.tenant?.id || "global";
+  const tenant = ensureTenant(tenantId);
+
+  const domains = calculateDomains(tenant.tools);
   const overall = calculateOverall(domains);
   const classification = classifyScore(overall);
-  const trend = calculateTrend(overall);
-  const volatility = calculateVolatility();
 
-  recordHistory(overall);
+  if (tenant.lastScore !== overall) {
+    tenant.history.push({
+      ts: Date.now(),
+      iso: new Date().toISOString(),
+      score: overall,
+    });
 
-  const posture = {
-    updatedAt: new Date().toISOString(),
-    score: overall,
-    tier: classification.tier,
-    risk: classification.risk,
-    trend,
-    volatility,
-    domains,
-  };
+    if (tenant.history.length > 200) {
+      tenant.history = tenant.history.slice(-200);
+    }
 
-  return res.json({ ok: true, posture });
-});
+    // Alert on critical drop
+    if (
+      tenant.lastScore !== null &&
+      tenant.lastScore - overall >= 15
+    ) {
+      recordEvent({
+        tenantId,
+        type: "posture_drop",
+        severity: "critical",
+        description: `Security posture dropped by ${
+          tenant.lastScore - overall
+        } points`,
+      });
+    }
 
-/* =========================================================
-   SCORE HISTORY
-   ========================================================= */
+    tenant.lastScore = overall;
+  }
 
-router.get("/score-history", (req, res) => {
   return res.json({
     ok: true,
-    history: scoreHistory.slice(-50),
+    posture: {
+      updatedAt: new Date().toISOString(),
+      score: overall,
+      tier: classification.tier,
+      risk: classification.risk,
+      domains,
+    },
   });
 });
 
 /* =========================================================
-   EVENTS
-   ========================================================= */
+   SCORE HISTORY
+========================================================= */
+
+router.get("/score-history", (req, res) => {
+  const tenantId = req.tenant?.id || "global";
+  const tenant = ensureTenant(tenantId);
+
+  return res.json({
+    ok: true,
+    history: tenant.history.slice(-50),
+  });
+});
+
+/* =========================================================
+   EVENTS (TENANT ISOLATED)
+========================================================= */
 
 router.get("/events", (req, res) => {
   try {
+    const tenantId = req.tenant?.id || "global";
     const limit = Number(req.query.limit) || 50;
     const severity = req.query.severity || null;
 
-    const events = listEvents({ limit, severity });
+    const events = listEvents({
+      tenantId,
+      limit,
+      severity,
+    });
 
     return res.json({ ok: true, events });
   } catch {
@@ -282,46 +204,65 @@ router.get("/events", (req, res) => {
 });
 
 /* =========================================================
-   TOOL LIST
-   ========================================================= */
+   TOOL LIST (TENANT-SCOPED)
+========================================================= */
 
 router.get("/tools", (req, res) => {
+  const tenantId = req.tenant?.id || "global";
+  const tenant = ensureTenant(tenantId);
+
   const tools = TOOL_CATALOG.map((tool) => ({
     id: tool.id,
     name: tool.name,
     domain: tool.domain,
-    installed: !!toolState[tool.id],
+    installed: !!tenant.tools[tool.id],
   }));
 
   return res.json({ ok: true, tools });
 });
 
 /* =========================================================
-   INSTALL / UNINSTALL
-   ========================================================= */
+   INSTALL / UNINSTALL (TENANT-SCOPED)
+========================================================= */
 
 router.post("/tools/:id/install", (req, res) => {
+  const tenantId = req.tenant?.id || "global";
+  const tenant = ensureTenant(tenantId);
   const id = req.params.id;
 
   if (!TOOL_CATALOG.find((t) => t.id === id)) {
     return res.status(404).json({ ok: false, error: "Tool not found" });
   }
 
-  toolState[id] = true;
-  saveTools();
+  tenant.tools[id] = true;
+
+  recordEvent({
+    tenantId,
+    type: "tool_install",
+    severity: "info",
+    description: `Installed tool: ${id}`,
+  });
 
   return res.json({ ok: true, installed: true });
 });
 
 router.post("/tools/:id/uninstall", (req, res) => {
+  const tenantId = req.tenant?.id || "global";
+  const tenant = ensureTenant(tenantId);
   const id = req.params.id;
 
   if (!TOOL_CATALOG.find((t) => t.id === id)) {
     return res.status(404).json({ ok: false, error: "Tool not found" });
   }
 
-  delete toolState[id];
-  saveTools();
+  delete tenant.tools[id];
+
+  recordEvent({
+    tenantId,
+    type: "tool_uninstall",
+    severity: "warn",
+    description: `Uninstalled tool: ${id}`,
+  });
 
   return res.json({ ok: true, installed: false });
 });
