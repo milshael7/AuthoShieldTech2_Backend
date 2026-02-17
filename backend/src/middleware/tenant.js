@@ -1,5 +1,5 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v2)
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v3)
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
@@ -13,8 +13,15 @@ function resolveFromSubdomain(req) {
   let host = req.hostname || req.headers.host;
   if (!host) return null;
 
-  // Remove port if present
   host = String(host).split(":")[0];
+
+  // Ignore localhost & IP addresses
+  if (
+    host.includes("localhost") ||
+    /^\d+\.\d+\.\d+\.\d+$/.test(host)
+  ) {
+    return null;
+  }
 
   const parts = host.split(".");
   if (parts.length < 3) return null;
@@ -23,11 +30,11 @@ function resolveFromSubdomain(req) {
 }
 
 function tenantMiddleware(req, res, next) {
+
+  // 🔒 DO NOT force auth here
+  // Auth middleware handles protection
   if (!req.user) {
-    return res.status(401).json({
-      ok: false,
-      error: "Authentication required",
-    });
+    return next();
   }
 
   const role = normRole(req.user.role);
@@ -38,13 +45,13 @@ function tenantMiddleware(req, res, next) {
 
   /* ================= RESOLUTION ORDER ================= */
 
-  // 1️⃣ Primary: Auth token
+  // 1️⃣ Auth token companyId
   if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
     resolvedFrom = "auth";
   }
 
-  // 2️⃣ Admin-only override header
+  // 2️⃣ Admin override header
   if (!companyId && isAdmin) {
     const headerCompany = req.headers["x-company-id"];
     if (headerCompany) {
@@ -53,7 +60,7 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  // 3️⃣ Subdomain (optional)
+  // 3️⃣ Subdomain
   if (!companyId) {
     const sub = resolveFromSubdomain(req);
     if (sub) {
@@ -62,12 +69,14 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  /* ================= ADMIN GLOBAL ACCESS ================= */
+  /* ================= GLOBAL ADMIN ================= */
 
   if (isAdmin && !companyId) {
     req.tenant = {
       id: null,
       type: "global",
+      brainKey: "global",
+      resolvedFrom: "admin-global",
       userId: req.user.id,
       role: req.user.role,
       scope: {
@@ -76,36 +85,29 @@ function tenantMiddleware(req, res, next) {
         isCompany: false,
         isIndividual: false,
       },
-      brainKey: "global",
-      resolvedFrom: "admin-global",
     };
 
     return next();
   }
 
-  if (!companyId) {
-    return res.status(400).json({
-      ok: false,
-      error: "Company context missing",
-    });
-  }
-
   /* ================= TENANT CONTEXT ================= */
 
-  req.tenant = {
-    id: companyId,
-    type: "tenant",
-    userId: req.user.id,
-    role: req.user.role,
-    scope: {
-      isAdmin,
-      isManager: role === "manager",
-      isCompany: role === "company",
-      isIndividual: role === "individual",
-    },
-    brainKey: companyId,
-    resolvedFrom,
-  };
+  if (companyId) {
+    req.tenant = {
+      id: companyId,
+      type: "tenant",
+      brainKey: `tenant:${companyId}`, // normalized
+      resolvedFrom,
+      userId: req.user.id,
+      role: req.user.role,
+      scope: {
+        isAdmin,
+        isManager: role === "manager",
+        isCompany: role === "company",
+        isIndividual: role === "individual",
+      },
+    };
+  }
 
   return next();
 }
