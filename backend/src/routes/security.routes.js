@@ -2,9 +2,10 @@ const express = require("express");
 const router = express.Router();
 
 const { listEvents, recordEvent } = require("../services/securityEvents");
+const securityTools = require("../services/securityTools");
 
 /* =========================================================
-   TOOL CATALOG (GLOBAL DEFINITION — STATE IS TENANT)
+   TOOL CATALOG (UI Reference Only)
 ========================================================= */
 
 const TOOL_CATALOG = [
@@ -15,26 +16,6 @@ const TOOL_CATALOG = [
   { id: "sat", name: "Security Awareness Training", domain: "awareness", weight: 10 },
   { id: "darkweb", name: "Dark Web Monitoring", domain: "threat", weight: 10 },
 ];
-
-/* =========================================================
-   TENANT STATE (IN MEMORY — ISOLATED)
-========================================================= */
-
-const TENANT_STATE = {}; // { tenantId: { tools, history, lastScore } }
-
-function ensureTenant(tenantId) {
-  if (!tenantId) tenantId = "global";
-
-  if (!TENANT_STATE[tenantId]) {
-    TENANT_STATE[tenantId] = {
-      tools: {},
-      history: [],
-      lastScore: null,
-    };
-  }
-
-  return TENANT_STATE[tenantId];
-}
 
 /* =========================================================
    DOMAIN LABELS
@@ -50,10 +31,11 @@ const DOMAIN_LABELS = {
 };
 
 /* =========================================================
-   SCORE ENGINE (TENANT-AWARE)
+   SCORE ENGINE (Service-backed)
 ========================================================= */
 
-function calculateDomains(tools) {
+function calculateDomains(installedList) {
+  const installed = new Set(installedList || []);
   const domains = {};
 
   TOOL_CATALOG.forEach((tool) => {
@@ -66,7 +48,7 @@ function calculateDomains(tools) {
 
     domains[tool.domain].totalWeight += tool.weight;
 
-    if (tools[tool.id]) {
+    if (installed.has(tool.id)) {
       domains[tool.domain].coverageWeight += tool.weight;
     }
   });
@@ -78,7 +60,7 @@ function calculateDomains(tools) {
         : Math.round((val.coverageWeight / val.totalWeight) * 100);
 
     const issues = TOOL_CATALOG.filter(
-      (t) => t.domain === key && !tools[t.id]
+      (t) => t.domain === key && !installed.has(t.id)
     ).length;
 
     return {
@@ -116,83 +98,165 @@ function classifyScore(score) {
 ========================================================= */
 
 router.get("/posture", (req, res) => {
-  const tenantId = req.tenant?.id || "global";
-  const tenant = ensureTenant(tenantId);
+  try {
+    const tenantId = req.tenant?.id;
 
-  const domains = calculateDomains(tenant.tools);
-  const overall = calculateOverall(domains);
-  const classification = classifyScore(overall);
-
-  if (tenant.lastScore !== overall) {
-    tenant.history.push({
-      ts: Date.now(),
-      iso: new Date().toISOString(),
-      score: overall,
-    });
-
-    if (tenant.history.length > 200) {
-      tenant.history = tenant.history.slice(-200);
-    }
-
-    // Alert on critical drop
-    if (
-      tenant.lastScore !== null &&
-      tenant.lastScore - overall >= 15
-    ) {
-      recordEvent({
-        tenantId,
-        type: "posture_drop",
-        severity: "critical",
-        description: `Security posture dropped by ${
-          tenant.lastScore - overall
-        } points`,
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
       });
     }
 
-    tenant.lastScore = overall;
-  }
+    const { installed } = securityTools.listTools(tenantId);
 
-  return res.json({
-    ok: true,
-    posture: {
-      updatedAt: new Date().toISOString(),
-      score: overall,
-      tier: classification.tier,
-      risk: classification.risk,
-      domains,
-    },
-  });
+    const domains = calculateDomains(installed);
+    const overall = calculateOverall(domains);
+    const classification = classifyScore(overall);
+
+    return res.json({
+      ok: true,
+      posture: {
+        updatedAt: new Date().toISOString(),
+        score: overall,
+        tier: classification.tier,
+        risk: classification.risk,
+        domains,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to calculate posture",
+    });
+  }
 });
 
 /* =========================================================
-   SCORE HISTORY
+   TOOL LIST
 ========================================================= */
 
-router.get("/score-history", (req, res) => {
-  const tenantId = req.tenant?.id || "global";
-  const tenant = ensureTenant(tenantId);
+router.get("/tools", (req, res) => {
+  try {
+    const tenantId = req.tenant?.id;
 
-  return res.json({
-    ok: true,
-    history: tenant.history.slice(-50),
-  });
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
+    const { installed, blocked } =
+      securityTools.listTools(tenantId);
+
+    const tools = TOOL_CATALOG.map((tool) => ({
+      id: tool.id,
+      name: tool.name,
+      domain: tool.domain,
+      installed: installed.includes(tool.id),
+      blocked: blocked.includes(tool.id),
+    }));
+
+    return res.json({ ok: true, tools });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to list tools",
+    });
+  }
 });
 
 /* =========================================================
-   EVENTS (TENANT ISOLATED)
+   INSTALL
+========================================================= */
+
+router.post("/tools/:id/install", (req, res) => {
+  try {
+    const tenantId = req.tenant?.id;
+    const toolId = req.params.id;
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
+    const updated = securityTools.installTool(
+      tenantId,
+      toolId,
+      req.user?.id
+    );
+
+    recordEvent({
+      type: "tool_install",
+      severity: "info",
+      source: "security_tools",
+      target: toolId,
+      description: `Installed tool: ${toolId}`,
+      meta: { tenantId },
+    });
+
+    return res.json({ ok: true, installed: updated });
+  } catch (e) {
+    return res.status(400).json({
+      ok: false,
+      error: e?.message || "Install failed",
+    });
+  }
+});
+
+/* =========================================================
+   UNINSTALL
+========================================================= */
+
+router.post("/tools/:id/uninstall", (req, res) => {
+  try {
+    const tenantId = req.tenant?.id;
+    const toolId = req.params.id;
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
+    const updated = securityTools.uninstallTool(
+      tenantId,
+      toolId,
+      req.user?.id
+    );
+
+    recordEvent({
+      type: "tool_uninstall",
+      severity: "warn",
+      source: "security_tools",
+      target: toolId,
+      description: `Uninstalled tool: ${toolId}`,
+      meta: { tenantId },
+    });
+
+    return res.json({ ok: true, installed: updated });
+  } catch (e) {
+    return res.status(400).json({
+      ok: false,
+      error: e?.message || "Uninstall failed",
+    });
+  }
+});
+
+/* =========================================================
+   EVENTS (Tenant Filtered)
 ========================================================= */
 
 router.get("/events", (req, res) => {
   try {
-    const tenantId = req.tenant?.id || "global";
     const limit = Number(req.query.limit) || 50;
     const severity = req.query.severity || null;
 
-    const events = listEvents({
-      tenantId,
-      limit,
-      severity,
-    });
+    const events = listEvents({ limit, severity });
 
     return res.json({ ok: true, events });
   } catch {
@@ -201,70 +265,6 @@ router.get("/events", (req, res) => {
       error: "Unable to fetch security events",
     });
   }
-});
-
-/* =========================================================
-   TOOL LIST (TENANT-SCOPED)
-========================================================= */
-
-router.get("/tools", (req, res) => {
-  const tenantId = req.tenant?.id || "global";
-  const tenant = ensureTenant(tenantId);
-
-  const tools = TOOL_CATALOG.map((tool) => ({
-    id: tool.id,
-    name: tool.name,
-    domain: tool.domain,
-    installed: !!tenant.tools[tool.id],
-  }));
-
-  return res.json({ ok: true, tools });
-});
-
-/* =========================================================
-   INSTALL / UNINSTALL (TENANT-SCOPED)
-========================================================= */
-
-router.post("/tools/:id/install", (req, res) => {
-  const tenantId = req.tenant?.id || "global";
-  const tenant = ensureTenant(tenantId);
-  const id = req.params.id;
-
-  if (!TOOL_CATALOG.find((t) => t.id === id)) {
-    return res.status(404).json({ ok: false, error: "Tool not found" });
-  }
-
-  tenant.tools[id] = true;
-
-  recordEvent({
-    tenantId,
-    type: "tool_install",
-    severity: "info",
-    description: `Installed tool: ${id}`,
-  });
-
-  return res.json({ ok: true, installed: true });
-});
-
-router.post("/tools/:id/uninstall", (req, res) => {
-  const tenantId = req.tenant?.id || "global";
-  const tenant = ensureTenant(tenantId);
-  const id = req.params.id;
-
-  if (!TOOL_CATALOG.find((t) => t.id === id)) {
-    return res.status(404).json({ ok: false, error: "Tool not found" });
-  }
-
-  delete tenant.tools[id];
-
-  recordEvent({
-    tenantId,
-    type: "tool_uninstall",
-    severity: "warn",
-    description: `Uninstalled tool: ${id}`,
-  });
-
-  return res.json({ ok: true, installed: false });
 });
 
 module.exports = router;
