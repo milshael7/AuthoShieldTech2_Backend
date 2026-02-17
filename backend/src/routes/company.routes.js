@@ -1,6 +1,6 @@
 // backend/src/routes/company.routes.js
-// Company Room API — Institutional Hardened
-// Scoped Isolation • Admin Override Safe • Production Ready
+// Company Room API — Institutional Hardened v2
+// Strict Isolation • No Privilege Escalation • Admin Override Safe
 
 const express = require("express");
 const router = express.Router();
@@ -25,6 +25,30 @@ function normRole(r) {
   return String(r || "").trim().toLowerCase();
 }
 
+/* =========================================================
+   SECURITY ENFORCEMENT
+========================================================= */
+
+function ensureCompanyActive(req) {
+  if (req.user?.suspended) {
+    const err = new Error("Company account suspended");
+    err.status = 403;
+    throw err;
+  }
+}
+
+function ensureMemberSafe(targetUser) {
+  const role = normRole(targetUser?.role);
+
+  if (role === normRole(users.ROLES.ADMIN)) {
+    throw new Error("Cannot assign admin to company");
+  }
+
+  if (role === normRole(users.ROLES.MANAGER)) {
+    throw new Error("Cannot assign manager to company");
+  }
+}
+
 /*
    Resolve company scope safely
 */
@@ -32,7 +56,7 @@ function resolveCompanyId(req) {
   const role = normRole(req.user?.role);
   const isAdmin = role === normRole(users.ROLES.ADMIN);
 
-  // Admin override
+  // Admin override allowed
   if (isAdmin) {
     const fromQuery = safeStr(req.query.companyId, 100);
     const fromBody = safeStr(req.body?.companyId, 100);
@@ -41,7 +65,7 @@ function resolveCompanyId(req) {
     return fromQuery || fromBody || fromToken || null;
   }
 
-  // Company users limited to assigned company
+  // Company role locked to its own company
   return safeStr(req.user.companyId, 100) || null;
 }
 
@@ -63,12 +87,13 @@ function requireCompany(req, res) {
    COMPANY PROFILE
 ========================================================= */
 
-// GET /api/company/me
 router.get(
   "/me",
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
+      ensureCompanyActive(req);
+
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -80,12 +105,22 @@ router.get(
         });
       }
 
+      // Sanitize output
+      const sanitized = {
+        id: c.id,
+        name: c.name,
+        sizeTier: c.sizeTier || "standard",
+        suspended: !!c.suspended,
+        members: c.members || [],
+        createdAt: c.createdAt || null,
+      };
+
       return res.json({
         ok: true,
-        company: c,
+        company: sanitized,
       });
     } catch (e) {
-      return res.status(500).json({
+      return res.status(e.status || 500).json({
         ok: false,
         error: e?.message || String(e),
       });
@@ -97,12 +132,13 @@ router.get(
    NOTIFICATIONS
 ========================================================= */
 
-// GET /api/company/notifications
 router.get(
   "/notifications",
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
+      ensureCompanyActive(req);
+
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -111,7 +147,7 @@ router.get(
         notifications: listNotifications({ companyId }) || [],
       });
     } catch (e) {
-      return res.status(500).json({
+      return res.status(e.status || 500).json({
         ok: false,
         error: e?.message || String(e),
       });
@@ -119,12 +155,13 @@ router.get(
   }
 );
 
-// POST /api/company/notifications/:id/read
 router.post(
   "/notifications/:id/read",
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
+      ensureCompanyActive(req);
+
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -150,7 +187,7 @@ router.post(
         notification: n,
       });
     } catch (e) {
-      return res.status(500).json({
+      return res.status(e.status || 500).json({
         ok: false,
         error: e?.message || String(e),
       });
@@ -162,12 +199,13 @@ router.post(
    MEMBER MANAGEMENT
 ========================================================= */
 
-// POST /api/company/members/add
 router.post(
   "/members/add",
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
+      ensureCompanyActive(req);
+
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -178,6 +216,16 @@ router.post(
           error: "Missing userId",
         });
       }
+
+      const targetUser = users.getUser(userId);
+      if (!targetUser) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found",
+        });
+      }
+
+      ensureMemberSafe(targetUser);
 
       const result = companies.addMember(
         companyId,
@@ -198,12 +246,13 @@ router.post(
   }
 );
 
-// POST /api/company/members/remove
 router.post(
   "/members/remove",
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
+      ensureCompanyActive(req);
+
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
