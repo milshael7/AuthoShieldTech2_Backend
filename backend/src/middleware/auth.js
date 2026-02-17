@@ -1,15 +1,21 @@
 // backend/src/middleware/auth.js
-// JWT auth middleware used by protected routes (Admin / Manager / Company gates)
+// JWT Auth Middleware — Phase 5 Hardened
+// Token validation + DB recheck + Suspension enforcement
 
-const { verify } = require("../lib/jwt"); // ✅ FIXED PATH (single source of truth)
+const { verify } = require("../lib/jwt");
+const { readDb } = require("../lib/db");
+
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
 
 /* ======================================================
-   AUTH REQUIRED
-   ====================================================== */
+   AUTH REQUIRED — HARD VALIDATION
+====================================================== */
 function authRequired(req, res, next) {
-  const h = String(req.headers.authorization || "");
-  const token = h.startsWith("Bearer ")
-    ? h.slice(7).trim()
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ")
+    ? header.slice(7).trim()
     : null;
 
   if (!token) {
@@ -17,20 +23,46 @@ function authRequired(req, res, next) {
   }
 
   try {
-    // ✅ verify now uses internal JWT_SECRET from lib/jwt.js
     const payload = verify(token);
 
-    // 🔒 Hard validation of token payload
     if (
       !payload ||
       typeof payload !== "object" ||
+      typeof payload.id !== "string" ||
       typeof payload.role !== "string"
     ) {
       return res.status(401).json({ error: "Invalid token payload" });
     }
 
-    req.user = payload;
+    // 🔒 RE-VALIDATE USER AGAINST DATABASE
+    const db = readDb();
+    const user = (db.users || []).find((u) => u.id === payload.id);
+
+    if (!user) {
+      return res.status(401).json({ error: "User no longer exists" });
+    }
+
+    if (user.locked === true) {
+      return res.status(403).json({ error: "Account suspended" });
+    }
+
+    // Optional: if company suspended
+    if (user.companyId && db.companies) {
+      const company = db.companies.find(c => c.id === user.companyId);
+      if (company?.suspended) {
+        return res.status(403).json({ error: "Company suspended" });
+      }
+    }
+
+    // Attach sanitized user context
+    req.user = {
+      id: user.id,
+      role: user.role,
+      companyId: user.companyId || null,
+    };
+
     return next();
+
   } catch (e) {
     return res.status(401).json({ error: "Invalid token" });
   }
@@ -38,21 +70,11 @@ function authRequired(req, res, next) {
 
 /* ======================================================
    ROLE GUARD
-   ====================================================== */
+====================================================== */
 
-function normRole(r) {
-  return String(r || "").trim().toLowerCase();
-}
-
-/**
- * requireRole('Admin','Manager')
- * requireRole(['Admin','Manager'])
- * requireRole('Manager', { adminAlso: true })
- */
 function requireRole(...args) {
   let opts = {};
 
-  // options object as last argument
   if (
     args.length &&
     typeof args[args.length - 1] === "object" &&
@@ -74,12 +96,12 @@ function requireRole(...args) {
 
     const userRole = normRole(req.user.role);
 
-    // ✅ Admin always allowed if explicitly listed
+    // Admin explicitly allowed
     if (allow.has(adminRole) && userRole === adminRole) {
       return next();
     }
 
-    // ✅ Optional admin override
+    // Optional admin override
     if (adminAlso && userRole === adminRole) {
       return next();
     }
