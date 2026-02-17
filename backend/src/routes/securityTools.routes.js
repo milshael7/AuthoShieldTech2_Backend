@@ -1,6 +1,6 @@
 // backend/src/routes/securityTools.routes.js
 // Enterprise Security Tool API
-// Tenant-aware • Production-ready
+// Tenant-aware • Admin override safe • Production hardened
 
 const express = require("express");
 const router = express.Router();
@@ -11,42 +11,69 @@ const {
   uninstallTool,
 } = require("../services/securityTools");
 
-// NOTE:
-// tenantMiddleware already runs before this route.
-// We expect req.tenant or req.companyId to exist.
+/* =========================================================
+   HELPERS
+========================================================= */
 
-function getCompanyId(req) {
-  return (
-    req.tenant?.companyId ||
-    req.companyId ||
-    "default"
-  );
+function resolveTenantId(req) {
+  // tenant middleware already resolved this
+  if (req.tenant?.id) return req.tenant.id;
+
+  // fallback (should rarely happen)
+  if (req.companyId) return req.companyId;
+
+  // admin global
+  if (req.tenant?.type === "global") return "global";
+
+  return null;
 }
 
-/* ================= LIST ================= */
+/* =========================================================
+   LIST TOOLS
+========================================================= */
 
 router.get("/", (req, res) => {
   try {
-    const companyId = getCompanyId(req);
-    const installed = listTools(companyId);
+    const tenantId = resolveTenantId(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
+    const installed = listTools(tenantId);
 
     return res.json({
       ok: true,
+      tenantId,
       installed,
     });
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "Failed to list tools",
+      error: e?.message || "Failed to list tools",
     });
   }
 });
 
-/* ================= INSTALL ================= */
+/* =========================================================
+   INSTALL TOOL
+========================================================= */
 
 router.post("/install", (req, res) => {
   try {
-    const { toolId } = req.body;
+    const tenantId = resolveTenantId(req);
+    const toolId = String(req.body?.toolId || "").trim();
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
     if (!toolId) {
       return res.status(400).json({
         ok: false,
@@ -54,26 +81,37 @@ router.post("/install", (req, res) => {
       });
     }
 
-    const companyId = getCompanyId(req);
-    const installed = installTool(companyId, toolId);
+    const installed = installTool(tenantId, toolId);
 
     return res.json({
       ok: true,
+      tenantId,
       installed,
     });
-  } catch {
+  } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "Install failed",
+      error: e?.message || "Install failed",
     });
   }
 });
 
-/* ================= UNINSTALL ================= */
+/* =========================================================
+   UNINSTALL TOOL
+========================================================= */
 
 router.post("/uninstall", (req, res) => {
   try {
-    const { toolId } = req.body;
+    const tenantId = resolveTenantId(req);
+    const toolId = String(req.body?.toolId || "").trim();
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Tenant context missing",
+      });
+    }
+
     if (!toolId) {
       return res.status(400).json({
         ok: false,
@@ -81,17 +119,17 @@ router.post("/uninstall", (req, res) => {
       });
     }
 
-    const companyId = getCompanyId(req);
-    const installed = uninstallTool(companyId, toolId);
+    const installed = uninstallTool(tenantId, toolId);
 
     return res.json({
       ok: true,
+      tenantId,
       installed,
     });
-  } catch {
+  } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "Uninstall failed",
+      error: e?.message || "Uninstall failed",
     });
   }
 });
