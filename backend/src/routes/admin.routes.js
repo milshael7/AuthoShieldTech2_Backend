@@ -1,5 +1,5 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Supreme Authority Version (Phase 4 Final)
+// Admin API — Supreme Authority Version (Phase 5 Hardened)
 
 const express = require("express");
 const router = express.Router();
@@ -38,6 +38,12 @@ function safeLimit(v, max = 1000, fallback = 200) {
   return Math.min(n, max);
 }
 
+function requireId(id) {
+  const clean = cleanStr(id, 100);
+  if (!clean) throw new Error("Invalid id");
+  return clean;
+}
+
 function audit(action, actorId, targetId, meta = {}) {
   const db = readDb();
   db.audit = db.audit || [];
@@ -52,6 +58,23 @@ function audit(action, actorId, targetId, meta = {}) {
   });
 
   writeDb(db);
+}
+
+function ensureNotSelfAction(req, targetId) {
+  if (req.user.id === targetId) {
+    throw new Error("Admin cannot perform this action on themselves");
+  }
+}
+
+function ensureNotLastAdmin(targetUser) {
+  const db = readDb();
+  const admins = (db.users || []).filter(
+    (u) => u.role === ADMIN_ROLE && !u.locked
+  );
+
+  if (admins.length <= 1 && targetUser.role === ADMIN_ROLE) {
+    throw new Error("Cannot modify the last active admin");
+  }
 }
 
 /* =========================================================
@@ -73,13 +96,21 @@ router.get("/users", (req, res) => {
 // SUSPEND USER
 router.post("/users/:id/suspend", (req, res) => {
   try {
+    const id = requireId(req.params.id);
+    ensureNotSelfAction(req, id);
+
+    const target = users.listUsers().find((u) => u.id === id);
+    if (!target) throw new Error("User not found");
+
+    ensureNotLastAdmin(target);
+
     const updated = users.updateUser(
-      req.params.id,
+      id,
       { locked: true },
       req.user.id
     );
 
-    audit("ADMIN_SUSPEND_USER", req.user.id, req.params.id);
+    audit("ADMIN_SUSPEND_USER", req.user.id, id);
 
     return res.json({ ok: true, user: updated });
   } catch (e) {
@@ -90,13 +121,15 @@ router.post("/users/:id/suspend", (req, res) => {
 // REACTIVATE USER
 router.post("/users/:id/reactivate", (req, res) => {
   try {
+    const id = requireId(req.params.id);
+
     const updated = users.updateUser(
-      req.params.id,
+      id,
       { locked: false },
       req.user.id
     );
 
-    audit("ADMIN_REACTIVATE_USER", req.user.id, req.params.id);
+    audit("ADMIN_REACTIVATE_USER", req.user.id, id);
 
     return res.json({ ok: true, user: updated });
   } catch (e) {
@@ -107,15 +140,26 @@ router.post("/users/:id/reactivate", (req, res) => {
 // CHANGE USER ROLE
 router.post("/users/:id/role", (req, res) => {
   try {
+    const id = requireId(req.params.id);
+    ensureNotSelfAction(req, id);
+
     const role = cleanStr(req.body.role, 50);
+    if (!Object.values(users.ROLES).includes(role)) {
+      throw new Error("Invalid role");
+    }
+
+    const target = users.listUsers().find((u) => u.id === id);
+    if (!target) throw new Error("User not found");
+
+    ensureNotLastAdmin(target);
 
     const updated = users.updateUser(
-      req.params.id,
+      id,
       { role },
       req.user.id
     );
 
-    audit("ADMIN_CHANGE_ROLE", req.user.id, req.params.id, { role });
+    audit("ADMIN_CHANGE_ROLE", req.user.id, id, { role });
 
     return res.json({ ok: true, user: updated });
   } catch (e) {
@@ -142,10 +186,11 @@ router.get("/companies", (req, res) => {
 // CREATE COMPANY
 router.post("/companies", (req, res) => {
   try {
-    const body = req.body || {};
+    const name = cleanStr(req.body?.name, 200);
+    if (!name) throw new Error("Company name required");
 
     const created = companies.createCompany({
-      name: cleanStr(body.name, 200),
+      name,
       createdBy: req.user.id,
     });
 
@@ -163,11 +208,13 @@ router.post("/companies", (req, res) => {
 // SUSPEND COMPANY
 router.post("/companies/:id/suspend", (req, res) => {
   try {
-    const updated = companies.updateCompany(req.params.id, {
+    const id = requireId(req.params.id);
+
+    const updated = companies.updateCompany(id, {
       suspended: true,
     });
 
-    audit("ADMIN_SUSPEND_COMPANY", req.user.id, req.params.id);
+    audit("ADMIN_SUSPEND_COMPANY", req.user.id, id);
 
     return res.json({ ok: true, company: updated });
   } catch (e) {
@@ -178,11 +225,13 @@ router.post("/companies/:id/suspend", (req, res) => {
 // REACTIVATE COMPANY
 router.post("/companies/:id/reactivate", (req, res) => {
   try {
-    const updated = companies.updateCompany(req.params.id, {
+    const id = requireId(req.params.id);
+
+    const updated = companies.updateCompany(id, {
       suspended: false,
     });
 
-    audit("ADMIN_REACTIVATE_COMPANY", req.user.id, req.params.id);
+    audit("ADMIN_REACTIVATE_COMPANY", req.user.id, id);
 
     return res.json({ ok: true, company: updated });
   } catch (e) {
