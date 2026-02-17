@@ -1,137 +1,200 @@
-// backend/src/routes/securityTools.routes.js
-// Enterprise Security Tool API
-// Tenant-aware • Admin override safe • Production hardened
+// backend/src/services/securityTools.js
+// Enterprise Security Tool State Engine
+// Tenant-isolated • Persistent • Admin-block capable • Scalable to 70+ tools
 
-const express = require("express");
-const router = express.Router();
-
-const {
-  listTools,
-  installTool,
-  uninstallTool,
-} = require("../services/securityTools");
+const fs = require("fs");
+const path = require("path");
 
 /* =========================================================
-   HELPERS
+   CONFIG
 ========================================================= */
 
-function resolveTenantId(req) {
-  // tenant middleware already resolved this
-  if (req.tenant?.id) return req.tenant.id;
+const DATA_PATH =
+  process.env.SECURITY_TOOLS_PATH ||
+  path.join("/tmp", "security_tools.json");
 
-  // fallback (should rarely happen)
-  if (req.companyId) return req.companyId;
+const MAX_TENANTS = 5000;
 
-  // admin global
-  if (req.tenant?.type === "global") return "global";
+/* =========================================================
+   UTIL
+========================================================= */
 
-  return null;
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function clean(v, max = 100) {
+  return String(v ?? "").trim().slice(0, max);
+}
+
+function ensureDir(file) {
+  try {
+    const dir = path.dirname(file);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  } catch {}
 }
 
 /* =========================================================
-   LIST TOOLS
+   STATE
 ========================================================= */
 
-router.get("/", (req, res) => {
-  try {
-    const tenantId = resolveTenantId(req);
-
-    if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Tenant context missing",
-      });
-    }
-
-    const installed = listTools(tenantId);
-
-    return res.json({
-      ok: true,
-      tenantId,
-      installed,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "Failed to list tools",
-    });
-  }
-});
+let state = {
+  createdAt: nowIso(),
+  updatedAt: nowIso(),
+  tenants: {
+    /*
+      tenantId: {
+        installed: [],
+        blocked: [],
+        createdAt,
+        updatedAt
+      }
+    */
+  },
+};
 
 /* =========================================================
-   INSTALL TOOL
+   LOAD / SAVE
 ========================================================= */
 
-router.post("/install", (req, res) => {
+function load() {
   try {
-    const tenantId = resolveTenantId(req);
-    const toolId = String(req.body?.toolId || "").trim();
+    ensureDir(DATA_PATH);
+    if (!fs.existsSync(DATA_PATH)) return;
 
-    if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Tenant context missing",
-      });
-    }
+    state = JSON.parse(fs.readFileSync(DATA_PATH, "utf-8"));
 
-    if (!toolId) {
-      return res.status(400).json({
-        ok: false,
-        error: "toolId required",
-      });
-    }
-
-    const installed = installTool(tenantId, toolId);
-
-    return res.json({
-      ok: true,
-      tenantId,
-      installed,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "Install failed",
-    });
+    if (!state.tenants) state.tenants = {};
+  } catch {
+    state = {
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      tenants: {},
+    };
   }
-});
+}
+
+function save() {
+  try {
+    state.updatedAt = nowIso();
+    fs.writeFileSync(DATA_PATH, JSON.stringify(state, null, 2));
+  } catch {}
+}
+
+load();
 
 /* =========================================================
-   UNINSTALL TOOL
+   TENANT RESOLUTION
 ========================================================= */
 
-router.post("/uninstall", (req, res) => {
-  try {
-    const tenantId = resolveTenantId(req);
-    const toolId = String(req.body?.toolId || "").trim();
+function ensureTenant(tenantId) {
+  tenantId = clean(tenantId || "global", 100);
 
-    if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Tenant context missing",
-      });
+  if (!state.tenants[tenantId]) {
+    if (Object.keys(state.tenants).length > MAX_TENANTS) {
+      throw new Error("Tenant limit reached");
     }
 
-    if (!toolId) {
-      return res.status(400).json({
-        ok: false,
-        error: "toolId required",
-      });
-    }
-
-    const installed = uninstallTool(tenantId, toolId);
-
-    return res.json({
-      ok: true,
-      tenantId,
-      installed,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "Uninstall failed",
-    });
+    state.tenants[tenantId] = {
+      installed: [],
+      blocked: [],
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
   }
-});
 
-module.exports = router;
+  return state.tenants[tenantId];
+}
+
+/* =========================================================
+   CORE API
+========================================================= */
+
+function listTools(tenantId) {
+  const tenant = ensureTenant(tenantId);
+
+  return {
+    installed: tenant.installed.slice(),
+    blocked: tenant.blocked.slice(),
+  };
+}
+
+function installTool(tenantId, toolId) {
+  const tenant = ensureTenant(tenantId);
+  toolId = clean(toolId, 100);
+
+  if (!toolId) throw new Error("Invalid toolId");
+
+  if (tenant.blocked.includes(toolId)) {
+    throw new Error("Tool is blocked by administrator");
+  }
+
+  if (!tenant.installed.includes(toolId)) {
+    tenant.installed.push(toolId);
+    tenant.updatedAt = nowIso();
+    save();
+  }
+
+  return tenant.installed.slice();
+}
+
+function uninstallTool(tenantId, toolId) {
+  const tenant = ensureTenant(tenantId);
+  toolId = clean(toolId, 100);
+
+  tenant.installed = tenant.installed.filter((t) => t !== toolId);
+  tenant.updatedAt = nowIso();
+
+  save();
+
+  return tenant.installed.slice();
+}
+
+/* =========================================================
+   ADMIN CONTROL (BLOCK / UNBLOCK)
+========================================================= */
+
+function blockTool(tenantId, toolId) {
+  const tenant = ensureTenant(tenantId);
+  toolId = clean(toolId, 100);
+
+  if (!tenant.blocked.includes(toolId)) {
+    tenant.blocked.push(toolId);
+  }
+
+  // force uninstall if blocked
+  tenant.installed = tenant.installed.filter((t) => t !== toolId);
+
+  tenant.updatedAt = nowIso();
+  save();
+
+  return {
+    blocked: tenant.blocked.slice(),
+    installed: tenant.installed.slice(),
+  };
+}
+
+function unblockTool(tenantId, toolId) {
+  const tenant = ensureTenant(tenantId);
+  toolId = clean(toolId, 100);
+
+  tenant.blocked = tenant.blocked.filter((t) => t !== toolId);
+  tenant.updatedAt = nowIso();
+  save();
+
+  return tenant.blocked.slice();
+}
+
+/* =========================================================
+   EXPORT
+========================================================= */
+
+module.exports = {
+  listTools,
+  installTool,
+  uninstallTool,
+  blockTool,
+  unblockTool,
+};
