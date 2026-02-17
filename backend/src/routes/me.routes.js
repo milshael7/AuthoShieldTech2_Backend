@@ -1,6 +1,6 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Institutional Hardened (Phase 3 Lock)
-// Individual Scope • Tenant Safe • AutoProtect Guarded • Audited • Context Validated
+// Me Endpoints — Institutional Hardened (Phase 4 Stability Lock)
+// Individual Scope • Tenant Safe • AutoProtect Guarded • Input Validated • Audited
 
 const express = require("express");
 const router = express.Router();
@@ -39,17 +39,19 @@ function normRole(r) {
   return String(r || "").trim().toLowerCase();
 }
 
+function isObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v);
+}
+
 function canUseAutoProtect(user) {
   const role = normRole(user.role);
 
   if (!role) return false;
 
-  // Only Individual accounts allowed
   if (role !== normRole(users.ROLES?.INDIVIDUAL || "Individual")) {
     return false;
   }
 
-  // Safe getter fallback
   if (typeof users.getAutoprotect !== "function") {
     return false;
   }
@@ -61,13 +63,10 @@ function canUseAutoProtect(user) {
    NOTIFICATIONS
 ========================================================= */
 
-// GET /api/me/notifications
 router.get("/notifications", (req, res) => {
   try {
     const notifications =
-      listNotifications({
-        userId: req.user.id,
-      }) || [];
+      listNotifications({ userId: req.user.id }) || [];
 
     return res.json({
       ok: true,
@@ -81,7 +80,6 @@ router.get("/notifications", (req, res) => {
   }
 });
 
-// POST /api/me/notifications/:id/read
 router.post("/notifications/:id/read", (req, res) => {
   try {
     const id = cleanStr(req.params.id, 100);
@@ -118,7 +116,6 @@ router.post("/notifications/:id/read", (req, res) => {
    AUTOPROTECT PROJECT CREATION
 ========================================================= */
 
-// POST /api/me/projects
 router.post("/projects", (req, res) => {
   try {
     const user = req.user;
@@ -131,13 +128,9 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    const body = req.body || {};
+    const body = isObject(req.body) ? req.body : {};
 
     const title = cleanStr(body.title, 200);
-    const issue = body.issue || {};
-
-    const issueType = cleanStr(issue.type, 100);
-    const details = cleanStr(issue.details, 2000);
 
     if (!title) {
       return res.status(400).json({
@@ -145,6 +138,16 @@ router.post("/projects", (req, res) => {
         error: "Missing title",
       });
     }
+
+    if (!isObject(body.issue)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid issue payload",
+      });
+    }
+
+    const issueType = cleanStr(body.issue.type, 100);
+    const details = cleanStr(body.issue.details, 2000);
 
     if (!issueType) {
       return res.status(400).json({
