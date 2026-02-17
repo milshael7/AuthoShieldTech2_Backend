@@ -1,6 +1,7 @@
 // backend/src/routes/manager.routes.js
 // Manager Room API — Institutional Hardened (Read-Only)
 // Admin inherits access
+// Explicit privilege boundaries enforced
 
 const express = require("express");
 const router = express.Router();
@@ -17,6 +18,7 @@ const { listNotifications } = require("../lib/notify");
 ========================================================= */
 
 const MANAGER = users?.ROLES?.MANAGER || "Manager";
+const ADMIN = users?.ROLES?.ADMIN || "Admin";
 
 /* =========================================================
    MIDDLEWARE
@@ -26,7 +28,7 @@ router.use(authRequired);
 router.use(requireRole(MANAGER, { adminAlso: true }));
 
 /* =========================================================
-   HELPERS
+   SECURITY HELPERS
 ========================================================= */
 
 function clampInt(n, min, max, fallback) {
@@ -41,12 +43,36 @@ function safeStr(v, maxLen = 120) {
 }
 
 /* =========================================================
+   ACCESS ENFORCEMENT
+========================================================= */
+
+// Manager cannot override admin
+function ensureNotAdminTarget(targetRole) {
+  if (String(targetRole || "").toLowerCase() === "admin") {
+    const err = new Error("Managers cannot act on admin accounts");
+    err.status = 403;
+    throw err;
+  }
+}
+
+// Prevent suspended manager usage
+function ensureManagerActive(req) {
+  if (req.user?.suspended) {
+    const err = new Error("Manager account suspended");
+    err.status = 403;
+    throw err;
+  }
+}
+
+/* =========================================================
    OVERVIEW
 ========================================================= */
 
 // GET /api/manager/overview
 router.get("/overview", (req, res) => {
   try {
+    ensureManagerActive(req);
+
     const db = readDb();
 
     return res.json({
@@ -60,7 +86,7 @@ router.get("/overview", (req, res) => {
       time: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
       error: e?.message || String(e),
     });
@@ -71,15 +97,28 @@ router.get("/overview", (req, res) => {
    USERS (READ-ONLY)
 ========================================================= */
 
-// GET /api/manager/users
 router.get("/users", (req, res) => {
   try {
+    ensureManagerActive(req);
+
+    const allUsers = users.listUsers() || [];
+
+    // Manager cannot inspect internal admin secrets
+    const sanitized = allUsers.map(u => ({
+      id: u.id,
+      email: u.email,
+      role: u.role,
+      companyId: u.companyId || null,
+      suspended: !!u.suspended,
+      mfa: !!u.mfa
+    }));
+
     return res.json({
       ok: true,
-      users: users.listUsers(),
+      users: sanitized,
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
       error: e?.message || String(e),
     });
@@ -90,15 +129,26 @@ router.get("/users", (req, res) => {
    COMPANIES (READ-ONLY)
 ========================================================= */
 
-// GET /api/manager/companies
 router.get("/companies", (req, res) => {
   try {
+    ensureManagerActive(req);
+
+    const list = companies.listCompanies() || [];
+
+    const sanitized = list.map(c => ({
+      id: c.id,
+      name: c.name,
+      suspended: !!c.suspended,
+      sizeTier: c.sizeTier || "standard",
+      createdAt: c.createdAt || null,
+    }));
+
     return res.json({
       ok: true,
-      companies: companies.listCompanies(),
+      companies: sanitized,
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
       error: e?.message || String(e),
     });
@@ -109,9 +159,10 @@ router.get("/companies", (req, res) => {
    NOTIFICATIONS
 ========================================================= */
 
-// GET /api/manager/notifications
 router.get("/notifications", (req, res) => {
   try {
+    ensureManagerActive(req);
+
     const limit = clampInt(req.query.limit, 1, 1000, 200);
     const all = listNotifications({}) || [];
 
@@ -120,7 +171,7 @@ router.get("/notifications", (req, res) => {
       notifications: all.slice(0, limit),
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
       error: e?.message || String(e),
     });
@@ -131,9 +182,10 @@ router.get("/notifications", (req, res) => {
    AUDIT
 ========================================================= */
 
-// GET /api/manager/audit
 router.get("/audit", (req, res) => {
   try {
+    ensureManagerActive(req);
+
     const db = readDb();
     const limit = clampInt(req.query.limit, 1, 1000, 200);
 
@@ -161,7 +213,7 @@ router.get("/audit", (req, res) => {
       audit: items.slice(0, limit),
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
       error: e?.message || String(e),
     });
