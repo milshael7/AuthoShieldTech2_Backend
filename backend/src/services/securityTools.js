@@ -1,6 +1,6 @@
 // backend/src/services/securityTools.js
-// Enterprise Security Tool State Engine — Hardened v2
-// Tenant-Isolated • Admin-Controllable • Auditable • 70+ Tool Ready
+// Enterprise Security Tool State Engine — Hardened v3
+// Tenant-Isolated • Company-Level Blocking • Admin-Governed • Auditable • 70+ Tool Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -19,7 +19,6 @@ const MAX_TOOLS_PER_COMPANY = 200;
 
 /* =========================================================
    TOOL REGISTRY (Master Catalog)
-   Later this will expand to 70+
 ========================================================= */
 
 const TOOL_REGISTRY = new Set([
@@ -59,10 +58,10 @@ function ensureDir(file) {
 {
   createdAt,
   updatedAt,
-  blockedTools: [],
   companies: {
      companyId: {
         installed: [],
+        blocked: [],
         createdAt
      }
   }
@@ -72,7 +71,6 @@ function ensureDir(file) {
 let state = {
   createdAt: nowIso(),
   updatedAt: nowIso(),
-  blockedTools: [],
   companies: {},
 };
 
@@ -89,7 +87,6 @@ function load() {
     state = {
       createdAt: nowIso(),
       updatedAt: nowIso(),
-      blockedTools: [],
       companies: {},
     };
   }
@@ -118,16 +115,16 @@ function validateTool(toolId) {
 
 function ensureCompany(companyId) {
   const id = clean(companyId, 100);
-
   if (!id) throw new Error("Company id required");
 
   if (!state.companies[id]) {
-    if (Object.keys(state.companies).length > MAX_COMPANIES) {
+    if (Object.keys(state.companies).length >= MAX_COMPANIES) {
       throw new Error("Company limit exceeded");
     }
 
     state.companies[id] = {
       installed: [],
+      blocked: [],
       createdAt: nowIso(),
     };
   }
@@ -144,7 +141,7 @@ function listTools(companyId) {
 
   return {
     installed: state.companies[id].installed,
-    blocked: state.blockedTools,
+    blocked: state.companies[id].blocked,
   };
 }
 
@@ -156,18 +153,18 @@ function installTool(companyId, toolId, actorId = "system") {
   const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
-  if (state.blockedTools.includes(tool)) {
-    throw new Error("Tool is globally blocked by admin");
+  const company = state.companies[id];
+
+  if (company.blocked.includes(tool)) {
+    throw new Error("Tool is blocked by admin for this company");
   }
 
-  const installed = state.companies[id].installed;
-
-  if (installed.length >= MAX_TOOLS_PER_COMPANY) {
+  if (company.installed.length >= MAX_TOOLS_PER_COMPANY) {
     throw new Error("Tool limit exceeded");
   }
 
-  if (!installed.includes(tool)) {
-    installed.push(tool);
+  if (!company.installed.includes(tool)) {
+    company.installed.push(tool);
     save();
 
     audit({
@@ -179,7 +176,10 @@ function installTool(companyId, toolId, actorId = "system") {
     });
   }
 
-  return installed;
+  return {
+    installed: company.installed,
+    blocked: company.blocked,
+  };
 }
 
 /* =========================================================
@@ -190,8 +190,10 @@ function uninstallTool(companyId, toolId, actorId = "system") {
   const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
-  state.companies[id].installed =
-    state.companies[id].installed.filter((t) => t !== tool);
+  const company = state.companies[id];
+
+  company.installed =
+    company.installed.filter((t) => t !== tool);
 
   save();
 
@@ -203,18 +205,29 @@ function uninstallTool(companyId, toolId, actorId = "system") {
     companyId: id,
   });
 
-  return state.companies[id].installed;
+  return {
+    installed: company.installed,
+    blocked: company.blocked,
+  };
 }
 
 /* =========================================================
-   ADMIN CONTROL — GLOBAL BLOCK
+   ADMIN CONTROL — COMPANY-SCOPED BLOCKING
 ========================================================= */
 
-function blockTool(toolId, actorId) {
+function blockTool(companyId, toolId, actorId) {
+  const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
-  if (!state.blockedTools.includes(tool)) {
-    state.blockedTools.push(tool);
+  const company = state.companies[id];
+
+  if (!company.blocked.includes(tool)) {
+    company.blocked.push(tool);
+
+    // remove from installed if currently installed
+    company.installed =
+      company.installed.filter((t) => t !== tool);
+
     save();
 
     audit({
@@ -222,28 +235,39 @@ function blockTool(toolId, actorId) {
       action: "ADMIN_BLOCK_TOOL",
       targetType: "Tool",
       targetId: tool,
+      companyId: id,
     });
   }
 
-  return state.blockedTools;
+  return {
+    installed: company.installed,
+    blocked: company.blocked,
+  };
 }
 
-function unblockTool(toolId, actorId) {
+function unblockTool(companyId, toolId, actorId) {
+  const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
-  state.blockedTools =
-    state.blockedTools.filter((t) => t !== tool);
+  const company = state.companies[id];
+
+  company.blocked =
+    company.blocked.filter((t) => t !== tool);
 
   save();
 
   audit({
     actorId,
     action: "ADMIN_UNBLOCK_TOOL",
-    targetType: "Tool",
-    targetId: tool,
+      targetType: "Tool",
+      targetId: tool,
+      companyId: id,
   });
 
-  return state.blockedTools;
+  return {
+    installed: company.installed,
+    blocked: company.blocked,
+  };
 }
 
 /* =========================================================
