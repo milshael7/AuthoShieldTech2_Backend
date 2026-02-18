@@ -1,9 +1,13 @@
 // backend/src/middleware/auth.js
-// JWT Auth Middleware — Production Hardened
-// Graceful token handling + stable refresh
+// JWT Auth Middleware — Enterprise Hardened • Tier Enforced • Approval Safe
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
+const users = require("../users/user.service");
+
+/* ======================================================
+   HELPERS
+====================================================== */
 
 function normRole(r) {
   return String(r || "").trim().toLowerCase();
@@ -17,53 +21,90 @@ function extractToken(req) {
   return null;
 }
 
+function error(res, code, message) {
+  return res.status(code).json({
+    ok: false,
+    error: message,
+  });
+}
+
 /* ======================================================
-   AUTH REQUIRED — STABLE
+   AUTH REQUIRED
 ====================================================== */
+
 function authRequired(req, res, next) {
   const token = extractToken(req);
 
   if (!token) {
-    return res.status(401).json({ error: "Missing token" });
+    return error(res, 401, "Missing token");
   }
 
   let payload;
 
   try {
     payload = verify(token);
-  } catch (e) {
-    // DO NOT crash
-    return res.status(401).json({ error: "Token expired or invalid" });
+  } catch {
+    return error(res, 401, "Token expired or invalid");
   }
 
   if (!payload?.id || !payload?.role) {
-    return res.status(401).json({ error: "Invalid token payload" });
+    return error(res, 401, "Invalid token payload");
   }
 
   const db = readDb();
   const user = (db.users || []).find((u) => u.id === payload.id);
 
   if (!user) {
-    return res.status(401).json({ error: "User no longer exists" });
+    return error(res, 401, "User no longer exists");
   }
+
+  /* --------------------------------------------------
+     USER STATUS ENFORCEMENT
+  -------------------------------------------------- */
 
   if (user.locked === true) {
-    return res.status(403).json({ error: "Account suspended" });
+    return error(res, 403, "Account locked");
   }
 
-  if (user.companyId && db.companies) {
+  if (user.status !== users.APPROVAL_STATUS.APPROVED) {
+    return error(res, 403, "Account not approved");
+  }
+
+  if (
+    user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
+    user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE
+  ) {
+    return error(res, 403, "Subscription inactive");
+  }
+
+  /* --------------------------------------------------
+     COMPANY STATUS ENFORCEMENT
+  -------------------------------------------------- */
+
+  if (user.companyId && Array.isArray(db.companies)) {
     const company = db.companies.find(
       (c) => c.id === user.companyId
     );
-    if (company?.suspended) {
-      return res.status(403).json({ error: "Company suspended" });
+
+    if (!company) {
+      return error(res, 403, "Company not found");
+    }
+
+    if (company.status !== "Active") {
+      return error(res, 403, "Company not active");
     }
   }
+
+  /* --------------------------------------------------
+     ATTACH CLEAN CONTEXT
+  -------------------------------------------------- */
 
   req.user = {
     id: user.id,
     role: user.role,
     companyId: user.companyId || null,
+    subscriptionStatus: user.subscriptionStatus,
+    status: user.status,
   };
 
   return next();
@@ -92,29 +133,25 @@ function requireRole(...args) {
 
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({ error: "Missing auth" });
+      return error(res, 401, "Missing auth context");
     }
 
     const userRole = normRole(req.user.role);
 
-    if (allow.has(adminRole) && userRole === adminRole) {
-      return next();
-    }
-
-    if (adminAlso && userRole === adminRole) {
+    // direct admin access
+    if (userRole === adminRole && adminAlso) {
       return next();
     }
 
     if (!allow.has(userRole)) {
-      return res.status(403).json({
-        error: "Forbidden",
-        role: req.user.role,
-        allowed: Array.from(allow),
-      });
+      return error(res, 403, "Forbidden");
     }
 
     return next();
   };
 }
 
-module.exports = { authRequired, requireRole };
+module.exports = {
+  authRequired,
+  requireRole,
+};
