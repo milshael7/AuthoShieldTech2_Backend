@@ -1,5 +1,5 @@
 // backend/src/routes/company.routes.js
-// Company Room API — Tier Controlled • Plan Enforced • Secure
+// Company Room API — Tier Controlled • Structured Members • Secure
 
 const express = require("express");
 const router = express.Router();
@@ -153,7 +153,7 @@ router.post(
 );
 
 /* =========================================================
-   MEMBER MANAGEMENT
+   MEMBER MANAGEMENT (WITH POSITION)
 ========================================================= */
 
 router.post(
@@ -165,6 +165,8 @@ router.post(
       if (!companyId) return;
 
       const userId = safeStr(req.body?.userId, 100);
+      const position = safeStr(req.body?.position, 80) || "member";
+
       if (!userId) {
         return res.status(400).json({
           ok: false,
@@ -193,7 +195,8 @@ router.post(
       const result = companies.addMember(
         companyId,
         userId,
-        req.user.id
+        req.user.id,
+        position
       );
 
       return res.json({
