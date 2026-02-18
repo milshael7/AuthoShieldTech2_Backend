@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Institutional Hardened (Phase 5 Integrity Lock)
+// Me Endpoints — Branch Aware • Structured Dashboard • Secure
 
 const express = require("express");
 const router = express.Router();
@@ -8,12 +8,13 @@ const { authRequired } = require("../middleware/auth");
 const { listNotifications, markRead } = require("../lib/notify");
 const { audit } = require("../lib/audit");
 const users = require("../users/user.service");
+const companies = require("../companies/company.service");
 const { createProject } = require("../autoprotect/autoprotect.service");
 
 router.use(authRequired);
 
 /* =========================================================
-   GLOBAL AUTH CONTEXT GUARD
+   AUTH CONTEXT GUARD
 ========================================================= */
 
 router.use((req, res, next) => {
@@ -42,21 +43,65 @@ function isObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
 }
 
-function canUseAutoProtect(user) {
+function canUseAutoDev(user) {
   const role = normRole(user.role);
-
-  if (!role) return false;
-
-  if (role !== normRole(users.ROLES?.INDIVIDUAL || "Individual")) {
-    return false;
-  }
-
-  if (typeof users.getAutoprotect !== "function") {
-    return false;
-  }
-
-  return !!users.getAutoprotect(user);
+  return role === normRole(users.ROLES?.INDIVIDUAL || "Individual");
 }
+
+/* =========================================================
+   DASHBOARD CONTEXT (NEW)
+========================================================= */
+
+router.get("/dashboard", (req, res) => {
+  try {
+    const user = req.user;
+    const role = normRole(user.role);
+
+    let dashboardType = "individual";
+    let position = "member";
+    let companyInfo = null;
+
+    if (user.companyId) {
+      const company = companies.getCompany(user.companyId);
+
+      if (company) {
+        dashboardType = "company_member";
+
+        const memberRecord =
+          company.members?.find(
+            m => String(m.userId || m) === String(user.id)
+          );
+
+        if (memberRecord && typeof memberRecord === "object") {
+          position = memberRecord.position || "member";
+        }
+
+        companyInfo = {
+          id: company.id,
+          name: company.name,
+          tier: company.tier,
+        };
+      }
+    }
+
+    return res.json({
+      ok: true,
+      dashboard: {
+        role: user.role,
+        type: dashboardType,
+        position,
+        company: companyInfo,
+        autoDevEnabled: canUseAutoDev(user),
+      },
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
 
 /* =========================================================
    NOTIFICATIONS
@@ -90,7 +135,6 @@ router.post("/notifications/:id/read", (req, res) => {
       });
     }
 
-    // Defensive check before mutation
     const existing =
       listNotifications({ userId: req.user.id })
         ?.find(n => String(n.id) === id);
@@ -98,7 +142,7 @@ router.post("/notifications/:id/read", (req, res) => {
     if (!existing) {
       return res.status(404).json({
         ok: false,
-        error: "Notification not found or not owned by user",
+        error: "Notification not found",
       });
     }
 
@@ -118,18 +162,17 @@ router.post("/notifications/:id/read", (req, res) => {
 });
 
 /* =========================================================
-   AUTOPROTECT PROJECT CREATION
+   PROJECT CREATION (INDIVIDUAL ONLY)
 ========================================================= */
 
 router.post("/projects", (req, res) => {
   try {
     const user = req.user;
 
-    if (!canUseAutoProtect(user)) {
+    if (!canUseAutoDev(user)) {
       return res.status(403).json({
         ok: false,
-        error: "AutoProtect not enabled for this account",
-        hint: "Upgrade required",
+        error: "Upgrade required",
       });
     }
 
@@ -141,7 +184,6 @@ router.post("/projects", (req, res) => {
     }
 
     const title = cleanStr(req.body.title, 200);
-
     if (!title) {
       return res.status(400).json({
         ok: false,
@@ -166,11 +208,9 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    const companyId = user.companyId || null;
-
     const project = createProject({
       actorId: user.id,
-      companyId,
+      companyId: user.companyId || null,
       title,
       issue: {
         type: issueType,
@@ -180,11 +220,9 @@ router.post("/projects", (req, res) => {
 
     audit({
       actorId: user.id,
-      action: "AUTOPROTECT_PROJECT_CREATED",
+      action: "PROJECT_CREATED",
       targetType: "Project",
       targetId: project.id,
-      companyId,
-      metadata: { issueType },
     });
 
     return res.status(201).json({
