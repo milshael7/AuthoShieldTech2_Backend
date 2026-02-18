@@ -28,6 +28,13 @@ const SUBSCRIPTION = {
   LOCKED: "Locked",
 };
 
+const APPROVAL_STATUS = {
+  PENDING: "pending",
+  MANAGER_APPROVED: "manager_approved",
+  APPROVED: "approved",
+  DENIED: "denied",
+};
+
 /* ======================================================
    INTERNAL HELPERS
 ====================================================== */
@@ -64,20 +71,6 @@ function requireRoleAuthority(actorRole, targetRole) {
 }
 
 /* ======================================================
-   AUTOPROTECT
-====================================================== */
-
-function getAutoprotect(u) {
-  return !!(u?.autoprotectEnabled ?? u?.autoprotechEnabled);
-}
-
-function setAutoprotect(u, enabled) {
-  const val = !!enabled;
-  u.autoprotectEnabled = val;
-  u.autoprotechEnabled = val;
-}
-
-/* ======================================================
    ADMIN BOOTSTRAP
 ====================================================== */
 
@@ -106,24 +99,18 @@ function ensureAdminFromEnv() {
     createdAt: new Date().toISOString(),
     subscriptionStatus: SUBSCRIPTION.ACTIVE,
     mustResetPassword: false,
-    profile: { displayName: "Admin" },
-  };
+    locked: false,
 
-  setAutoprotect(admin, true);
+    status: APPROVAL_STATUS.APPROVED,
+    approvedBy: "system",
+  };
 
   db.users.push(admin);
   writeDb(db);
-
-  audit({
-    actorId: admin.id,
-    actorRole: admin.role,
-    action: "ADMIN_BOOTSTRAP",
-    target: admin.id,
-  });
 }
 
 /* ======================================================
-   USER CREATION
+   USER CREATION (NOW PENDING BY DEFAULT)
 ====================================================== */
 
 function createUser({ email, password, role, profile = {}, companyId = null }) {
@@ -143,8 +130,6 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     throw new Error("Password too short");
   }
 
-  const isIndividual = r === ROLES.INDIVIDUAL;
-
   const u = {
     id: nanoid(),
     platformId: `AS-${nanoid(10).toUpperCase()}`,
@@ -153,29 +138,76 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     role: r,
     companyId: companyId || null,
     createdAt: new Date().toISOString(),
-    subscriptionStatus: isIndividual
-      ? SUBSCRIPTION.TRIAL
-      : SUBSCRIPTION.ACTIVE,
-    trialEndsAt: isIndividual
-      ? new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
-      : null,
+    subscriptionStatus: SUBSCRIPTION.TRIAL,
     mustResetPassword: false,
-    profile: typeof profile === "object" ? profile : {},
     locked: false,
-  };
 
-  setAutoprotect(u, r === ROLES.ADMIN || r === ROLES.MANAGER);
+    status: APPROVAL_STATUS.PENDING,
+    approvedBy: null,
+    profile: typeof profile === "object" ? profile : {},
+  };
 
   db.users.push(u);
   writeDb(db);
 
-  audit({
-    actorId: u.id,
-    actorRole: u.role,
-    action: "USER_CREATED",
-    target: u.id,
-  });
+  return sanitize(u);
+}
 
+/* ======================================================
+   APPROVAL SYSTEM
+====================================================== */
+
+function listPendingUsers() {
+  const db = readDb();
+  ensureArrays(db);
+  return db.users
+    .filter((u) => u.status === APPROVAL_STATUS.PENDING)
+    .map(sanitize);
+}
+
+function managerApproveUser(id, actorId) {
+  const db = readDb();
+  ensureArrays(db);
+
+  const u = db.users.find((x) => x.id === id);
+  if (!u) throw new Error("User not found");
+
+  if (u.status !== APPROVAL_STATUS.PENDING) {
+    throw new Error("User not pending");
+  }
+
+  u.status = APPROVAL_STATUS.MANAGER_APPROVED;
+  u.approvedBy = "manager";
+
+  writeDb(db);
+  return sanitize(u);
+}
+
+function adminApproveUser(id, actorId) {
+  const db = readDb();
+  ensureArrays(db);
+
+  const u = db.users.find((x) => x.id === id);
+  if (!u) throw new Error("User not found");
+
+  u.status = APPROVAL_STATUS.APPROVED;
+  u.approvedBy = "admin";
+
+  writeDb(db);
+  return sanitize(u);
+}
+
+function adminDenyUser(id, actorId) {
+  const db = readDb();
+  ensureArrays(db);
+
+  const u = db.users.find((x) => x.id === id);
+  if (!u) throw new Error("User not found");
+
+  u.status = APPROVAL_STATUS.DENIED;
+  u.locked = true;
+
+  writeDb(db);
   return sanitize(u);
 }
 
@@ -196,129 +228,16 @@ function listUsers() {
 }
 
 /* ======================================================
-   UPDATE (HARDENED)
+   PASSWORD VERIFY (LOGIN ENFORCEMENT)
 ====================================================== */
-
-function updateUser(id, patch, actorId, actorRole = ROLES.ADMIN) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  const p = patch && typeof patch === "object" ? { ...patch } : {};
-
-  // Prevent privilege escalation
-  if (typeof p.role !== "undefined") {
-    const newRole = requireValidRole(p.role);
-    requireRoleAuthority(actorRole, u.role);
-    p.role = newRole;
-  }
-
-  if (typeof p.autoprotectEnabled !== "undefined") {
-    setAutoprotect(u, p.autoprotectEnabled);
-    delete p.autoprotectEnabled;
-    delete p.autoprotechEnabled;
-  }
-
-  Object.assign(u, p);
-  writeDb(db);
-
-  audit({
-    actorId,
-    actorRole,
-    action: "USER_UPDATED",
-    target: id,
-  });
-
-  return sanitize(u);
-}
-
-/* ======================================================
-   LOCK / SUSPEND
-====================================================== */
-
-function suspendUser(id, actorId, actorRole) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  requireRoleAuthority(actorRole, u.role);
-
-  u.locked = true;
-  u.subscriptionStatus = SUBSCRIPTION.LOCKED;
-
-  writeDb(db);
-
-  audit({
-    actorId,
-    actorRole,
-    action: "USER_SUSPENDED",
-    target: id,
-  });
-
-  return sanitize(u);
-}
-
-/* ======================================================
-   PASSWORD / SECURITY
-====================================================== */
-
-function rotatePlatformIdAndForceReset(id, actorId) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  u.platformId = `AS-${nanoid(10).toUpperCase()}`;
-  u.mustResetPassword = true;
-
-  writeDb(db);
-
-  audit({
-    actorId,
-    actorRole: "system",
-    action: "USER_ROTATE_ID",
-    target: id,
-  });
-
-  return sanitize(u);
-}
-
-function setPassword(id, newPassword, actorId) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  if (!newPassword || String(newPassword).length < 4) {
-    throw new Error("Password too short");
-  }
-
-  u.passwordHash = bcrypt.hashSync(String(newPassword), 10);
-  u.mustResetPassword = false;
-
-  writeDb(db);
-
-  audit({
-    actorId,
-    actorRole: "system",
-    action: "USER_PASSWORD_SET",
-    target: id,
-  });
-
-  return sanitize(u);
-}
 
 function verifyPassword(user, password) {
   if (!user) return false;
 
-  if (user.locked || user.subscriptionStatus === SUBSCRIPTION.LOCKED) {
-    throw new Error("Account locked");
+  if (user.locked) throw new Error("Account locked");
+
+  if (user.status !== APPROVAL_STATUS.APPROVED) {
+    throw new Error("Account not approved");
   }
 
   return bcrypt.compareSync(
@@ -334,14 +253,14 @@ function verifyPassword(user, password) {
 module.exports = {
   ROLES,
   SUBSCRIPTION,
+  APPROVAL_STATUS,
   ensureAdminFromEnv,
   createUser,
+  listPendingUsers,
+  managerApproveUser,
+  adminApproveUser,
+  adminDenyUser,
   findByEmail,
   listUsers,
-  updateUser,
-  suspendUser,
-  rotatePlatformIdAndForceReset,
-  setPassword,
   verifyPassword,
-  getAutoprotect,
 };
