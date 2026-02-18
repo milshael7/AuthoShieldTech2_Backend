@@ -1,5 +1,5 @@
 // backend/src/routes/auth.routes.js
-// Auth API — Phase 8 Hardened Approval + Multi-Tenant Safe
+// Auth API — Phase 9 Hardened Approval + Multi-Tenant Safe
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -106,7 +106,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // 🔒 Approval enforcement
+    // Approval enforcement
     if (u.status !== users.APPROVAL_STATUS.APPROVED) {
       return res.status(403).json({
         error: "Account not approved",
@@ -139,15 +139,12 @@ router.post("/login", async (req, res) => {
 });
 
 /* =========================================================
-   REFRESH (FIXED)
+   REFRESH (CLEAN + SAFE)
 ========================================================= */
 
 router.post("/refresh", authRequired, (req, res) => {
   try {
-    const dbUser = users.findByEmail(
-      users.listUsers()
-        .find(u => u.id === req.user.id)?.email
-    );
+    const dbUser = users.findById(req.user.id);
 
     if (!dbUser) {
       return res.status(401).json({ error: "User not found" });
