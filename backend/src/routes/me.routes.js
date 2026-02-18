@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Branch Aware • Structured Dashboard • Secure
+// Me Endpoints — Structured Dashboard • Branch Aware • Secure
 
 const express = require("express");
 const router = express.Router();
@@ -9,6 +9,7 @@ const { listNotifications, markRead } = require("../lib/notify");
 const { audit } = require("../lib/audit");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
+const securityTools = require("../services/securityTools");
 const { createProject } = require("../autoprotect/autoprotect.service");
 
 router.use(authRequired);
@@ -49,17 +50,17 @@ function canUseAutoDev(user) {
 }
 
 /* =========================================================
-   DASHBOARD CONTEXT (NEW)
+   DASHBOARD (BRANCH + TIER AWARE)
 ========================================================= */
 
 router.get("/dashboard", (req, res) => {
   try {
     const user = req.user;
-    const role = normRole(user.role);
 
     let dashboardType = "individual";
     let position = "member";
     let companyInfo = null;
+    let visibleTools = [];
 
     if (user.companyId) {
       const company = companies.getCompany(user.companyId);
@@ -67,6 +68,7 @@ router.get("/dashboard", (req, res) => {
       if (company) {
         dashboardType = "company_member";
 
+        // Member lookup (supports both string or object format)
         const memberRecord =
           company.members?.find(
             m => String(m.userId || m) === String(user.id)
@@ -80,7 +82,18 @@ router.get("/dashboard", (req, res) => {
           id: company.id,
           name: company.name,
           tier: company.tier,
+          maxUsers: company.maxUsers,
+          currentUsers: Array.isArray(company.members)
+            ? company.members.length
+            : 0,
         };
+
+        // Tool visibility based on branch + company rules
+        const toolState = securityTools.listTools(company.id);
+
+        visibleTools = toolState.installed.filter(
+          t => !toolState.blocked.includes(t)
+        );
       }
     }
 
@@ -92,6 +105,7 @@ router.get("/dashboard", (req, res) => {
         position,
         company: companyInfo,
         autoDevEnabled: canUseAutoDev(user),
+        visibleTools,
       },
     });
 
