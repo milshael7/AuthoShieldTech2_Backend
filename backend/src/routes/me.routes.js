@@ -50,7 +50,7 @@ function canUseAutoDev(user) {
 }
 
 /* =========================================================
-   DASHBOARD (SAFE + STRUCTURED)
+   DASHBOARD (BRANCH FILTERED)
 ========================================================= */
 
 router.get("/dashboard", (req, res) => {
@@ -58,21 +58,16 @@ router.get("/dashboard", (req, res) => {
     const user = req.user;
 
     let dashboardType = "individual";
-    let position = "member";
+    let branch = "member";
     let companyInfo = null;
     let visibleTools = [];
     let plan = null;
-
-    /* -----------------------------------------------
-       COMPANY CONTEXT
-    ------------------------------------------------ */
 
     if (user.companyId) {
       const company = companies.getCompany(user.companyId);
 
       if (company && company.status === "Active") {
 
-        // Ensure user is actually a member
         const memberRecord = company.members?.find(
           (m) => String(m.userId || m) === String(user.id)
         );
@@ -82,7 +77,7 @@ router.get("/dashboard", (req, res) => {
           dashboardType = "company_member";
 
           if (typeof memberRecord === "object") {
-            position = memberRecord.position || "member";
+            branch = memberRecord.position || "member";
           }
 
           plan = company.tier;
@@ -97,32 +92,22 @@ router.get("/dashboard", (req, res) => {
               : 0,
           };
 
-          /* -----------------------------------------------
-             TOOL VISIBILITY
-          ------------------------------------------------ */
-
-          const toolState = securityTools.listTools(company.id);
-
-          const installed = toolState.installed || [];
-          const blocked = toolState.blocked || [];
-
-          visibleTools = installed.filter(
-            (tool) => !blocked.includes(tool)
-          );
+          // 🔐 Branch-aware tool visibility
+          visibleTools =
+            securityTools.getVisibleToolsForBranch(
+              company.id,
+              branch
+            );
         }
       }
     }
-
-    /* -----------------------------------------------
-       FINAL RESPONSE
-    ------------------------------------------------ */
 
     return res.json({
       ok: true,
       dashboard: {
         role: user.role,
         type: dashboardType,
-        branch: position,
+        branch,
         plan,
         company: companyInfo,
         autoDevEnabled: canUseAutoDev(user),
