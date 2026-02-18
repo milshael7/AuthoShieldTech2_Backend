@@ -1,5 +1,5 @@
 // backend/src/routes/auth.routes.js
-// Auth API — Phase 7 Approval + Multi-Tenant Hardened
+// Auth API — Phase 8 Hardened Approval + Multi-Tenant Safe
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -44,7 +44,7 @@ function ensureJwtSecret(res) {
 }
 
 /* =========================================================
-   SIGNUP (PENDING FLOW)
+   SIGNUP (PENDING)
 ========================================================= */
 
 router.post("/signup", (req, res) => {
@@ -95,7 +95,7 @@ router.post("/login", async (req, res) => {
 
     const u = users.findByEmail(email);
 
-    // Anti-enumeration
+    // Anti-enumeration timing defense
     if (!u) {
       await bcrypt.compare(password, "$2a$10$invalidsaltinvalidsaltinv");
       return res.status(401).json({ error: "Invalid credentials" });
@@ -139,34 +139,47 @@ router.post("/login", async (req, res) => {
 });
 
 /* =========================================================
-   REFRESH
+   REFRESH (FIXED)
 ========================================================= */
 
 router.post("/refresh", authRequired, (req, res) => {
   try {
-    const u = users.findByEmail(req.user.email) || null;
+    const dbUser = users.findByEmail(
+      users.listUsers()
+        .find(u => u.id === req.user.id)?.email
+    );
 
-    if (!u) {
+    if (!dbUser) {
       return res.status(401).json({ error: "User not found" });
     }
 
-    if (u.status !== users.APPROVAL_STATUS.APPROVED) {
+    if (dbUser.status !== users.APPROVAL_STATUS.APPROVED) {
       return res.status(403).json({
         error: "Account not approved",
+      });
+    }
+
+    if (dbUser.locked === true) {
+      return res.status(403).json({
+        error: "Account suspended",
       });
     }
 
     if (!ensureJwtSecret(res)) return;
 
     const token = sign(
-      { id: u.id, role: u.role, companyId: u.companyId || null },
+      {
+        id: dbUser.id,
+        role: dbUser.role,
+        companyId: dbUser.companyId || null,
+      },
       null,
       "7d"
     );
 
     return res.json({
       token,
-      user: safeUserResponse(u),
+      user: safeUserResponse(dbUser),
     });
 
   } catch (e) {
@@ -204,7 +217,9 @@ router.post("/reset-password", (req, res) => {
       });
     }
 
-    users.setPassword?.(u.id, newPassword, u.id);
+    if (typeof users.setPassword === "function") {
+      users.setPassword(u.id, newPassword, u.id);
+    }
 
     return res.json({ ok: true });
 
