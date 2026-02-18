@@ -1,18 +1,15 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Supreme Authority (Phase 8 Hardened)
-// Approval System + Tool Governance + Safety Enforcement
+// Admin API — Phase 8
+// Approval History + Tool Governance + Supreme Authority
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
-const { readDb, writeDb } = require("../lib/db");
-
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
 const { listNotifications } = require("../lib/notify");
-const { recordEvent } = require("../services/securityEvents");
 
 /* =========================================================
    ROLE SAFETY
@@ -41,44 +38,19 @@ function requireId(id) {
   return clean;
 }
 
-function audit(action, actorId, targetId, meta = {}) {
-  const db = readDb();
-  db.audit = db.audit || [];
-
-  db.audit.push({
-    id: Date.now().toString(),
-    at: new Date().toISOString(),
-    action,
-    actorId,
-    targetId,
-    meta,
-  });
-
-  writeDb(db);
-}
-
 /* =========================================================
-   APPROVAL SYSTEM — HARDENED
+   APPROVAL SYSTEM
 ========================================================= */
 
 /**
- * List pending users (admin sees both pending + manager_approved)
+ * List pending users
  */
 router.get("/pending-users", (req, res) => {
   try {
-    const db = readDb();
-
-    const list = (db.users || []).filter(
-      (u) =>
-        u.status === users.APPROVAL_STATUS.PENDING ||
-        u.status === users.APPROVAL_STATUS.MANAGER_APPROVED
-    );
-
     return res.json({
       ok: true,
-      users: list,
+      users: users.listPendingUsers(),
     });
-
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
@@ -90,34 +62,17 @@ router.get("/pending-users", (req, res) => {
 router.post("/users/:id/approve", (req, res) => {
   try {
     const id = requireId(req.params.id);
-    const db = readDb();
 
-    const u = (db.users || []).find((x) => x.id === id);
-    if (!u) throw new Error("User not found");
-
-    if (u.role === ADMIN_ROLE) {
-      throw new Error("Cannot modify admin approval state");
-    }
-
-    if (
-      u.status !== users.APPROVAL_STATUS.PENDING &&
-      u.status !== users.APPROVAL_STATUS.MANAGER_APPROVED
-    ) {
-      throw new Error("User not eligible for approval");
-    }
-
-    u.status = users.APPROVAL_STATUS.APPROVED;
-    u.approvedBy = "admin";
-
-    writeDb(db);
-
-    audit("ADMIN_APPROVE_USER", req.user.id, id);
+    const updated = users.adminApproveUser(
+      id,
+      req.user.id,
+      req.user.role
+    );
 
     return res.json({
       ok: true,
-      user: u,
+      user: updated,
     });
-
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
@@ -129,31 +84,33 @@ router.post("/users/:id/approve", (req, res) => {
 router.post("/users/:id/deny", (req, res) => {
   try {
     const id = requireId(req.params.id);
-    const db = readDb();
 
-    const u = (db.users || []).find((x) => x.id === id);
-    if (!u) throw new Error("User not found");
-
-    if (u.role === ADMIN_ROLE) {
-      throw new Error("Cannot deny admin account");
-    }
-
-    if (u.status === users.APPROVAL_STATUS.DENIED) {
-      throw new Error("User already denied");
-    }
-
-    u.status = users.APPROVAL_STATUS.DENIED;
-    u.locked = true;
-
-    writeDb(db);
-
-    audit("ADMIN_DENY_USER", req.user.id, id);
+    const updated = users.adminDenyUser(
+      id,
+      req.user.id,
+      req.user.role
+    );
 
     return res.json({
       ok: true,
-      user: u,
+      user: updated,
     });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
 
+/**
+ * Approval history
+ */
+router.get("/approvals", (req, res) => {
+  try {
+    const limit = Number(req.query.limit) || 200;
+
+    return res.json({
+      ok: true,
+      approvals: users.listApprovalHistory(limit),
+    });
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
@@ -174,7 +131,6 @@ router.get("/companies/:id/tools", (req, res) => {
       installed: result.installed,
       blocked: result.blocked || [],
     });
-
   } catch (e) {
     return res.status(400).json({ ok: false, error: e.message });
   }
@@ -191,22 +147,10 @@ router.post("/companies/:id/tools/:toolId/block", (req, res) => {
       req.user.id
     );
 
-    audit("ADMIN_BLOCK_TOOL", req.user.id, companyId, { toolId });
-
-    recordEvent({
-      type: "tool_blocked",
-      severity: "warn",
-      source: "admin",
-      target: toolId,
-      description: `Admin blocked tool ${toolId}`,
-      meta: { companyId },
-    });
-
     return res.json({
       ok: true,
       blocked: updated.blocked,
     });
-
   } catch (e) {
     return res.status(400).json({ ok: false, error: e.message });
   }
@@ -223,22 +167,10 @@ router.post("/companies/:id/tools/:toolId/unblock", (req, res) => {
       req.user.id
     );
 
-    audit("ADMIN_UNBLOCK_TOOL", req.user.id, companyId, { toolId });
-
-    recordEvent({
-      type: "tool_unblocked",
-      severity: "info",
-      source: "admin",
-      target: toolId,
-      description: `Admin unblocked tool ${toolId}`,
-      meta: { companyId },
-    });
-
     return res.json({
       ok: true,
       blocked: updated.blocked,
     });
-
   } catch (e) {
     return res.status(400).json({ ok: false, error: e.message });
   }
