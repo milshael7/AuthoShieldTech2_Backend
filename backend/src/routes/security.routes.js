@@ -1,5 +1,5 @@
 // backend/src/routes/security.routes.js
-// Security Tool Control — Plan Enforced • Tenant Locked • Hardened v2
+// Security Tool Control — Subscription Enforced • Company Scoped • Hardened
 
 const express = require("express");
 const router = express.Router();
@@ -23,6 +23,26 @@ function normRole(r) {
   return String(r || "").trim().toLowerCase();
 }
 
+function requireActiveSubscription(dbUser) {
+  if (!dbUser) {
+    const err = new Error("User not found");
+    err.status = 404;
+    throw err;
+  }
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
+    const err = new Error("Account locked");
+    err.status = 403;
+    throw err;
+  }
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
+    const err = new Error("Subscription past due");
+    err.status = 402;
+    throw err;
+  }
+}
+
 function resolveCompanyId(req) {
   const role = normRole(req.user.role);
 
@@ -33,66 +53,30 @@ function resolveCompanyId(req) {
   return clean(req.user.companyId);
 }
 
-function requireCompanyContext(req, res) {
+function requireCompanyContext(req) {
   const companyId = resolveCompanyId(req);
 
   if (!companyId) {
-    res.status(400).json({
-      ok: false,
-      error: "Company context missing",
-    });
-    return null;
+    const err = new Error("Company context missing");
+    err.status = 400;
+    throw err;
   }
 
   const company = companies.getCompany(companyId);
 
   if (!company) {
-    res.status(404).json({
-      ok: false,
-      error: "Company not found",
-    });
-    return null;
+    const err = new Error("Company not found");
+    err.status = 404;
+    throw err;
   }
 
   if (company.status !== "Active") {
-    res.status(403).json({
-      ok: false,
-      error: "Company suspended",
-    });
-    return null;
+    const err = new Error("Company not active");
+    err.status = 403;
+    throw err;
   }
 
-  return { companyId, company };
-}
-
-/* =========================================================
-   PLAN ENFORCEMENT
-========================================================= */
-
-function enforcePlan(company, currentTools) {
-  const tier = String(company.tier || "micro").toLowerCase();
-
-  // Example enforcement logic:
-  // Micro → max 3 tools
-  // Small → max 6 tools
-  // Mid → max 15 tools
-  // Enterprise/Unlimited → no cap
-
-  const caps = {
-    micro: 3,
-    small: 6,
-    mid: 15,
-    enterprise: Infinity,
-    unlimited: Infinity,
-  };
-
-  const max = caps[tier] ?? 3;
-
-  if (currentTools.length >= max) {
-    throw new Error(
-      `Plan limit reached (${tier}). Upgrade required.`
-    );
-  }
+  return companyId;
 }
 
 /* =========================================================
@@ -104,19 +88,20 @@ router.get(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const ctx = requireCompanyContext(req, res);
-      if (!ctx) return;
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
 
-      const tools = securityTools.listTools(ctx.companyId);
+      const companyId = requireCompanyContext(req);
+
+      const tools = securityTools.listTools(companyId);
 
       return res.json({
         ok: true,
-        plan: ctx.company.tier,
         tools,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      return res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
@@ -125,7 +110,7 @@ router.get(
 );
 
 /* =========================================================
-   INSTALL TOOL (PLAN SAFE)
+   INSTALL TOOL
 ========================================================= */
 
 router.post(
@@ -133,8 +118,10 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const ctx = requireCompanyContext(req, res);
-      if (!ctx) return;
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
+
+      const companyId = requireCompanyContext(req);
 
       const toolId = clean(req.body?.toolId, 50);
       if (!toolId) {
@@ -144,24 +131,19 @@ router.post(
         });
       }
 
-      const current = securityTools.listTools(ctx.companyId);
-
-      enforcePlan(ctx.company, current.installed);
-
       const result = securityTools.installTool(
-        ctx.companyId,
+        companyId,
         toolId,
         req.user.id
       );
 
       return res.json({
         ok: true,
-        plan: ctx.company.tier,
         result,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      return res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
@@ -178,11 +160,12 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const ctx = requireCompanyContext(req, res);
-      if (!ctx) return;
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
+
+      const companyId = requireCompanyContext(req);
 
       const toolId = clean(req.body?.toolId, 50);
-
       if (!toolId) {
         return res.status(400).json({
           ok: false,
@@ -191,7 +174,7 @@ router.post(
       }
 
       const result = securityTools.uninstallTool(
-        ctx.companyId,
+        companyId,
         toolId,
         req.user.id
       );
@@ -202,7 +185,7 @@ router.post(
       });
 
     } catch (e) {
-      return res.status(400).json({
+      return res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
