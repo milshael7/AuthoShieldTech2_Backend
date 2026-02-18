@@ -1,159 +1,196 @@
-require("dotenv").config();
+// backend/src/routes/security.routes.js
+// Security Tool Control — Subscription Enforced • Company Scoped • Hardened
+
 const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const http = require("http");
-const { WebSocketServer } = require("ws");
+const router = express.Router();
 
-const { ensureDb } = require("./lib/db");
-const users = require("./users/user.service");
-const tenantMiddleware = require("./middleware/tenant");
+const { authRequired, requireRole } = require("../middleware/auth");
+const users = require("../users/user.service");
+const companies = require("../companies/company.service");
+const securityTools = require("../services/securityTools");
 
-const paperTrader = require("./services/paperTrader");
-const liveTrader = require("./services/liveTrader");
-const { startKrakenFeed } = require("./services/krakenFeed");
-
-const securityRoutes = require("./routes/security.routes");
-const billingRoutes = require("./routes/billing.routes"); // ✅ NEW
+router.use(authRequired);
 
 /* =========================================================
-   SAFE BOOT
+   HELPERS
 ========================================================= */
 
-function requireEnv(name) {
-  if (!process.env[name]) {
-    console.error(`[BOOT] Missing required env var: ${name}`);
-    process.exit(1);
+function clean(v, max = 100) {
+  return String(v ?? "").trim().slice(0, max);
+}
+
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
+
+function requireActiveSubscription(dbUser) {
+  if (!dbUser) {
+    const err = new Error("User not found");
+    err.status = 404;
+    throw err;
+  }
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
+    const err = new Error("Account locked");
+    err.status = 403;
+    throw err;
+  }
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
+    const err = new Error("Subscription past due");
+    err.status = 402;
+    throw err;
   }
 }
 
-requireEnv("JWT_SECRET");
-ensureDb();
-users.ensureAdminFromEnv();
+function resolveCompanyId(req) {
+  const role = normRole(req.user.role);
 
-console.log("[BOOT] Backend initialized");
+  if (role === normRole(users.ROLES.ADMIN)) {
+    return clean(req.query.companyId || req.body?.companyId);
+  }
+
+  return clean(req.user.companyId);
+}
+
+function requireCompanyContext(req) {
+  const companyId = resolveCompanyId(req);
+
+  if (!companyId) {
+    const err = new Error("Company context missing");
+    err.status = 400;
+    throw err;
+  }
+
+  const company = companies.getCompany(companyId);
+
+  if (!company) {
+    const err = new Error("Company not found");
+    err.status = 404;
+    throw err;
+  }
+
+  if (company.status !== "Active") {
+    const err = new Error("Company not active");
+    err.status = 403;
+    throw err;
+  }
+
+  return companyId;
+}
 
 /* =========================================================
-   EXPRESS
+   LIST TOOLS
 ========================================================= */
 
-const app = express();
-app.set("trust proxy", 1);
+router.get(
+  "/tools",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
 
-/* =========================================================
-   CORS
-========================================================= */
+      const companyId = requireCompanyContext(req);
 
-app.use(
-  cors({
-    origin: true,
-    credentials: true,
-  })
+      const tools = securityTools.listTools(companyId);
+
+      return res.json({
+        ok: true,
+        tools,
+      });
+
+    } catch (e) {
+      return res.status(e.status || 400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
 );
 
 /* =========================================================
-   SECURITY
+   INSTALL TOOL
 ========================================================= */
 
-app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
-app.use(morgan("dev"));
+router.post(
+  "/tools/install",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: Number(process.env.AUTH_RATELIMIT_MAX || 30),
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+      const companyId = requireCompanyContext(req);
+
+      const toolId = clean(req.body?.toolId, 50);
+      if (!toolId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing toolId",
+        });
+      }
+
+      const result = securityTools.installTool(
+        companyId,
+        toolId,
+        req.user.id
+      );
+
+      return res.json({
+        ok: true,
+        result,
+      });
+
+    } catch (e) {
+      return res.status(e.status || 400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
 
 /* =========================================================
-   HEALTH
+   UNINSTALL TOOL
 ========================================================= */
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    time: new Date().toISOString(),
-  });
-});
+router.post(
+  "/tools/uninstall",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const dbUser = users.findById(req.user.id);
+      requireActiveSubscription(dbUser);
 
-/* =========================================================
-   AUTH ROUTES
-========================================================= */
+      const companyId = requireCompanyContext(req);
 
-app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
+      const toolId = clean(req.body?.toolId, 50);
+      if (!toolId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing toolId",
+        });
+      }
 
-/* =========================================================
-   TENANT CONTEXT
-========================================================= */
+      const result = securityTools.uninstallTool(
+        companyId,
+        toolId,
+        req.user.id
+      );
 
-app.use(tenantMiddleware);
+      return res.json({
+        ok: true,
+        result,
+      });
 
-/* =========================================================
-   API ROUTES
-========================================================= */
+    } catch (e) {
+      return res.status(e.status || 400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
 
-app.use("/api/admin", require("./routes/admin.routes"));
-app.use("/api/manager", require("./routes/manager.routes"));
-app.use("/api/company", require("./routes/company.routes"));
-app.use("/api/me", require("./routes/me.routes"));
-app.use("/api/security", securityRoutes);
-app.use("/api/billing", billingRoutes); // ✅ NEW BILLING ROUTE
-
-app.use("/api/trading", require("./routes/trading.routes"));
-app.use("/api/ai", require("./routes/ai.routes"));
-app.use("/api/voice", require("./routes/voice.routes"));
-app.use("/api/live", require("./routes/live.routes"));
-app.use("/api/paper", require("./routes/paper.routes"));
-
-/* =========================================================
-   SERVER
-========================================================= */
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws/market" });
-
-let onlineUsers = 0;
-
-function safeSend(client, payload) {
-  if (!client || client.readyState !== 1) return;
-  try { client.send(payload); } catch {}
-}
-
-wss.on("connection", (ws) => {
-  onlineUsers++;
-
-  ws.on("close", () => {
-    onlineUsers = Math.max(onlineUsers - 1, 0);
-  });
-
-  ws.on("error", () => {
-    onlineUsers = Math.max(onlineUsers - 1, 0);
-  });
-});
-
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
-
-app.use((err, req, res, next) => {
-  console.error("[HTTP ERROR]", err);
-
-  return res.status(500).json({
-    ok: false,
-    error: "Internal server error",
-  });
-});
-
-/* =========================================================
-   START
-========================================================= */
-
-const port = process.env.PORT || 5000;
-
-server.listen(port, () => {
-  console.log(`[BOOT] Running on port ${port}`);
-});
+module.exports = router;
