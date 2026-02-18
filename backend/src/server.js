@@ -16,6 +16,7 @@ const liveTrader = require("./services/liveTrader");
 const { startKrakenFeed } = require("./services/krakenFeed");
 
 const securityRoutes = require("./routes/security.routes");
+const billingRoutes = require("./routes/billing.routes"); // ✅ NEW
 
 /* =========================================================
    SAFE BOOT
@@ -42,13 +43,13 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   🔥 FIXED CORS (THIS WAS CAUSING LOGIN LOOP)
+   CORS
 ========================================================= */
 
 app.use(
   cors({
-    origin: true,            // allow all origins safely
-    credentials: true,       // required for auth refresh
+    origin: true,
+    credentials: true,
   })
 );
 
@@ -99,12 +100,14 @@ app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/manager", require("./routes/manager.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/me", require("./routes/me.routes"));
+app.use("/api/security", securityRoutes);
+app.use("/api/billing", billingRoutes); // ✅ NEW BILLING ROUTE
+
 app.use("/api/trading", require("./routes/trading.routes"));
 app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/voice", require("./routes/voice.routes"));
 app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
-app.use("/api/security", securityRoutes);
 
 /* =========================================================
    SERVER
