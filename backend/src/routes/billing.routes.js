@@ -1,5 +1,5 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Persistent • Enforced • Tenant Safe
+// Billing & Subscription Control — Stripe Integrated • Persistent • Tenant Safe
 
 const express = require("express");
 const router = express.Router();
@@ -9,12 +9,13 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+const { createCheckoutSession } = require("../services/stripe.service");
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
-function clean(v, max = 100) {
+function clean(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
 
@@ -79,94 +80,52 @@ router.get("/me", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   COMPANY UPGRADE (PERSISTENT)
+   CREATE STRIPE CHECKOUT SESSION
 ========================================================= */
 
-router.post(
-  "/company/upgrade",
-  authRequired,
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const user = requireUser(req, res);
-      if (!user) return;
+router.post("/checkout", authRequired, async (req, res) => {
+  try {
+    const user = requireUser(req, res);
+    if (!user) return;
 
-      const newTier = clean(req.body?.tier, 50);
-      if (!newTier) {
-        return res.status(400).json({ error: "Missing tier" });
-      }
+    const type = clean(req.body?.type, 50);
+    if (!type) {
+      return res.status(400).json({ error: "Missing plan type" });
+    }
 
-      const updated = companies.upgradeCompany(
-        user.companyId,
-        newTier,
-        user.id
-      );
+    const successUrl =
+      clean(req.body?.successUrl) || process.env.STRIPE_SUCCESS_URL;
 
-      audit({
-        actorId: user.id,
-        action: "COMPANY_PLAN_UPGRADED",
-        targetType: "Company",
-        targetId: updated.id,
-        metadata: { newTier },
-      });
+    const cancelUrl =
+      clean(req.body?.cancelUrl) || process.env.STRIPE_CANCEL_URL;
 
-      return res.json({
-        ok: true,
-        tier: updated.tier,
-        maxUsers: updated.maxUsers,
-      });
-
-    } catch (e) {
+    if (!successUrl || !cancelUrl) {
       return res.status(400).json({
-        error: e?.message || String(e),
+        error: "Missing success or cancel URL",
       });
     }
+
+    const checkoutUrl = await createCheckoutSession({
+      userId: user.id,
+      type,
+      successUrl,
+      cancelUrl,
+    });
+
+    return res.json({
+      ok: true,
+      checkoutUrl,
+    });
+
+  } catch (e) {
+    return res.status(400).json({
+      error: e?.message || String(e),
+    });
   }
-);
+});
 
 /* =========================================================
-   INDIVIDUAL PLAN ACTIVATION
-========================================================= */
-
-router.post(
-  "/autodev/activate",
-  authRequired,
-  requireRole(users.ROLES.INDIVIDUAL),
-  (req, res) => {
-    try {
-      const user = requireUser(req, res);
-      if (!user) return;
-
-      const dbUser = users.findById(user.id);
-      if (!dbUser) {
-        return res.status(404).json({ error: "User not found" });
-      }
-
-      dbUser.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
-      saveUser(dbUser);
-
-      audit({
-        actorId: user.id,
-        action: "INDIVIDUAL_SUBSCRIPTION_ACTIVATED",
-        targetType: "User",
-        targetId: user.id,
-      });
-
-      return res.json({
-        ok: true,
-        subscriptionStatus: dbUser.subscriptionStatus,
-      });
-
-    } catch (e) {
-      return res.status(400).json({
-        error: e?.message || String(e),
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN SET SUBSCRIPTION STATUS
+   ADMIN SET SUBSCRIPTION STATUS (MANUAL OVERRIDE)
 ========================================================= */
 
 router.post(
