@@ -35,6 +35,29 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
+   COMPANY BRANCH REGISTRY
+====================================================== */
+
+const BRANCHES = [
+  "soc",
+  "analyst",
+  "consultant",
+  "incident_response",
+  "compliance",
+  "threat_intel",
+  "vulnerability",
+  "forensics",
+];
+
+function validateBranch(branch) {
+  const b = String(branch || "").toLowerCase().trim();
+  if (!BRANCHES.includes(b)) {
+    throw new Error("Invalid branch");
+  }
+  return b;
+}
+
+/* ======================================================
    HELPERS
 ====================================================== */
 
@@ -70,24 +93,6 @@ function requireAuthority(actorRole, targetRole) {
   }
 }
 
-function logApproval(db, {
-  action,
-  targetUser,
-  actorId,
-  actorRole,
-}) {
-  db.approvals.push({
-    id: nanoid(),
-    type: "approval",
-    action,
-    targetUserId: targetUser.id,
-    targetEmail: targetUser.email,
-    actorId,
-    actorRole,
-    timestamp: new Date().toISOString(),
-  });
-}
-
 /* ======================================================
    ADMIN BOOTSTRAP
 ====================================================== */
@@ -120,6 +125,7 @@ function ensureAdminFromEnv() {
     locked: false,
     status: APPROVAL_STATUS.APPROVED,
     approvedBy: "system",
+    branch: null,
   };
 
   db.users.push(admin);
@@ -154,6 +160,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     passwordHash: bcrypt.hashSync(String(password), 10),
     role: r,
     companyId: companyId || null,
+    branch: null, // NEW
     createdAt: new Date().toISOString(),
     subscriptionStatus: SUBSCRIPTION.TRIAL,
     mustResetPassword: false,
@@ -170,111 +177,37 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 }
 
 /* ======================================================
-   APPROVAL SYSTEM WITH AUDIT TRAIL
+   BRANCH ASSIGNMENT
 ====================================================== */
 
-function listPendingUsers() {
+function assignBranch(userId, branch, actorRole) {
   const db = readDb();
   ensureArrays(db);
 
-  return db.users
-    .filter(
-      (u) =>
-        u.status === APPROVAL_STATUS.PENDING ||
-        u.status === APPROVAL_STATUS.MANAGER_APPROVED
-    )
-    .map(sanitize);
-}
+  const user = db.users.find((u) => u.id === userId);
+  if (!user) throw new Error("User not found");
 
-function managerApproveUser(id, actorId, actorRole = ROLES.MANAGER) {
-  const db = readDb();
-  ensureArrays(db);
+  requireAuthority(actorRole, user.role);
 
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  requireAuthority(actorRole, u.role);
-
-  if (u.status !== APPROVAL_STATUS.PENDING) {
-    throw new Error("User not pending manager approval");
-  }
-
-  u.status = APPROVAL_STATUS.MANAGER_APPROVED;
-  u.approvedBy = "manager";
-
-  logApproval(db, {
-    action: "manager_approved",
-    targetUser: u,
-    actorId,
-    actorRole,
-  });
+  user.branch = validateBranch(branch);
 
   writeDb(db);
-  return sanitize(u);
+  return sanitize(user);
 }
 
-function adminApproveUser(id, actorId, actorRole = ROLES.ADMIN) {
+function removeBranch(userId, actorRole) {
   const db = readDb();
   ensureArrays(db);
 
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
+  const user = db.users.find((u) => u.id === userId);
+  if (!user) throw new Error("User not found");
 
-  requireAuthority(actorRole, u.role);
+  requireAuthority(actorRole, user.role);
 
-  if (u.status === APPROVAL_STATUS.DENIED) {
-    throw new Error("User was denied");
-  }
-
-  u.status = APPROVAL_STATUS.APPROVED;
-  u.approvedBy = "admin";
-
-  logApproval(db, {
-    action: "admin_approved",
-    targetUser: u,
-    actorId,
-    actorRole,
-  });
+  user.branch = null;
 
   writeDb(db);
-  return sanitize(u);
-}
-
-function adminDenyUser(id, actorId, actorRole = ROLES.ADMIN) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const u = db.users.find((x) => x.id === id);
-  if (!u) throw new Error("User not found");
-
-  requireAuthority(actorRole, u.role);
-
-  u.status = APPROVAL_STATUS.DENIED;
-  u.locked = true;
-
-  logApproval(db, {
-    action: "admin_denied",
-    targetUser: u,
-    actorId,
-    actorRole,
-  });
-
-  writeDb(db);
-  return sanitize(u);
-}
-
-/* ======================================================
-   APPROVAL HISTORY
-====================================================== */
-
-function listApprovalHistory(limit = 200) {
-  const db = readDb();
-  ensureArrays(db);
-
-  return (db.approvals || [])
-    .slice()
-    .reverse()
-    .slice(0, limit);
+  return sanitize(user);
 }
 
 /* ======================================================
@@ -301,12 +234,9 @@ function listUsers() {
 
 function verifyPassword(user, password) {
   if (!user) return false;
-
   if (user.locked) throw new Error("Account locked");
-
-  if (user.status !== APPROVAL_STATUS.APPROVED) {
+  if (user.status !== APPROVAL_STATUS.APPROVED)
     throw new Error("Account not approved");
-  }
 
   return bcrypt.compareSync(password, user.passwordHash);
 }
@@ -315,13 +245,11 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
+  BRANCHES,
   ensureAdminFromEnv,
   createUser,
-  listPendingUsers,
-  managerApproveUser,
-  adminApproveUser,
-  adminDenyUser,
-  listApprovalHistory,
+  assignBranch,
+  removeBranch,
   findByEmail,
   findById,
   listUsers,
