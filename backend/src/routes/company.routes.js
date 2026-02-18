@@ -1,6 +1,5 @@
 // backend/src/routes/company.routes.js
-// Company Room API — Institutional Hardened v2
-// Strict Isolation • No Privilege Escalation • Admin Override Safe
+// Company Room API — Tier Controlled • Plan Enforced • Secure
 
 const express = require("express");
 const router = express.Router();
@@ -26,46 +25,20 @@ function normRole(r) {
 }
 
 /* =========================================================
-   SECURITY ENFORCEMENT
+   COMPANY CONTEXT
 ========================================================= */
 
-function ensureCompanyActive(req) {
-  if (req.user?.suspended) {
-    const err = new Error("Company account suspended");
-    err.status = 403;
-    throw err;
-  }
-}
-
-function ensureMemberSafe(targetUser) {
-  const role = normRole(targetUser?.role);
-
-  if (role === normRole(users.ROLES.ADMIN)) {
-    throw new Error("Cannot assign admin to company");
-  }
-
-  if (role === normRole(users.ROLES.MANAGER)) {
-    throw new Error("Cannot assign manager to company");
-  }
-}
-
-/*
-   Resolve company scope safely
-*/
 function resolveCompanyId(req) {
   const role = normRole(req.user?.role);
   const isAdmin = role === normRole(users.ROLES.ADMIN);
 
-  // Admin override allowed
   if (isAdmin) {
     const fromQuery = safeStr(req.query.companyId, 100);
     const fromBody = safeStr(req.body?.companyId, 100);
     const fromToken = safeStr(req.user.companyId, 100);
-
     return fromQuery || fromBody || fromToken || null;
   }
 
-  // Company role locked to its own company
   return safeStr(req.user.companyId, 100) || null;
 }
 
@@ -83,6 +56,14 @@ function requireCompany(req, res) {
   return companyId;
 }
 
+function ensureCompanyActive(company) {
+  if (!company || company.status !== "Active") {
+    const err = new Error("Company not active");
+    err.status = 403;
+    throw err;
+  }
+}
+
 /* =========================================================
    COMPANY PROFILE
 ========================================================= */
@@ -92,8 +73,6 @@ router.get(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      ensureCompanyActive(req);
-
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -105,24 +84,161 @@ router.get(
         });
       }
 
-      // Sanitize output
-      const sanitized = {
-        id: c.id,
-        name: c.name,
-        sizeTier: c.sizeTier || "standard",
-        suspended: !!c.suspended,
-        members: c.members || [],
-        createdAt: c.createdAt || null,
-      };
+      ensureCompanyActive(c);
 
       return res.json({
         ok: true,
-        company: sanitized,
+        company: {
+          id: c.id,
+          name: c.name,
+          tier: c.tier,
+          maxUsers: c.maxUsers,
+          currentUsers: Array.isArray(c.members)
+            ? c.members.length
+            : 0,
+          members: c.members || [],
+          createdAt: c.createdAt || null,
+        },
       });
     } catch (e) {
       return res.status(e.status || 500).json({
         ok: false,
-        error: e?.message || String(e),
+        error: e.message,
+      });
+    }
+  }
+);
+
+/* =========================================================
+   UPGRADE PLAN
+========================================================= */
+
+router.post(
+  "/upgrade",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const companyId = requireCompany(req, res);
+      if (!companyId) return;
+
+      const newTier = safeStr(req.body?.tier, 30);
+      if (!newTier) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing tier",
+        });
+      }
+
+      const updated = companies.upgradeCompany(
+        companyId,
+        newTier,
+        req.user.id
+      );
+
+      return res.json({
+        ok: true,
+        company: {
+          id: updated.id,
+          tier: updated.tier,
+          maxUsers: updated.maxUsers,
+        },
+      });
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
+
+/* =========================================================
+   MEMBER MANAGEMENT
+========================================================= */
+
+router.post(
+  "/members/add",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const companyId = requireCompany(req, res);
+      if (!companyId) return;
+
+      const userId = safeStr(req.body?.userId, 100);
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing userId",
+        });
+      }
+
+      const targetUser = users.findById(userId);
+      if (!targetUser) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found",
+        });
+      }
+
+      if (
+        normRole(targetUser.role) === normRole(users.ROLES.ADMIN) ||
+        normRole(targetUser.role) === normRole(users.ROLES.MANAGER)
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error: "Cannot assign admin or manager to company",
+        });
+      }
+
+      const result = companies.addMember(
+        companyId,
+        userId,
+        req.user.id
+      );
+
+      return res.json({
+        ok: true,
+        company: result,
+      });
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
+
+router.post(
+  "/members/remove",
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const companyId = requireCompany(req, res);
+      if (!companyId) return;
+
+      const userId = safeStr(req.body?.userId, 100);
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing userId",
+        });
+      }
+
+      const result = companies.removeMember(
+        companyId,
+        userId,
+        req.user.id
+      );
+
+      return res.json({
+        ok: true,
+        company: result,
+      });
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
       });
     }
   }
@@ -137,8 +253,6 @@ router.get(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      ensureCompanyActive(req);
-
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -147,9 +261,9 @@ router.get(
         notifications: listNotifications({ companyId }) || [],
       });
     } catch (e) {
-      return res.status(e.status || 500).json({
+      return res.status(500).json({
         ok: false,
-        error: e?.message || String(e),
+        error: e.message,
       });
     }
   }
@@ -160,8 +274,6 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      ensureCompanyActive(req);
-
       const companyId = requireCompany(req, res);
       if (!companyId) return;
 
@@ -187,97 +299,9 @@ router.post(
         notification: n,
       });
     } catch (e) {
-      return res.status(e.status || 500).json({
+      return res.status(500).json({
         ok: false,
-        error: e?.message || String(e),
-      });
-    }
-  }
-);
-
-/* =========================================================
-   MEMBER MANAGEMENT
-========================================================= */
-
-router.post(
-  "/members/add",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      ensureCompanyActive(req);
-
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const userId = safeStr(req.body?.userId, 100);
-      if (!userId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing userId",
-        });
-      }
-
-      const targetUser = users.getUser(userId);
-      if (!targetUser) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found",
-        });
-      }
-
-      ensureMemberSafe(targetUser);
-
-      const result = companies.addMember(
-        companyId,
-        userId,
-        req.user.id
-      );
-
-      return res.json({
-        ok: true,
-        result,
-      });
-    } catch (e) {
-      return res.status(400).json({
-        ok: false,
-        error: e?.message || String(e),
-      });
-    }
-  }
-);
-
-router.post(
-  "/members/remove",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      ensureCompanyActive(req);
-
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const userId = safeStr(req.body?.userId, 100);
-      if (!userId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing userId",
-        });
-      }
-
-      const result = companies.removeMember(
-        companyId,
-        userId,
-        req.user.id
-      );
-
-      return res.json({
-        ok: true,
-        result,
-      });
-    } catch (e) {
-      return res.status(400).json({
-        ok: false,
-        error: e?.message || String(e),
+        error: e.message,
       });
     }
   }
