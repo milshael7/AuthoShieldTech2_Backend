@@ -1,5 +1,5 @@
 // backend/src/routes/security.routes.js
-// Security Tool Control — Company Scoped • Tier Enforced • Hardened
+// Security Tool Control — Plan Enforced • Tenant Locked • Hardened v2
 
 const express = require("express");
 const router = express.Router();
@@ -57,12 +57,42 @@ function requireCompanyContext(req, res) {
   if (company.status !== "Active") {
     res.status(403).json({
       ok: false,
-      error: "Company not active",
+      error: "Company suspended",
     });
     return null;
   }
 
-  return companyId;
+  return { companyId, company };
+}
+
+/* =========================================================
+   PLAN ENFORCEMENT
+========================================================= */
+
+function enforcePlan(company, currentTools) {
+  const tier = String(company.tier || "micro").toLowerCase();
+
+  // Example enforcement logic:
+  // Micro → max 3 tools
+  // Small → max 6 tools
+  // Mid → max 15 tools
+  // Enterprise/Unlimited → no cap
+
+  const caps = {
+    micro: 3,
+    small: 6,
+    mid: 15,
+    enterprise: Infinity,
+    unlimited: Infinity,
+  };
+
+  const max = caps[tier] ?? 3;
+
+  if (currentTools.length >= max) {
+    throw new Error(
+      `Plan limit reached (${tier}). Upgrade required.`
+    );
+  }
 }
 
 /* =========================================================
@@ -74,13 +104,14 @@ router.get(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = requireCompanyContext(req, res);
-      if (!companyId) return;
+      const ctx = requireCompanyContext(req, res);
+      if (!ctx) return;
 
-      const tools = securityTools.listTools(companyId);
+      const tools = securityTools.listTools(ctx.companyId);
 
       return res.json({
         ok: true,
+        plan: ctx.company.tier,
         tools,
       });
 
@@ -94,7 +125,7 @@ router.get(
 );
 
 /* =========================================================
-   INSTALL TOOL
+   INSTALL TOOL (PLAN SAFE)
 ========================================================= */
 
 router.post(
@@ -102,11 +133,10 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = requireCompanyContext(req, res);
-      if (!companyId) return;
+      const ctx = requireCompanyContext(req, res);
+      if (!ctx) return;
 
       const toolId = clean(req.body?.toolId, 50);
-
       if (!toolId) {
         return res.status(400).json({
           ok: false,
@@ -114,14 +144,19 @@ router.post(
         });
       }
 
+      const current = securityTools.listTools(ctx.companyId);
+
+      enforcePlan(ctx.company, current.installed);
+
       const result = securityTools.installTool(
-        companyId,
+        ctx.companyId,
         toolId,
         req.user.id
       );
 
       return res.json({
         ok: true,
+        plan: ctx.company.tier,
         result,
       });
 
@@ -143,8 +178,8 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = requireCompanyContext(req, res);
-      if (!companyId) return;
+      const ctx = requireCompanyContext(req, res);
+      if (!ctx) return;
 
       const toolId = clean(req.body?.toolId, 50);
 
@@ -156,7 +191,7 @@ router.post(
       }
 
       const result = securityTools.uninstallTool(
-        companyId,
+        ctx.companyId,
         toolId,
         req.user.id
       );
