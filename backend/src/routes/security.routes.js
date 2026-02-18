@@ -1,5 +1,5 @@
 // backend/src/routes/security.routes.js
-// Security Tool Control — Company Scoped • Tier Enforced • Clean
+// Security Tool Control — Company Scoped • Tier Enforced • Hardened
 
 const express = require("express");
 const router = express.Router();
@@ -33,6 +33,38 @@ function resolveCompanyId(req) {
   return clean(req.user.companyId);
 }
 
+function requireCompanyContext(req, res) {
+  const companyId = resolveCompanyId(req);
+
+  if (!companyId) {
+    res.status(400).json({
+      ok: false,
+      error: "Company context missing",
+    });
+    return null;
+  }
+
+  const company = companies.getCompany(companyId);
+
+  if (!company) {
+    res.status(404).json({
+      ok: false,
+      error: "Company not found",
+    });
+    return null;
+  }
+
+  if (company.status !== "Active") {
+    res.status(403).json({
+      ok: false,
+      error: "Company not active",
+    });
+    return null;
+  }
+
+  return companyId;
+}
+
 /* =========================================================
    LIST TOOLS
 ========================================================= */
@@ -42,14 +74,8 @@ router.get(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = resolveCompanyId(req);
-
-      if (!companyId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Company context missing",
-        });
-      }
+      const companyId = requireCompanyContext(req, res);
+      if (!companyId) return;
 
       const tools = securityTools.listTools(companyId);
 
@@ -76,13 +102,15 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = resolveCompanyId(req);
+      const companyId = requireCompanyContext(req, res);
+      if (!companyId) return;
+
       const toolId = clean(req.body?.toolId, 50);
 
-      if (!companyId || !toolId) {
+      if (!toolId) {
         return res.status(400).json({
           ok: false,
-          error: "Missing companyId or toolId",
+          error: "Missing toolId",
         });
       }
 
@@ -115,13 +143,15 @@ router.post(
   requireRole(users.ROLES.COMPANY, { adminAlso: true }),
   (req, res) => {
     try {
-      const companyId = resolveCompanyId(req);
+      const companyId = requireCompanyContext(req, res);
+      if (!companyId) return;
+
       const toolId = clean(req.body?.toolId, 50);
 
-      if (!companyId || !toolId) {
+      if (!toolId) {
         return res.status(400).json({
           ok: false,
-          error: "Missing companyId or toolId",
+          error: "Missing toolId",
         });
       }
 
