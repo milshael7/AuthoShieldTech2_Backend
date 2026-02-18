@@ -11,12 +11,9 @@ const { ensureDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
-const paperTrader = require("./services/paperTrader");
-const liveTrader = require("./services/liveTrader");
-const { startKrakenFeed } = require("./services/krakenFeed");
-
 const securityRoutes = require("./routes/security.routes");
-const billingRoutes = require("./routes/billing.routes"); // ✅ NEW
+const billingRoutes = require("./routes/billing.routes");
+const stripeWebhookRoutes = require("./routes/stripe.webhook.routes");
 
 /* =========================================================
    SAFE BOOT
@@ -30,6 +27,7 @@ function requireEnv(name) {
 }
 
 requireEnv("JWT_SECRET");
+
 ensureDb();
 users.ensureAdminFromEnv();
 
@@ -41,6 +39,12 @@ console.log("[BOOT] Backend initialized");
 
 const app = express();
 app.set("trust proxy", 1);
+
+/* =========================================================
+   STRIPE WEBHOOK (MUST BE BEFORE JSON PARSER)
+========================================================= */
+
+app.use("/api/stripe/webhook", stripeWebhookRoutes);
 
 /* =========================================================
    CORS
@@ -101,7 +105,7 @@ app.use("/api/manager", require("./routes/manager.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/me", require("./routes/me.routes"));
 app.use("/api/security", securityRoutes);
-app.use("/api/billing", billingRoutes); // ✅ NEW BILLING ROUTE
+app.use("/api/billing", billingRoutes);
 
 app.use("/api/trading", require("./routes/trading.routes"));
 app.use("/api/ai", require("./routes/ai.routes"));
@@ -110,7 +114,7 @@ app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
 
 /* =========================================================
-   SERVER
+   SERVER + WS
 ========================================================= */
 
 const server = http.createServer(app);
@@ -120,7 +124,9 @@ let onlineUsers = 0;
 
 function safeSend(client, payload) {
   if (!client || client.readyState !== 1) return;
-  try { client.send(payload); } catch {}
+  try {
+    client.send(payload);
+  } catch {}
 }
 
 wss.on("connection", (ws) => {
@@ -136,7 +142,7 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
-   ERROR HANDLER
+   GLOBAL ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
