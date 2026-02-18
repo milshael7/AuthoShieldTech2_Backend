@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Structured Dashboard • Tier Aware • Branch Controlled • Hardened
+// Me Endpoints — Subscription Enforced • Branch Controlled • Hardened
 
 const express = require("express");
 const router = express.Router();
@@ -15,20 +15,6 @@ const { createProject } = require("../autoprotect/autoprotect.service");
 router.use(authRequired);
 
 /* =========================================================
-   AUTH CONTEXT GUARD
-========================================================= */
-
-router.use((req, res, next) => {
-  if (!req.user || !req.user.id) {
-    return res.status(401).json({
-      ok: false,
-      error: "Invalid authentication context",
-    });
-  }
-  next();
-});
-
-/* =========================================================
    HELPERS
 ========================================================= */
 
@@ -36,26 +22,46 @@ function cleanStr(v, max = 200) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-function normRole(r) {
-  return String(r || "").trim().toLowerCase();
-}
-
 function isObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
 }
 
-function canUseAutoDev(user) {
-  const role = normRole(user.role);
-  return role === normRole(users.ROLES?.INDIVIDUAL || "Individual");
+function requireActiveSubscription(dbUser) {
+  if (!dbUser) throw new Error("User not found");
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
+    const err = new Error("Account locked");
+    err.status = 403;
+    throw err;
+  }
+
+  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
+    const err = new Error("Subscription past due");
+    err.status = 402;
+    throw err;
+  }
+}
+
+function requireActiveCompany(company) {
+  if (!company || company.status !== "Active") {
+    const err = new Error("Company not active");
+    err.status = 403;
+    throw err;
+  }
 }
 
 /* =========================================================
-   DASHBOARD (BRANCH FILTERED)
+   DASHBOARD (SUBSCRIPTION ENFORCED)
 ========================================================= */
 
 router.get("/dashboard", (req, res) => {
   try {
-    const user = req.user;
+    const dbUser = users.findById(req.user.id);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    requireActiveSubscription(dbUser);
 
     let dashboardType = "individual";
     let branch = "member";
@@ -63,62 +69,60 @@ router.get("/dashboard", (req, res) => {
     let visibleTools = [];
     let plan = null;
 
-    if (user.companyId) {
-      const company = companies.getCompany(user.companyId);
+    /* ================= COMPANY CONTEXT ================= */
 
-      if (company && company.status === "Active") {
+    if (dbUser.companyId) {
+      const company = companies.getCompany(dbUser.companyId);
+      requireActiveCompany(company);
 
-        const memberRecord = company.members?.find(
-          (m) => String(m.userId || m) === String(user.id)
-        );
+      const memberRecord = company.members?.find(
+        (m) => String(m.userId || m) === String(dbUser.id)
+      );
 
-        if (memberRecord) {
+      if (memberRecord) {
+        dashboardType = "company_member";
+        branch =
+          typeof memberRecord === "object"
+            ? memberRecord.position || "member"
+            : "member";
 
-          dashboardType = "company_member";
+        plan = company.tier;
 
-          if (typeof memberRecord === "object") {
-            branch = memberRecord.position || "member";
-          }
+        companyInfo = {
+          id: company.id,
+          name: company.name,
+          tier: company.tier,
+          maxUsers: company.maxUsers,
+          currentUsers: Array.isArray(company.members)
+            ? company.members.length
+            : 0,
+        };
 
-          plan = company.tier;
-
-          companyInfo = {
-            id: company.id,
-            name: company.name,
-            tier: company.tier,
-            maxUsers: company.maxUsers,
-            currentUsers: Array.isArray(company.members)
-              ? company.members.length
-              : 0,
-          };
-
-          // 🔐 Branch-aware tool visibility
-          visibleTools =
-            securityTools.getVisibleToolsForBranch(
-              company.id,
-              branch
-            );
-        }
+        visibleTools =
+          securityTools.getVisibleToolsForBranch(
+            company.id,
+            branch
+          );
       }
     }
 
     return res.json({
       ok: true,
       dashboard: {
-        role: user.role,
+        role: dbUser.role,
         type: dashboardType,
         branch,
         plan,
         company: companyInfo,
-        autoDevEnabled: canUseAutoDev(user),
+        subscriptionStatus: dbUser.subscriptionStatus,
         visibleTools,
       },
     });
 
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
@@ -129,6 +133,9 @@ router.get("/dashboard", (req, res) => {
 
 router.get("/notifications", (req, res) => {
   try {
+    const dbUser = users.findById(req.user.id);
+    requireActiveSubscription(dbUser);
+
     const notifications =
       listNotifications({ userId: req.user.id }) || [];
 
@@ -136,33 +143,25 @@ router.get("/notifications", (req, res) => {
       ok: true,
       notifications,
     });
+
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
 
 router.post("/notifications/:id/read", (req, res) => {
   try {
-    const id = cleanStr(req.params.id, 100);
+    const dbUser = users.findById(req.user.id);
+    requireActiveSubscription(dbUser);
 
+    const id = cleanStr(req.params.id, 100);
     if (!id) {
       return res.status(400).json({
         ok: false,
         error: "Missing notification id",
-      });
-    }
-
-    const existing =
-      listNotifications({ userId: req.user.id })
-        ?.find((n) => String(n.id) === id);
-
-    if (!existing) {
-      return res.status(404).json({
-        ok: false,
-        error: "Notification not found",
       });
     }
 
@@ -174,22 +173,23 @@ router.post("/notifications/:id/read", (req, res) => {
     });
 
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
 
 /* =========================================================
-   PROJECT CREATION (INDIVIDUAL ONLY)
+   PROJECT CREATION (SUBSCRIPTION REQUIRED)
 ========================================================= */
 
 router.post("/projects", (req, res) => {
   try {
-    const user = req.user;
+    const dbUser = users.findById(req.user.id);
+    requireActiveSubscription(dbUser);
 
-    if (!canUseAutoDev(user)) {
+    if (dbUser.role !== users.ROLES.INDIVIDUAL) {
       return res.status(403).json({
         ok: false,
         error: "Upgrade required",
@@ -211,15 +211,8 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    if (!isObject(req.body.issue)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid issue payload",
-      });
-    }
-
-    const issueType = cleanStr(req.body.issue.type, 100);
-    const details = cleanStr(req.body.issue.details, 2000);
+    const issueType = cleanStr(req.body.issue?.type, 100);
+    const details = cleanStr(req.body.issue?.details, 2000);
 
     if (!issueType) {
       return res.status(400).json({
@@ -229,8 +222,8 @@ router.post("/projects", (req, res) => {
     }
 
     const project = createProject({
-      actorId: user.id,
-      companyId: user.companyId || null,
+      actorId: dbUser.id,
+      companyId: dbUser.companyId || null,
       title,
       issue: {
         type: issueType,
@@ -239,7 +232,7 @@ router.post("/projects", (req, res) => {
     });
 
     audit({
-      actorId: user.id,
+      actorId: dbUser.id,
       action: "PROJECT_CREATED",
       targetType: "Project",
       targetId: project.id,
@@ -251,9 +244,9 @@ router.post("/projects", (req, res) => {
     });
 
   } catch (e) {
-    return res.status(400).json({
+    return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
