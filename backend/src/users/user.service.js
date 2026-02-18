@@ -35,7 +35,7 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   INTERNAL HELPERS
+   HELPERS
 ====================================================== */
 
 function ensureArrays(db) {
@@ -58,6 +58,15 @@ function requireValidRole(role) {
     throw new Error(`Invalid role: ${r}`);
   }
   return r;
+}
+
+function requireAuthority(actorRole, targetRole) {
+  const actorRank = ROLE_RANK[actorRole] || 0;
+  const targetRank = ROLE_RANK[targetRole] || 0;
+
+  if (actorRank <= targetRank) {
+    throw new Error("Insufficient authority");
+  }
 }
 
 /* ======================================================
@@ -99,7 +108,7 @@ function ensureAdminFromEnv() {
 }
 
 /* ======================================================
-   USER CREATION (PENDING FLOW)
+   USER CREATION
 ====================================================== */
 
 function createUser({ email, password, role, profile = {}, companyId = null }) {
@@ -158,12 +167,17 @@ function listPendingUsers() {
     .map(sanitize);
 }
 
-function managerApproveUser(id) {
+/* ---------- MANAGER APPROVAL (NON-FINAL) ---------- */
+
+function managerApproveUser(id, actorRole = ROLES.MANAGER) {
   const db = readDb();
   ensureArrays(db);
 
   const u = db.users.find((x) => x.id === id);
   if (!u) throw new Error("User not found");
+
+  // Managers cannot approve managers or admins
+  requireAuthority(actorRole, u.role);
 
   if (u.status !== APPROVAL_STATUS.PENDING) {
     throw new Error("User is not pending manager approval");
@@ -176,12 +190,16 @@ function managerApproveUser(id) {
   return sanitize(u);
 }
 
-function adminApproveUser(id) {
+/* ---------- ADMIN FINAL APPROVAL ---------- */
+
+function adminApproveUser(id, actorRole = ROLES.ADMIN) {
   const db = readDb();
   ensureArrays(db);
 
   const u = db.users.find((x) => x.id === id);
   if (!u) throw new Error("User not found");
+
+  requireAuthority(actorRole, u.role);
 
   if (u.status === APPROVAL_STATUS.DENIED) {
     throw new Error("User was denied");
@@ -194,12 +212,16 @@ function adminApproveUser(id) {
   return sanitize(u);
 }
 
-function adminDenyUser(id) {
+/* ---------- ADMIN DENY ---------- */
+
+function adminDenyUser(id, actorRole = ROLES.ADMIN) {
   const db = readDb();
   ensureArrays(db);
 
   const u = db.users.find((x) => x.id === id);
   if (!u) throw new Error("User not found");
+
+  requireAuthority(actorRole, u.role);
 
   u.status = APPROVAL_STATUS.DENIED;
   u.locked = true;
@@ -216,6 +238,12 @@ function findByEmail(email) {
   const db = readDb();
   ensureArrays(db);
   return db.users.find((u) => normEmail(u.email) === normEmail(email)) || null;
+}
+
+function findById(id) {
+  const db = readDb();
+  ensureArrays(db);
+  return db.users.find((u) => u.id === id) || null;
 }
 
 function listUsers() {
@@ -260,6 +288,7 @@ module.exports = {
   adminApproveUser,
   adminDenyUser,
   findByEmail,
+  findById,
   listUsers,
   verifyPassword,
 };
