@@ -1,13 +1,14 @@
 // backend/src/routes/manager.routes.js
-// Manager Room API — Institutional Hardened (Read-Only)
+// Manager Room API — Phase 7 Upgrade
+// Manager approval layer (non-final)
 // Admin inherits access
-// Explicit privilege boundaries enforced
+// No override authority
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
+const { readDb, writeDb } = require("../lib/db");
 
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
@@ -28,7 +29,7 @@ router.use(authRequired);
 router.use(requireRole(MANAGER, { adminAlso: true }));
 
 /* =========================================================
-   SECURITY HELPERS
+   HELPERS
 ========================================================= */
 
 function clampInt(n, min, max, fallback) {
@@ -42,22 +43,14 @@ function safeStr(v, maxLen = 120) {
   return s ? s.slice(0, maxLen) : "";
 }
 
-/* =========================================================
-   ACCESS ENFORCEMENT
-========================================================= */
-
-// Manager cannot override admin
-function ensureNotAdminTarget(targetRole) {
-  if (String(targetRole || "").toLowerCase() === "admin") {
-    const err = new Error("Managers cannot act on admin accounts");
-    err.status = 403;
-    throw err;
-  }
+function requireId(id) {
+  const clean = safeStr(id, 100);
+  if (!clean) throw new Error("Invalid id");
+  return clean;
 }
 
-// Prevent suspended manager usage
 function ensureManagerActive(req) {
-  if (req.user?.suspended) {
+  if (req.user?.locked) {
     const err = new Error("Manager account suspended");
     err.status = 403;
     throw err;
@@ -65,10 +58,59 @@ function ensureManagerActive(req) {
 }
 
 /* =========================================================
+   APPROVAL SYSTEM (MANAGER LAYER)
+========================================================= */
+
+/**
+ * List pending users (visible to manager)
+ */
+router.get("/pending-users", (req, res) => {
+  try {
+    ensureManagerActive(req);
+
+    return res.json({
+      ok: true,
+      users: users.listPendingUsers(),
+    });
+  } catch (e) {
+    return res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/**
+ * Manager approves user (NOT final)
+ * Admin can override later
+ */
+router.post("/users/:id/approve", (req, res) => {
+  try {
+    ensureManagerActive(req);
+
+    const id = requireId(req.params.id);
+
+    const updated = users.managerApproveUser(
+      id,
+      req.user.id
+    );
+
+    return res.json({
+      ok: true,
+      user: updated,
+    });
+  } catch (e) {
+    return res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
    OVERVIEW
 ========================================================= */
 
-// GET /api/manager/overview
 router.get("/overview", (req, res) => {
   try {
     ensureManagerActive(req);
@@ -103,14 +145,12 @@ router.get("/users", (req, res) => {
 
     const allUsers = users.listUsers() || [];
 
-    // Manager cannot inspect internal admin secrets
     const sanitized = allUsers.map(u => ({
       id: u.id,
       email: u.email,
       role: u.role,
       companyId: u.companyId || null,
-      suspended: !!u.suspended,
-      mfa: !!u.mfa
+      locked: !!u.locked,
     }));
 
     return res.json({
