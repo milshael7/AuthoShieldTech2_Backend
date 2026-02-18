@@ -1,5 +1,5 @@
 // backend/src/services/securityTools.js
-// Enterprise Security Tool Engine — Branch Aware • Tier Ready • Auditable
+// Security Tool Engine — Branch Controlled • Company Scoped • Tier Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -12,38 +12,6 @@ const { audit } = require("../lib/audit");
 const DATA_PATH =
   process.env.SECURITY_TOOLS_PATH ||
   path.join("/tmp", "security_tools.json");
-
-const MAX_COMPANIES = 10000;
-const MAX_TOOLS_PER_COMPANY = 200;
-
-/* =========================================================
-   MASTER TOOL REGISTRY
-========================================================= */
-
-const TOOL_REGISTRY = new Set([
-  "edr",
-  "itdr",
-  "email",
-  "data",
-  "sat",
-  "darkweb",
-]);
-
-/* =========================================================
-   BRANCH TOOL PROFILES
-========================================================= */
-
-const BRANCH_TOOL_ACCESS = {
-  soc: ["edr", "itdr", "darkweb"],
-  analyst: ["data", "email", "darkweb"],
-  consultant: ["sat", "email"],
-  admin: Array.from(TOOL_REGISTRY),
-  member: [],
-};
-
-/* =========================================================
-   HELPERS
-========================================================= */
 
 function nowIso() {
   return new Date().toISOString();
@@ -62,13 +30,36 @@ function ensureDir(file) {
   } catch {}
 }
 
-function normalizePosition(pos) {
-  const p = clean(pos, 50).toLowerCase();
-  return BRANCH_TOOL_ACCESS[p] ? p : "member";
-}
+/* =========================================================
+   MASTER TOOL REGISTRY
+========================================================= */
+
+const TOOL_REGISTRY = new Set([
+  "edr",
+  "itdr",
+  "email",
+  "data",
+  "sat",
+  "darkweb",
+  "siem",
+  "xdr",
+  "forensics",
+  "vulnscan",
+]);
 
 /* =========================================================
-   STATE STRUCTURE
+   BRANCH TOOL MAP
+========================================================= */
+
+const BRANCH_TOOLS = {
+  soc: ["siem", "xdr", "edr"],
+  analyst: ["vulnscan", "forensics", "data"],
+  consultant: ["sat", "darkweb", "email"],
+  member: [], // default
+};
+
+/* =========================================================
+   STATE
 ========================================================= */
 
 let state = {
@@ -121,10 +112,6 @@ function ensureCompany(companyId) {
   if (!id) throw new Error("Company id required");
 
   if (!state.companies[id]) {
-    if (Object.keys(state.companies).length >= MAX_COMPANIES) {
-      throw new Error("Company limit exceeded");
-    }
-
     state.companies[id] = {
       installed: [],
       blocked: [],
@@ -136,7 +123,7 @@ function ensureCompany(companyId) {
 }
 
 /* =========================================================
-   LIST (Company-Level)
+   LIST TOOLS
 ========================================================= */
 
 function listTools(companyId) {
@@ -149,30 +136,7 @@ function listTools(companyId) {
 }
 
 /* =========================================================
-   USER-SCOPED TOOL VIEW (NEW)
-========================================================= */
-
-function getToolsForUser(companyId, position) {
-  const id = ensureCompany(companyId);
-  const normalized = normalizePosition(position);
-
-  const company = state.companies[id];
-  const allowedForBranch = BRANCH_TOOL_ACCESS[normalized] || [];
-
-  const visible = company.installed.filter(
-    (tool) =>
-      allowedForBranch.includes(tool) &&
-      !company.blocked.includes(tool)
-  );
-
-  return {
-    position: normalized,
-    tools: visible,
-  };
-}
-
-/* =========================================================
-   INSTALL
+   INSTALL / UNINSTALL
 ========================================================= */
 
 function installTool(companyId, toolId, actorId = "system") {
@@ -180,14 +144,6 @@ function installTool(companyId, toolId, actorId = "system") {
   const tool = validateTool(toolId);
 
   const company = state.companies[id];
-
-  if (company.blocked.includes(tool)) {
-    throw new Error("Tool is blocked");
-  }
-
-  if (company.installed.length >= MAX_TOOLS_PER_COMPANY) {
-    throw new Error("Tool limit exceeded");
-  }
 
   if (!company.installed.includes(tool)) {
     company.installed.push(tool);
@@ -205,18 +161,13 @@ function installTool(companyId, toolId, actorId = "system") {
   return listTools(id);
 }
 
-/* =========================================================
-   UNINSTALL
-========================================================= */
-
 function uninstallTool(companyId, toolId, actorId = "system") {
   const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
   const company = state.companies[id];
 
-  company.installed =
-    company.installed.filter((t) => t !== tool);
+  company.installed = company.installed.filter((t) => t !== tool);
 
   save();
 
@@ -232,7 +183,7 @@ function uninstallTool(companyId, toolId, actorId = "system") {
 }
 
 /* =========================================================
-   ADMIN BLOCKING
+   BLOCKING
 ========================================================= */
 
 function blockTool(companyId, toolId, actorId) {
@@ -243,9 +194,7 @@ function blockTool(companyId, toolId, actorId) {
 
   if (!company.blocked.includes(tool)) {
     company.blocked.push(tool);
-    company.installed =
-      company.installed.filter((t) => t !== tool);
-
+    company.installed = company.installed.filter((t) => t !== tool);
     save();
 
     audit({
@@ -265,9 +214,7 @@ function unblockTool(companyId, toolId, actorId) {
   const tool = validateTool(toolId);
 
   const company = state.companies[id];
-
-  company.blocked =
-    company.blocked.filter((t) => t !== tool);
+  company.blocked = company.blocked.filter((t) => t !== tool);
 
   save();
 
@@ -283,14 +230,33 @@ function unblockTool(companyId, toolId, actorId) {
 }
 
 /* =========================================================
+   BRANCH FILTERING (NEW)
+========================================================= */
+
+function getVisibleToolsForBranch(companyId, branch) {
+  const id = ensureCompany(companyId);
+
+  const installed = state.companies[id].installed || [];
+  const blocked = state.companies[id].blocked || [];
+
+  const branchKey = clean(branch || "member").toLowerCase();
+  const allowedForBranch =
+    BRANCH_TOOLS[branchKey] || BRANCH_TOOLS.member;
+
+  return installed
+    .filter((tool) => !blocked.includes(tool))
+    .filter((tool) => allowedForBranch.includes(tool));
+}
+
+/* =========================================================
    EXPORT
 ========================================================= */
 
 module.exports = {
   listTools,
-  getToolsForUser,
   installTool,
   uninstallTool,
   blockTool,
   unblockTool,
+  getVisibleToolsForBranch,
 };
