@@ -1,313 +1,257 @@
-// backend/src/routes/company.routes.js
-// Company Room API — Tier Controlled • Structured Members • Secure
+const { nanoid } = require("nanoid");
+const { readDb, writeDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
+const { createNotification } = require("../lib/notify");
 
-const express = require("express");
-const router = express.Router();
+/* =========================================================
+   TIER CONFIG (USER LIMIT BASED)
+========================================================= */
 
-const { authRequired, requireRole } = require("../middleware/auth");
-const users = require("../users/user.service");
-const companies = require("../companies/company.service");
-const { listNotifications, markRead } = require("../lib/notify");
+const TIERS = {
+  micro: { maxUsers: 5 },
+  small: { maxUsers: 15 },
+  mid: { maxUsers: 50 },
+  enterprise: { maxUsers: 150 },
+  unlimited: { maxUsers: Infinity },
+};
 
-router.use(authRequired);
+function normalizeTier(tier) {
+  const t = String(tier || "").toLowerCase();
+  return TIERS[t] ? t : "micro";
+}
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
-function safeStr(v, max = 120) {
+function ensureCompanies(db) {
+  if (!Array.isArray(db.companies)) db.companies = [];
+}
+
+function safeStr(v, maxLen = 160) {
   const s = String(v || "").trim();
-  return s ? s.slice(0, max) : "";
+  return s ? s.slice(0, maxLen) : "";
 }
 
-function normRole(r) {
-  return String(r || "").trim().toLowerCase();
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function getCompanyById(db, id) {
+  ensureCompanies(db);
+  const cid = String(id || "").trim();
+  if (!cid) return null;
+  return db.companies.find((c) => String(c.id) === cid) || null;
+}
+
+function enforceUserLimit(company) {
+  const tier = normalizeTier(company.tier);
+  const limit = TIERS[tier].maxUsers;
+
+  if (!Array.isArray(company.members)) company.members = [];
+
+  if (company.members.length >= limit) {
+    throw new Error("User limit reached for current plan. Please upgrade.");
+  }
 }
 
 /* =========================================================
-   COMPANY CONTEXT
+   CREATE COMPANY
 ========================================================= */
 
-function resolveCompanyId(req) {
-  const role = normRole(req.user?.role);
-  const isAdmin = role === normRole(users.ROLES.ADMIN);
+function createCompany({
+  name,
+  country,
+  website,
+  industry,
+  contactEmail,
+  contactPhone,
+  tier = "micro",
+  createdBy,
+}) {
+  const db = readDb();
+  ensureCompanies(db);
 
-  if (isAdmin) {
-    const fromQuery = safeStr(req.query.companyId, 100);
-    const fromBody = safeStr(req.body?.companyId, 100);
-    const fromToken = safeStr(req.user.companyId, 100);
-    return fromQuery || fromBody || fromToken || null;
-  }
+  const cleanName = safeStr(name, 120);
+  if (!cleanName) throw new Error("Company name is required");
 
-  return safeStr(req.user.companyId, 100) || null;
+  const normalizedTier = normalizeTier(tier);
+
+  const c = {
+    id: nanoid(),
+    name: cleanName,
+    country: safeStr(country, 80),
+    website: safeStr(website, 160),
+    industry: safeStr(industry, 120),
+    contactEmail: safeStr(contactEmail, 160),
+    contactPhone: safeStr(contactPhone, 60),
+
+    tier: normalizedTier,
+    maxUsers: TIERS[normalizedTier].maxUsers,
+
+    createdAt: nowISO(),
+    status: "Active",
+    createdBy: createdBy ? String(createdBy) : null,
+
+    // structured members
+    members: [],
+  };
+
+  db.companies.push(c);
+  writeDb(db);
+
+  audit({
+    actorId: c.createdBy,
+    action: "COMPANY_CREATED",
+    targetType: "Company",
+    targetId: c.id,
+  });
+
+  createNotification({
+    companyId: c.id,
+    severity: "info",
+    title: "Company created",
+    message: "Company workspace is ready.",
+  });
+
+  return c;
 }
 
-function requireCompany(req, res) {
-  const companyId = resolveCompanyId(req);
+/* =========================================================
+   UPGRADE COMPANY
+========================================================= */
 
-  if (!companyId) {
-    res.status(400).json({
-      ok: false,
-      error: "Company context missing",
+function upgradeCompany(companyId, newTier, actorId) {
+  const db = readDb();
+  ensureCompanies(db);
+
+  const c = getCompanyById(db, companyId);
+  if (!c) throw new Error("Company not found");
+
+  const normalizedTier = normalizeTier(newTier);
+
+  c.tier = normalizedTier;
+  c.maxUsers = TIERS[normalizedTier].maxUsers;
+
+  writeDb(db);
+
+  audit({
+    actorId: actorId ? String(actorId) : null,
+    action: "COMPANY_UPGRADED",
+    targetType: "Company",
+    targetId: c.id,
+    metadata: { newTier: normalizedTier },
+  });
+
+  return c;
+}
+
+/* =========================================================
+   MEMBER MANAGEMENT (STRUCTURED)
+========================================================= */
+
+function addMember(companyId, userId, actorId, position = "member") {
+  const db = readDb();
+  ensureCompanies(db);
+
+  const c = getCompanyById(db, companyId);
+  if (!c) throw new Error("Company not found");
+
+  const uid = String(userId || "").trim();
+  if (!uid) throw new Error("Missing userId");
+
+  if (!Array.isArray(c.members)) c.members = [];
+
+  // prevent duplicate
+  const exists = c.members.find(
+    (m) => String(m.userId || m) === uid
+  );
+
+  if (exists) return c;
+
+  enforceUserLimit(c);
+
+  c.members.push({
+    userId: uid,
+    position: safeStr(position, 80) || "member",
+    assignedAt: nowISO(),
+  });
+
+  writeDb(db);
+
+  audit({
+    actorId: actorId ? String(actorId) : null,
+    action: "COMPANY_ADD_MEMBER",
+    targetType: "Company",
+    targetId: c.id,
+    metadata: { userId: uid, position },
+  });
+
+  createNotification({
+    companyId: c.id,
+    severity: "info",
+    title: "Member added",
+    message: `User ${uid} added as ${position}.`,
+  });
+
+  return c;
+}
+
+function removeMember(companyId, userId, actorId) {
+  const db = readDb();
+  ensureCompanies(db);
+
+  const c = getCompanyById(db, companyId);
+  if (!c) throw new Error("Company not found");
+
+  const uid = String(userId || "").trim();
+  if (!uid) throw new Error("Missing userId");
+
+  const before = c.members.length;
+
+  c.members = c.members.filter(
+    (m) => String(m.userId || m) !== uid
+  );
+
+  if (c.members.length !== before) {
+    writeDb(db);
+
+    audit({
+      actorId: actorId ? String(actorId) : null,
+      action: "COMPANY_REMOVE_MEMBER",
+      targetType: "Company",
+      targetId: c.id,
+      metadata: { userId: uid },
     });
-    return null;
+
+    createNotification({
+      companyId: c.id,
+      severity: "warn",
+      title: "Member removed",
+      message: `User ${uid} removed.`,
+    });
   }
 
-  return companyId;
+  return c;
 }
 
-function ensureCompanyActive(company) {
-  if (!company || company.status !== "Active") {
-    const err = new Error("Company not active");
-    err.status = 403;
-    throw err;
-  }
-}
-
 /* =========================================================
-   COMPANY PROFILE
+   EXPORT
 ========================================================= */
 
-router.get(
-  "/me",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const c = companies.getCompany(companyId);
-      if (!c) {
-        return res.status(404).json({
-          ok: false,
-          error: "Company not found",
-        });
-      }
-
-      ensureCompanyActive(c);
-
-      return res.json({
-        ok: true,
-        company: {
-          id: c.id,
-          name: c.name,
-          tier: c.tier,
-          maxUsers: c.maxUsers,
-          currentUsers: Array.isArray(c.members)
-            ? c.members.length
-            : 0,
-          members: c.members || [],
-          createdAt: c.createdAt || null,
-        },
-      });
-    } catch (e) {
-      return res.status(e.status || 500).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-/* =========================================================
-   UPGRADE PLAN
-========================================================= */
-
-router.post(
-  "/upgrade",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const newTier = safeStr(req.body?.tier, 30);
-      if (!newTier) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing tier",
-        });
-      }
-
-      const updated = companies.upgradeCompany(
-        companyId,
-        newTier,
-        req.user.id
-      );
-
-      return res.json({
-        ok: true,
-        company: {
-          id: updated.id,
-          tier: updated.tier,
-          maxUsers: updated.maxUsers,
-        },
-      });
-    } catch (e) {
-      return res.status(400).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-/* =========================================================
-   MEMBER MANAGEMENT (WITH POSITION)
-========================================================= */
-
-router.post(
-  "/members/add",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const userId = safeStr(req.body?.userId, 100);
-      const position = safeStr(req.body?.position, 80) || "member";
-
-      if (!userId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing userId",
-        });
-      }
-
-      const targetUser = users.findById(userId);
-      if (!targetUser) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found",
-        });
-      }
-
-      if (
-        normRole(targetUser.role) === normRole(users.ROLES.ADMIN) ||
-        normRole(targetUser.role) === normRole(users.ROLES.MANAGER)
-      ) {
-        return res.status(403).json({
-          ok: false,
-          error: "Cannot assign admin or manager to company",
-        });
-      }
-
-      const result = companies.addMember(
-        companyId,
-        userId,
-        req.user.id,
-        position
-      );
-
-      return res.json({
-        ok: true,
-        company: result,
-      });
-    } catch (e) {
-      return res.status(400).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-router.post(
-  "/members/remove",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const userId = safeStr(req.body?.userId, 100);
-      if (!userId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing userId",
-        });
-      }
-
-      const result = companies.removeMember(
-        companyId,
-        userId,
-        req.user.id
-      );
-
-      return res.json({
-        ok: true,
-        company: result,
-      });
-    } catch (e) {
-      return res.status(400).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-/* =========================================================
-   NOTIFICATIONS
-========================================================= */
-
-router.get(
-  "/notifications",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      return res.json({
-        ok: true,
-        notifications: listNotifications({ companyId }) || [],
-      });
-    } catch (e) {
-      return res.status(500).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-router.post(
-  "/notifications/:id/read",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
-  (req, res) => {
-    try {
-      const companyId = requireCompany(req, res);
-      if (!companyId) return;
-
-      const id = safeStr(req.params.id, 100);
-      if (!id) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing notification id",
-        });
-      }
-
-      const n = markRead(id, null, companyId);
-
-      if (!n) {
-        return res.status(404).json({
-          ok: false,
-          error: "Notification not found",
-        });
-      }
-
-      return res.json({
-        ok: true,
-        notification: n,
-      });
-    } catch (e) {
-      return res.status(500).json({
-        ok: false,
-        error: e.message,
-      });
-    }
-  }
-);
-
-module.exports = router;
+module.exports = {
+  TIERS,
+  createCompany,
+  upgradeCompany,
+  listCompanies: () => {
+    const db = readDb();
+    ensureCompanies(db);
+    return db.companies;
+  },
+  getCompany: (id) => {
+    const db = readDb();
+    return getCompanyById(db, id);
+  },
+  addMember,
+  removeMember,
+};
