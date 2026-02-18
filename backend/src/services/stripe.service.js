@@ -1,10 +1,10 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Production Hardened • Subscription Activation Engine
+// Stripe Service — Production Ready • Tier Integrated • Portal Enabled
 
 const Stripe = require("stripe");
-const { readDb, writeDb } = require("../lib/db");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
+const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 
 if (!process.env.STRIPE_SECRET_KEY) {
@@ -16,7 +16,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP
+   PRICE MAP (MATCH STRIPE DASHBOARD)
 ========================================================= */
 
 const PRICE_MAP = {
@@ -38,60 +38,6 @@ function saveUser(updatedUser) {
     db.users[idx] = updatedUser;
     writeDb(db);
   }
-}
-
-function activateIndividual(userId) {
-  const user = users.findById(userId);
-  if (!user) return;
-
-  user.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
-  user.autoDevEnabled = true;
-
-  saveUser(user);
-
-  audit({
-    actorId: userId,
-    action: "INDIVIDUAL_SUBSCRIPTION_ACTIVATED",
-    targetType: "User",
-    targetId: userId,
-  });
-}
-
-function activateCompany(companyId, planType, userId) {
-  if (!companyId) return;
-
-  const updated = companies.upgradeCompany(
-    companyId,
-    planType,
-    userId
-  );
-
-  audit({
-    actorId: userId,
-    action: "COMPANY_SUBSCRIPTION_ACTIVATED",
-    targetType: "Company",
-    targetId: companyId,
-    metadata: { planType },
-  });
-
-  return updated;
-}
-
-function deactivateSubscription(userId) {
-  const user = users.findById(userId);
-  if (!user) return;
-
-  user.subscriptionStatus = users.SUBSCRIPTION.PAST_DUE;
-  user.autoDevEnabled = false;
-
-  saveUser(user);
-
-  audit({
-    actorId: userId,
-    action: "SUBSCRIPTION_DEACTIVATED",
-    targetType: "User",
-    targetId: userId,
-  });
 }
 
 /* =========================================================
@@ -141,67 +87,101 @@ async function createCheckoutSession({
 }
 
 /* =========================================================
-   WEBHOOK HANDLER
+   CREATE CUSTOMER PORTAL SESSION
 ========================================================= */
 
-async function handleStripeWebhook(event) {
+async function createCustomerPortalSession({
+  userId,
+  returnUrl,
+}) {
+  const user = users.findById(userId);
+  if (!user) throw new Error("User not found");
 
-  switch (event.type) {
-
-    case "checkout.session.completed": {
-      const session = event.data.object;
-
-      const userId = session.metadata?.userId;
-      const planType = session.metadata?.planType;
-      const companyId = session.metadata?.companyId || null;
-
-      if (!userId || !planType) return;
-
-      if (planType === "individual_autodev") {
-        activateIndividual(userId);
-      } else {
-        activateCompany(companyId, planType, userId);
-      }
-
-      break;
-    }
-
-    case "invoice.payment_failed": {
-      const subscription = event.data.object;
-      const customerEmail = subscription.customer_email;
-
-      if (!customerEmail) return;
-
-      const user = users.findByEmail(customerEmail);
-      if (!user) return;
-
-      deactivateSubscription(user.id);
-      break;
-    }
-
-    case "customer.subscription.deleted": {
-      const subscription = event.data.object;
-      const customerEmail = subscription.customer_email;
-
-      if (!customerEmail) return;
-
-      const user = users.findByEmail(customerEmail);
-      if (!user) return;
-
-      deactivateSubscription(user.id);
-      break;
-    }
-
-    default:
-      break;
+  if (!user.stripeCustomerId) {
+    throw new Error("No Stripe customer linked");
   }
+
+  const session = await stripe.billingPortal.sessions.create({
+    customer: user.stripeCustomerId,
+    return_url: returnUrl,
+  });
+
+  audit({
+    actorId: user.id,
+    action: "STRIPE_PORTAL_OPENED",
+    targetType: "Billing",
+    targetId: user.stripeCustomerId,
+  });
+
+  return session.url;
 }
 
 /* =========================================================
-   EXPORT
+   ACTIVATE SUBSCRIPTION (Webhook Triggered)
 ========================================================= */
+
+async function activateSubscription({
+  userId,
+  planType,
+  subscriptionId,
+}) {
+  const user = users.findById(userId);
+  if (!user) return;
+
+  const subscription = await stripe.subscriptions.retrieve(
+    subscriptionId
+  );
+
+  user.subscriptionStatus = "Active";
+  user.stripeCustomerId = subscription.customer;
+  user.stripeSubscriptionId = subscriptionId;
+
+  saveUser(user);
+
+  // If company plan upgrade
+  if (user.companyId && PRICE_MAP[planType]) {
+    companies.upgradeCompany(
+      user.companyId,
+      planType,
+      user.id
+    );
+  }
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_ACTIVATED",
+    targetType: "User",
+    targetId: user.id,
+    metadata: { planType },
+  });
+}
+
+/* =========================================================
+   CANCEL SUBSCRIPTION
+========================================================= */
+
+async function cancelSubscription(userId) {
+  const user = users.findById(userId);
+  if (!user?.stripeSubscriptionId) {
+    throw new Error("No active subscription");
+  }
+
+  await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+
+  user.subscriptionStatus = "Cancelled";
+  saveUser(user);
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_CANCELLED",
+    targetType: "User",
+    targetId: user.id,
+  });
+}
 
 module.exports = {
   createCheckoutSession,
-  handleStripeWebhook,
+  createCustomerPortalSession,
+  activateSubscription,
+  cancelSubscription,
 };
