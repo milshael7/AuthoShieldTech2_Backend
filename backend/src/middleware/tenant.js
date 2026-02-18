@@ -1,5 +1,8 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v3)
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v4)
+// Tenant + Plan + Suspension Enforcement Layer
+
+const { readDb } = require("../lib/db");
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
@@ -15,7 +18,6 @@ function resolveFromSubdomain(req) {
 
   host = String(host).split(":")[0];
 
-  // Ignore localhost & IP addresses
   if (
     host.includes("localhost") ||
     /^\d+\.\d+\.\d+\.\d+$/.test(host)
@@ -31,27 +33,41 @@ function resolveFromSubdomain(req) {
 
 function tenantMiddleware(req, res, next) {
 
-  // 🔒 DO NOT force auth here
-  // Auth middleware handles protection
   if (!req.user) {
     return next();
   }
 
+  const db = readDb();
+
   const role = normRole(req.user.role);
   const isAdmin = role === "admin";
+
+  /* =====================================================
+     GLOBAL USER LOCK CHECK
+  ===================================================== */
+
+  const dbUser = (db.users || []).find(u => u.id === req.user.id);
+
+  if (!dbUser) {
+    return res.status(401).json({ error: "User not found" });
+  }
+
+  if (dbUser.locked === true) {
+    return res.status(403).json({ error: "Account suspended" });
+  }
 
   let companyId = null;
   let resolvedFrom = null;
 
-  /* ================= RESOLUTION ORDER ================= */
+  /* =====================================================
+     RESOLUTION ORDER
+  ===================================================== */
 
-  // 1️⃣ Auth token companyId
   if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
     resolvedFrom = "auth";
   }
 
-  // 2️⃣ Admin override header
   if (!companyId && isAdmin) {
     const headerCompany = req.headers["x-company-id"];
     if (headerCompany) {
@@ -60,7 +76,6 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  // 3️⃣ Subdomain
   if (!companyId) {
     const sub = resolveFromSubdomain(req);
     if (sub) {
@@ -69,7 +84,9 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  /* ================= GLOBAL ADMIN ================= */
+  /* =====================================================
+     ADMIN GLOBAL MODE
+  ===================================================== */
 
   if (isAdmin && !companyId) {
     req.tenant = {
@@ -79,6 +96,8 @@ function tenantMiddleware(req, res, next) {
       resolvedFrom: "admin-global",
       userId: req.user.id,
       role: req.user.role,
+      plan: "global",
+      suspended: false,
       scope: {
         isAdmin: true,
         isManager: false,
@@ -90,16 +109,36 @@ function tenantMiddleware(req, res, next) {
     return next();
   }
 
-  /* ================= TENANT CONTEXT ================= */
+  /* =====================================================
+     TENANT ENFORCEMENT
+  ===================================================== */
 
   if (companyId) {
+
+    const company =
+      (db.companies || []).find(c => c.id === companyId);
+
+    if (!company) {
+      return res.status(404).json({
+        error: "Company not found",
+      });
+    }
+
+    if (company.status !== "Active") {
+      return res.status(403).json({
+        error: "Company suspended",
+      });
+    }
+
     req.tenant = {
       id: companyId,
       type: "tenant",
-      brainKey: `tenant:${companyId}`, // normalized
+      brainKey: `tenant:${companyId}`,
       resolvedFrom,
       userId: req.user.id,
       role: req.user.role,
+      plan: company.tier || "micro",
+      suspended: false,
       scope: {
         isAdmin,
         isManager: role === "manager",
