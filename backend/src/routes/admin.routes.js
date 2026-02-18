@@ -1,5 +1,5 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Supreme Authority Version (Phase 6 — Tool Governance Added)
+// Admin API — Supreme Authority Version (Phase 7 — Approval System + Tool Governance)
 
 const express = require("express");
 const router = express.Router();
@@ -57,16 +57,70 @@ function audit(action, actorId, targetId, meta = {}) {
 }
 
 /* =========================================================
-   TOOL GOVERNANCE
+   APPROVAL SYSTEM (NEW)
 ========================================================= */
 
 /**
- * View installed tools for a company
+ * List pending users
  */
+router.get("/pending-users", (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      users: users.listPendingUsers(),
+    });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+/**
+ * Admin final approval
+ */
+router.post("/users/:id/approve", (req, res) => {
+  try {
+    const id = requireId(req.params.id);
+
+    const updated = users.adminApproveUser(id, req.user.id);
+
+    audit("ADMIN_APPROVE_USER", req.user.id, id);
+
+    return res.json({
+      ok: true,
+      user: updated,
+    });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+/**
+ * Admin deny
+ */
+router.post("/users/:id/deny", (req, res) => {
+  try {
+    const id = requireId(req.params.id);
+
+    const updated = users.adminDenyUser(id, req.user.id);
+
+    audit("ADMIN_DENY_USER", req.user.id, id);
+
+    return res.json({
+      ok: true,
+      user: updated,
+    });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   TOOL GOVERNANCE
+========================================================= */
+
 router.get("/companies/:id/tools", (req, res) => {
   try {
     const companyId = requireId(req.params.id);
-
     const result = securityTools.listTools(companyId);
 
     return res.json({
@@ -76,16 +130,10 @@ router.get("/companies/:id/tools", (req, res) => {
       blocked: result.blocked || [],
     });
   } catch (e) {
-    return res.status(400).json({
-      ok: false,
-      error: e.message,
-    });
+    return res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-/**
- * Globally block tool for a company
- */
 router.post("/companies/:id/tools/:toolId/block", (req, res) => {
   try {
     const companyId = requireId(req.params.id);
@@ -97,16 +145,14 @@ router.post("/companies/:id/tools/:toolId/block", (req, res) => {
       req.user.id
     );
 
-    audit("ADMIN_BLOCK_TOOL", req.user.id, companyId, {
-      toolId,
-    });
+    audit("ADMIN_BLOCK_TOOL", req.user.id, companyId, { toolId });
 
     recordEvent({
       type: "tool_blocked",
       severity: "warn",
       source: "admin",
       target: toolId,
-      description: `Admin blocked tool ${toolId} for company ${companyId}`,
+      description: `Admin blocked tool ${toolId}`,
       meta: { companyId },
     });
 
@@ -115,16 +161,10 @@ router.post("/companies/:id/tools/:toolId/block", (req, res) => {
       blocked: updated.blocked,
     });
   } catch (e) {
-    return res.status(400).json({
-      ok: false,
-      error: e.message,
-    });
+    return res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-/**
- * Unblock tool
- */
 router.post("/companies/:id/tools/:toolId/unblock", (req, res) => {
   try {
     const companyId = requireId(req.params.id);
@@ -136,16 +176,14 @@ router.post("/companies/:id/tools/:toolId/unblock", (req, res) => {
       req.user.id
     );
 
-    audit("ADMIN_UNBLOCK_TOOL", req.user.id, companyId, {
-      toolId,
-    });
+    audit("ADMIN_UNBLOCK_TOOL", req.user.id, companyId, { toolId });
 
     recordEvent({
       type: "tool_unblocked",
       severity: "info",
       source: "admin",
       target: toolId,
-      description: `Admin unblocked tool ${toolId} for company ${companyId}`,
+      description: `Admin unblocked tool ${toolId}`,
       meta: { companyId },
     });
 
@@ -154,18 +192,14 @@ router.post("/companies/:id/tools/:toolId/unblock", (req, res) => {
       blocked: updated.blocked,
     });
   } catch (e) {
-    return res.status(400).json({
-      ok: false,
-      error: e.message,
-    });
+    return res.status(400).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   EXISTING ADMIN SYSTEM (unchanged below)
+   EXISTING ADMIN SYSTEM
 ========================================================= */
 
-// USERS
 router.get("/users", (req, res) => {
   try {
     return res.json({
@@ -177,7 +211,6 @@ router.get("/users", (req, res) => {
   }
 });
 
-// COMPANIES
 router.get("/companies", (req, res) => {
   try {
     return res.json({
@@ -189,7 +222,6 @@ router.get("/companies", (req, res) => {
   }
 });
 
-// NOTIFICATIONS
 router.get("/notifications", (req, res) => {
   try {
     return res.json({
