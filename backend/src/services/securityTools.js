@@ -1,9 +1,10 @@
 // backend/src/services/securityTools.js
-// Security Tool Engine — Branch Controlled • Company Scoped • Tier Safe
+// Security Tool Engine — Engine-Level Branch Enforcement • Company Scoped • Hardened
 
 const fs = require("fs");
 const path = require("path");
 const { audit } = require("../lib/audit");
+const companies = require("../companies/company.service");
 
 /* =========================================================
    CONFIG
@@ -55,7 +56,7 @@ const BRANCH_TOOLS = {
   soc: ["siem", "xdr", "edr"],
   analyst: ["vulnscan", "forensics", "data"],
   consultant: ["sat", "darkweb", "email"],
-  member: [], // default
+  member: [],
 };
 
 /* =========================================================
@@ -122,8 +123,41 @@ function ensureCompany(companyId) {
   return id;
 }
 
+function getUserBranch(companyId, userId) {
+  const company = companies.getCompany(companyId);
+  if (!company || !Array.isArray(company.members)) return null;
+
+  const record = company.members.find(
+    (m) => String(m.userId || m) === String(userId)
+  );
+
+  if (!record) return null;
+
+  if (typeof record === "object") {
+    return record.position || "member";
+  }
+
+  return "member";
+}
+
+function ensureBranchAllowed(companyId, userId, toolId) {
+  const branch = getUserBranch(companyId, userId);
+
+  if (!branch) {
+    throw new Error("User not assigned to company branch");
+  }
+
+  const allowed = BRANCH_TOOLS[branch] || BRANCH_TOOLS.member;
+
+  if (!allowed.includes(toolId)) {
+    throw new Error(
+      `Branch '${branch}' not authorized for tool '${toolId}'`
+    );
+  }
+}
+
 /* =========================================================
-   LIST TOOLS
+   LIST
 ========================================================= */
 
 function listTools(companyId) {
@@ -136,14 +170,24 @@ function listTools(companyId) {
 }
 
 /* =========================================================
-   INSTALL / UNINSTALL
+   INSTALL (ENGINE-LEVEL ENFORCED)
 ========================================================= */
 
-function installTool(companyId, toolId, actorId = "system") {
+function installTool(companyId, toolId, actorId = "system", options = {}) {
   const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
+  const { bypassBranch = false } = options;
+
+  if (!bypassBranch && actorId !== "system") {
+    ensureBranchAllowed(id, actorId, tool);
+  }
+
   const company = state.companies[id];
+
+  if (company.blocked.includes(tool)) {
+    throw new Error("Tool is blocked for this company");
+  }
 
   if (!company.installed.includes(tool)) {
     company.installed.push(tool);
@@ -161,13 +205,25 @@ function installTool(companyId, toolId, actorId = "system") {
   return listTools(id);
 }
 
-function uninstallTool(companyId, toolId, actorId = "system") {
+/* =========================================================
+   UNINSTALL (ENGINE-LEVEL ENFORCED)
+========================================================= */
+
+function uninstallTool(companyId, toolId, actorId = "system", options = {}) {
   const id = ensureCompany(companyId);
   const tool = validateTool(toolId);
 
+  const { bypassBranch = false } = options;
+
+  if (!bypassBranch && actorId !== "system") {
+    ensureBranchAllowed(id, actorId, tool);
+  }
+
   const company = state.companies[id];
 
-  company.installed = company.installed.filter((t) => t !== tool);
+  company.installed = company.installed.filter(
+    (t) => t !== tool
+  );
 
   save();
 
@@ -194,7 +250,9 @@ function blockTool(companyId, toolId, actorId) {
 
   if (!company.blocked.includes(tool)) {
     company.blocked.push(tool);
-    company.installed = company.installed.filter((t) => t !== tool);
+    company.installed = company.installed.filter(
+      (t) => t !== tool
+    );
     save();
 
     audit({
@@ -214,7 +272,10 @@ function unblockTool(companyId, toolId, actorId) {
   const tool = validateTool(toolId);
 
   const company = state.companies[id];
-  company.blocked = company.blocked.filter((t) => t !== tool);
+
+  company.blocked = company.blocked.filter(
+    (t) => t !== tool
+  );
 
   save();
 
@@ -230,7 +291,7 @@ function unblockTool(companyId, toolId, actorId) {
 }
 
 /* =========================================================
-   BRANCH FILTERING (NEW)
+   BRANCH FILTERED VISIBILITY
 ========================================================= */
 
 function getVisibleToolsForBranch(companyId, branch) {
