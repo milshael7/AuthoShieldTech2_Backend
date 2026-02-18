@@ -1,187 +1,163 @@
-// backend/src/services/stripe.service.js
-// Stripe Service — Production Ready • Tier Integrated • Portal Enabled
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const morgan = require("morgan");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const http = require("http");
+const { WebSocketServer } = require("ws");
 
-const Stripe = require("stripe");
-const users = require("../users/user.service");
-const companies = require("../companies/company.service");
-const { readDb, writeDb } = require("../lib/db");
-const { audit } = require("../lib/audit");
+const { ensureDb } = require("./lib/db");
+const users = require("./users/user.service");
+const tenantMiddleware = require("./middleware/tenant");
 
-if (!process.env.STRIPE_SECRET_KEY) {
-  throw new Error("STRIPE_SECRET_KEY missing");
+const securityRoutes = require("./routes/security.routes");
+const billingRoutes = require("./routes/billing.routes");
+const stripeWebhookRoutes = require("./routes/stripe.webhook.routes"); // ✅ STRIPE WEBHOOK
+
+/* =========================================================
+   SAFE BOOT
+========================================================= */
+
+function requireEnv(name) {
+  if (!process.env[name]) {
+    console.error(`[BOOT] Missing required env var: ${name}`);
+    process.exit(1);
+  }
 }
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2023-10-16",
+requireEnv("JWT_SECRET");
+requireEnv("STRIPE_SECRET_KEY");
+requireEnv("STRIPE_WEBHOOK_SECRET");
+
+ensureDb();
+users.ensureAdminFromEnv();
+
+console.log("[BOOT] Backend initialized");
+
+/* =========================================================
+   EXPRESS
+========================================================= */
+
+const app = express();
+app.set("trust proxy", 1);
+
+/* =========================================================
+   🔥 STRIPE WEBHOOK (MUST BE BEFORE JSON)
+========================================================= */
+
+app.use(
+  "/api/stripe/webhook",
+  stripeWebhookRoutes
+);
+
+/* =========================================================
+   CORS
+========================================================= */
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
+/* =========================================================
+   SECURITY
+========================================================= */
+
+app.use(helmet());
+app.use(express.json({ limit: "2mb" }));
+app.use(morgan("dev"));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.AUTH_RATELIMIT_MAX || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 /* =========================================================
-   PRICE MAP (MATCH STRIPE DASHBOARD)
+   HEALTH
 ========================================================= */
 
-const PRICE_MAP = {
-  individual_autodev: process.env.STRIPE_PRICE_AUTODEV,
-  micro: process.env.STRIPE_PRICE_MICRO,
-  small: process.env.STRIPE_PRICE_SMALL,
-  mid: process.env.STRIPE_PRICE_MID,
-  enterprise: process.env.STRIPE_PRICE_ENTERPRISE,
-};
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    time: new Date().toISOString(),
+  });
+});
 
 /* =========================================================
-   INTERNAL HELPERS
+   AUTH ROUTES
 ========================================================= */
 
-function saveUser(updatedUser) {
-  const db = readDb();
-  const idx = db.users.findIndex((u) => u.id === updatedUser.id);
-  if (idx !== -1) {
-    db.users[idx] = updatedUser;
-    writeDb(db);
-  }
-}
+app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
 
 /* =========================================================
-   CREATE CHECKOUT SESSION
+   TENANT CONTEXT
 ========================================================= */
 
-async function createCheckoutSession({
-  userId,
-  type,
-  successUrl,
-  cancelUrl,
-}) {
-  const user = users.findById(userId);
-  if (!user) throw new Error("User not found");
-
-  const priceId = PRICE_MAP[type];
-  if (!priceId) throw new Error("Invalid plan type");
-
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    payment_method_types: ["card"],
-    line_items: [
-      {
-        price: priceId,
-        quantity: 1,
-      },
-    ],
-    customer_email: user.email,
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    metadata: {
-      userId: user.id,
-      planType: type,
-      companyId: user.companyId || "",
-    },
-  });
-
-  audit({
-    actorId: user.id,
-    action: "STRIPE_CHECKOUT_CREATED",
-    targetType: "Billing",
-    targetId: session.id,
-    metadata: { planType: type },
-  });
-
-  return session.url;
-}
+app.use(tenantMiddleware);
 
 /* =========================================================
-   CREATE CUSTOMER PORTAL SESSION
+   API ROUTES
 ========================================================= */
 
-async function createCustomerPortalSession({
-  userId,
-  returnUrl,
-}) {
-  const user = users.findById(userId);
-  if (!user) throw new Error("User not found");
+app.use("/api/admin", require("./routes/admin.routes"));
+app.use("/api/manager", require("./routes/manager.routes"));
+app.use("/api/company", require("./routes/company.routes"));
+app.use("/api/me", require("./routes/me.routes"));
+app.use("/api/security", securityRoutes);
+app.use("/api/billing", billingRoutes);
 
-  if (!user.stripeCustomerId) {
-    throw new Error("No Stripe customer linked");
-  }
-
-  const session = await stripe.billingPortal.sessions.create({
-    customer: user.stripeCustomerId,
-    return_url: returnUrl,
-  });
-
-  audit({
-    actorId: user.id,
-    action: "STRIPE_PORTAL_OPENED",
-    targetType: "Billing",
-    targetId: user.stripeCustomerId,
-  });
-
-  return session.url;
-}
+app.use("/api/trading", require("./routes/trading.routes"));
+app.use("/api/ai", require("./routes/ai.routes"));
+app.use("/api/voice", require("./routes/voice.routes"));
+app.use("/api/live", require("./routes/live.routes"));
+app.use("/api/paper", require("./routes/paper.routes"));
 
 /* =========================================================
-   ACTIVATE SUBSCRIPTION (Webhook Triggered)
+   SERVER
 ========================================================= */
 
-async function activateSubscription({
-  userId,
-  planType,
-  subscriptionId,
-}) {
-  const user = users.findById(userId);
-  if (!user) return;
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws/market" });
 
-  const subscription = await stripe.subscriptions.retrieve(
-    subscriptionId
-  );
+let onlineUsers = 0;
 
-  user.subscriptionStatus = "Active";
-  user.stripeCustomerId = subscription.customer;
-  user.stripeSubscriptionId = subscriptionId;
+wss.on("connection", (ws) => {
+  onlineUsers++;
 
-  saveUser(user);
-
-  // If company plan upgrade
-  if (user.companyId && PRICE_MAP[planType]) {
-    companies.upgradeCompany(
-      user.companyId,
-      planType,
-      user.id
-    );
-  }
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_ACTIVATED",
-    targetType: "User",
-    targetId: user.id,
-    metadata: { planType },
+  ws.on("close", () => {
+    onlineUsers = Math.max(onlineUsers - 1, 0);
   });
-}
+
+  ws.on("error", () => {
+    onlineUsers = Math.max(onlineUsers - 1, 0);
+  });
+});
 
 /* =========================================================
-   CANCEL SUBSCRIPTION
+   ERROR HANDLER
 ========================================================= */
 
-async function cancelSubscription(userId) {
-  const user = users.findById(userId);
-  if (!user?.stripeSubscriptionId) {
-    throw new Error("No active subscription");
-  }
+app.use((err, req, res, next) => {
+  console.error("[HTTP ERROR]", err);
 
-  await stripe.subscriptions.cancel(user.stripeSubscriptionId);
-
-  user.subscriptionStatus = "Cancelled";
-  saveUser(user);
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_CANCELLED",
-    targetType: "User",
-    targetId: user.id,
+  return res.status(500).json({
+    ok: false,
+    error: "Internal server error",
   });
-}
+});
 
-module.exports = {
-  createCheckoutSession,
-  createCustomerPortalSession,
-  activateSubscription,
-  cancelSubscription,
-};
+/* =========================================================
+   START
+========================================================= */
+
+const port = process.env.PORT || 5000;
+
+server.listen(port, () => {
+  console.log(`[BOOT] Running on port ${port}`);
+});
