@@ -1,8 +1,8 @@
 // backend/src/routes/manager.routes.js
-// Manager Room API — Phase 7 Upgrade
+// Manager API — Phase 8 Hardened
 // Manager approval layer (non-final)
 // Admin inherits access
-// No override authority
+// Strict hierarchy enforcement
 
 const express = require("express");
 const router = express.Router();
@@ -57,21 +57,45 @@ function ensureManagerActive(req) {
   }
 }
 
+function audit(action, actorId, targetId) {
+  const db = readDb();
+  db.audit = db.audit || [];
+
+  db.audit.push({
+    id: Date.now().toString(),
+    at: new Date().toISOString(),
+    action,
+    actorId,
+    targetId,
+  });
+
+  writeDb(db);
+}
+
 /* =========================================================
    APPROVAL SYSTEM (MANAGER LAYER)
 ========================================================= */
 
 /**
- * List pending users (visible to manager)
+ * Manager sees ONLY strictly pending users
  */
 router.get("/pending-users", (req, res) => {
   try {
     ensureManagerActive(req);
 
+    const db = readDb();
+
+    const list = (db.users || []).filter(
+      (u) =>
+        u.status === users.APPROVAL_STATUS.PENDING &&
+        u.role !== ADMIN
+    );
+
     return res.json({
       ok: true,
-      users: users.listPendingUsers(),
+      users: list,
     });
+
   } catch (e) {
     return res.status(e.status || 400).json({
       ok: false,
@@ -81,24 +105,40 @@ router.get("/pending-users", (req, res) => {
 });
 
 /**
- * Manager approves user (NOT final)
- * Admin can override later
+ * Manager approval (NOT FINAL)
+ * Cannot approve Admin
+ * Cannot approve already processed users
  */
 router.post("/users/:id/approve", (req, res) => {
   try {
     ensureManagerActive(req);
 
     const id = requireId(req.params.id);
+    const db = readDb();
 
-    const updated = users.managerApproveUser(
-      id,
-      req.user.id
-    );
+    const u = (db.users || []).find((x) => x.id === id);
+    if (!u) throw new Error("User not found");
+
+    if (u.role === ADMIN) {
+      throw new Error("Managers cannot approve admin accounts");
+    }
+
+    if (u.status !== users.APPROVAL_STATUS.PENDING) {
+      throw new Error("User not eligible for manager approval");
+    }
+
+    u.status = users.APPROVAL_STATUS.MANAGER_APPROVED;
+    u.approvedBy = "manager";
+
+    writeDb(db);
+
+    audit("MANAGER_APPROVE_USER", req.user.id, id);
 
     return res.json({
       ok: true,
-      user: updated,
+      user: u,
     });
+
   } catch (e) {
     return res.status(e.status || 400).json({
       ok: false,
@@ -127,6 +167,7 @@ router.get("/overview", (req, res) => {
       },
       time: new Date().toISOString(),
     });
+
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
@@ -145,18 +186,20 @@ router.get("/users", (req, res) => {
 
     const allUsers = users.listUsers() || [];
 
-    const sanitized = allUsers.map(u => ({
+    const sanitized = allUsers.map((u) => ({
       id: u.id,
       email: u.email,
       role: u.role,
       companyId: u.companyId || null,
       locked: !!u.locked,
+      status: u.status,
     }));
 
     return res.json({
       ok: true,
       users: sanitized,
     });
+
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
@@ -175,7 +218,7 @@ router.get("/companies", (req, res) => {
 
     const list = companies.listCompanies() || [];
 
-    const sanitized = list.map(c => ({
+    const sanitized = list.map((c) => ({
       id: c.id,
       name: c.name,
       suspended: !!c.suspended,
@@ -187,6 +230,7 @@ router.get("/companies", (req, res) => {
       ok: true,
       companies: sanitized,
     });
+
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
@@ -210,6 +254,7 @@ router.get("/notifications", (req, res) => {
       ok: true,
       notifications: all.slice(0, limit),
     });
+
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
@@ -252,6 +297,7 @@ router.get("/audit", (req, res) => {
       ok: true,
       audit: items.slice(0, limit),
     });
+
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
