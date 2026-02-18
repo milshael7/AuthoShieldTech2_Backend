@@ -1,11 +1,11 @@
 // backend/src/routes/stripe.webhook.routes.js
-// Stripe Webhook — Subscription Activation Engine
+// Stripe Webhook — Production Hardened • Signature Verified • Subscription Engine
 
 const express = require("express");
 const router = express.Router();
 const Stripe = require("stripe");
 
-const { activateSubscription } = require("../services/stripe.service");
+const { handleStripeWebhook } = require("../services/stripe.service");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -20,15 +20,16 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   RAW BODY REQUIRED FOR STRIPE SIGNATURE
+   IMPORTANT:
+   This route MUST use raw body
 ========================================================= */
 
 router.post(
   "/",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    const sig = req.headers["stripe-signature"];
 
+    const sig = req.headers["stripe-signature"];
     let event;
 
     try {
@@ -38,33 +39,19 @@ router.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error("Stripe webhook signature failed:", err.message);
+      console.error("[STRIPE] Signature verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    /* =========================================================
-       HANDLE EVENTS
-    ========================================================= */
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-
-      if (session.mode === "subscription") {
-        const userId = session.metadata?.userId;
-        const planType = session.metadata?.planType;
-        const subscriptionId = session.subscription;
-
-        if (userId && planType && subscriptionId) {
-          activateSubscription({
-            userId,
-            planType,
-            subscriptionId,
-          });
-        }
-      }
+    try {
+      await handleStripeWebhook(event);
+    } catch (err) {
+      console.error("[STRIPE] Webhook handler error:", err);
+      return res.status(500).json({
+        ok: false,
+        error: "Webhook processing failed",
+      });
     }
-
-    /* ========================================================= */
 
     return res.json({ received: true });
   }
