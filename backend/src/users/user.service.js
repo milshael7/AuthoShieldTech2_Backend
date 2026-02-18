@@ -1,7 +1,6 @@
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
-const { readDb, writeDb, writeAudit: audit } = require("../lib/db");
-const { createNotification } = require("../lib/notify");
+const { readDb, writeDb } = require("../lib/db");
 
 /* ======================================================
    CONSTANTS
@@ -61,15 +60,6 @@ function requireValidRole(role) {
   return r;
 }
 
-function requireRoleAuthority(actorRole, targetRole) {
-  const actorRank = ROLE_RANK[actorRole] || 0;
-  const targetRank = ROLE_RANK[targetRole] || 0;
-
-  if (actorRank <= targetRank) {
-    throw new Error("Insufficient authority for this action");
-  }
-}
-
 /* ======================================================
    ADMIN BOOTSTRAP
 ====================================================== */
@@ -100,7 +90,6 @@ function ensureAdminFromEnv() {
     subscriptionStatus: SUBSCRIPTION.ACTIVE,
     mustResetPassword: false,
     locked: false,
-
     status: APPROVAL_STATUS.APPROVED,
     approvedBy: "system",
   };
@@ -110,7 +99,7 @@ function ensureAdminFromEnv() {
 }
 
 /* ======================================================
-   USER CREATION (NOW PENDING BY DEFAULT)
+   USER CREATION (PENDING FLOW)
 ====================================================== */
 
 function createUser({ email, password, role, profile = {}, companyId = null }) {
@@ -126,8 +115,8 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     throw new Error("Email already exists");
   }
 
-  if (!password || String(password).length < 4) {
-    throw new Error("Password too short");
+  if (!password || String(password).length < 6) {
+    throw new Error("Password must be at least 6 characters");
   }
 
   const u = {
@@ -141,7 +130,6 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     subscriptionStatus: SUBSCRIPTION.TRIAL,
     mustResetPassword: false,
     locked: false,
-
     status: APPROVAL_STATUS.PENDING,
     approvedBy: null,
     profile: typeof profile === "object" ? profile : {},
@@ -160,12 +148,17 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 function listPendingUsers() {
   const db = readDb();
   ensureArrays(db);
+
   return db.users
-    .filter((u) => u.status === APPROVAL_STATUS.PENDING)
+    .filter(
+      (u) =>
+        u.status === APPROVAL_STATUS.PENDING ||
+        u.status === APPROVAL_STATUS.MANAGER_APPROVED
+    )
     .map(sanitize);
 }
 
-function managerApproveUser(id, actorId) {
+function managerApproveUser(id) {
   const db = readDb();
   ensureArrays(db);
 
@@ -173,7 +166,7 @@ function managerApproveUser(id, actorId) {
   if (!u) throw new Error("User not found");
 
   if (u.status !== APPROVAL_STATUS.PENDING) {
-    throw new Error("User not pending");
+    throw new Error("User is not pending manager approval");
   }
 
   u.status = APPROVAL_STATUS.MANAGER_APPROVED;
@@ -183,12 +176,16 @@ function managerApproveUser(id, actorId) {
   return sanitize(u);
 }
 
-function adminApproveUser(id, actorId) {
+function adminApproveUser(id) {
   const db = readDb();
   ensureArrays(db);
 
   const u = db.users.find((x) => x.id === id);
   if (!u) throw new Error("User not found");
+
+  if (u.status === APPROVAL_STATUS.DENIED) {
+    throw new Error("User was denied");
+  }
 
   u.status = APPROVAL_STATUS.APPROVED;
   u.approvedBy = "admin";
@@ -197,7 +194,7 @@ function adminApproveUser(id, actorId) {
   return sanitize(u);
 }
 
-function adminDenyUser(id, actorId) {
+function adminDenyUser(id) {
   const db = readDb();
   ensureArrays(db);
 
@@ -228,13 +225,15 @@ function listUsers() {
 }
 
 /* ======================================================
-   PASSWORD VERIFY (LOGIN ENFORCEMENT)
+   LOGIN ENFORCEMENT
 ====================================================== */
 
 function verifyPassword(user, password) {
   if (!user) return false;
 
-  if (user.locked) throw new Error("Account locked");
+  if (user.locked) {
+    throw new Error("Account locked");
+  }
 
   if (user.status !== APPROVAL_STATUS.APPROVED) {
     throw new Error("Account not approved");
