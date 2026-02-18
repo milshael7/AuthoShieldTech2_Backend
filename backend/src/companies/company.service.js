@@ -1,4 +1,5 @@
 // backend/src/companies/company.service.js
+
 const { nanoid } = require("nanoid");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
@@ -45,11 +46,28 @@ function getCompanyById(db, id) {
   return db.companies.find((c) => String(c.id) === cid) || null;
 }
 
+function normalizeMembers(company) {
+  if (!Array.isArray(company.members)) company.members = [];
+
+  // Convert legacy string members to structured objects
+  company.members = company.members.map((m) => {
+    if (typeof m === "string") {
+      return {
+        userId: m,
+        position: "member",
+        assignedAt: nowISO(),
+        assignedBy: null,
+      };
+    }
+    return m;
+  });
+}
+
 function enforceUserLimit(company) {
   const tier = normalizeTier(company.tier);
   const limit = TIERS[tier].maxUsers;
 
-  if (!Array.isArray(company.members)) company.members = [];
+  normalizeMembers(company);
 
   if (company.members.length >= limit) {
     throw new Error(
@@ -163,26 +181,35 @@ function getCompany(id) {
 }
 
 /* =========================================================
-   MEMBER MANAGEMENT
+   MEMBER MANAGEMENT (STRUCTURED)
 ========================================================= */
 
-function addMember(companyId, userId, actorId) {
+function addMember(companyId, userId, actorId, position = "member") {
   const db = readDb();
   ensureCompanies(db);
 
   const c = getCompanyById(db, companyId);
   if (!c) throw new Error("Company not found");
 
+  normalizeMembers(c);
+
   const uid = String(userId || "").trim();
   if (!uid) throw new Error("Missing userId");
 
-  if (!Array.isArray(c.members)) c.members = [];
-
-  // Enforce user limit BEFORE adding
   enforceUserLimit(c);
 
-  if (!c.members.map(String).includes(uid)) {
-    c.members.push(uid);
+  const exists = c.members.find(
+    (m) => String(m.userId) === uid
+  );
+
+  if (!exists) {
+    c.members.push({
+      userId: uid,
+      position: safeStr(position, 80) || "member",
+      assignedAt: nowISO(),
+      assignedBy: actorId ? String(actorId) : null,
+    });
+
     writeDb(db);
 
     audit({
@@ -190,14 +217,14 @@ function addMember(companyId, userId, actorId) {
       action: "COMPANY_ADD_MEMBER",
       targetType: "Company",
       targetId: c.id,
-      metadata: { userId: uid },
+      metadata: { userId: uid, position },
     });
 
     createNotification({
       companyId: c.id,
       severity: "info",
       title: "Member added",
-      message: `User ${uid} was added to company.`,
+      message: `User ${uid} assigned as ${position}.`,
     });
   }
 
@@ -211,13 +238,16 @@ function removeMember(companyId, userId, actorId) {
   const c = getCompanyById(db, companyId);
   if (!c) throw new Error("Company not found");
 
+  normalizeMembers(c);
+
   const uid = String(userId || "").trim();
   if (!uid) throw new Error("Missing userId");
 
-  if (!Array.isArray(c.members)) c.members = [];
-
   const before = c.members.length;
-  c.members = c.members.filter((x) => String(x) !== uid);
+
+  c.members = c.members.filter(
+    (m) => String(m.userId) !== uid
+  );
 
   if (c.members.length !== before) {
     writeDb(db);
@@ -234,7 +264,7 @@ function removeMember(companyId, userId, actorId) {
       companyId: c.id,
       severity: "warn",
       title: "Member removed",
-      message: `User ${uid} was removed from company.`,
+      message: `User ${uid} removed from company.`,
     });
   }
 
