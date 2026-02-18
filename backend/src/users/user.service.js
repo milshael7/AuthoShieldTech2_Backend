@@ -40,6 +40,7 @@ const APPROVAL_STATUS = {
 
 function ensureArrays(db) {
   if (!Array.isArray(db.users)) db.users = [];
+  if (!Array.isArray(db.approvals)) db.approvals = [];
 }
 
 function normEmail(email) {
@@ -67,6 +68,24 @@ function requireAuthority(actorRole, targetRole) {
   if (actorRank <= targetRank) {
     throw new Error("Insufficient authority");
   }
+}
+
+function logApproval(db, {
+  action,
+  targetUser,
+  actorId,
+  actorRole,
+}) {
+  db.approvals.push({
+    id: nanoid(),
+    type: "approval",
+    action,
+    targetUserId: targetUser.id,
+    targetEmail: targetUser.email,
+    actorId,
+    actorRole,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 /* ======================================================
@@ -151,7 +170,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 }
 
 /* ======================================================
-   APPROVAL SYSTEM
+   APPROVAL SYSTEM WITH AUDIT TRAIL
 ====================================================== */
 
 function listPendingUsers() {
@@ -167,32 +186,34 @@ function listPendingUsers() {
     .map(sanitize);
 }
 
-/* ---------- MANAGER APPROVAL (NON-FINAL) ---------- */
-
-function managerApproveUser(id, actorRole = ROLES.MANAGER) {
+function managerApproveUser(id, actorId, actorRole = ROLES.MANAGER) {
   const db = readDb();
   ensureArrays(db);
 
   const u = db.users.find((x) => x.id === id);
   if (!u) throw new Error("User not found");
 
-  // Managers cannot approve managers or admins
   requireAuthority(actorRole, u.role);
 
   if (u.status !== APPROVAL_STATUS.PENDING) {
-    throw new Error("User is not pending manager approval");
+    throw new Error("User not pending manager approval");
   }
 
   u.status = APPROVAL_STATUS.MANAGER_APPROVED;
   u.approvedBy = "manager";
 
+  logApproval(db, {
+    action: "manager_approved",
+    targetUser: u,
+    actorId,
+    actorRole,
+  });
+
   writeDb(db);
   return sanitize(u);
 }
 
-/* ---------- ADMIN FINAL APPROVAL ---------- */
-
-function adminApproveUser(id, actorRole = ROLES.ADMIN) {
+function adminApproveUser(id, actorId, actorRole = ROLES.ADMIN) {
   const db = readDb();
   ensureArrays(db);
 
@@ -208,13 +229,18 @@ function adminApproveUser(id, actorRole = ROLES.ADMIN) {
   u.status = APPROVAL_STATUS.APPROVED;
   u.approvedBy = "admin";
 
+  logApproval(db, {
+    action: "admin_approved",
+    targetUser: u,
+    actorId,
+    actorRole,
+  });
+
   writeDb(db);
   return sanitize(u);
 }
 
-/* ---------- ADMIN DENY ---------- */
-
-function adminDenyUser(id, actorRole = ROLES.ADMIN) {
+function adminDenyUser(id, actorId, actorRole = ROLES.ADMIN) {
   const db = readDb();
   ensureArrays(db);
 
@@ -226,8 +252,29 @@ function adminDenyUser(id, actorRole = ROLES.ADMIN) {
   u.status = APPROVAL_STATUS.DENIED;
   u.locked = true;
 
+  logApproval(db, {
+    action: "admin_denied",
+    targetUser: u,
+    actorId,
+    actorRole,
+  });
+
   writeDb(db);
   return sanitize(u);
+}
+
+/* ======================================================
+   APPROVAL HISTORY
+====================================================== */
+
+function listApprovalHistory(limit = 200) {
+  const db = readDb();
+  ensureArrays(db);
+
+  return (db.approvals || [])
+    .slice()
+    .reverse()
+    .slice(0, limit);
 }
 
 /* ======================================================
@@ -252,30 +299,17 @@ function listUsers() {
   return db.users.map(sanitize);
 }
 
-/* ======================================================
-   LOGIN ENFORCEMENT
-====================================================== */
-
 function verifyPassword(user, password) {
   if (!user) return false;
 
-  if (user.locked) {
-    throw new Error("Account locked");
-  }
+  if (user.locked) throw new Error("Account locked");
 
   if (user.status !== APPROVAL_STATUS.APPROVED) {
     throw new Error("Account not approved");
   }
 
-  return bcrypt.compareSync(
-    String(password || ""),
-    String(user.passwordHash || "")
-  );
+  return bcrypt.compareSync(password, user.passwordHash);
 }
-
-/* ======================================================
-   EXPORT
-====================================================== */
 
 module.exports = {
   ROLES,
@@ -287,6 +321,7 @@ module.exports = {
   managerApproveUser,
   adminApproveUser,
   adminDenyUser,
+  listApprovalHistory,
   findByEmail,
   findById,
   listUsers,
