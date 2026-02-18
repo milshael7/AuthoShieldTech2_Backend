@@ -13,6 +13,7 @@ const tenantMiddleware = require("./middleware/tenant");
 
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
+const stripeWebhookRoutes = require("./routes/stripe.webhook.routes"); // ✅ STRIPE WEBHOOK
 
 /* =========================================================
    SAFE BOOT
@@ -42,12 +43,12 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   🔥 STRIPE WEBHOOK (MUST BE BEFORE express.json)
+   🔥 STRIPE WEBHOOK (MUST BE BEFORE JSON)
 ========================================================= */
 
 app.use(
   "/api/stripe/webhook",
-  require("./routes/stripe.webhook.routes")
+  stripeWebhookRoutes
 );
 
 /* =========================================================
@@ -126,11 +127,6 @@ const wss = new WebSocketServer({ server, path: "/ws/market" });
 
 let onlineUsers = 0;
 
-function safeSend(client, payload) {
-  if (!client || client.readyState !== 1) return;
-  try { client.send(payload); } catch {}
-}
-
 wss.on("connection", (ws) => {
   onlineUsers++;
 
@@ -149,6 +145,7 @@ wss.on("connection", (ws) => {
 
 app.use((err, req, res, next) => {
   console.error("[HTTP ERROR]", err);
+
   return res.status(500).json({
     ok: false,
     error: "Internal server error",
