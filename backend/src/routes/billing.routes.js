@@ -1,5 +1,5 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Tier Enforcement • Multi-Tenant Safe
+// Billing & Subscription Control — Persistent • Enforced • Tenant Safe
 
 const express = require("express");
 const router = express.Router();
@@ -7,6 +7,7 @@ const router = express.Router();
 const { authRequired, requireRole } = require("../middleware/auth");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
+const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 
 /* =========================================================
@@ -17,16 +18,21 @@ function clean(v, max = 100) {
   return String(v || "").trim().slice(0, max);
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
 function requireUser(req, res) {
   if (!req.user?.id) {
     res.status(401).json({ error: "Invalid auth context" });
     return null;
   }
   return req.user;
+}
+
+function saveUser(updatedUser) {
+  const db = readDb();
+  const idx = db.users.findIndex((u) => u.id === updatedUser.id);
+  if (idx !== -1) {
+    db.users[idx] = updatedUser;
+    writeDb(db);
+  }
 }
 
 /* =========================================================
@@ -51,6 +57,7 @@ router.get("/me", authRequired, (req, res) => {
         companyPlan = {
           tier: company.tier,
           maxUsers: company.maxUsers,
+          status: company.status,
         };
       }
     }
@@ -72,7 +79,7 @@ router.get("/me", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   UPGRADE COMPANY TIER
+   COMPANY UPGRADE (PERSISTENT)
 ========================================================= */
 
 router.post(
@@ -89,7 +96,7 @@ router.post(
         return res.status(400).json({ error: "Missing tier" });
       }
 
-      const company = companies.upgradeCompany(
+      const updated = companies.upgradeCompany(
         user.companyId,
         newTier,
         user.id
@@ -99,14 +106,14 @@ router.post(
         actorId: user.id,
         action: "COMPANY_PLAN_UPGRADED",
         targetType: "Company",
-        targetId: company.id,
+        targetId: updated.id,
         metadata: { newTier },
       });
 
       return res.json({
         ok: true,
-        tier: company.tier,
-        maxUsers: company.maxUsers,
+        tier: updated.tier,
+        maxUsers: updated.maxUsers,
       });
 
     } catch (e) {
@@ -118,11 +125,11 @@ router.post(
 );
 
 /* =========================================================
-   ENABLE AUTODEV FOR INDIVIDUAL
+   INDIVIDUAL PLAN ACTIVATION
 ========================================================= */
 
 router.post(
-  "/autodev/enable",
+  "/autodev/activate",
   authRequired,
   requireRole(users.ROLES.INDIVIDUAL),
   (req, res) => {
@@ -135,20 +142,19 @@ router.post(
         return res.status(404).json({ error: "User not found" });
       }
 
-      // Simulate upgrade activation
-      dbUser.subscriptionStatus = "Active";
-      dbUser.autoDevEnabled = true;
+      dbUser.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
+      saveUser(dbUser);
 
       audit({
         actorId: user.id,
-        action: "AUTODEV_ENABLED",
+        action: "INDIVIDUAL_SUBSCRIPTION_ACTIVATED",
         targetType: "User",
         targetId: user.id,
       });
 
       return res.json({
         ok: true,
-        message: "AutoDev enabled",
+        subscriptionStatus: dbUser.subscriptionStatus,
       });
 
     } catch (e) {
@@ -160,7 +166,7 @@ router.post(
 );
 
 /* =========================================================
-   ADMIN LOCK / UNLOCK USER
+   ADMIN SET SUBSCRIPTION STATUS
 ========================================================= */
 
 router.post(
@@ -178,14 +184,15 @@ router.post(
         });
       }
 
-      const target = users.findById(userId);
-      if (!target) {
+      const dbUser = users.findById(userId);
+      if (!dbUser) {
         return res.status(404).json({
           error: "User not found",
         });
       }
 
-      target.subscriptionStatus = status;
+      dbUser.subscriptionStatus = status;
+      saveUser(dbUser);
 
       audit({
         actorId: req.user.id,
