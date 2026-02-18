@@ -1,0 +1,212 @@
+// backend/src/routes/billing.routes.js
+// Billing & Subscription Control — Tier Enforcement • Multi-Tenant Safe
+
+const express = require("express");
+const router = express.Router();
+
+const { authRequired, requireRole } = require("../middleware/auth");
+const users = require("../users/user.service");
+const companies = require("../companies/company.service");
+const { audit } = require("../lib/audit");
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function clean(v, max = 100) {
+  return String(v || "").trim().slice(0, max);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function requireUser(req, res) {
+  if (!req.user?.id) {
+    res.status(401).json({ error: "Invalid auth context" });
+    return null;
+  }
+  return req.user;
+}
+
+/* =========================================================
+   GET CURRENT SUBSCRIPTION
+========================================================= */
+
+router.get("/me", authRequired, (req, res) => {
+  try {
+    const user = requireUser(req, res);
+    if (!user) return;
+
+    const dbUser = users.findById(user.id);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    let companyPlan = null;
+
+    if (dbUser.companyId) {
+      const company = companies.getCompany(dbUser.companyId);
+      if (company) {
+        companyPlan = {
+          tier: company.tier,
+          maxUsers: company.maxUsers,
+        };
+      }
+    }
+
+    return res.json({
+      ok: true,
+      subscription: {
+        status: dbUser.subscriptionStatus,
+        role: dbUser.role,
+        companyPlan,
+      },
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      error: e?.message || String(e),
+    });
+  }
+});
+
+/* =========================================================
+   UPGRADE COMPANY TIER
+========================================================= */
+
+router.post(
+  "/company/upgrade",
+  authRequired,
+  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  (req, res) => {
+    try {
+      const user = requireUser(req, res);
+      if (!user) return;
+
+      const newTier = clean(req.body?.tier, 50);
+      if (!newTier) {
+        return res.status(400).json({ error: "Missing tier" });
+      }
+
+      const company = companies.upgradeCompany(
+        user.companyId,
+        newTier,
+        user.id
+      );
+
+      audit({
+        actorId: user.id,
+        action: "COMPANY_PLAN_UPGRADED",
+        targetType: "Company",
+        targetId: company.id,
+        metadata: { newTier },
+      });
+
+      return res.json({
+        ok: true,
+        tier: company.tier,
+        maxUsers: company.maxUsers,
+      });
+
+    } catch (e) {
+      return res.status(400).json({
+        error: e?.message || String(e),
+      });
+    }
+  }
+);
+
+/* =========================================================
+   ENABLE AUTODEV FOR INDIVIDUAL
+========================================================= */
+
+router.post(
+  "/autodev/enable",
+  authRequired,
+  requireRole(users.ROLES.INDIVIDUAL),
+  (req, res) => {
+    try {
+      const user = requireUser(req, res);
+      if (!user) return;
+
+      const dbUser = users.findById(user.id);
+      if (!dbUser) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Simulate upgrade activation
+      dbUser.subscriptionStatus = "Active";
+      dbUser.autoDevEnabled = true;
+
+      audit({
+        actorId: user.id,
+        action: "AUTODEV_ENABLED",
+        targetType: "User",
+        targetId: user.id,
+      });
+
+      return res.json({
+        ok: true,
+        message: "AutoDev enabled",
+      });
+
+    } catch (e) {
+      return res.status(400).json({
+        error: e?.message || String(e),
+      });
+    }
+  }
+);
+
+/* =========================================================
+   ADMIN LOCK / UNLOCK USER
+========================================================= */
+
+router.post(
+  "/admin/set-status",
+  authRequired,
+  requireRole(users.ROLES.ADMIN),
+  (req, res) => {
+    try {
+      const userId = clean(req.body?.userId, 100);
+      const status = clean(req.body?.status, 50);
+
+      if (!userId || !status) {
+        return res.status(400).json({
+          error: "Missing userId or status",
+        });
+      }
+
+      const target = users.findById(userId);
+      if (!target) {
+        return res.status(404).json({
+          error: "User not found",
+        });
+      }
+
+      target.subscriptionStatus = status;
+
+      audit({
+        actorId: req.user.id,
+        action: "SUBSCRIPTION_STATUS_CHANGED",
+        targetType: "User",
+        targetId: userId,
+        metadata: { status },
+      });
+
+      return res.json({
+        ok: true,
+        userId,
+        status,
+      });
+
+    } catch (e) {
+      return res.status(400).json({
+        error: e?.message || String(e),
+      });
+    }
+  }
+);
+
+module.exports = router;
