@@ -13,7 +13,6 @@ const tenantMiddleware = require("./middleware/tenant");
 
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
-const stripeWebhookRoutes = require("./routes/stripe.webhook.routes");
 
 /* =========================================================
    SAFE BOOT
@@ -27,6 +26,8 @@ function requireEnv(name) {
 }
 
 requireEnv("JWT_SECRET");
+requireEnv("STRIPE_SECRET_KEY");
+requireEnv("STRIPE_WEBHOOK_SECRET");
 
 ensureDb();
 users.ensureAdminFromEnv();
@@ -41,10 +42,13 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   STRIPE WEBHOOK (MUST BE BEFORE JSON PARSER)
+   🔥 STRIPE WEBHOOK (MUST BE BEFORE express.json)
 ========================================================= */
 
-app.use("/api/stripe/webhook", stripeWebhookRoutes);
+app.use(
+  "/api/stripe/webhook",
+  require("./routes/stripe.webhook.routes")
+);
 
 /* =========================================================
    CORS
@@ -114,7 +118,7 @@ app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
 
 /* =========================================================
-   SERVER + WS
+   SERVER
 ========================================================= */
 
 const server = http.createServer(app);
@@ -124,9 +128,7 @@ let onlineUsers = 0;
 
 function safeSend(client, payload) {
   if (!client || client.readyState !== 1) return;
-  try {
-    client.send(payload);
-  } catch {}
+  try { client.send(payload); } catch {}
 }
 
 wss.on("connection", (ws) => {
@@ -142,12 +144,11 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
-   GLOBAL ERROR HANDLER
+   ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
   console.error("[HTTP ERROR]", err);
-
   return res.status(500).json({
     ok: false,
     error: "Internal server error",
