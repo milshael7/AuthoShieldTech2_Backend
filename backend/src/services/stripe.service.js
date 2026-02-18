@@ -1,10 +1,15 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Production Ready • Tier Integrated
+// Stripe Service — Production Ready • Persistent • Webhook Compatible
 
 const Stripe = require("stripe");
+const { readDb, writeDb } = require("../lib/db");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { audit } = require("../lib/audit");
+
+/* =========================================================
+   ENV VALIDATION
+========================================================= */
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -15,7 +20,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP (MATCH TO STRIPE DASHBOARD PRICE IDS)
+   PRICE MAP (MUST MATCH STRIPE DASHBOARD)
 ========================================================= */
 
 const PRICE_MAP = {
@@ -27,12 +32,43 @@ const PRICE_MAP = {
 };
 
 /* =========================================================
+   INTERNAL HELPERS
+========================================================= */
+
+function saveUser(updatedUser) {
+  const db = readDb();
+  const idx = db.users.findIndex((u) => u.id === updatedUser.id);
+  if (idx !== -1) {
+    db.users[idx] = updatedUser;
+    writeDb(db);
+  }
+}
+
+async function getOrCreateCustomer(user) {
+  if (user.stripeCustomerId) {
+    return user.stripeCustomerId;
+  }
+
+  const customer = await stripe.customers.create({
+    email: user.email,
+    metadata: {
+      userId: user.id,
+    },
+  });
+
+  user.stripeCustomerId = customer.id;
+  saveUser(user);
+
+  return customer.id;
+}
+
+/* =========================================================
    CREATE CHECKOUT SESSION
 ========================================================= */
 
 async function createCheckoutSession({
   userId,
-  type, // "individual_autodev" OR company tier
+  type,
   successUrl,
   cancelUrl,
 }) {
@@ -42,8 +78,11 @@ async function createCheckoutSession({
   const priceId = PRICE_MAP[type];
   if (!priceId) throw new Error("Invalid plan type");
 
+  const customerId = await getOrCreateCustomer(user);
+
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
+    customer: customerId,
     payment_method_types: ["card"],
     line_items: [
       {
@@ -51,7 +90,6 @@ async function createCheckoutSession({
         quantity: 1,
       },
     ],
-    customer_email: user.email,
     success_url: successUrl,
     cancel_url: cancelUrl,
     metadata: {
@@ -72,6 +110,34 @@ async function createCheckoutSession({
   return session.url;
 }
 
+/* =========================================================
+   ACTIVATE SUBSCRIPTION (CALLED FROM WEBHOOK)
+========================================================= */
+
+function activateSubscription({ userId, planType, subscriptionId }) {
+  const user = users.findById(userId);
+  if (!user) return;
+
+  user.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
+  user.stripeSubscriptionId = subscriptionId;
+
+  saveUser(user);
+
+  // If company plan → upgrade tier
+  if (user.companyId && planType !== "individual_autodev") {
+    companies.upgradeCompany(user.companyId, planType, user.id);
+  }
+
+  audit({
+    actorId: user.id,
+    action: "STRIPE_SUBSCRIPTION_ACTIVATED",
+    targetType: "Billing",
+    targetId: subscriptionId,
+    metadata: { planType },
+  });
+}
+
 module.exports = {
   createCheckoutSession,
+  activateSubscription,
 };
