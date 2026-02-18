@@ -1,15 +1,11 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Production Ready • Persistent • Webhook Compatible
+// Stripe Service — Production Hardened • Subscription Activation Engine
 
 const Stripe = require("stripe");
 const { readDb, writeDb } = require("../lib/db");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { audit } = require("../lib/audit");
-
-/* =========================================================
-   ENV VALIDATION
-========================================================= */
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -20,7 +16,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP (MUST MATCH STRIPE DASHBOARD)
+   PRICE MAP
 ========================================================= */
 
 const PRICE_MAP = {
@@ -44,22 +40,58 @@ function saveUser(updatedUser) {
   }
 }
 
-async function getOrCreateCustomer(user) {
-  if (user.stripeCustomerId) {
-    return user.stripeCustomerId;
-  }
+function activateIndividual(userId) {
+  const user = users.findById(userId);
+  if (!user) return;
 
-  const customer = await stripe.customers.create({
-    email: user.email,
-    metadata: {
-      userId: user.id,
-    },
-  });
+  user.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
+  user.autoDevEnabled = true;
 
-  user.stripeCustomerId = customer.id;
   saveUser(user);
 
-  return customer.id;
+  audit({
+    actorId: userId,
+    action: "INDIVIDUAL_SUBSCRIPTION_ACTIVATED",
+    targetType: "User",
+    targetId: userId,
+  });
+}
+
+function activateCompany(companyId, planType, userId) {
+  if (!companyId) return;
+
+  const updated = companies.upgradeCompany(
+    companyId,
+    planType,
+    userId
+  );
+
+  audit({
+    actorId: userId,
+    action: "COMPANY_SUBSCRIPTION_ACTIVATED",
+    targetType: "Company",
+    targetId: companyId,
+    metadata: { planType },
+  });
+
+  return updated;
+}
+
+function deactivateSubscription(userId) {
+  const user = users.findById(userId);
+  if (!user) return;
+
+  user.subscriptionStatus = users.SUBSCRIPTION.PAST_DUE;
+  user.autoDevEnabled = false;
+
+  saveUser(user);
+
+  audit({
+    actorId: userId,
+    action: "SUBSCRIPTION_DEACTIVATED",
+    targetType: "User",
+    targetId: userId,
+  });
 }
 
 /* =========================================================
@@ -78,11 +110,8 @@ async function createCheckoutSession({
   const priceId = PRICE_MAP[type];
   if (!priceId) throw new Error("Invalid plan type");
 
-  const customerId = await getOrCreateCustomer(user);
-
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
-    customer: customerId,
     payment_method_types: ["card"],
     line_items: [
       {
@@ -90,6 +119,7 @@ async function createCheckoutSession({
         quantity: 1,
       },
     ],
+    customer_email: user.email,
     success_url: successUrl,
     cancel_url: cancelUrl,
     metadata: {
@@ -111,33 +141,67 @@ async function createCheckoutSession({
 }
 
 /* =========================================================
-   ACTIVATE SUBSCRIPTION (CALLED FROM WEBHOOK)
+   WEBHOOK HANDLER
 ========================================================= */
 
-function activateSubscription({ userId, planType, subscriptionId }) {
-  const user = users.findById(userId);
-  if (!user) return;
+async function handleStripeWebhook(event) {
 
-  user.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
-  user.stripeSubscriptionId = subscriptionId;
+  switch (event.type) {
 
-  saveUser(user);
+    case "checkout.session.completed": {
+      const session = event.data.object;
 
-  // If company plan → upgrade tier
-  if (user.companyId && planType !== "individual_autodev") {
-    companies.upgradeCompany(user.companyId, planType, user.id);
+      const userId = session.metadata?.userId;
+      const planType = session.metadata?.planType;
+      const companyId = session.metadata?.companyId || null;
+
+      if (!userId || !planType) return;
+
+      if (planType === "individual_autodev") {
+        activateIndividual(userId);
+      } else {
+        activateCompany(companyId, planType, userId);
+      }
+
+      break;
+    }
+
+    case "invoice.payment_failed": {
+      const subscription = event.data.object;
+      const customerEmail = subscription.customer_email;
+
+      if (!customerEmail) return;
+
+      const user = users.findByEmail(customerEmail);
+      if (!user) return;
+
+      deactivateSubscription(user.id);
+      break;
+    }
+
+    case "customer.subscription.deleted": {
+      const subscription = event.data.object;
+      const customerEmail = subscription.customer_email;
+
+      if (!customerEmail) return;
+
+      const user = users.findByEmail(customerEmail);
+      if (!user) return;
+
+      deactivateSubscription(user.id);
+      break;
+    }
+
+    default:
+      break;
   }
-
-  audit({
-    actorId: user.id,
-    action: "STRIPE_SUBSCRIPTION_ACTIVATED",
-    targetType: "Billing",
-    targetId: subscriptionId,
-    metadata: { planType },
-  });
 }
+
+/* =========================================================
+   EXPORT
+========================================================= */
 
 module.exports = {
   createCheckoutSession,
-  activateSubscription,
+  handleStripeWebhook,
 };
