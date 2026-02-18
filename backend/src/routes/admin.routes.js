@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Phase 8
-// Approval History + Tool Governance + Supreme Authority
+// Admin API — Phase 9
+// Approval + Tool Governance + Hierarchical Company System
 
 const express = require("express");
 const router = express.Router();
@@ -10,6 +10,8 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
 const { listNotifications } = require("../lib/notify");
+const { readDb, writeDb } = require("../lib/db");
+const { nanoid } = require("nanoid");
 
 /* =========================================================
    ROLE SAFETY
@@ -38,13 +40,14 @@ function requireId(id) {
   return clean;
 }
 
+function ensureArrays(db) {
+  if (!Array.isArray(db.companies)) db.companies = [];
+}
+
 /* =========================================================
    APPROVAL SYSTEM
 ========================================================= */
 
-/**
- * List pending users
- */
 router.get("/pending-users", (req, res) => {
   try {
     return res.json({
@@ -56,9 +59,6 @@ router.get("/pending-users", (req, res) => {
   }
 });
 
-/**
- * Admin final approval
- */
 router.post("/users/:id/approve", (req, res) => {
   try {
     const id = requireId(req.params.id);
@@ -69,18 +69,12 @@ router.post("/users/:id/approve", (req, res) => {
       req.user.role
     );
 
-    return res.json({
-      ok: true,
-      user: updated,
-    });
+    return res.json({ ok: true, user: updated });
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
 });
 
-/**
- * Admin deny
- */
 router.post("/users/:id/deny", (req, res) => {
   try {
     const id = requireId(req.params.id);
@@ -91,18 +85,12 @@ router.post("/users/:id/deny", (req, res) => {
       req.user.role
     );
 
-    return res.json({
-      ok: true,
-      user: updated,
-    });
+    return res.json({ ok: true, user: updated });
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
 });
 
-/**
- * Approval history
- */
 router.get("/approvals", (req, res) => {
   try {
     const limit = Number(req.query.limit) || 200;
@@ -113,6 +101,90 @@ router.get("/approvals", (req, res) => {
     });
   } catch (e) {
     return res.status(400).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   COMPANY SYSTEM (NEW HIERARCHY)
+========================================================= */
+
+/**
+ * Create Company
+ * Can optionally create as child of another company
+ */
+router.post("/companies", (req, res) => {
+  try {
+    const db = readDb();
+    ensureArrays(db);
+
+    const name = cleanStr(req.body?.name, 150);
+    const parentCompanyId = cleanStr(req.body?.parentCompanyId, 100) || null;
+
+    if (!name) {
+      return res.status(400).json({
+        error: "Company name required",
+      });
+    }
+
+    if (parentCompanyId) {
+      const parent = db.companies.find(c => c.id === parentCompanyId);
+      if (!parent) {
+        return res.status(400).json({
+          error: "Parent company not found",
+        });
+      }
+    }
+
+    const newCompany = {
+      id: nanoid(),
+      name,
+      parentCompanyId,
+      createdAt: new Date().toISOString(),
+      suspended: false,
+      sizeTier: "standard",
+    };
+
+    db.companies.push(newCompany);
+    writeDb(db);
+
+    return res.status(201).json({
+      ok: true,
+      company: newCompany,
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      error: e?.message || String(e),
+    });
+  }
+});
+
+/**
+ * Company Hierarchy Tree
+ */
+router.get("/companies-tree", (req, res) => {
+  try {
+    const db = readDb();
+    ensureArrays(db);
+
+    const buildTree = (parentId = null) => {
+      return db.companies
+        .filter(c => c.parentCompanyId === parentId)
+        .map(c => ({
+          ...c,
+          children: buildTree(c.id),
+        }));
+    };
+
+    return res.json({
+      ok: true,
+      tree: buildTree(null),
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      error: e?.message || String(e),
+    });
   }
 });
 
