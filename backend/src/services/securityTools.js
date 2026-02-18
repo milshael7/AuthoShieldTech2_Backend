@@ -1,6 +1,5 @@
 // backend/src/services/securityTools.js
-// Enterprise Security Tool State Engine — Hardened v3
-// Tenant-Isolated • Company-Level Blocking • Admin-Governed • Auditable • 70+ Tool Ready
+// Enterprise Security Tool Engine — Branch Aware • Tier Ready • Auditable
 
 const fs = require("fs");
 const path = require("path");
@@ -18,7 +17,7 @@ const MAX_COMPANIES = 10000;
 const MAX_TOOLS_PER_COMPANY = 200;
 
 /* =========================================================
-   TOOL REGISTRY (Master Catalog)
+   MASTER TOOL REGISTRY
 ========================================================= */
 
 const TOOL_REGISTRY = new Set([
@@ -29,6 +28,18 @@ const TOOL_REGISTRY = new Set([
   "sat",
   "darkweb",
 ]);
+
+/* =========================================================
+   BRANCH TOOL PROFILES
+========================================================= */
+
+const BRANCH_TOOL_ACCESS = {
+  soc: ["edr", "itdr", "darkweb"],
+  analyst: ["data", "email", "darkweb"],
+  consultant: ["sat", "email"],
+  admin: Array.from(TOOL_REGISTRY),
+  member: [],
+};
 
 /* =========================================================
    HELPERS
@@ -51,22 +62,14 @@ function ensureDir(file) {
   } catch {}
 }
 
+function normalizePosition(pos) {
+  const p = clean(pos, 50).toLowerCase();
+  return BRANCH_TOOL_ACCESS[p] ? p : "member";
+}
+
 /* =========================================================
    STATE STRUCTURE
 ========================================================= */
-/*
-{
-  createdAt,
-  updatedAt,
-  companies: {
-     companyId: {
-        installed: [],
-        blocked: [],
-        createdAt
-     }
-  }
-}
-*/
 
 let state = {
   createdAt: nowIso(),
@@ -133,7 +136,7 @@ function ensureCompany(companyId) {
 }
 
 /* =========================================================
-   LIST
+   LIST (Company-Level)
 ========================================================= */
 
 function listTools(companyId) {
@@ -142,6 +145,29 @@ function listTools(companyId) {
   return {
     installed: state.companies[id].installed,
     blocked: state.companies[id].blocked,
+  };
+}
+
+/* =========================================================
+   USER-SCOPED TOOL VIEW (NEW)
+========================================================= */
+
+function getToolsForUser(companyId, position) {
+  const id = ensureCompany(companyId);
+  const normalized = normalizePosition(position);
+
+  const company = state.companies[id];
+  const allowedForBranch = BRANCH_TOOL_ACCESS[normalized] || [];
+
+  const visible = company.installed.filter(
+    (tool) =>
+      allowedForBranch.includes(tool) &&
+      !company.blocked.includes(tool)
+  );
+
+  return {
+    position: normalized,
+    tools: visible,
   };
 }
 
@@ -156,7 +182,7 @@ function installTool(companyId, toolId, actorId = "system") {
   const company = state.companies[id];
 
   if (company.blocked.includes(tool)) {
-    throw new Error("Tool is blocked by admin for this company");
+    throw new Error("Tool is blocked");
   }
 
   if (company.installed.length >= MAX_TOOLS_PER_COMPANY) {
@@ -176,10 +202,7 @@ function installTool(companyId, toolId, actorId = "system") {
     });
   }
 
-  return {
-    installed: company.installed,
-    blocked: company.blocked,
-  };
+  return listTools(id);
 }
 
 /* =========================================================
@@ -205,14 +228,11 @@ function uninstallTool(companyId, toolId, actorId = "system") {
     companyId: id,
   });
 
-  return {
-    installed: company.installed,
-    blocked: company.blocked,
-  };
+  return listTools(id);
 }
 
 /* =========================================================
-   ADMIN CONTROL — COMPANY-SCOPED BLOCKING
+   ADMIN BLOCKING
 ========================================================= */
 
 function blockTool(companyId, toolId, actorId) {
@@ -223,8 +243,6 @@ function blockTool(companyId, toolId, actorId) {
 
   if (!company.blocked.includes(tool)) {
     company.blocked.push(tool);
-
-    // remove from installed if currently installed
     company.installed =
       company.installed.filter((t) => t !== tool);
 
@@ -239,10 +257,7 @@ function blockTool(companyId, toolId, actorId) {
     });
   }
 
-  return {
-    installed: company.installed,
-    blocked: company.blocked,
-  };
+  return listTools(id);
 }
 
 function unblockTool(companyId, toolId, actorId) {
@@ -259,15 +274,12 @@ function unblockTool(companyId, toolId, actorId) {
   audit({
     actorId,
     action: "ADMIN_UNBLOCK_TOOL",
-      targetType: "Tool",
-      targetId: tool,
-      companyId: id,
+    targetType: "Tool",
+    targetId: tool,
+    companyId: id,
   });
 
-  return {
-    installed: company.installed,
-    blocked: company.blocked,
-  };
+  return listTools(id);
 }
 
 /* =========================================================
@@ -276,6 +288,7 @@ function unblockTool(companyId, toolId, actorId) {
 
 module.exports = {
   listTools,
+  getToolsForUser,
   installTool,
   uninstallTool,
   blockTool,
