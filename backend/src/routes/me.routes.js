@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Structured Dashboard • Branch Aware • Secure
+// Me Endpoints — Structured Dashboard • Tier Aware • Branch Controlled • Hardened
 
 const express = require("express");
 const router = express.Router();
@@ -50,7 +50,7 @@ function canUseAutoDev(user) {
 }
 
 /* =========================================================
-   DASHBOARD (BRANCH + TIER AWARE)
+   DASHBOARD (SAFE + STRUCTURED)
 ========================================================= */
 
 router.get("/dashboard", (req, res) => {
@@ -61,48 +61,69 @@ router.get("/dashboard", (req, res) => {
     let position = "member";
     let companyInfo = null;
     let visibleTools = [];
+    let plan = null;
+
+    /* -----------------------------------------------
+       COMPANY CONTEXT
+    ------------------------------------------------ */
 
     if (user.companyId) {
       const company = companies.getCompany(user.companyId);
 
-      if (company) {
-        dashboardType = "company_member";
+      if (company && company.status === "Active") {
 
-        // Member lookup (supports both string or object format)
-        const memberRecord =
-          company.members?.find(
-            m => String(m.userId || m) === String(user.id)
-          );
-
-        if (memberRecord && typeof memberRecord === "object") {
-          position = memberRecord.position || "member";
-        }
-
-        companyInfo = {
-          id: company.id,
-          name: company.name,
-          tier: company.tier,
-          maxUsers: company.maxUsers,
-          currentUsers: Array.isArray(company.members)
-            ? company.members.length
-            : 0,
-        };
-
-        // Tool visibility based on branch + company rules
-        const toolState = securityTools.listTools(company.id);
-
-        visibleTools = toolState.installed.filter(
-          t => !toolState.blocked.includes(t)
+        // Ensure user is actually a member
+        const memberRecord = company.members?.find(
+          (m) => String(m.userId || m) === String(user.id)
         );
+
+        if (memberRecord) {
+
+          dashboardType = "company_member";
+
+          if (typeof memberRecord === "object") {
+            position = memberRecord.position || "member";
+          }
+
+          plan = company.tier;
+
+          companyInfo = {
+            id: company.id,
+            name: company.name,
+            tier: company.tier,
+            maxUsers: company.maxUsers,
+            currentUsers: Array.isArray(company.members)
+              ? company.members.length
+              : 0,
+          };
+
+          /* -----------------------------------------------
+             TOOL VISIBILITY
+          ------------------------------------------------ */
+
+          const toolState = securityTools.listTools(company.id);
+
+          const installed = toolState.installed || [];
+          const blocked = toolState.blocked || [];
+
+          visibleTools = installed.filter(
+            (tool) => !blocked.includes(tool)
+          );
+        }
       }
     }
+
+    /* -----------------------------------------------
+       FINAL RESPONSE
+    ------------------------------------------------ */
 
     return res.json({
       ok: true,
       dashboard: {
         role: user.role,
         type: dashboardType,
-        position,
+        branch: position,
+        plan,
         company: companyInfo,
         autoDevEnabled: canUseAutoDev(user),
         visibleTools,
@@ -112,7 +133,7 @@ router.get("/dashboard", (req, res) => {
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: e.message,
+      error: e?.message || String(e),
     });
   }
 });
@@ -151,7 +172,7 @@ router.post("/notifications/:id/read", (req, res) => {
 
     const existing =
       listNotifications({ userId: req.user.id })
-        ?.find(n => String(n.id) === id);
+        ?.find((n) => String(n.id) === id);
 
     if (!existing) {
       return res.status(404).json({
