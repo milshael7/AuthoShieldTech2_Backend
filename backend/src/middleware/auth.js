@@ -1,5 +1,5 @@
 // backend/src/middleware/auth.js
-// JWT Auth Middleware — Enterprise Hardened • Tier Enforced • Approval Safe
+// JWT Auth Middleware — Enterprise Hardened • Tier Enforced • Billing Safe
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -26,6 +26,10 @@ function error(res, code, message) {
     ok: false,
     error: message,
   });
+}
+
+function isBillingRoute(req) {
+  return req.originalUrl.startsWith("/api/billing");
 }
 
 /* ======================================================
@@ -70,10 +74,16 @@ function authRequired(req, res, next) {
     return error(res, 403, "Account not approved");
   }
 
-  if (
+  /* --------------------------------------------------
+     SUBSCRIPTION ENFORCEMENT
+     Allow billing routes even if inactive
+  -------------------------------------------------- */
+
+  const subscriptionInactive =
     user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
-    user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE
-  ) {
+    user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
+
+  if (subscriptionInactive && !isBillingRoute(req)) {
     return error(res, 403, "Subscription inactive");
   }
 
@@ -138,7 +148,7 @@ function requireRole(...args) {
 
     const userRole = normRole(req.user.role);
 
-    // direct admin access
+    // Admin bypass
     if (userRole === adminRole && adminAlso) {
       return next();
     }
