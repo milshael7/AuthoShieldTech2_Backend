@@ -13,7 +13,7 @@ const tenantMiddleware = require("./middleware/tenant");
 
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
-const stripeWebhookRoutes = require("./routes/stripe.webhook.routes"); // ✅ STRIPE WEBHOOK
+const stripeWebhookRoutes = require("./routes/stripe.webhook.routes");
 
 /* =========================================================
    SAFE BOOT
@@ -43,11 +43,13 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   🔥 STRIPE WEBHOOK (MUST BE BEFORE JSON)
+   STRIPE WEBHOOK (RAW BODY ONLY)
+   MUST BE BEFORE express.json()
 ========================================================= */
 
 app.use(
   "/api/stripe/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
   stripeWebhookRoutes
 );
 
@@ -57,7 +59,7 @@ app.use(
 
 app.use(
   cors({
-    origin: true,
+    origin: process.env.CORS_ORIGIN || true,
     credentials: true,
   })
 );
@@ -140,11 +142,18 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
-   ERROR HANDLER
+   GLOBAL ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
   console.error("[HTTP ERROR]", err);
+
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({
+      ok: false,
+      error: "Payload too large",
+    });
+  }
 
   return res.status(500).json({
     ok: false,
