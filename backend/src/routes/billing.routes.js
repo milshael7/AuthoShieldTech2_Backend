@@ -9,7 +9,12 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const { createCheckoutSession } = require("../services/stripe.service");
+
+const {
+  createCheckoutSession,
+  createCustomerPortalSession,
+  cancelSubscription,
+} = require("../services/stripe.service");
 
 /* =========================================================
    HELPERS
@@ -68,6 +73,8 @@ router.get("/me", authRequired, (req, res) => {
       subscription: {
         status: dbUser.subscriptionStatus,
         role: dbUser.role,
+        stripeCustomerId: dbUser.stripeCustomerId || null,
+        stripeSubscriptionId: dbUser.stripeSubscriptionId || null,
         companyPlan,
       },
     });
@@ -115,6 +122,65 @@ router.post("/checkout", authRequired, async (req, res) => {
     return res.json({
       ok: true,
       checkoutUrl,
+    });
+
+  } catch (e) {
+    return res.status(400).json({
+      error: e?.message || String(e),
+    });
+  }
+});
+
+/* =========================================================
+   OPEN STRIPE CUSTOMER PORTAL
+========================================================= */
+
+router.post("/portal", authRequired, async (req, res) => {
+  try {
+    const user = requireUser(req, res);
+    if (!user) return;
+
+    const returnUrl =
+      clean(req.body?.returnUrl) ||
+      process.env.STRIPE_PORTAL_RETURN_URL;
+
+    if (!returnUrl) {
+      return res.status(400).json({
+        error: "Missing return URL",
+      });
+    }
+
+    const portalUrl = await createCustomerPortalSession({
+      userId: user.id,
+      returnUrl,
+    });
+
+    return res.json({
+      ok: true,
+      portalUrl,
+    });
+
+  } catch (e) {
+    return res.status(400).json({
+      error: e?.message || String(e),
+    });
+  }
+});
+
+/* =========================================================
+   CANCEL SUBSCRIPTION
+========================================================= */
+
+router.post("/cancel", authRequired, async (req, res) => {
+  try {
+    const user = requireUser(req, res);
+    if (!user) return;
+
+    await cancelSubscription(user.id);
+
+    return res.json({
+      ok: true,
+      message: "Subscription cancelled",
     });
 
   } catch (e) {
