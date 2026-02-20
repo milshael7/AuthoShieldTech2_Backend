@@ -1,3 +1,7 @@
+// backend/src/users/user.service.js
+// Enterprise User Service — Governance Enabled
+// Role Separation • Finance Role • Trial Safe • Billing Safe
+
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
 const { readDb, writeDb, updateDb } = require("../lib/db");
@@ -11,7 +15,10 @@ const ROLES = {
   MANAGER: "Manager",
   COMPANY: "Company",
   INDIVIDUAL: "Individual",
+  FINANCE: "Finance", // 🔥 NEW ENTERPRISE ROLE
 };
+
+const ROLE_ALLOWLIST = Object.values(ROLES);
 
 const SUBSCRIPTION = {
   TRIAL: "Trial",
@@ -28,14 +35,14 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   TRIAL CONFIG (ENTERPRISE)
+   TRIAL CONFIG
 ====================================================== */
 
 const TRIAL_DURATION_DAYS = 14;
 const TRIAL_GRACE_DAYS = 3;
 
 /* ======================================================
-   AUTOPROTECT PRICING
+   AUTOPROTECT CONFIG
 ====================================================== */
 
 const AUTOPROTECT_PRICING = {
@@ -45,6 +52,30 @@ const AUTOPROTECT_PRICING = {
 };
 
 const AUTOPROTECT_ACTIVE_LIMIT = 10;
+
+/* ======================================================
+   HELPERS
+====================================================== */
+
+function ensureArrays(db) {
+  if (!Array.isArray(db.users)) db.users = [];
+}
+
+function normEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function sanitize(u) {
+  if (!u) return null;
+  const { passwordHash, ...rest } = u;
+  return rest;
+}
+
+function validateRole(role) {
+  if (!ROLE_ALLOWLIST.includes(role)) {
+    throw new Error("Invalid role assignment");
+  }
+}
 
 /* ======================================================
    TRIAL ENGINE
@@ -132,150 +163,14 @@ function validateBilling(userId) {
 }
 
 /* ======================================================
-   AUTOPROTECT ENGINE
-====================================================== */
-
-function activateAutoProtect(userId) {
-  updateDb(db => {
-    db.autoprotek = db.autoprotek || { users: {} };
-
-    const nextBilling = new Date();
-    nextBilling.setMonth(nextBilling.getMonth() + 1);
-
-    db.autoprotek.users[userId] = {
-      status: "ACTIVE",
-      activatedAt: new Date().toISOString(),
-      subscriptionStatus: "ACTIVE",
-      nextBillingDate: nextBilling.toISOString(),
-      pricing: AUTOPROTECT_PRICING,
-      activeJobsCount: 0,
-      activeJobLimit: AUTOPROTECT_ACTIVE_LIMIT,
-    };
-  });
-}
-
-function deactivateAutoProtect(userId) {
-  updateDb(db => {
-    if (!db.autoprotek?.users?.[userId]) return;
-    db.autoprotek.users[userId].status = "INACTIVE";
-    db.autoprotek.users[userId].subscriptionStatus = "INACTIVE";
-  });
-}
-
-function isAutoProtectActive(userId) {
-  if (!validateBilling(userId)) return false;
-
-  const db = readDb();
-  const userAP = db.autoprotek?.users?.[userId];
-  if (!userAP) return false;
-  if (userAP.status !== "ACTIVE") return false;
-
-  return true;
-}
-
-function canRunAutoProtect(user) {
-  if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
-    return true;
-  }
-
-  if (!validateBilling(user.id)) return false;
-
-  const db = readDb();
-  const userAP = db.autoprotek?.users?.[user.id];
-  if (!userAP) return false;
-
-  if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) {
-    return false;
-  }
-
-  return true;
-}
-
-function registerAutoProtectJob(user) {
-  if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
-    return;
-  }
-
-  updateDb(db => {
-    const userAP = db.autoprotek?.users?.[user.id];
-    if (!userAP) return;
-    if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) return;
-    userAP.activeJobsCount += 1;
-  });
-}
-
-function closeAutoProtectJob(user) {
-  updateDb(db => {
-    const userAP = db.autoprotek?.users?.[user.id];
-    if (!userAP) return;
-    if (userAP.activeJobsCount <= 0) return;
-    userAP.activeJobsCount -= 1;
-  });
-}
-
-/* ======================================================
-   HELPERS
-====================================================== */
-
-function ensureArrays(db) {
-  if (!Array.isArray(db.users)) db.users = [];
-}
-
-function normEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
-function sanitize(u) {
-  if (!u) return null;
-  const { passwordHash, ...rest } = u;
-  return rest;
-}
-
-/* ======================================================
-   ADMIN BOOTSTRAP
-====================================================== */
-
-function ensureAdminFromEnv() {
-  const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
-
-  const db = readDb();
-  ensureArrays(db);
-
-  const emailKey = normEmail(ADMIN_EMAIL);
-
-  const exists = db.users.find(
-    u => normEmail(u.email) === emailKey && u.role === ROLES.ADMIN
-  );
-
-  if (exists) return;
-
-  const admin = {
-    id: nanoid(),
-    platformId: `AS-${nanoid(10).toUpperCase()}`,
-    email: ADMIN_EMAIL.trim(),
-    passwordHash: bcrypt.hashSync(String(ADMIN_PASSWORD), 10),
-    role: ROLES.ADMIN,
-    companyId: null,
-    createdAt: new Date().toISOString(),
-    subscriptionStatus: SUBSCRIPTION.ACTIVE,
-    mustResetPassword: false,
-    locked: false,
-    status: APPROVAL_STATUS.APPROVED,
-    approvedBy: "system",
-  };
-
-  db.users.push(admin);
-  writeDb(db);
-}
-
-/* ======================================================
    USER CREATION
 ====================================================== */
 
 function createUser({ email, password, role, profile = {}, companyId = null }) {
   const db = readDb();
   ensureArrays(db);
+
+  validateRole(role); // 🔥 ROLE SAFETY
 
   const cleanEmail = String(email || "").trim();
   if (!cleanEmail) throw new Error("Email required");
@@ -358,12 +253,5 @@ module.exports = {
   listUsers,
   verifyPassword,
   getTrialStatus,
-
-  // AutoProtect
-  activateAutoProtect,
-  deactivateAutoProtect,
-  isAutoProtectActive,
-  canRunAutoProtect,
-  registerAutoProtectJob,
-  closeAutoProtectJob,
+  validateBilling,
 };
