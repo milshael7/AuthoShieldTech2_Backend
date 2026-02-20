@@ -1,13 +1,15 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Subscription Enforced • Usage Meter Enabled
+// Me Endpoints — Enterprise Hardened
+// Subscription Enforced • Tenant Safe • Audit Enabled
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const { listNotifications, markRead } = require("../lib/notify");
-const { audit } = require("../lib/audit");
 const { readDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
+const { listNotifications } = require("../lib/notify");
+
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
@@ -20,7 +22,7 @@ router.use(authRequired);
    HELPERS
 ========================================================= */
 
-function cleanStr(v, max = 200) {
+function clean(v, max = 200) {
   return String(v ?? "").trim().slice(0, max);
 }
 
@@ -28,49 +30,53 @@ function isObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
 }
 
-function requireActiveSubscription(dbUser) {
-  if (!dbUser) throw new Error("User not found");
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+}
 
-  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
+function requireActiveSubscription(user) {
+  if (!user) {
+    const err = new Error("User not found");
+    err.status = 401;
+    throw err;
+  }
+
+  if (user.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
     const err = new Error("Account locked");
     err.status = 403;
     throw err;
   }
 
-  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
+  if (user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
     const err = new Error("Subscription past due");
     err.status = 402;
     throw err;
   }
 }
 
-function currentMonthKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+function getDbUser(id) {
+  return users.findById(id);
 }
 
 /* =========================================================
-   USAGE METER (NEW)
+   USAGE METER
 ========================================================= */
 
 router.get("/usage", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
+    const dbUser = getDbUser(req.user.id);
     requireActiveSubscription(dbUser);
 
     const db = readDb();
     const plan = getUserEffectivePlan(dbUser);
     const included = plan.includedScans || 0;
-
     const monthKey = currentMonthKey();
 
     let used = 0;
 
-    if (db.scanCredits && db.scanCredits[dbUser.id]) {
-      const record = db.scanCredits[dbUser.id];
-      if (record.month === monthKey) {
-        used = record.used;
-      }
+    if (db.scanCredits?.[dbUser.id]?.month === monthKey) {
+      used = db.scanCredits[dbUser.id].used;
     }
 
     const remaining =
@@ -78,7 +84,14 @@ router.get("/usage", (req, res) => {
         ? Infinity
         : Math.max(0, included - used);
 
-    return res.json({
+    audit({
+      actorId: dbUser.id,
+      action: "VIEW_USAGE",
+      targetType: "User",
+      targetId: dbUser.id,
+    });
+
+    res.json({
       ok: true,
       usage: {
         planLabel: plan.label,
@@ -90,7 +103,7 @@ router.get("/usage", (req, res) => {
     });
 
   } catch (e) {
-    return res.status(e.status || 500).json({
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message,
     });
@@ -103,19 +116,20 @@ router.get("/usage", (req, res) => {
 
 router.get("/dashboard", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
+    const dbUser = getDbUser(req.user.id);
     requireActiveSubscription(dbUser);
 
-    return res.json({
+    res.json({
       ok: true,
       dashboard: {
         role: dbUser.role,
         subscriptionStatus: dbUser.subscriptionStatus,
+        companyId: dbUser.companyId || null,
       },
     });
 
   } catch (e) {
-    return res.status(e.status || 500).json({
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message,
     });
@@ -123,27 +137,82 @@ router.get("/dashboard", (req, res) => {
 });
 
 /* =========================================================
-   SCAN HISTORY
+   SCAN HISTORY (Tenant Safe)
 ========================================================= */
 
 router.get("/scans", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
+    const dbUser = getDbUser(req.user.id);
     requireActiveSubscription(dbUser);
 
     const db = readDb();
+
     const scans = (db.scans || [])
       .filter((s) => s.userId === dbUser.id)
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-    return res.json({
+    audit({
+      actorId: dbUser.id,
+      action: "VIEW_SCAN_HISTORY",
+      targetType: "User",
+      targetId: dbUser.id,
+    });
+
+    res.json({
       ok: true,
       total: scans.length,
       scans,
     });
 
   } catch (e) {
-    return res.status(e.status || 500).json({
+    res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   TOOL VISIBILITY (NEW)
+========================================================= */
+
+router.get("/tools", (req, res) => {
+  try {
+    const dbUser = getDbUser(req.user.id);
+    requireActiveSubscription(dbUser);
+
+    if (!dbUser.companyId) {
+      return res.json({
+        ok: true,
+        tools: [],
+      });
+    }
+
+    const company = companies.getCompany(dbUser.companyId);
+    const branchRecord =
+      company?.members?.find(
+        (m) => String(m.userId) === String(dbUser.id)
+      ) || null;
+
+    const branch =
+      typeof branchRecord === "object"
+        ? branchRecord.position
+        : "member";
+
+    const visible =
+      securityTools.getVisibleToolsForBranch(
+        dbUser.companyId,
+        branch
+      );
+
+    res.json({
+      ok: true,
+      branch,
+      tools: visible,
+    });
+
+  } catch (e) {
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message,
     });
@@ -156,16 +225,16 @@ router.get("/scans", (req, res) => {
 
 router.get("/notifications", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
+    const dbUser = getDbUser(req.user.id);
     requireActiveSubscription(dbUser);
 
     const notifications =
-      listNotifications({ userId: req.user.id }) || [];
+      listNotifications({ userId: dbUser.id }) || [];
 
-    return res.json({ ok: true, notifications });
+    res.json({ ok: true, notifications });
 
   } catch (e) {
-    return res.status(e.status || 500).json({
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message,
     });
@@ -178,7 +247,7 @@ router.get("/notifications", (req, res) => {
 
 router.post("/projects", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
+    const dbUser = getDbUser(req.user.id);
     requireActiveSubscription(dbUser);
 
     if (!isObject(req.body)) {
@@ -188,7 +257,7 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    const title = cleanStr(req.body.title, 200);
+    const title = clean(req.body.title, 200);
     if (!title) {
       return res.status(400).json({
         ok: false,
@@ -210,10 +279,13 @@ router.post("/projects", (req, res) => {
       targetId: project.id,
     });
 
-    return res.status(201).json({ ok: true, project });
+    res.status(201).json({
+      ok: true,
+      project,
+    });
 
   } catch (e) {
-    return res.status(e.status || 500).json({
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message,
     });
