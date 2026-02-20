@@ -1,31 +1,45 @@
 // backend/src/lib/audit.js
-// Central Audit Writer — HARDENED & SAFE
-//
-// PURPOSE:
-// - Single source of truth for audit events
-// - Safe concurrent writes
-// - Consistent schema across admin / manager / system
-//
-// RULES:
-// - No auth logic
-// - Never throws
-// - Always returns a record or null
+// Enterprise Immutable Audit Ledger
+// Tamper-Evident • Hash Chained • Safe • Backward Compatible
 
 const crypto = require("crypto");
-const { updateDb } = require("./db");
+const { updateDb, readDb } = require("./db");
 
-/**
- * writeAudit({
- *   actor,
- *   role,
- *   action,
- *   target,
- *   companyId,
- *   detail
- * })
- */
+/* =========================================================
+   HASH UTIL
+========================================================= */
+
+function sha256(data) {
+  return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+function computeRecordHash(record) {
+  const base = JSON.stringify({
+    ts: record.ts,
+    actor: record.actor,
+    role: record.role,
+    action: record.action,
+    target: record.target,
+    companyId: record.companyId,
+    detail: record.detail,
+    prevHash: record.prevHash,
+  });
+
+  return sha256(base);
+}
+
+/* =========================================================
+   WRITE AUDIT (IMMUTABLE CHAIN)
+========================================================= */
+
 function writeAudit(input = {}) {
   try {
+    const db = readDb();
+    if (!Array.isArray(db.audit)) db.audit = [];
+
+    const prev = db.audit[db.audit.length - 1];
+    const prevHash = prev ? prev.hash : "GENESIS";
+
     const record = {
       id: crypto.randomUUID(),
       ts: Date.now(),
@@ -41,18 +55,23 @@ function writeAudit(input = {}) {
         input.detail && typeof input.detail === "object"
           ? input.detail
           : {},
+
+      prevHash,
+      hash: null, // calculated below
     };
 
-    updateDb((db) => {
-      if (!Array.isArray(db.audit)) db.audit = [];
-      db.audit.push(record);
+    record.hash = computeRecordHash(record);
+
+    updateDb((db2) => {
+      if (!Array.isArray(db2.audit)) db2.audit = [];
+      db2.audit.push(record);
 
       // Hard cap: keep last 10,000 events
-      if (db.audit.length > 10_000) {
-        db.audit = db.audit.slice(-10_000);
+      if (db2.audit.length > 10_000) {
+        db2.audit = db2.audit.slice(-10_000);
       }
 
-      return db;
+      return db2;
     });
 
     return record;
@@ -62,10 +81,56 @@ function writeAudit(input = {}) {
   }
 }
 
-/**
- * 🔁 Backward compatibility layer
- * Many routes still call `audit({...})`
- */
+/* =========================================================
+   VERIFY AUDIT INTEGRITY
+========================================================= */
+
+function verifyAuditIntegrity() {
+  try {
+    const db = readDb();
+    const logs = db.audit || [];
+
+    if (logs.length === 0) {
+      return { ok: true, message: "No audit records" };
+    }
+
+    for (let i = 0; i < logs.length; i++) {
+      const current = logs[i];
+
+      const expectedHash = computeRecordHash(current);
+
+      if (current.hash !== expectedHash) {
+        return {
+          ok: false,
+          tamperedAt: current.id,
+          index: i,
+        };
+      }
+
+      if (i > 0) {
+        if (current.prevHash !== logs[i - 1].hash) {
+          return {
+            ok: false,
+            brokenChainAt: current.id,
+            index: i,
+          };
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      totalRecords: logs.length,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/* =========================================================
+   BACKWARD COMPATIBILITY
+========================================================= */
+
 function audit(input = {}) {
   return writeAudit({
     actor: input.actorId || input.actor || "system",
@@ -79,5 +144,6 @@ function audit(input = {}) {
 
 module.exports = {
   writeAudit,
-  audit, // ← critical fix
+  audit,
+  verifyAuditIntegrity,
 };
