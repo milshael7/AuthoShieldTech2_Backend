@@ -1,5 +1,5 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Subscriptions + One-Time Tool Sales • Hardened
+// Stripe Service — Enterprise Hardened • Payment Authoritative • Webhook Safe
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
@@ -93,7 +93,6 @@ async function createToolCheckoutSession({
   const scan = getScan(scanId);
   if (!scan) throw new Error("Scan not found");
 
-  // 🔒 Never trust client amount
   if (amount !== scan.finalPrice) {
     throw new Error("Price mismatch");
   }
@@ -170,7 +169,6 @@ async function activateSubscription({
 async function handleStripeWebhook(event) {
   const db = readDb();
 
-  // 🛑 Prevent duplicate webhook processing
   if (!Array.isArray(db.processedStripeEvents)) {
     db.processedStripeEvents = [];
   }
@@ -187,7 +185,8 @@ async function handleStripeWebhook(event) {
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
 
-    // Subscription
+    /* ---- Subscription ---- */
+
     if (session.mode === "subscription") {
       const userId = session.metadata?.userId;
       const planType = session.metadata?.planType;
@@ -202,28 +201,52 @@ async function handleStripeWebhook(event) {
       }
     }
 
-    // Tool Payment
+    /* ---- Tool Payment ---- */
+
     if (
       session.mode === "payment" &&
       session.metadata?.type === "tool_payment"
     ) {
       const scanId = session.metadata?.scanId;
+      if (!scanId) return;
 
-      if (scanId) {
-        markScanPaid(scanId);
-        processScan(scanId);
+      const scan = getScan(scanId);
+      if (!scan) return;
 
+      /* 🔒 Extra payment validation */
+      const paidAmount = session.amount_total / 100;
+
+      if (paidAmount !== scan.finalPrice) {
         audit({
           actorId: "system",
-          action: "TOOL_PAYMENT_COMPLETED",
+          action: "PAYMENT_AMOUNT_MISMATCH",
           targetType: "Scan",
           targetId: scanId,
         });
+        return;
       }
+
+      /* 🔥 Save paymentIntent ID */
+      updateDb((db2) => {
+        const s = db2.scans?.find((x) => x.id === scanId);
+        if (s) {
+          s.stripePaymentIntentId = session.payment_intent;
+        }
+      });
+
+      markScanPaid(scanId);
+      processScan(scanId);
+
+      audit({
+        actorId: "system",
+        action: "TOOL_PAYMENT_COMPLETED",
+        targetType: "Scan",
+        targetId: scanId,
+      });
     }
   }
 
-  /* ---------------- SUBSCRIPTION STATUS ---------------- */
+  /* ---------------- SUBSCRIPTION STATUS SYNC ---------------- */
 
   if (
     event.type === "customer.subscription.updated" ||
@@ -292,6 +315,13 @@ async function cancelSubscription(userId) {
 
   user.subscriptionStatus = "Locked";
   saveUser(user);
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_CANCELLED",
+    targetType: "User",
+    targetId: user.id,
+  });
 }
 
 module.exports = {
