@@ -1,11 +1,12 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Production Ready • Tier Integrated • Full Sync Engine
+// Stripe Service — Subscriptions + One-Time Tool Sales • Full Sync Engine
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+const { markScanPaid, processScan } = require("./scan.service");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -16,7 +17,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP
+   PRICE MAP (SUBSCRIPTIONS)
 ========================================================= */
 
 const PRICE_MAP = {
@@ -41,7 +42,7 @@ function saveUser(updatedUser) {
 }
 
 /* =========================================================
-   CREATE CHECKOUT SESSION
+   SUBSCRIPTION CHECKOUT
 ========================================================= */
 
 async function createCheckoutSession({
@@ -59,12 +60,7 @@ async function createCheckoutSession({
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
     payment_method_types: ["card"],
-    line_items: [
-      {
-        price: priceId,
-        quantity: 1,
-      },
-    ],
+    line_items: [{ price: priceId, quantity: 1 }],
     customer_email: user.email,
     success_url: successUrl,
     cancel_url: cancelUrl,
@@ -77,7 +73,7 @@ async function createCheckoutSession({
 
   audit({
     actorId: user.id,
-    action: "STRIPE_CHECKOUT_CREATED",
+    action: "STRIPE_SUBSCRIPTION_CHECKOUT_CREATED",
     targetType: "Billing",
     targetId: session.id,
     metadata: { planType: type },
@@ -87,37 +83,51 @@ async function createCheckoutSession({
 }
 
 /* =========================================================
-   CREATE CUSTOMER PORTAL SESSION
+   TOOL ONE-TIME CHECKOUT
 ========================================================= */
 
-async function createCustomerPortalSession({
-  userId,
-  returnUrl,
+async function createToolCheckoutSession({
+  scanId,
+  amount,
+  successUrl,
+  cancelUrl,
 }) {
-  const user = users.findById(userId);
-  if (!user) throw new Error("User not found");
-
-  if (!user.stripeCustomerId) {
-    throw new Error("No Stripe customer linked");
-  }
-
-  const session = await stripe.billingPortal.sessions.create({
-    customer: user.stripeCustomerId,
-    return_url: returnUrl,
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    payment_method_types: ["card"],
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          product_data: {
+            name: "Security Scan",
+          },
+          unit_amount: amount * 100,
+        },
+        quantity: 1,
+      },
+    ],
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: {
+      scanId,
+      type: "tool_payment",
+    },
   });
 
   audit({
-    actorId: user.id,
-    action: "STRIPE_PORTAL_OPENED",
-    targetType: "Billing",
-    targetId: user.stripeCustomerId,
+    actorId: "system",
+    action: "STRIPE_TOOL_CHECKOUT_CREATED",
+    targetType: "Scan",
+    targetId: scanId,
+    metadata: { amount },
   });
 
   return session.url;
 }
 
 /* =========================================================
-   ACTIVATE SUBSCRIPTION (CHECKOUT COMPLETE)
+   ACTIVATE SUBSCRIPTION
 ========================================================= */
 
 async function activateSubscription({
@@ -128,9 +138,7 @@ async function activateSubscription({
   const user = users.findById(userId);
   if (!user) return;
 
-  const subscription = await stripe.subscriptions.retrieve(
-    subscriptionId
-  );
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
 
   user.subscriptionStatus = "Active";
   user.stripeCustomerId = subscription.customer;
@@ -152,7 +160,7 @@ async function activateSubscription({
 }
 
 /* =========================================================
-   SYNC SUBSCRIPTION STATUS (AUTHORITATIVE)
+   SYNC SUBSCRIPTION STATUS
 ========================================================= */
 
 async function syncSubscriptionStatus(subscriptionId, stripeStatus) {
@@ -201,7 +209,8 @@ async function syncSubscriptionStatus(subscriptionId, stripeStatus) {
 
 async function handleStripeWebhook(event) {
 
-  /* Checkout Complete */
+  /* ---------------- SUBSCRIPTION ---------------- */
+
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
 
@@ -218,36 +227,44 @@ async function handleStripeWebhook(event) {
         });
       }
     }
+
+    /* ---------------- TOOL PAYMENT ---------------- */
+
+    if (session.mode === "payment" && session.metadata?.type === "tool_payment") {
+      const scanId = session.metadata?.scanId;
+
+      if (scanId) {
+        markScanPaid(scanId);
+        processScan(scanId);
+
+        audit({
+          actorId: "system",
+          action: "TOOL_PAYMENT_COMPLETED",
+          targetType: "Scan",
+          targetId: scanId,
+        });
+      }
+    }
   }
 
-  /* Subscription Updated / Deleted */
+  /* Subscription updates */
+
   if (
     event.type === "customer.subscription.updated" ||
     event.type === "customer.subscription.deleted"
   ) {
     const subscription = event.data.object;
-    await syncSubscriptionStatus(
-      subscription.id,
-      subscription.status
-    );
+    await syncSubscriptionStatus(subscription.id, subscription.status);
   }
 
-  /* Payment Failed */
   if (event.type === "invoice.payment_failed") {
     const invoice = event.data.object;
-    await syncSubscriptionStatus(
-      invoice.subscription,
-      "past_due"
-    );
+    await syncSubscriptionStatus(invoice.subscription, "past_due");
   }
 
-  /* Payment Succeeded */
   if (event.type === "invoice.payment_succeeded") {
     const invoice = event.data.object;
-    await syncSubscriptionStatus(
-      invoice.subscription,
-      "active"
-    );
+    await syncSubscriptionStatus(invoice.subscription, "active");
   }
 }
 
@@ -280,4 +297,5 @@ module.exports = {
   activateSubscription,
   cancelSubscription,
   handleStripeWebhook,
+  createToolCheckoutSession, // NEW
 };
