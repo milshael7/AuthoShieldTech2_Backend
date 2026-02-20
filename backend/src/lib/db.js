@@ -1,6 +1,6 @@
 // backend/src/lib/db.js
 // File-based JSON DB with schema + safe writes (atomic)
-// Fully Hardened • Stripe Ready • Scan Credit Ready • AutoProtect Ready
+// Fully Hardened • Stripe Ready • Scan Credit Ready • AutoProtect Ready • Invoice Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +8,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 /* ======================================================
    UTIL
@@ -40,42 +40,23 @@ function defaultDb() {
     processedStripeEvents: [],
 
     /* ======================================================
+       🔥 INVOICES + REVENUE TRACKING
+    ====================================================== */
+
+    invoices: [],
+    revenueSummary: {
+      totalRevenue: 0,
+      autoprotekRevenue: 0,
+      subscriptionRevenue: 0,
+      toolRevenue: 0,
+    },
+
+    /* ======================================================
        🔥 AUTOPROTECT (User Scoped)
     ====================================================== */
 
     autoprotek: {
-      users: {
-        /*
-        USER_ID: {
-          status: "ACTIVE" | "INACTIVE",
-          activatedAt: "",
-          expiresAt: "",
-          monthlyJobLimit: 30,
-          jobsUsedThisMonth: 0,
-          lastResetMonth: "2026-02",
-
-          companies: {
-            COMPANY_ID: {
-              schedule: {
-                timezone: "",
-                workingDays: [],
-                startTime: "",
-                endTime: ""
-              },
-              vacation: {
-                from: "",
-                to: ""
-              },
-              email: "",
-              jobs: [],
-              reports: [],
-              emailDrafts: [],
-              emailSent: []
-            }
-          }
-        }
-        */
-      }
+      users: {},
     },
 
     brain: {
@@ -121,13 +102,20 @@ function migrate(db) {
   if (!Array.isArray(db.audit)) db.audit = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
   if (!Array.isArray(db.scans)) db.scans = [];
+  if (!Array.isArray(db.processedStripeEvents)) db.processedStripeEvents = [];
+  if (!Array.isArray(db.invoices)) db.invoices = [];
 
   if (!db.scanCredits || typeof db.scanCredits !== "object") {
     db.scanCredits = {};
   }
 
-  if (!Array.isArray(db.processedStripeEvents)) {
-    db.processedStripeEvents = [];
+  if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
+    db.revenueSummary = {
+      totalRevenue: 0,
+      autoprotekRevenue: 0,
+      subscriptionRevenue: 0,
+      toolRevenue: 0,
+    };
   }
 
   /* ======================================================
@@ -147,12 +135,11 @@ function migrate(db) {
 
     if (!userContainer.status) userContainer.status = "INACTIVE";
     if (!userContainer.monthlyJobLimit)
-      userContainer.monthlyJobLimit = 30;
+      userContainer.monthlyJobLimit = 10;
     if (!userContainer.jobsUsedThisMonth)
       userContainer.jobsUsedThisMonth = 0;
     if (!userContainer.lastResetMonth)
       userContainer.lastResetMonth = "";
-
     if (!userContainer.companies)
       userContainer.companies = {};
 
@@ -179,6 +166,10 @@ function migrate(db) {
       if (!Array.isArray(c.emailSent)) c.emailSent = [];
     }
   }
+
+  /* ======================================================
+     OTHER SYSTEM MIGRATION
+  ====================================================== */
 
   if (!db.brain) db.brain = {};
   if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
