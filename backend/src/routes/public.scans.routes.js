@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Dynamic Pricing • Plan Engine Integrated
+// Public Scan Routes — Credit Enforced • Plan Discount Integrated
 
 const express = require("express");
 const router = express.Router();
@@ -17,12 +17,10 @@ const {
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
-const {
-  getUserEffectivePlan,
-} = require("../users/user.service");
+const { getUserEffectivePlan } = require("../users/user.service");
 
 /* =========================================================
-   OPTIONAL AUTH (SOFT)
+   OPTIONAL AUTH
 ========================================================= */
 
 function getOptionalUser(req) {
@@ -56,15 +54,9 @@ router.get("/tools", (req, res) => {
       })
     );
 
-    return res.json({
-      ok: true,
-      tools,
-    });
+    return res.json({ ok: true, tools });
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e.message,
-    });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -85,13 +77,15 @@ router.post("/", async (req, res) => {
 
     const user = getOptionalUser(req);
 
+    // 🔥 Pass user for credit enforcement
     const scan = createScan({
       toolId,
       email,
       inputData: inputData || {},
+      user,
     });
 
-    /* ---------------- FREE TOOL ---------------- */
+    /* ================= CREDIT USED OR FREE TOOL ================= */
 
     if (scan.finalPrice === 0) {
       processScan(scan.id);
@@ -100,20 +94,27 @@ router.post("/", async (req, res) => {
         ok: true,
         scanId: scan.id,
         finalPrice: 0,
+        creditUsed: scan.creditUsed || false,
         status: "processing",
       });
     }
 
-    /* ---------------- PLAN ENGINE ---------------- */
+    /* ================= PLAN DISCOUNT ================= */
 
-    const plan = getUserEffectivePlan(user);
+    let finalCharge = scan.finalPrice;
+    let discountPercent = 0;
+    let planLabel = "Public";
 
-    const discountPercent = plan.discountPercent || 0;
+    if (user) {
+      const plan = getUserEffectivePlan(user);
+      discountPercent = plan.discountPercent || 0;
+      planLabel = plan.label;
 
-    const discountedPrice = Math.round(
-      scan.finalPrice -
-        (scan.finalPrice * discountPercent) / 100
-    );
+      finalCharge = Math.round(
+        scan.finalPrice -
+          (scan.finalPrice * discountPercent) / 100
+      );
+    }
 
     const successUrl =
       process.env.STRIPE_TOOL_SUCCESS_URL ||
@@ -125,7 +126,7 @@ router.post("/", async (req, res) => {
 
     const checkoutUrl = await createToolCheckoutSession({
       scanId: scan.id,
-      amount: discountedPrice,
+      amount: finalCharge,
       successUrl,
       cancelUrl,
     });
@@ -135,9 +136,9 @@ router.post("/", async (req, res) => {
       scanId: scan.id,
       basePrice: scan.basePrice,
       originalPrice: scan.finalPrice,
-      discountedPrice,
+      finalCharge,
       discountPercent,
-      planLabel: plan.label,
+      planLabel,
       checkoutUrl,
       status: "awaiting_payment",
     });
@@ -157,7 +158,6 @@ router.post("/", async (req, res) => {
 router.get("/:id", (req, res) => {
   try {
     const scan = getScan(req.params.id);
-
     if (!scan) {
       return res.status(404).json({
         ok: false,
@@ -165,10 +165,8 @@ router.get("/:id", (req, res) => {
       });
     }
 
-    return res.json({
-      ok: true,
-      scan,
-    });
+    return res.json({ ok: true, scan });
+
   } catch (e) {
     return res.status(500).json({
       ok: false,
