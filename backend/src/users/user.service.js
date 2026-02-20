@@ -35,7 +35,51 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   AUTOPROTECT CONTROL (10 JOB HARD LIMIT)
+   PLAN ENGINE (UNCHANGED)
+====================================================== */
+
+const PLAN_BENEFITS = {
+  trial: { planKey: "trial", discountPercent: 0, includedScans: 0 },
+  individual: { planKey: "individual", discountPercent: 30, includedScans: 1 },
+  micro: { planKey: "micro", discountPercent: 35, includedScans: 2 },
+  small: { planKey: "small", discountPercent: 40, includedScans: 5 },
+  mid: { planKey: "mid", discountPercent: 45, includedScans: 10 },
+  enterprise: { planKey: "enterprise", discountPercent: 50, includedScans: Infinity },
+};
+
+function getUserEffectivePlan(user) {
+  if (!user) return PLAN_BENEFITS.trial;
+
+  if (user.subscriptionStatus !== SUBSCRIPTION.ACTIVE) {
+    return PLAN_BENEFITS.trial;
+  }
+
+  const db = readDb();
+
+  if (user.companyId) {
+    const company = db.companies?.find(c => c.id === user.companyId);
+    if (company?.tier) {
+      const tierKey = String(company.tier).toLowerCase();
+      if (PLAN_BENEFITS[tierKey]) {
+        return PLAN_BENEFITS[tierKey];
+      }
+    }
+  }
+
+  if (user.role === ROLES.INDIVIDUAL) {
+    return PLAN_BENEFITS.individual;
+  }
+
+  return PLAN_BENEFITS.trial;
+}
+
+function getPlanBenefits(planKey) {
+  const key = String(planKey || "").toLowerCase();
+  return PLAN_BENEFITS[key] || PLAN_BENEFITS.trial;
+}
+
+/* ======================================================
+   AUTOPROTECT ENGINE (10 JOB HARD LIMIT)
 ====================================================== */
 
 function currentMonthKey() {
@@ -44,16 +88,13 @@ function currentMonthKey() {
 }
 
 function activateAutoProtect(userId) {
-  updateDb((db) => {
+  updateDb(db => {
     db.autoprotek = db.autoprotek || { users: {} };
 
     db.autoprotek.users[userId] = db.autoprotek.users[userId] || {
       status: "ACTIVE",
       activatedAt: new Date().toISOString(),
-
-      // 🔒 HARD LIMIT LOCKED
-      monthlyJobLimit: 10,
-
+      monthlyJobLimit: 10, // 🔒 HARD LOCKED
       jobsUsedThisMonth: 0,
       lastResetMonth: currentMonthKey(),
       companies: {},
@@ -65,19 +106,18 @@ function activateAutoProtect(userId) {
 }
 
 function deactivateAutoProtect(userId) {
-  updateDb((db) => {
+  updateDb(db => {
     if (!db.autoprotek?.users?.[userId]) return;
     db.autoprotek.users[userId].status = "INACTIVE";
   });
 }
 
 function enforceMonthlyReset(userId) {
-  updateDb((db) => {
+  updateDb(db => {
     const userAP = db.autoprotek?.users?.[userId];
     if (!userAP) return;
 
     const current = currentMonthKey();
-
     if (userAP.lastResetMonth !== current) {
       userAP.jobsUsedThisMonth = 0;
       userAP.lastResetMonth = current;
@@ -102,7 +142,7 @@ function canRunAutoProtect(userId) {
 }
 
 function registerAutoProtectJob(userId) {
-  updateDb((db) => {
+  updateDb(db => {
     const userAP = db.autoprotek?.users?.[userId];
     if (!userAP) return;
 
@@ -113,16 +153,74 @@ function registerAutoProtectJob(userId) {
 }
 
 /* ======================================================
+   HELPERS
+====================================================== */
+
+function ensureArrays(db) {
+  if (!Array.isArray(db.users)) db.users = [];
+}
+
+function normEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function sanitize(u) {
+  if (!u) return null;
+  const { passwordHash, ...rest } = u;
+  return rest;
+}
+
+/* ======================================================
+   ADMIN BOOTSTRAP (UNCHANGED)
+====================================================== */
+
+function ensureAdminFromEnv() {
+  const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
+
+  const db = readDb();
+  ensureArrays(db);
+
+  const emailKey = normEmail(ADMIN_EMAIL);
+
+  const exists = db.users.find(
+    u => normEmail(u.email) === emailKey && u.role === ROLES.ADMIN
+  );
+
+  if (exists) return;
+
+  const admin = {
+    id: nanoid(),
+    platformId: `AS-${nanoid(10).toUpperCase()}`,
+    email: ADMIN_EMAIL.trim(),
+    passwordHash: bcrypt.hashSync(String(ADMIN_PASSWORD), 10),
+    role: ROLES.ADMIN,
+    companyId: null,
+    createdAt: new Date().toISOString(),
+    subscriptionStatus: SUBSCRIPTION.ACTIVE,
+    mustResetPassword: false,
+    locked: false,
+    status: APPROVAL_STATUS.APPROVED,
+    approvedBy: "system",
+    branch: null,
+  };
+
+  db.users.push(admin);
+  writeDb(db);
+}
+
+/* ======================================================
    USER CREATION
 ====================================================== */
 
 function createUser({ email, password, role, profile = {}, companyId = null }) {
   const db = readDb();
+  ensureArrays(db);
 
   const cleanEmail = String(email || "").trim();
   if (!cleanEmail) throw new Error("Email required");
 
-  if (db.users.find((u) => u.email.toLowerCase() === cleanEmail.toLowerCase())) {
+  if (db.users.find(u => normEmail(u.email) === normEmail(cleanEmail))) {
     throw new Error("Email already exists");
   }
 
@@ -149,7 +247,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
   db.users.push(u);
   writeDb(db);
 
-  return u;
+  return sanitize(u);
 }
 
 /* ======================================================
@@ -158,22 +256,20 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 
 function findByEmail(email) {
   const db = readDb();
-  return db.users.find(
-    (u) => u.email.toLowerCase() === String(email).toLowerCase()
-  ) || null;
+  ensureArrays(db);
+  return db.users.find(u => normEmail(u.email) === normEmail(email)) || null;
 }
 
 function findById(id) {
   const db = readDb();
-  return db.users.find((u) => u.id === id) || null;
+  ensureArrays(db);
+  return db.users.find(u => u.id === id) || null;
 }
 
 function listUsers() {
   const db = readDb();
-  return db.users.map((u) => {
-    const { passwordHash, ...rest } = u;
-    return rest;
-  });
+  ensureArrays(db);
+  return db.users.map(sanitize);
 }
 
 function verifyPassword(user, password) {
@@ -189,12 +285,16 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
+  getUserEffectivePlan,
+  getPlanBenefits,
+  ensureAdminFromEnv,
   createUser,
   findByEmail,
   findById,
   listUsers,
   verifyPassword,
 
+  // AutoProtect
   activateAutoProtect,
   deactivateAutoProtect,
   canRunAutoProtect,
