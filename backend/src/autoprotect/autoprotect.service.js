@@ -1,5 +1,5 @@
 // backend/src/autoprotect/autoprotect.service.js
-// AutoProtect Engine — Fully Hardened • Schedule Aware • Limit Enforced
+// AutoProtect Engine — Active Job Model • Subscription Safe • Hardened
 
 const { audit } = require("../lib/audit");
 const { createNotification } = require("../lib/notify");
@@ -7,15 +7,11 @@ const { readDb, updateDb } = require("../lib/db");
 const {
   canRunAutoProtect,
   registerAutoProtectJob,
+  closeAutoProtectJob,
+  ROLES,
 } = require("../users/user.service");
 
-/* =========================================================
-   UTIL
-========================================================= */
-
-function now() {
-  return new Date();
-}
+/* ========================================================= */
 
 function nowIso() {
   return new Date().toISOString();
@@ -56,49 +52,6 @@ function ensureCompanyMembership(actorId, companyId) {
 }
 
 /* =========================================================
-   SCHEDULE + VACATION CHECK
-========================================================= */
-
-function withinWorkingWindow(userAPCompany) {
-  if (!userAPCompany?.schedule) return false;
-
-  const { workingDays, startTime, endTime } =
-    userAPCompany.schedule;
-
-  const nowDate = now();
-
-  const day = nowDate.getDay(); // 0-6
-  const hour = nowDate.getHours();
-  const minute = nowDate.getMinutes();
-
-  const timeNow = hour * 60 + minute;
-
-  const startParts = (startTime || "00:00").split(":");
-  const endParts = (endTime || "23:59").split(":");
-
-  const start = parseInt(startParts[0]) * 60 +
-    parseInt(startParts[1] || 0);
-  const end = parseInt(endParts[0]) * 60 +
-    parseInt(endParts[1] || 0);
-
-  const workingDayMatch =
-    Array.isArray(workingDays) &&
-    workingDays.includes(day);
-
-  return workingDayMatch && timeNow >= start && timeNow <= end;
-}
-
-function withinVacation(userAPCompany) {
-  if (!userAPCompany?.vacation?.from) return false;
-
-  const nowTs = Date.now();
-  const from = new Date(userAPCompany.vacation.from).getTime();
-  const to = new Date(userAPCompany.vacation.to).getTime();
-
-  return nowTs >= from && nowTs <= to;
-}
-
-/* =========================================================
    RUN AUTOPROTECT JOB
 ========================================================= */
 
@@ -116,37 +69,28 @@ function runAutoProtectJob({
     throw new Error("Invalid issue payload");
   }
 
+  const db = readDb();
+  const user = db.users.find(u => u.id === actorId);
+
+  if (!user) {
+    throw new Error("User not found");
+  }
+
   ensureCompanyMembership(actorId, companyId);
 
   /* --------------------------------------------------
-     🔥 STATUS + LIMIT CHECK
+     🔥 LIMIT CHECK (Active Job Model)
   -------------------------------------------------- */
 
-  if (!canRunAutoProtect(actorId)) {
-    throw new Error("AutoProtect inactive or limit reached");
+  if (!canRunAutoProtect(user)) {
+    throw new Error("AutoProtect inactive or active job limit reached (10)");
   }
 
-  const db = readDb();
-  const userAP = db.autoprotek?.users?.[actorId];
+  /* --------------------------------------------------
+     🔥 REGISTER ACTIVE JOB
+  -------------------------------------------------- */
 
-  if (!userAP) {
-    throw new Error("AutoProtect not configured");
-  }
-
-  const companyContainer =
-    userAP.companies?.[companyId];
-
-  if (!companyContainer) {
-    throw new Error("Company schedule not configured");
-  }
-
-  if (!withinWorkingWindow(companyContainer)) {
-    throw new Error("Outside working schedule");
-  }
-
-  if (withinVacation(companyContainer)) {
-    throw new Error("User on vacation");
-  }
+  registerAutoProtectJob(user);
 
   /* --------------------------------------------------
      🔥 JOB CREATION
@@ -167,29 +111,22 @@ function runAutoProtectJob({
   };
 
   updateDb((db2) => {
-    const ap = db2.autoprotek.users[actorId];
-    const companyData =
-      ap.companies[companyId];
+    db2.autoprotek = db2.autoprotek || { users: {} };
+    const apUser = db2.autoprotek.users[actorId];
 
-    companyData.reports = companyData.reports || [];
-    companyData.emailDrafts =
-      companyData.emailDrafts || [];
+    if (!apUser) return;
 
-    companyData.reports.push(report);
-
-    companyData.emailDrafts.push({
-      id: `EMAIL-${jobId}`,
-      reportId: jobId,
-      createdAt: nowIso(),
-      sent: false,
-    });
+    apUser.reports = apUser.reports || [];
+    apUser.reports.push(report);
   });
 
   /* --------------------------------------------------
-     🔥 REGISTER JOB COUNT
+     🔥 CLOSE ACTIVE JOB (Instant Completion Model)
   -------------------------------------------------- */
 
-  registerAutoProtectJob(actorId);
+  if (user.role !== ROLES.ADMIN && user.role !== ROLES.MANAGER) {
+    closeAutoProtectJob(user);
+  }
 
   /* --------------------------------------------------
      🔥 AUDIT
@@ -207,7 +144,7 @@ function runAutoProtectJob({
   });
 
   /* --------------------------------------------------
-     🔥 NOTIFY OWNER
+     🔥 NOTIFY
   -------------------------------------------------- */
 
   createNotification({
