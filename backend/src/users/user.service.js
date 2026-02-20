@@ -13,13 +13,6 @@ const ROLES = {
   INDIVIDUAL: "Individual",
 };
 
-const ROLE_RANK = {
-  [ROLES.ADMIN]: 4,
-  [ROLES.MANAGER]: 3,
-  [ROLES.COMPANY]: 2,
-  [ROLES.INDIVIDUAL]: 1,
-};
-
 const SUBSCRIPTION = {
   TRIAL: "Trial",
   ACTIVE: "Active",
@@ -35,73 +28,32 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   PLAN ENGINE (UNCHANGED)
+   AUTOPROTECT CONFIG
 ====================================================== */
 
-const PLAN_BENEFITS = {
-  trial: { planKey: "trial", discountPercent: 0, includedScans: 0 },
-  individual: { planKey: "individual", discountPercent: 30, includedScans: 1 },
-  micro: { planKey: "micro", discountPercent: 35, includedScans: 2 },
-  small: { planKey: "small", discountPercent: 40, includedScans: 5 },
-  mid: { planKey: "mid", discountPercent: 45, includedScans: 10 },
-  enterprise: { planKey: "enterprise", discountPercent: 50, includedScans: Infinity },
-};
-
-function getUserEffectivePlan(user) {
-  if (!user) return PLAN_BENEFITS.trial;
-
-  if (user.subscriptionStatus !== SUBSCRIPTION.ACTIVE) {
-    return PLAN_BENEFITS.trial;
-  }
-
-  const db = readDb();
-
-  if (user.companyId) {
-    const company = db.companies?.find(c => c.id === user.companyId);
-    if (company?.tier) {
-      const tierKey = String(company.tier).toLowerCase();
-      if (PLAN_BENEFITS[tierKey]) {
-        return PLAN_BENEFITS[tierKey];
-      }
-    }
-  }
-
-  if (user.role === ROLES.INDIVIDUAL) {
-    return PLAN_BENEFITS.individual;
-  }
-
-  return PLAN_BENEFITS.trial;
-}
-
-function getPlanBenefits(planKey) {
-  const key = String(planKey || "").toLowerCase();
-  return PLAN_BENEFITS[key] || PLAN_BENEFITS.trial;
-}
+const AUTOPROTECT_PRICE = 550; // $500 + $50 tax
+const AUTOPROTECT_ACTIVE_LIMIT = 10;
 
 /* ======================================================
-   AUTOPROTECT ENGINE (10 JOB HARD LIMIT)
+   AUTOPROTECT ENGINE (ACTIVE JOB MODEL)
 ====================================================== */
-
-function currentMonthKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-}
 
 function activateAutoProtect(userId) {
   updateDb(db => {
     db.autoprotek = db.autoprotek || { users: {} };
 
-    db.autoprotek.users[userId] = db.autoprotek.users[userId] || {
+    const nextBilling = new Date();
+    nextBilling.setMonth(nextBilling.getMonth() + 1);
+
+    db.autoprotek.users[userId] = {
       status: "ACTIVE",
       activatedAt: new Date().toISOString(),
-      monthlyJobLimit: 10, // 🔒 HARD LOCKED
-      jobsUsedThisMonth: 0,
-      lastResetMonth: currentMonthKey(),
-      companies: {},
+      subscriptionStatus: "ACTIVE",
+      nextBillingDate: nextBilling.toISOString(),
+      priceLocked: AUTOPROTECT_PRICE,
+      activeJobsCount: 0,
+      activeJobLimit: AUTOPROTECT_ACTIVE_LIMIT,
     };
-
-    db.autoprotek.users[userId].status = "ACTIVE";
-    db.autoprotek.users[userId].monthlyJobLimit = 10;
   });
 }
 
@@ -109,46 +61,61 @@ function deactivateAutoProtect(userId) {
   updateDb(db => {
     if (!db.autoprotek?.users?.[userId]) return;
     db.autoprotek.users[userId].status = "INACTIVE";
+    db.autoprotek.users[userId].subscriptionStatus = "INACTIVE";
   });
 }
 
-function enforceMonthlyReset(userId) {
-  updateDb(db => {
-    const userAP = db.autoprotek?.users?.[userId];
-    if (!userAP) return;
-
-    const current = currentMonthKey();
-    if (userAP.lastResetMonth !== current) {
-      userAP.jobsUsedThisMonth = 0;
-      userAP.lastResetMonth = current;
-    }
-  });
-}
-
-function canRunAutoProtect(userId) {
+function isAutoProtectActive(userId) {
   const db = readDb();
   const userAP = db.autoprotek?.users?.[userId];
+  if (!userAP) return false;
+  if (userAP.status !== "ACTIVE") return false;
+  if (userAP.subscriptionStatus !== "ACTIVE") return false;
+  return true;
+}
+
+function canRunAutoProtect(user) {
+  // Admin & Manager unlimited
+  if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
+    return true;
+  }
+
+  const db = readDb();
+  const userAP = db.autoprotek?.users?.[user.id];
 
   if (!userAP) return false;
   if (userAP.status !== "ACTIVE") return false;
+  if (userAP.subscriptionStatus !== "ACTIVE") return false;
 
-  enforceMonthlyReset(userId);
-
-  if (userAP.jobsUsedThisMonth >= 10) {
+  if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) {
     return false;
   }
 
   return true;
 }
 
-function registerAutoProtectJob(userId) {
+function registerAutoProtectJob(user) {
+  // Admin & Manager not limited
+  if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
+    return;
+  }
+
   updateDb(db => {
-    const userAP = db.autoprotek?.users?.[userId];
+    const userAP = db.autoprotek?.users?.[user.id];
     if (!userAP) return;
+    if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) return;
 
-    if (userAP.jobsUsedThisMonth >= 10) return;
+    userAP.activeJobsCount += 1;
+  });
+}
 
-    userAP.jobsUsedThisMonth += 1;
+function closeAutoProtectJob(user) {
+  updateDb(db => {
+    const userAP = db.autoprotek?.users?.[user.id];
+    if (!userAP) return;
+    if (userAP.activeJobsCount <= 0) return;
+
+    userAP.activeJobsCount -= 1;
   });
 }
 
@@ -171,7 +138,7 @@ function sanitize(u) {
 }
 
 /* ======================================================
-   ADMIN BOOTSTRAP (UNCHANGED)
+   ADMIN BOOTSTRAP
 ====================================================== */
 
 function ensureAdminFromEnv() {
@@ -202,7 +169,6 @@ function ensureAdminFromEnv() {
     locked: false,
     status: APPROVAL_STATUS.APPROVED,
     approvedBy: "system",
-    branch: null,
   };
 
   db.users.push(admin);
@@ -285,8 +251,6 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
-  getUserEffectivePlan,
-  getPlanBenefits,
   ensureAdminFromEnv,
   createUser,
   findByEmail,
@@ -297,6 +261,8 @@ module.exports = {
   // AutoProtect
   activateAutoProtect,
   deactivateAutoProtect,
+  isAutoProtectActive,
   canRunAutoProtect,
   registerAutoProtectJob,
+  closeAutoProtectJob,
 };
