@@ -35,38 +35,44 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   PLAN ENGINE
+   PLAN ENGINE (HARDENED)
 ====================================================== */
 
 const PLAN_BENEFITS = {
   trial: {
+    planKey: "trial",
     discountPercent: 0,
     includedScans: 0,
     label: "Trial",
   },
   individual: {
+    planKey: "individual",
     discountPercent: 30,
     includedScans: 1,
     label: "Individual Active",
   },
   micro: {
+    planKey: "micro",
     discountPercent: 35,
     includedScans: 2,
     label: "Micro Plan",
   },
   small: {
+    planKey: "small",
     discountPercent: 40,
     includedScans: 5,
     label: "Small Plan",
   },
   mid: {
+    planKey: "mid",
     discountPercent: 45,
     includedScans: 10,
     label: "Mid Plan",
   },
   enterprise: {
+    planKey: "enterprise",
     discountPercent: 50,
-    includedScans: 999,
+    includedScans: Infinity,
     label: "Enterprise Plan",
   },
 };
@@ -80,18 +86,24 @@ function getUserEffectivePlan(user) {
 
   const db = readDb();
 
-  // Company plan overrides individual
+  /* ================= COMPANY OVERRIDE ================= */
+
   if (user.companyId) {
-    const company = db.companies.find(
+    const company = db.companies?.find(
       (c) => c.id === user.companyId
     );
 
-    if (company && PLAN_BENEFITS[company.tier]) {
-      return PLAN_BENEFITS[company.tier];
+    if (company && company.tier) {
+      const tierKey = String(company.tier).toLowerCase();
+
+      if (PLAN_BENEFITS[tierKey]) {
+        return PLAN_BENEFITS[tierKey];
+      }
     }
   }
 
-  // Individual active
+  /* ================= INDIVIDUAL ACTIVE ================= */
+
   if (user.role === ROLES.INDIVIDUAL) {
     return PLAN_BENEFITS.individual;
   }
@@ -100,7 +112,8 @@ function getUserEffectivePlan(user) {
 }
 
 function getPlanBenefits(planKey) {
-  return PLAN_BENEFITS[planKey] || PLAN_BENEFITS.trial;
+  const key = String(planKey || "").toLowerCase();
+  return PLAN_BENEFITS[key] || PLAN_BENEFITS.trial;
 }
 
 /* ======================================================
