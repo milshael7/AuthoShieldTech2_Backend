@@ -28,14 +28,19 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   AUTOPROTECT CONFIG
+   AUTOPROTECT PRICING (SERVICE-SCOPED)
 ====================================================== */
 
-const AUTOPROTECT_PRICE = 550; // $500 + $50 tax
+const AUTOPROTECT_PRICING = {
+  automationService: 500,
+  platformFee: 50,
+  total: 550,
+};
+
 const AUTOPROTECT_ACTIVE_LIMIT = 10;
 
 /* ======================================================
-   AUTOPROTECT ENGINE (ACTIVE JOB MODEL)
+   AUTOPROTECT ENGINE
 ====================================================== */
 
 function activateAutoProtect(userId) {
@@ -50,7 +55,7 @@ function activateAutoProtect(userId) {
       activatedAt: new Date().toISOString(),
       subscriptionStatus: "ACTIVE",
       nextBillingDate: nextBilling.toISOString(),
-      priceLocked: AUTOPROTECT_PRICE,
+      pricing: AUTOPROTECT_PRICING,
       activeJobsCount: 0,
       activeJobLimit: AUTOPROTECT_ACTIVE_LIMIT,
     };
@@ -60,6 +65,7 @@ function activateAutoProtect(userId) {
 function deactivateAutoProtect(userId) {
   updateDb(db => {
     if (!db.autoprotek?.users?.[userId]) return;
+
     db.autoprotek.users[userId].status = "INACTIVE";
     db.autoprotek.users[userId].subscriptionStatus = "INACTIVE";
   });
@@ -68,9 +74,11 @@ function deactivateAutoProtect(userId) {
 function isAutoProtectActive(userId) {
   const db = readDb();
   const userAP = db.autoprotek?.users?.[userId];
+
   if (!userAP) return false;
   if (userAP.status !== "ACTIVE") return false;
   if (userAP.subscriptionStatus !== "ACTIVE") return false;
+
   return true;
 }
 
@@ -95,7 +103,6 @@ function canRunAutoProtect(user) {
 }
 
 function registerAutoProtectJob(user) {
-  // Admin & Manager not limited
   if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
     return;
   }
