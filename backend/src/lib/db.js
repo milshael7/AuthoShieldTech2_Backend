@@ -1,11 +1,12 @@
 // backend/src/lib/db.js
 // File-based JSON DB with schema + safe writes (atomic)
+// Upgraded to support scans + hardened migration
 
-const fs = require('fs');
-const path = require('path');
+const fs = require("fs");
+const path = require("path");
 
-const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
-const TMP_PATH = DB_PATH + '.tmp';
+const DB_PATH = path.join(__dirname, "..", "data", "db.json");
+const TMP_PATH = DB_PATH + ".tmp";
 
 const SCHEMA_VERSION = 4;
 
@@ -34,10 +35,7 @@ function defaultDb() {
     companies: [],
     audit: [],
     notifications: [],
-
-    // 🔥 NEW
-    tools: [],
-    scans: [],
+    scans: [], // ✅ NEW
 
     brain: {
       memory: [],
@@ -73,7 +71,7 @@ function defaultDb() {
 ====================================================== */
 
 function migrate(db) {
-  if (!db || typeof db !== 'object') return defaultDb();
+  if (!db || typeof db !== "object") return defaultDb();
 
   if (!db.schemaVersion) db.schemaVersion = 1;
 
@@ -81,10 +79,7 @@ function migrate(db) {
   if (!Array.isArray(db.companies)) db.companies = [];
   if (!Array.isArray(db.audit)) db.audit = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
-
-  // 🔥 NEW
-  if (!Array.isArray(db.tools)) db.tools = [];
-  if (!Array.isArray(db.scans)) db.scans = [];
+  if (!Array.isArray(db.scans)) db.scans = []; // ✅ ensure scans
 
   if (!db.brain) db.brain = {};
   if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
@@ -106,7 +101,6 @@ function migrate(db) {
       lastTradeTs: 0,
     };
   }
-
   if (!Array.isArray(db.paper.trades)) db.paper.trades = [];
   if (!Array.isArray(db.paper.daily)) db.paper.daily = [];
 
@@ -130,14 +124,14 @@ function ensureDb() {
   }
 
   try {
-    const raw = fs.readFileSync(DB_PATH, 'utf-8');
+    const raw = fs.readFileSync(DB_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     const migrated = migrate(parsed);
     fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
   } catch {
     try {
-      const bad = fs.readFileSync(DB_PATH, 'utf-8');
-      fs.writeFileSync(DB_PATH + '.corrupt.' + Date.now(), bad);
+      const bad = fs.readFileSync(DB_PATH, "utf-8");
+      fs.writeFileSync(DB_PATH + ".corrupt." + Date.now(), bad);
     } catch {}
     fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
   }
@@ -145,7 +139,7 @@ function ensureDb() {
 
 function readDb() {
   ensureDb();
-  return migrate(JSON.parse(fs.readFileSync(DB_PATH, 'utf-8')));
+  return migrate(JSON.parse(fs.readFileSync(DB_PATH, "utf-8")));
 }
 
 function writeDb(db) {
@@ -170,11 +164,11 @@ function writeAudit(event = {}) {
     updateDb((db) => {
       db.audit.push({
         ts: now(),
-        actorId: event.actorId || 'system',
-        actorRole: event.actorRole || 'system',
+        actorId: event.actorId || "system",
+        actorRole: event.actorRole || "system",
         companyId: event.companyId || null,
-        action: String(event.action || 'unknown').slice(0, 120),
-        target: String(event.target || '').slice(0, 120),
+        action: String(event.action || "unknown").slice(0, 120),
+        target: String(event.target || "").slice(0, 120),
         meta: event.meta || {},
       });
 
@@ -183,7 +177,7 @@ function writeAudit(event = {}) {
       }
     });
   } catch (e) {
-    console.error('AUDIT WRITE FAILED:', e);
+    console.error("AUDIT WRITE FAILED:", e);
   }
 }
 
