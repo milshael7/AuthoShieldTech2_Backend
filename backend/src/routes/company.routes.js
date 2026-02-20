@@ -1,257 +1,209 @@
-const { nanoid } = require("nanoid");
-const { readDb, writeDb } = require("../lib/db");
-const { audit } = require("../lib/audit");
-const { createNotification } = require("../lib/notify");
+// Company Routes — Clean Layered Architecture
+// Routes ONLY — Business logic lives in company.service.js
+
+const express = require("express");
+const router = express.Router();
+
+const { authRequired, requireRole } = require("../middleware/auth");
+const companyService = require("../companies/company.service");
 
 /* =========================================================
-   TIER CONFIG (USER LIMIT BASED)
+   ROLE SETUP
 ========================================================= */
 
-const TIERS = {
-  micro: { maxUsers: 5 },
-  small: { maxUsers: 15 },
-  mid: { maxUsers: 50 },
-  enterprise: { maxUsers: 150 },
-  unlimited: { maxUsers: Infinity },
-};
-
-function normalizeTier(tier) {
-  const t = String(tier || "").toLowerCase();
-  return TIERS[t] ? t : "micro";
-}
-
-/* =========================================================
-   HELPERS
-========================================================= */
-
-function ensureCompanies(db) {
-  if (!Array.isArray(db.companies)) db.companies = [];
-}
-
-function safeStr(v, maxLen = 160) {
-  const s = String(v || "").trim();
-  return s ? s.slice(0, maxLen) : "";
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function getCompanyById(db, id) {
-  ensureCompanies(db);
-  const cid = String(id || "").trim();
-  if (!cid) return null;
-  return db.companies.find((c) => String(c.id) === cid) || null;
-}
-
-function enforceUserLimit(company) {
-  const tier = normalizeTier(company.tier);
-  const limit = TIERS[tier].maxUsers;
-
-  if (!Array.isArray(company.members)) company.members = [];
-
-  if (company.members.length >= limit) {
-    throw new Error("User limit reached for current plan. Please upgrade.");
-  }
-}
+router.use(authRequired);
 
 /* =========================================================
    CREATE COMPANY
+   Admin only
 ========================================================= */
 
-function createCompany({
-  name,
-  country,
-  website,
-  industry,
-  contactEmail,
-  contactPhone,
-  tier = "micro",
-  createdBy,
-}) {
-  const db = readDb();
-  ensureCompanies(db);
+router.post(
+  "/",
+  requireRole("Admin"),
+  (req, res) => {
+    try {
+      const {
+        name,
+        country,
+        website,
+        industry,
+        contactEmail,
+        contactPhone,
+        tier,
+      } = req.body;
 
-  const cleanName = safeStr(name, 120);
-  if (!cleanName) throw new Error("Company name is required");
+      const company = companyService.createCompany({
+        name,
+        country,
+        website,
+        industry,
+        contactEmail,
+        contactPhone,
+        tier,
+        createdBy: req.user.id,
+      });
 
-  const normalizedTier = normalizeTier(tier);
+      return res.status(201).json({
+        ok: true,
+        company,
+      });
 
-  const c = {
-    id: nanoid(),
-    name: cleanName,
-    country: safeStr(country, 80),
-    website: safeStr(website, 160),
-    industry: safeStr(industry, 120),
-    contactEmail: safeStr(contactEmail, 160),
-    contactPhone: safeStr(contactPhone, 60),
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
 
-    tier: normalizedTier,
-    maxUsers: TIERS[normalizedTier].maxUsers,
+/* =========================================================
+   LIST COMPANIES
+   Admin + Manager
+========================================================= */
 
-    createdAt: nowISO(),
-    status: "Active",
-    createdBy: createdBy ? String(createdBy) : null,
+router.get(
+  "/",
+  requireRole("Admin", "Manager", { adminAlso: true }),
+  (req, res) => {
+    try {
+      const companies = companyService.listCompanies();
 
-    // structured members
-    members: [],
-  };
+      return res.json({
+        ok: true,
+        companies,
+      });
 
-  db.companies.push(c);
-  writeDb(db);
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
 
-  audit({
-    actorId: c.createdBy,
-    action: "COMPANY_CREATED",
-    targetType: "Company",
-    targetId: c.id,
-  });
+/* =========================================================
+   GET COMPANY
+========================================================= */
 
-  createNotification({
-    companyId: c.id,
-    severity: "info",
-    title: "Company created",
-    message: "Company workspace is ready.",
-  });
+router.get("/:id", authRequired, (req, res) => {
+  try {
+    const company = companyService.getCompany(req.params.id);
 
-  return c;
-}
+    if (!company) {
+      return res.status(404).json({
+        ok: false,
+        error: "Company not found",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      company,
+    });
+
+  } catch (e) {
+    return res.status(400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
 
 /* =========================================================
    UPGRADE COMPANY
+   Admin only
 ========================================================= */
 
-function upgradeCompany(companyId, newTier, actorId) {
-  const db = readDb();
-  ensureCompanies(db);
+router.post(
+  "/:id/upgrade",
+  requireRole("Admin"),
+  (req, res) => {
+    try {
+      const { tier } = req.body;
 
-  const c = getCompanyById(db, companyId);
-  if (!c) throw new Error("Company not found");
+      const company = companyService.upgradeCompany(
+        req.params.id,
+        tier,
+        req.user.id
+      );
 
-  const normalizedTier = normalizeTier(newTier);
+      return res.json({
+        ok: true,
+        company,
+      });
 
-  c.tier = normalizedTier;
-  c.maxUsers = TIERS[normalizedTier].maxUsers;
-
-  writeDb(db);
-
-  audit({
-    actorId: actorId ? String(actorId) : null,
-    action: "COMPANY_UPGRADED",
-    targetType: "Company",
-    targetId: c.id,
-    metadata: { newTier: normalizedTier },
-  });
-
-  return c;
-}
-
-/* =========================================================
-   MEMBER MANAGEMENT (STRUCTURED)
-========================================================= */
-
-function addMember(companyId, userId, actorId, position = "member") {
-  const db = readDb();
-  ensureCompanies(db);
-
-  const c = getCompanyById(db, companyId);
-  if (!c) throw new Error("Company not found");
-
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("Missing userId");
-
-  if (!Array.isArray(c.members)) c.members = [];
-
-  // prevent duplicate
-  const exists = c.members.find(
-    (m) => String(m.userId || m) === uid
-  );
-
-  if (exists) return c;
-
-  enforceUserLimit(c);
-
-  c.members.push({
-    userId: uid,
-    position: safeStr(position, 80) || "member",
-    assignedAt: nowISO(),
-  });
-
-  writeDb(db);
-
-  audit({
-    actorId: actorId ? String(actorId) : null,
-    action: "COMPANY_ADD_MEMBER",
-    targetType: "Company",
-    targetId: c.id,
-    metadata: { userId: uid, position },
-  });
-
-  createNotification({
-    companyId: c.id,
-    severity: "info",
-    title: "Member added",
-    message: `User ${uid} added as ${position}.`,
-  });
-
-  return c;
-}
-
-function removeMember(companyId, userId, actorId) {
-  const db = readDb();
-  ensureCompanies(db);
-
-  const c = getCompanyById(db, companyId);
-  if (!c) throw new Error("Company not found");
-
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("Missing userId");
-
-  const before = c.members.length;
-
-  c.members = c.members.filter(
-    (m) => String(m.userId || m) !== uid
-  );
-
-  if (c.members.length !== before) {
-    writeDb(db);
-
-    audit({
-      actorId: actorId ? String(actorId) : null,
-      action: "COMPANY_REMOVE_MEMBER",
-      targetType: "Company",
-      targetId: c.id,
-      metadata: { userId: uid },
-    });
-
-    createNotification({
-      companyId: c.id,
-      severity: "warn",
-      title: "Member removed",
-      message: `User ${uid} removed.`,
-    });
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
   }
-
-  return c;
-}
+);
 
 /* =========================================================
-   EXPORT
+   ADD MEMBER
+   Admin or Company owner
 ========================================================= */
 
-module.exports = {
-  TIERS,
-  createCompany,
-  upgradeCompany,
-  listCompanies: () => {
-    const db = readDb();
-    ensureCompanies(db);
-    return db.companies;
-  },
-  getCompany: (id) => {
-    const db = readDb();
-    return getCompanyById(db, id);
-  },
-  addMember,
-  removeMember,
-};
+router.post(
+  "/:id/members",
+  requireRole("Admin", "Company", { adminAlso: true }),
+  (req, res) => {
+    try {
+      const { userId, position } = req.body;
+
+      const company = companyService.addMember(
+        req.params.id,
+        userId,
+        req.user.id,
+        position
+      );
+
+      return res.json({
+        ok: true,
+        company,
+      });
+
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
+
+/* =========================================================
+   REMOVE MEMBER
+========================================================= */
+
+router.delete(
+  "/:id/members/:userId",
+  requireRole("Admin", "Company", { adminAlso: true }),
+  (req, res) => {
+    try {
+      const company = companyService.removeMember(
+        req.params.id,
+        req.params.userId,
+        req.user.id
+      );
+
+      return res.json({
+        ok: true,
+        company,
+      });
+
+    } catch (e) {
+      return res.status(400).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
+
+module.exports = router;
