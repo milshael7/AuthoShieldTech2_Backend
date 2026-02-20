@@ -1,12 +1,16 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Enterprise Revenue Hardened • Invoice Authoritative • Idempotent Safe
+// Stripe Service — Enterprise Financial Integrity Layer
+// Invoice Synced • Refund Safe • Dispute Safe • Revenue Reconciled
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const { createInvoice } = require("./invoice.service");
+const {
+  createInvoice,
+  createRefundInvoice,
+} = require("./invoice.service");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -15,18 +19,6 @@ if (!process.env.STRIPE_SECRET_KEY) {
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
-
-/* =========================================================
-   PRICE MAP
-========================================================= */
-
-const PRICE_MAP = {
-  individual_autodev: process.env.STRIPE_PRICE_AUTODEV,
-  micro: process.env.STRIPE_PRICE_MICRO,
-  small: process.env.STRIPE_PRICE_SMALL,
-  mid: process.env.STRIPE_PRICE_MID,
-  enterprise: process.env.STRIPE_PRICE_ENTERPRISE,
-};
 
 /* =========================================================
    INTERNAL SAVE
@@ -42,7 +34,7 @@ function saveUser(updatedUser) {
 }
 
 /* =========================================================
-   AUTOPROTECT SYNC
+   AUTOPROTECT STATE CONTROL
 ========================================================= */
 
 function activateAutoProtectBilling(userId, nextBillingDate) {
@@ -59,95 +51,12 @@ function activateAutoProtectBilling(userId, nextBillingDate) {
   });
 }
 
-function markAutoProtectPastDue(userId) {
+function lockUserBilling(userId) {
   updateDb((db) => {
     if (!db.autoprotek?.users?.[userId]) return;
-    db.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
-    db.autoprotek.users[userId].status = "INACTIVE";
-  });
-}
 
-function lockAutoProtect(userId) {
-  updateDb((db) => {
-    if (!db.autoprotek?.users?.[userId]) return;
+    db.autoprotek.users[userId].status = "INACTIVE";
     db.autoprotek.users[userId].subscriptionStatus = "LOCKED";
-    db.autoprotek.users[userId].status = "INACTIVE";
-  });
-}
-
-/* =========================================================
-   CHECKOUT SESSION
-========================================================= */
-
-async function createCheckoutSession({
-  userId,
-  type,
-  successUrl,
-  cancelUrl,
-}) {
-  const user = users.findById(userId);
-  if (!user) throw new Error("User not found");
-
-  const priceId = PRICE_MAP[type];
-  if (!priceId) throw new Error("Invalid plan type");
-
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    payment_method_types: ["card"],
-    line_items: [{ price: priceId, quantity: 1 }],
-    customer_email: user.email,
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    metadata: {
-      userId: user.id,
-      planType: type,
-    },
-  });
-
-  audit({
-    actorId: user.id,
-    action: "STRIPE_SUBSCRIPTION_CHECKOUT_CREATED",
-    targetType: "Billing",
-    targetId: session.id,
-  });
-
-  return session.url;
-}
-
-/* =========================================================
-   ACTIVATE SUBSCRIPTION
-========================================================= */
-
-async function activateSubscription({
-  userId,
-  planType,
-  subscriptionId,
-}) {
-  const user = users.findById(userId);
-  if (!user) return;
-
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-  const nextBillingDate = new Date(
-    subscription.current_period_end * 1000
-  ).toISOString();
-
-  user.subscriptionStatus = "Active";
-  user.stripeCustomerId = subscription.customer;
-  user.stripeSubscriptionId = subscriptionId;
-
-  saveUser(user);
-  activateAutoProtectBilling(user.id, nextBillingDate);
-
-  if (user.companyId && PRICE_MAP[planType]) {
-    companies.upgradeCompany(user.companyId, planType, user.id);
-  }
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_ACTIVATED",
-    targetType: "User",
-    targetId: user.id,
   });
 }
 
@@ -170,45 +79,7 @@ async function handleStripeWebhook(event) {
   writeDb(db);
 
   /* =====================================================
-     CHECKOUT COMPLETED (INITIAL SUBSCRIPTION)
-  ====================================================== */
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-
-    if (session.mode === "subscription") {
-      const userId = session.metadata?.userId;
-      const planType = session.metadata?.planType;
-      const subscriptionId = session.subscription;
-
-      if (userId && subscriptionId) {
-        await activateSubscription({
-          userId,
-          planType,
-          subscriptionId,
-        });
-
-        // 🔥 Create initial invoice (first payment)
-        if (session.amount_total) {
-          createInvoice({
-            userId,
-            type: "subscription",
-            stripeSessionId: session.id,
-            stripeSubscriptionId: subscriptionId,
-            stripePaymentIntentId: session.payment_intent,
-            amountPaidCents: session.amount_total,
-            meta: {
-              phase: "initial_subscription_payment",
-              planType,
-            },
-          });
-        }
-      }
-    }
-  }
-
-  /* =====================================================
-     RECURRING SUBSCRIPTION PAYMENT
+     SUBSCRIPTION PAYMENT SUCCEEDED
   ====================================================== */
 
   if (event.type === "invoice.payment_succeeded") {
@@ -238,30 +109,84 @@ async function handleStripeWebhook(event) {
         stripeSubscriptionId: subscription.id,
         stripePaymentIntentId: invoiceObj.payment_intent,
         amountPaidCents: invoiceObj.amount_paid,
-        meta: {
-          phase: "recurring_subscription",
-        },
+        meta: { phase: "recurring" },
       });
     }
   }
 
   /* =====================================================
-     PAYMENT FAILED
+     REFUND ISSUED (FULL OR PARTIAL)
   ====================================================== */
 
-  if (event.type === "invoice.payment_failed") {
-    const invoiceObj = event.data.object;
+  if (event.type === "charge.refunded") {
+    const charge = event.data.object;
+
+    if (!charge.payment_intent) return;
 
     const db2 = readDb();
     const user = db2.users.find(
-      (u) => u.stripeSubscriptionId === invoiceObj.subscription
+      (u) => u.stripePaymentIntentId === charge.payment_intent
     );
 
-    if (user) {
-      user.subscriptionStatus = "PastDue";
-      saveUser(user);
-      markAutoProtectPastDue(user.id);
-    }
+    if (!user) return;
+
+    createRefundInvoice({
+      userId: user.id,
+      stripePaymentIntentId: charge.payment_intent,
+      amountRefundedCents: charge.amount_refunded,
+      reason: "stripe_refund",
+    });
+
+    lockUserBilling(user.id);
+
+    audit({
+      actorId: user.id,
+      action: "PAYMENT_REFUNDED",
+      targetType: "User",
+      targetId: user.id,
+    });
+  }
+
+  /* =====================================================
+     DISPUTE CREATED (CHARGEBACK)
+  ====================================================== */
+
+  if (event.type === "charge.dispute.created") {
+    const dispute = event.data.object;
+
+    if (!dispute.payment_intent) return;
+
+    const db2 = readDb();
+    const user = db2.users.find(
+      (u) => u.stripePaymentIntentId === dispute.payment_intent
+    );
+
+    if (!user) return;
+
+    lockUserBilling(user.id);
+
+    audit({
+      actorId: user.id,
+      action: "PAYMENT_DISPUTE_CREATED",
+      targetType: "User",
+      targetId: user.id,
+    });
+  }
+
+  /* =====================================================
+     DISPUTE CLOSED (WON OR LOST)
+  ====================================================== */
+
+  if (event.type === "charge.dispute.closed") {
+    const dispute = event.data.object;
+
+    audit({
+      actorId: "system",
+      action: "PAYMENT_DISPUTE_CLOSED",
+      targetType: "StripeDispute",
+      targetId: dispute.id,
+      meta: { status: dispute.status },
+    });
   }
 
   /* =====================================================
@@ -279,7 +204,7 @@ async function handleStripeWebhook(event) {
     if (user) {
       user.subscriptionStatus = "Locked";
       saveUser(user);
-      lockAutoProtect(user.id);
+      lockUserBilling(user.id);
     }
   }
 }
@@ -298,7 +223,7 @@ async function cancelSubscription(userId) {
 
   user.subscriptionStatus = "Locked";
   saveUser(user);
-  lockAutoProtect(user.id);
+  lockUserBilling(user.id);
 
   audit({
     actorId: user.id,
@@ -309,8 +234,6 @@ async function cancelSubscription(userId) {
 }
 
 module.exports = {
-  createCheckoutSession,
-  activateSubscription,
   cancelSubscription,
   handleStripeWebhook,
 };
