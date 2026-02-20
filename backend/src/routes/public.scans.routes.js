@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Tool Sales Engine • Dynamic Pricing Ready
+// Public Scan Routes — Dynamic Pricing • Member Discount Engine
 
 const express = require("express");
 const router = express.Router();
@@ -15,8 +15,57 @@ const {
   createToolCheckoutSession,
 } = require("../services/stripe.service");
 
+const { verify } = require("../lib/jwt");
+const { readDb } = require("../lib/db");
+
 /* =========================================================
-   LIST PUBLIC TOOLS
+   OPTIONAL AUTH (SOFT)
+========================================================= */
+
+function getOptionalUser(req) {
+  const header = String(req.headers.authorization || "");
+  if (!header.startsWith("Bearer ")) return null;
+
+  const token = header.slice(7).trim();
+
+  try {
+    const payload = verify(token);
+    const db = readDb();
+    return db.users.find((u) => u.id === payload.id) || null;
+  } catch {
+    return null;
+  }
+}
+
+/* =========================================================
+   MEMBER DISCOUNT CONFIG
+========================================================= */
+
+function calculateMemberDiscount(user, finalPrice) {
+  if (!user) return finalPrice;
+
+  if (user.subscriptionStatus !== "Active") {
+    return finalPrice;
+  }
+
+  // Example discount logic
+  let discountPercent = 0;
+
+  if (user.role === "Individual") {
+    discountPercent = 30;
+  }
+
+  if (user.role === "Company") {
+    discountPercent = 40;
+  }
+
+  const discounted = finalPrice - (finalPrice * discountPercent) / 100;
+
+  return Math.round(discounted);
+}
+
+/* =========================================================
+   LIST TOOLS
 ========================================================= */
 
 router.get("/tools", (req, res) => {
@@ -44,7 +93,7 @@ router.get("/tools", (req, res) => {
 });
 
 /* =========================================================
-   CREATE SCAN (FREE OR PAID)
+   CREATE SCAN
 ========================================================= */
 
 router.post("/", async (req, res) => {
@@ -58,13 +107,15 @@ router.post("/", async (req, res) => {
       });
     }
 
+    const user = getOptionalUser(req);
+
     const scan = createScan({
       toolId,
       email,
       inputData: inputData || {},
     });
 
-    /* ---------------- FREE TOOL ---------------- */
+    /* FREE TOOL */
 
     if (scan.finalPrice === 0) {
       processScan(scan.id);
@@ -77,7 +128,12 @@ router.post("/", async (req, res) => {
       });
     }
 
-    /* ---------------- PAID TOOL ---------------- */
+    /* MEMBER DISCOUNT */
+
+    const discountedPrice = calculateMemberDiscount(
+      user,
+      scan.finalPrice
+    );
 
     const successUrl =
       process.env.STRIPE_TOOL_SUCCESS_URL ||
@@ -89,7 +145,7 @@ router.post("/", async (req, res) => {
 
     const checkoutUrl = await createToolCheckoutSession({
       scanId: scan.id,
-      amount: scan.finalPrice,
+      amount: discountedPrice,
       successUrl,
       cancelUrl,
     });
@@ -98,8 +154,9 @@ router.post("/", async (req, res) => {
       ok: true,
       scanId: scan.id,
       basePrice: scan.basePrice,
-      finalPrice: scan.finalPrice,
-      pricingModel: scan.pricingModel,
+      originalPrice: scan.finalPrice,
+      discountedPrice,
+      member: !!user,
       checkoutUrl,
       status: "awaiting_payment",
     });
@@ -113,7 +170,7 @@ router.post("/", async (req, res) => {
 });
 
 /* =========================================================
-   GET SCAN STATUS / RESULT
+   GET SCAN
 ========================================================= */
 
 router.get("/:id", (req, res) => {
