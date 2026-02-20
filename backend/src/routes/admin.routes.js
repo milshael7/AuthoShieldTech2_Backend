@@ -1,7 +1,7 @@
 // backend/src/routes/admin.routes.js
-// Phase 18 — Governance + Audit Integrity Layer
+// Phase 19 — Governance + SOC2 Compliance Layer
 // Admin + Finance Separation
-// Revenue • Forecast • Churn • Audit Verification
+// Revenue • Forecast • Churn • Audit • Compliance Engine
 
 const express = require("express");
 const router = express.Router();
@@ -9,6 +9,8 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
 const { verifyAuditIntegrity } = require("../lib/audit");
+const { generateComplianceReport } = require("../services/compliance.service");
+
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
 
@@ -33,7 +35,10 @@ function requireFinanceOrAdmin(req, res, next) {
     req.user.role !== ADMIN_ROLE &&
     req.user.role !== FINANCE_ROLE
   ) {
-    return res.status(403).json({ ok: false, error: "Finance or Admin only" });
+    return res.status(403).json({
+      ok: false,
+      error: "Finance or Admin only",
+    });
   }
   next();
 }
@@ -48,9 +53,17 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
     const usersList = db.users || [];
     const invoices = db.invoices || [];
 
-    const activeUsers = usersList.filter(u => u.subscriptionStatus === "Active");
-    const trialUsers = usersList.filter(u => u.subscriptionStatus === "Trial");
-    const lockedUsers = usersList.filter(u => u.subscriptionStatus === "Locked");
+    const activeUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Active"
+    );
+
+    const trialUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Trial"
+    );
+
+    const lockedUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Locked"
+    );
 
     const totalRevenue = db.revenueSummary?.totalRevenue || 0;
 
@@ -58,16 +71,19 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
     const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
 
     const mrr = invoices
-      .filter(i =>
-        i.type === "subscription" &&
-        now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
+      .filter(
+        (i) =>
+          i.type === "subscription" &&
+          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
       )
       .reduce((sum, i) => sum + i.amount, 0);
 
     const arr = mrr * 12;
 
     const payingUsers = new Set(
-      invoices.filter(i => i.type === "subscription").map(i => i.userId)
+      invoices
+        .filter((i) => i.type === "subscription")
+        .map((i) => i.userId)
     ).size;
 
     const arpu =
@@ -81,7 +97,9 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
         : 0;
 
     const estimatedLTV =
-      churnRate > 0 ? Number((arpu / churnRate).toFixed(2)) : 0;
+      churnRate > 0
+        ? Number((arpu / churnRate).toFixed(2))
+        : 0;
 
     res.json({
       ok: true,
@@ -117,15 +135,16 @@ router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
     const now = Date.now();
     const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
 
-    const results = usersList.map(user => {
+    const results = usersList.map((user) => {
       let riskScore = 0;
 
       if (user.subscriptionStatus === "Locked") riskScore += 50;
       if (user.subscriptionStatus === "Trial") riskScore += 10;
 
-      const recentPayment = invoices.find(i =>
-        i.userId === user.id &&
-        now - new Date(i.createdAt).getTime() <= SIXTY_DAYS
+      const recentPayment = invoices.find(
+        (i) =>
+          i.userId === user.id &&
+          now - new Date(i.createdAt).getTime() <= SIXTY_DAYS
       );
 
       if (!recentPayment) riskScore += 20;
@@ -156,36 +175,68 @@ router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
    REVENUE SUMMARY (Finance + Admin)
 ========================================================= */
 
-router.get("/revenue/summary", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    res.json({
-      ok: true,
-      revenue: db.revenueSummary || {},
-      invoices: db.invoices?.length || 0,
-      time: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+router.get(
+  "/revenue/summary",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const db = readDb();
+      res.json({
+        ok: true,
+        revenue: db.revenueSummary || {},
+        invoices: db.invoices?.length || 0,
+        time: new Date().toISOString(),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
-});
+);
 
 /* =========================================================
    🔐 AUDIT INTEGRITY CHECK (Finance + Admin)
 ========================================================= */
 
-router.get("/audit/verify", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const result = verifyAuditIntegrity();
-    res.json({
-      ok: true,
-      integrity: result,
-      time: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+router.get(
+  "/audit/verify",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const result = verifyAuditIntegrity();
+      res.json({
+        ok: true,
+        integrity: result,
+        time: new Date().toISOString(),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
-});
+);
+
+/* =========================================================
+   🔎 SOC2 COMPLIANCE REPORT (Finance + Admin)
+========================================================= */
+
+router.get(
+  "/compliance/report",
+  requireFinanceOrAdmin,
+  async (req, res) => {
+    try {
+      const report = await generateComplianceReport();
+
+      res.json({
+        ok: true,
+        complianceReport: report,
+      });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        error: e.message,
+      });
+    }
+  }
+);
 
 /* =========================================================
    🔐 USERS (Admin Only)
@@ -193,7 +244,10 @@ router.get("/audit/verify", requireFinanceOrAdmin, (req, res) => {
 
 router.get("/users", requireAdmin, (req, res) => {
   try {
-    res.json({ ok: true, users: users.listUsers() });
+    res.json({
+      ok: true,
+      users: users.listUsers(),
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -203,15 +257,19 @@ router.get("/users", requireAdmin, (req, res) => {
    🔐 NOTIFICATIONS (Admin Only)
 ========================================================= */
 
-router.get("/notifications", requireAdmin, (req, res) => {
-  try {
-    res.json({
-      ok: true,
-      notifications: listNotifications({}),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+router.get(
+  "/notifications",
+  requireAdmin,
+  (req, res) => {
+    try {
+      res.json({
+        ok: true,
+        notifications: listNotifications({}),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
-});
+);
 
 module.exports = router;
