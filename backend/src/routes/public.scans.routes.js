@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Dynamic Pricing • Member Discount Engine
+// Public Scan Routes — Dynamic Pricing • Plan Engine Integrated
 
 const express = require("express");
 const router = express.Router();
@@ -17,6 +17,9 @@ const {
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
+const {
+  getUserEffectivePlan,
+} = require("../users/user.service");
 
 /* =========================================================
    OPTIONAL AUTH (SOFT)
@@ -35,33 +38,6 @@ function getOptionalUser(req) {
   } catch {
     return null;
   }
-}
-
-/* =========================================================
-   MEMBER DISCOUNT CONFIG
-========================================================= */
-
-function calculateMemberDiscount(user, finalPrice) {
-  if (!user) return finalPrice;
-
-  if (user.subscriptionStatus !== "Active") {
-    return finalPrice;
-  }
-
-  // Example discount logic
-  let discountPercent = 0;
-
-  if (user.role === "Individual") {
-    discountPercent = 30;
-  }
-
-  if (user.role === "Company") {
-    discountPercent = 40;
-  }
-
-  const discounted = finalPrice - (finalPrice * discountPercent) / 100;
-
-  return Math.round(discounted);
 }
 
 /* =========================================================
@@ -115,7 +91,7 @@ router.post("/", async (req, res) => {
       inputData: inputData || {},
     });
 
-    /* FREE TOOL */
+    /* ---------------- FREE TOOL ---------------- */
 
     if (scan.finalPrice === 0) {
       processScan(scan.id);
@@ -128,11 +104,15 @@ router.post("/", async (req, res) => {
       });
     }
 
-    /* MEMBER DISCOUNT */
+    /* ---------------- PLAN ENGINE ---------------- */
 
-    const discountedPrice = calculateMemberDiscount(
-      user,
-      scan.finalPrice
+    const plan = getUserEffectivePlan(user);
+
+    const discountPercent = plan.discountPercent || 0;
+
+    const discountedPrice = Math.round(
+      scan.finalPrice -
+        (scan.finalPrice * discountPercent) / 100
     );
 
     const successUrl =
@@ -156,7 +136,8 @@ router.post("/", async (req, res) => {
       basePrice: scan.basePrice,
       originalPrice: scan.finalPrice,
       discountedPrice,
-      member: !!user,
+      discountPercent,
+      planLabel: plan.label,
       checkoutUrl,
       status: "awaiting_payment",
     });
