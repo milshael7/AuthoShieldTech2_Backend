@@ -1,6 +1,6 @@
 // backend/src/routes/billing.routes.js
 // Billing & Subscription Control — Enterprise Hardened
-// Stripe Safe • Plan Scoped • Revenue Protected
+// Stripe Safe • Portal Enabled • Revenue Protected
 
 const express = require("express");
 const router = express.Router();
@@ -13,9 +13,18 @@ const { audit } = require("../lib/audit");
 
 const {
   createCheckoutSession,
-  createCustomerPortalSession,
   cancelSubscription,
 } = require("../services/stripe.service");
+
+const Stripe = require("stripe");
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY missing");
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2023-10-16",
+});
 
 /* =========================================================
    PLAN CONTROL
@@ -46,14 +55,8 @@ function saveUser(updatedUser) {
 }
 
 function validatePlanForUser(dbUser, type) {
-  if (INDIVIDUAL_PLANS.includes(type)) {
-    return true;
-  }
-
-  if (COMPANY_PLANS.includes(type) && dbUser.companyId) {
-    return true;
-  }
-
+  if (INDIVIDUAL_PLANS.includes(type)) return true;
+  if (COMPANY_PLANS.includes(type) && dbUser.companyId) return true;
   throw new Error("Plan not allowed for this user type");
 }
 
@@ -109,7 +112,6 @@ router.post("/checkout", authRequired, async (req, res) => {
     if (!user) return;
 
     const type = clean(req.body?.type, 50);
-
     const dbUser = users.findById(user.id);
     if (!dbUser) {
       return res.status(404).json({ ok: false, error: "User not found" });
@@ -167,6 +169,14 @@ router.post("/portal", authRequired, async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
 
+    const dbUser = users.findById(user.id);
+    if (!dbUser?.stripeCustomerId) {
+      return res.status(400).json({
+        ok: false,
+        error: "No Stripe customer found",
+      });
+    }
+
     const returnUrl =
       clean(req.body?.returnUrl) ||
       process.env.STRIPE_PORTAL_RETURN_URL;
@@ -178,12 +188,19 @@ router.post("/portal", authRequired, async (req, res) => {
       });
     }
 
-    const portalUrl = await createCustomerPortalSession({
-      userId: user.id,
-      returnUrl,
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: dbUser.stripeCustomerId,
+      return_url: returnUrl,
     });
 
-    res.json({ ok: true, portalUrl });
+    audit({
+      actorId: user.id,
+      action: "STRIPE_PORTAL_OPENED",
+      targetType: "Billing",
+      targetId: dbUser.stripeCustomerId,
+    });
+
+    res.json({ ok: true, portalUrl: portalSession.url });
 
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
