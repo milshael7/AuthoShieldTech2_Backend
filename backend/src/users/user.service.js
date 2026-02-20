@@ -1,10 +1,10 @@
 // backend/src/users/user.service.js
-// Enterprise User Service — Governance Enabled
-// Role Separation • Finance Role • Trial Safe • Billing Safe
+// Phase 27 — Enterprise User Service
+// Role Separation • Finance Governance • Field-Level Masking • Exposure Control
 
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
-const { readDb, writeDb, updateDb } = require("../lib/db");
+const { readDb, writeDb } = require("../lib/db");
 
 /* ======================================================
    CONSTANTS
@@ -15,7 +15,7 @@ const ROLES = {
   MANAGER: "Manager",
   COMPANY: "Company",
   INDIVIDUAL: "Individual",
-  FINANCE: "Finance", // 🔥 NEW ENTERPRISE ROLE
+  FINANCE: "Finance",
 };
 
 const ROLE_ALLOWLIST = Object.values(ROLES);
@@ -35,25 +35,6 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   TRIAL CONFIG
-====================================================== */
-
-const TRIAL_DURATION_DAYS = 14;
-const TRIAL_GRACE_DAYS = 3;
-
-/* ======================================================
-   AUTOPROTECT CONFIG
-====================================================== */
-
-const AUTOPROTECT_PRICING = {
-  automationService: 500,
-  platformFee: 50,
-  total: 550,
-};
-
-const AUTOPROTECT_ACTIVE_LIMIT = 10;
-
-/* ======================================================
    HELPERS
 ====================================================== */
 
@@ -65,101 +46,84 @@ function normEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
-function sanitize(u) {
-  if (!u) return null;
-  const { passwordHash, ...rest } = u;
-  return rest;
-}
-
 function validateRole(role) {
   if (!ROLE_ALLOWLIST.includes(role)) {
     throw new Error("Invalid role assignment");
   }
 }
 
-/* ======================================================
-   TRIAL ENGINE
-====================================================== */
-
-function enforceTrialIfExpired(userId) {
-  const db = readDb();
-  const user = db.users.find(u => u.id === userId);
-  if (!user) return;
-
-  if (user.subscriptionStatus !== SUBSCRIPTION.TRIAL) return;
-
-  const now = Date.now();
-  const expires = new Date(user.trialExpiresAt).getTime();
-  const graceLimit =
-    expires + TRIAL_GRACE_DAYS * 24 * 60 * 60 * 1000;
-
-  if (now > graceLimit) {
-    updateDb(db2 => {
-      const u = db2.users.find(x => x.id === userId);
-      if (!u) return;
-      u.subscriptionStatus = SUBSCRIPTION.LOCKED;
-      u.trialExpiredAt = new Date().toISOString();
-    });
-  }
+function maskEmail(email) {
+  const [name, domain] = String(email).split("@");
+  if (!domain) return "***";
+  return `${name.slice(0, 2)}***@${domain}`;
 }
 
-function getTrialStatus(userId) {
-  const db = readDb();
-  const user = db.users.find(u => u.id === userId);
-  if (!user || user.subscriptionStatus !== SUBSCRIPTION.TRIAL) {
-    return null;
+/* ======================================================
+   FIELD-LEVEL MASKING ENGINE
+====================================================== */
+
+function maskUserForRole(user, accessTier) {
+  if (!user) return null;
+
+  const base = {
+    id: user.id,
+    platformId: user.platformId,
+    role: user.role,
+    companyId: user.companyId,
+    subscriptionStatus: user.subscriptionStatus,
+    createdAt: user.createdAt,
+  };
+
+  // ADMIN → full visibility (except passwordHash)
+  if (accessTier === "ADMIN") {
+    return {
+      ...base,
+      email: user.email,
+      status: user.status,
+      approvedBy: user.approvedBy,
+      trialStartAt: user.trialStartAt,
+      trialExpiresAt: user.trialExpiresAt,
+      profile: user.profile || {},
+    };
   }
 
-  const now = Date.now();
-  const expires = new Date(user.trialExpiresAt).getTime();
-  const remainingMs = expires - now;
+  // FINANCE → see email + billing state, but not approval metadata
+  if (accessTier === "FINANCE") {
+    return {
+      ...base,
+      email: user.email,
+      subscriptionStatus: user.subscriptionStatus,
+      profile: {},
+    };
+  }
 
+  // MANAGER → limited internal visibility
+  if (accessTier === "MANAGER") {
+    return {
+      ...base,
+      email: maskEmail(user.email),
+      subscriptionStatus: user.subscriptionStatus,
+    };
+  }
+
+  // STANDARD → strict masking
   return {
-    trialStartAt: user.trialStartAt,
-    trialExpiresAt: user.trialExpiresAt,
-    daysRemaining: Math.max(
-      0,
-      Math.ceil(remainingMs / (24 * 60 * 60 * 1000))
-    ),
+    id: user.id,
+    email: maskEmail(user.email),
+    role: user.role,
+    subscriptionStatus: user.subscriptionStatus,
   };
 }
 
-/* ======================================================
-   BILLING VALIDATION
-====================================================== */
-
-function validateBilling(userId) {
-  enforceTrialIfExpired(userId);
-
+function listUsersForAccess(accessContext) {
   const db = readDb();
-  const user = db.users.find(u => u.id === userId);
-  if (!user) return false;
+  ensureArrays(db);
 
-  if (user.subscriptionStatus === SUBSCRIPTION.TRIAL) {
-    return true;
-  }
+  const tier = accessContext?.tier || "STANDARD";
 
-  if (user.subscriptionStatus !== SUBSCRIPTION.ACTIVE) {
-    return false;
-  }
-
-  const userAP = db.autoprotek?.users?.[userId];
-  if (!userAP) return false;
-
-  const now = Date.now();
-  const nextBilling = new Date(userAP.nextBillingDate).getTime();
-
-  if (now > nextBilling) {
-    updateDb(db2 => {
-      if (!db2.autoprotek?.users?.[userId]) return;
-      db2.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
-      db2.autoprotek.users[userId].status = "INACTIVE";
-    });
-
-    return false;
-  }
-
-  return true;
+  return db.users.map((u) =>
+    maskUserForRole(u, tier)
+  );
 }
 
 /* ======================================================
@@ -170,7 +134,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
   const db = readDb();
   ensureArrays(db);
 
-  validateRole(role); // 🔥 ROLE SAFETY
+  validateRole(role);
 
   const cleanEmail = String(email || "").trim();
   if (!cleanEmail) throw new Error("Email required");
@@ -184,31 +148,28 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
   }
 
   const now = new Date();
-  const expires = new Date();
-  expires.setDate(now.getDate() + TRIAL_DURATION_DAYS);
 
-  const u = {
+  const user = {
     id: nanoid(),
     platformId: `AS-${nanoid(10).toUpperCase()}`,
     email: cleanEmail,
     passwordHash: bcrypt.hashSync(String(password), 10),
     role,
-    companyId: companyId || null,
+    companyId,
     createdAt: now.toISOString(),
     subscriptionStatus: SUBSCRIPTION.TRIAL,
     trialStartAt: now.toISOString(),
-    trialExpiresAt: expires.toISOString(),
-    mustResetPassword: false,
+    trialExpiresAt: null,
     locked: false,
     status: APPROVAL_STATUS.PENDING,
     approvedBy: null,
     profile: typeof profile === "object" ? profile : {},
   };
 
-  db.users.push(u);
+  db.users.push(user);
   writeDb(db);
 
-  return sanitize(u);
+  return maskUserForRole(user, "ADMIN");
 }
 
 /* ======================================================
@@ -230,7 +191,10 @@ function findById(id) {
 function listUsers() {
   const db = readDb();
   ensureArrays(db);
-  return db.users.map(sanitize);
+  return db.users.map(u => {
+    const { passwordHash, ...safe } = u;
+    return safe;
+  });
 }
 
 function verifyPassword(user, password) {
@@ -246,12 +210,11 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
-  ensureAdminFromEnv,
   createUser,
   findByEmail,
   findById,
   listUsers,
+  listUsersForAccess,
+  maskUserForRole,
   verifyPassword,
-  getTrialStatus,
-  validateBilling,
 };
