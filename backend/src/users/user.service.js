@@ -28,7 +28,14 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   AUTOPROTECT PRICING (SERVICE SCOPED)
+   TRIAL CONFIG (ENTERPRISE)
+====================================================== */
+
+const TRIAL_DURATION_DAYS = 14;
+const TRIAL_GRACE_DAYS = 3;
+
+/* ======================================================
+   AUTOPROTECT PRICING
 ====================================================== */
 
 const AUTOPROTECT_PRICING = {
@@ -40,24 +47,78 @@ const AUTOPROTECT_PRICING = {
 const AUTOPROTECT_ACTIVE_LIMIT = 10;
 
 /* ======================================================
+   TRIAL ENGINE
+====================================================== */
+
+function enforceTrialIfExpired(userId) {
+  const db = readDb();
+  const user = db.users.find(u => u.id === userId);
+  if (!user) return;
+
+  if (user.subscriptionStatus !== SUBSCRIPTION.TRIAL) return;
+
+  const now = Date.now();
+  const expires = new Date(user.trialExpiresAt).getTime();
+  const graceLimit =
+    expires + TRIAL_GRACE_DAYS * 24 * 60 * 60 * 1000;
+
+  if (now > graceLimit) {
+    updateDb(db2 => {
+      const u = db2.users.find(x => x.id === userId);
+      if (!u) return;
+      u.subscriptionStatus = SUBSCRIPTION.LOCKED;
+      u.trialExpiredAt = new Date().toISOString();
+    });
+  }
+}
+
+function getTrialStatus(userId) {
+  const db = readDb();
+  const user = db.users.find(u => u.id === userId);
+  if (!user || user.subscriptionStatus !== SUBSCRIPTION.TRIAL) {
+    return null;
+  }
+
+  const now = Date.now();
+  const expires = new Date(user.trialExpiresAt).getTime();
+  const remainingMs = expires - now;
+
+  return {
+    trialStartAt: user.trialStartAt,
+    trialExpiresAt: user.trialExpiresAt,
+    daysRemaining: Math.max(
+      0,
+      Math.ceil(remainingMs / (24 * 60 * 60 * 1000))
+    ),
+  };
+}
+
+/* ======================================================
    BILLING VALIDATION
 ====================================================== */
 
 function validateBilling(userId) {
+  enforceTrialIfExpired(userId);
+
   const db = readDb();
-  const userAP = db.autoprotek?.users?.[userId];
+  const user = db.users.find(u => u.id === userId);
+  if (!user) return false;
 
-  if (!userAP) return false;
+  if (user.subscriptionStatus === SUBSCRIPTION.TRIAL) {
+    return true;
+  }
 
-  if (userAP.subscriptionStatus !== "ACTIVE") {
+  if (user.subscriptionStatus !== SUBSCRIPTION.ACTIVE) {
     return false;
   }
+
+  const userAP = db.autoprotek?.users?.[userId];
+  if (!userAP) return false;
 
   const now = Date.now();
   const nextBilling = new Date(userAP.nextBillingDate).getTime();
 
   if (now > nextBilling) {
-    // mark past due
     updateDb(db2 => {
       if (!db2.autoprotek?.users?.[userId]) return;
       db2.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
@@ -96,7 +157,6 @@ function activateAutoProtect(userId) {
 function deactivateAutoProtect(userId) {
   updateDb(db => {
     if (!db.autoprotek?.users?.[userId]) return;
-
     db.autoprotek.users[userId].status = "INACTIVE";
     db.autoprotek.users[userId].subscriptionStatus = "INACTIVE";
   });
@@ -107,7 +167,6 @@ function isAutoProtectActive(userId) {
 
   const db = readDb();
   const userAP = db.autoprotek?.users?.[userId];
-
   if (!userAP) return false;
   if (userAP.status !== "ACTIVE") return false;
 
@@ -115,22 +174,15 @@ function isAutoProtectActive(userId) {
 }
 
 function canRunAutoProtect(user) {
-  // Admin & Manager unlimited
   if (user.role === ROLES.ADMIN || user.role === ROLES.MANAGER) {
     return true;
   }
 
+  if (!validateBilling(user.id)) return false;
+
   const db = readDb();
   const userAP = db.autoprotek?.users?.[user.id];
-
   if (!userAP) return false;
-
-  // Billing enforcement
-  if (!validateBilling(user.id)) {
-    return false;
-  }
-
-  if (userAP.status !== "ACTIVE") return false;
 
   if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) {
     return false;
@@ -148,7 +200,6 @@ function registerAutoProtectJob(user) {
     const userAP = db.autoprotek?.users?.[user.id];
     if (!userAP) return;
     if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) return;
-
     userAP.activeJobsCount += 1;
   });
 }
@@ -158,7 +209,6 @@ function closeAutoProtectJob(user) {
     const userAP = db.autoprotek?.users?.[user.id];
     if (!userAP) return;
     if (userAP.activeJobsCount <= 0) return;
-
     userAP.activeJobsCount -= 1;
   });
 }
@@ -238,6 +288,10 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     throw new Error("Password must be at least 6 characters");
   }
 
+  const now = new Date();
+  const expires = new Date();
+  expires.setDate(now.getDate() + TRIAL_DURATION_DAYS);
+
   const u = {
     id: nanoid(),
     platformId: `AS-${nanoid(10).toUpperCase()}`,
@@ -245,8 +299,10 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     passwordHash: bcrypt.hashSync(String(password), 10),
     role,
     companyId: companyId || null,
-    createdAt: new Date().toISOString(),
+    createdAt: now.toISOString(),
     subscriptionStatus: SUBSCRIPTION.TRIAL,
+    trialStartAt: now.toISOString(),
+    trialExpiresAt: expires.toISOString(),
     mustResetPassword: false,
     locked: false,
     status: APPROVAL_STATUS.PENDING,
@@ -301,6 +357,7 @@ module.exports = {
   findById,
   listUsers,
   verifyPassword,
+  getTrialStatus,
 
   // AutoProtect
   activateAutoProtect,
