@@ -1,30 +1,62 @@
 // backend/src/services/scan.service.js
-// Scan Engine — Queue Based • Revenue Ready • Upgrade Optimized
+// Scan Engine — Dynamic Pricing • Queue Based • Revenue Optimized
 
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
 
 /* =========================================================
-   TOOL REGISTRY
+   TOOL REGISTRY (BASE CONFIG)
 ========================================================= */
 
 const TOOL_REGISTRY = {
   "vulnerability-scan": {
     name: "Vulnerability Scan",
-    price: 199,
+    basePrice: 199,
+    pricingModel: "per_scan", // per_scan | per_hour
     type: "paid",
   },
   "dark-web-scan": {
     name: "Dark Web Exposure Scan",
-    price: 299,
+    basePrice: 299,
+    pricingModel: "per_scan",
     type: "paid",
   },
   "basic-risk": {
     name: "Basic Risk Assessment",
-    price: 0,
+    basePrice: 0,
+    pricingModel: "per_scan",
     type: "free",
   },
 };
+
+/* =========================================================
+   PRICE CALCULATION ENGINE
+========================================================= */
+
+function calculatePrice(tool, inputData = {}) {
+  let price = tool.basePrice;
+
+  // Depth multiplier
+  if (inputData.depth === "deep") price += 150;
+  if (inputData.depth === "enterprise") price += 400;
+
+  // Multiple targets
+  if (inputData.targets && Number(inputData.targets) > 1) {
+    price += (Number(inputData.targets) - 1) * 50;
+  }
+
+  // Urgency
+  if (inputData.urgency === "rush") {
+    price += 200;
+  }
+
+  // Hourly model support
+  if (tool.pricingModel === "per_hour" && inputData.hours) {
+    price = tool.basePrice * Number(inputData.hours);
+  }
+
+  return Math.max(0, Math.round(price));
+}
 
 /* =========================================================
    CREATE SCAN
@@ -34,14 +66,18 @@ function createScan({ toolId, email, inputData }) {
   const tool = TOOL_REGISTRY[toolId];
   if (!tool) throw new Error("Invalid tool");
 
+  const finalPrice = calculatePrice(tool, inputData);
+
   const scan = {
     id: nanoid(),
     toolId,
     toolName: tool.name,
     email,
     inputData,
-    price: tool.price,
-    status: tool.price > 0 ? "awaiting_payment" : "pending",
+    basePrice: tool.basePrice,
+    finalPrice,
+    pricingModel: tool.pricingModel,
+    status: finalPrice > 0 ? "awaiting_payment" : "pending",
     createdAt: new Date().toISOString(),
     completedAt: null,
     result: null,
@@ -96,11 +132,11 @@ function processScan(scanId) {
 }
 
 /* =========================================================
-   RISK LOGIC
+   RISK ENGINE
 ========================================================= */
 
 function generateRiskScore() {
-  return Math.floor(Math.random() * 60) + 20; // realistic 20–80
+  return Math.floor(Math.random() * 60) + 20;
 }
 
 function getRiskLevel(score) {
@@ -110,7 +146,7 @@ function getRiskLevel(score) {
 }
 
 /* =========================================================
-   REPORT ENGINE (CONVERSION OPTIMIZED)
+   REPORT ENGINE
 ========================================================= */
 
 function generateReport(scan, riskScore) {
@@ -121,7 +157,13 @@ function generateReport(scan, riskScore) {
       riskScore,
       riskLevel,
       scannedTool: scan.toolName,
-      scanType: scan.price === 0 ? "Free Scan" : "One-Time Scan",
+      pricingModel: scan.pricingModel,
+      scanType: scan.finalPrice === 0 ? "Free Scan" : "One-Time Scan",
+    },
+
+    billing: {
+      basePrice: scan.basePrice,
+      finalPrice: scan.finalPrice,
     },
 
     severityBreakdown: {
@@ -142,37 +184,17 @@ function generateReport(scan, riskScore) {
 
     upgradeInsight: {
       message:
-        "This report reflects a single-time external scan. Ongoing monitoring can detect new exposures automatically and provide real-time alerts.",
-      includedInMembership: [
-        "Real-time threat alerts",
-        "Continuous vulnerability monitoring",
-        "Historical risk tracking",
-        "Automated compliance tracking",
+        "This was a single-time scan. Continuous monitoring automatically detects new vulnerabilities and real-time exposure.",
+      membershipBenefits: [
+        "24/7 threat monitoring",
+        "Real-time alerts",
+        "Historical risk analytics",
+        "Compliance dashboard",
       ],
-      lockedFeatures: [
-        "24/7 monitoring engine",
-        "Live threat feed",
-        "Incident response priority",
-      ],
-    },
-
-    comparison: {
-      oneTimeScan: {
-        realTimeMonitoring: false,
-        historicalTracking: false,
-        alertSystem: false,
-        complianceDashboard: false,
-      },
-      membership: {
-        realTimeMonitoring: true,
-        historicalTracking: true,
-        alertSystem: true,
-        complianceDashboard: true,
-      },
     },
 
     nextStepCTA:
-      "Upgrade to continuous protection to reduce exposure risk and maintain ongoing security posture visibility.",
+      "Upgrade to continuous protection to maintain ongoing security visibility.",
   };
 }
 
