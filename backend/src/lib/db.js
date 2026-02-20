@@ -1,7 +1,6 @@
 // backend/src/lib/db.js
-// File-based JSON DB with schema + safe writes (atomic)
-// Enterprise Financial Ledger Enabled
-// Payments • Refunds • Disputes • Revenue Integrity
+// Enterprise DB — Phase 22 Compliance Layer
+// Atomic Writes • Financial Ledger • Audit Hash Chain • Retention Policies
 
 const fs = require("fs");
 const path = require("path");
@@ -9,7 +8,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 /* ======================================================
    UTIL
@@ -32,17 +31,25 @@ function defaultDb() {
   return {
     schemaVersion: SCHEMA_VERSION,
 
+    /* ================= CORE ================= */
+
     users: [],
     companies: [],
-    audit: [],
     notifications: [],
     scans: [],
     scanCredits: [],
     processedStripeEvents: [],
 
-    /* ======================================================
-       🔥 FINANCIAL LEDGER
-    ====================================================== */
+    /* ================= AUDIT ================= */
+
+    audit: [],
+    auditMeta: {
+      lastHash: null,
+      lastSequence: 0,
+      integrityVersion: 1,
+    },
+
+    /* ================= FINANCIAL LEDGER ================= */
 
     invoices: [],
     payments: [],
@@ -58,13 +65,22 @@ function defaultDb() {
       disputedAmount: 0,
     },
 
-    /* ======================================================
-       🔥 AUTOPROTECT
-    ====================================================== */
+    /* ================= AUTOPROTECT ================= */
 
     autoprotek: {
       users: {},
     },
+
+    /* ================= COMPLIANCE ================= */
+
+    complianceSnapshots: [],
+    retentionPolicy: {
+      auditRetentionDays: 365 * 2,
+      financialRetentionDays: 365 * 7,
+      snapshotRetentionDays: 365 * 3,
+    },
+
+    /* ================= OTHER SYSTEMS ================= */
 
     brain: {
       memory: [],
@@ -104,18 +120,28 @@ function migrate(db) {
 
   if (!db.schemaVersion) db.schemaVersion = 1;
 
-  if (!Array.isArray(db.users)) db.users = [];
-  if (!Array.isArray(db.companies)) db.companies = [];
-  if (!Array.isArray(db.audit)) db.audit = [];
-  if (!Array.isArray(db.notifications)) db.notifications = [];
-  if (!Array.isArray(db.scans)) db.scans = [];
-  if (!Array.isArray(db.processedStripeEvents))
-    db.processedStripeEvents = [];
+  /* Ensure arrays */
 
-  if (!Array.isArray(db.invoices)) db.invoices = [];
-  if (!Array.isArray(db.payments)) db.payments = [];
-  if (!Array.isArray(db.refunds)) db.refunds = [];
-  if (!Array.isArray(db.disputes)) db.disputes = [];
+  const arrayFields = [
+    "users",
+    "companies",
+    "notifications",
+    "scans",
+    "scanCredits",
+    "processedStripeEvents",
+    "audit",
+    "invoices",
+    "payments",
+    "refunds",
+    "disputes",
+    "complianceSnapshots",
+  ];
+
+  for (const field of arrayFields) {
+    if (!Array.isArray(db[field])) db[field] = [];
+  }
+
+  /* Revenue summary */
 
   if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
     db.revenueSummary = {
@@ -128,19 +154,40 @@ function migrate(db) {
     };
   }
 
-  /* Ensure new revenue fields exist */
   db.revenueSummary.refundedAmount =
     db.revenueSummary.refundedAmount || 0;
 
   db.revenueSummary.disputedAmount =
     db.revenueSummary.disputedAmount || 0;
 
-  /* AUTOPROTECT SAFETY */
+  /* Audit metadata */
+
+  if (!db.auditMeta || typeof db.auditMeta !== "object") {
+    db.auditMeta = {
+      lastHash: null,
+      lastSequence: 0,
+      integrityVersion: 1,
+    };
+  }
+
+  /* Autoprotect */
+
   if (!db.autoprotek || typeof db.autoprotek !== "object") {
     db.autoprotek = { users: {} };
   }
 
-  if (!db.autoprotek.users) db.autoprotek.users = {};
+  if (!db.autoprotek.users)
+    db.autoprotek.users = {};
+
+  /* Retention policy */
+
+  if (!db.retentionPolicy) {
+    db.retentionPolicy = {
+      auditRetentionDays: 365 * 2,
+      financialRetentionDays: 365 * 7,
+      snapshotRetentionDays: 365 * 3,
+    };
+  }
 
   db.schemaVersion = SCHEMA_VERSION;
   return db;
@@ -154,7 +201,10 @@ function ensureDb() {
   ensureDir(DB_PATH);
 
   if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
+    fs.writeFileSync(
+      DB_PATH,
+      JSON.stringify(defaultDb(), null, 2)
+    );
     return;
   }
 
@@ -162,24 +212,41 @@ function ensureDb() {
     const raw = fs.readFileSync(DB_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     const migrated = migrate(parsed);
-    fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
+    fs.writeFileSync(
+      DB_PATH,
+      JSON.stringify(migrated, null, 2)
+    );
   } catch {
     try {
       const bad = fs.readFileSync(DB_PATH, "utf-8");
-      fs.writeFileSync(DB_PATH + ".corrupt." + Date.now(), bad);
+      fs.writeFileSync(
+        DB_PATH + ".corrupt." + Date.now(),
+        bad
+      );
     } catch {}
-    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
+
+    fs.writeFileSync(
+      DB_PATH,
+      JSON.stringify(defaultDb(), null, 2)
+    );
   }
 }
 
 function readDb() {
   ensureDb();
-  return migrate(JSON.parse(fs.readFileSync(DB_PATH, "utf-8")));
+  return migrate(
+    JSON.parse(fs.readFileSync(DB_PATH, "utf-8"))
+  );
 }
 
 function writeDb(db) {
   const safe = migrate(db);
-  fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
+
+  fs.writeFileSync(
+    TMP_PATH,
+    JSON.stringify(safe, null, 2)
+  );
+
   fs.renameSync(TMP_PATH, DB_PATH);
 }
 
@@ -190,33 +257,10 @@ function updateDb(mutator) {
   return out;
 }
 
-function writeAudit(event = {}) {
-  try {
-    updateDb((db) => {
-      db.audit.push({
-        ts: now(),
-        actorId: event.actorId || "system",
-        actorRole: event.actorRole || "system",
-        companyId: event.companyId || null,
-        action: String(event.action || "unknown").slice(0, 120),
-        target: String(event.target || "").slice(0, 120),
-        meta: event.meta || {},
-      });
-
-      if (db.audit.length > 5000) {
-        db.audit = db.audit.slice(-4000);
-      }
-    });
-  } catch (e) {
-    console.error("AUDIT WRITE FAILED:", e);
-  }
-}
-
 module.exports = {
   DB_PATH,
   ensureDb,
   readDb,
   writeDb,
   updateDb,
-  writeAudit,
 };
