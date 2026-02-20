@@ -1,26 +1,47 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Phase 16 Enterprise Intelligence
+// Admin API — Phase 17 Governance Layer
+// Admin + Finance Role Separation
 // Revenue • Forecast • Cashflow • Predictive Churn Engine
 
 const express = require("express");
 const router = express.Router();
 
-const { authRequired, requireRole } = require("../middleware/auth");
+const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
-const { nanoid } = require("nanoid");
 
 const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
+const FINANCE_ROLE = users?.ROLES?.FINANCE || "Finance";
 
 router.use(authRequired);
-router.use(requireRole(ADMIN_ROLE));
 
 /* =========================================================
-   EXECUTIVE METRICS
+   ROLE GUARDS
 ========================================================= */
 
-router.get("/metrics", (req, res) => {
+function requireAdmin(req, res, next) {
+  if (req.user.role !== ADMIN_ROLE) {
+    return res.status(403).json({ ok: false, error: "Admin only" });
+  }
+  next();
+}
+
+function requireFinanceOrAdmin(req, res, next) {
+  if (
+    req.user.role !== ADMIN_ROLE &&
+    req.user.role !== FINANCE_ROLE
+  ) {
+    return res.status(403).json({ ok: false, error: "Finance or Admin only" });
+  }
+  next();
+}
+
+/* =========================================================
+   🔥 EXECUTIVE METRICS (Finance + Admin)
+========================================================= */
+
+router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
     const usersList = db.users || [];
@@ -82,15 +103,13 @@ router.get("/metrics", (req, res) => {
 });
 
 /* =========================================================
-   PREDICTIVE CHURN RISK ENGINE
+   🔥 PREDICTIVE CHURN RISK (Finance + Admin)
 ========================================================= */
 
-router.get("/churn-risk", (req, res) => {
+router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
     const usersList = db.users || [];
-    const refunds = db.refunds || [];
-    const disputes = db.disputes || [];
     const invoices = db.invoices || [];
 
     const now = Date.now();
@@ -103,12 +122,6 @@ router.get("/churn-risk", (req, res) => {
 
       if (user.subscriptionStatus === "Locked") riskScore += 50;
       if (user.subscriptionStatus === "Trial") riskScore += 10;
-
-      const userRefunds = refunds.filter(r => r.userId === user.id);
-      const userDisputes = disputes.filter(d => d.userId === user.id);
-
-      riskScore += userRefunds.length * 15;
-      riskScore += userDisputes.length * 25;
 
       const recentPayment = invoices.find(i =>
         i.userId === user.id &&
@@ -129,31 +142,9 @@ router.get("/churn-risk", (req, res) => {
       });
     }
 
-    const distribution = {
-      LOW: results.filter(r => r.level === "LOW").length,
-      MEDIUM: results.filter(r => r.level === "MEDIUM").length,
-      HIGH: results.filter(r => r.level === "HIGH").length,
-    };
-
-    const riskIndex =
-      results.length > 0
-        ? Number((
-            results.reduce((sum, r) => sum + r.riskScore, 0) /
-            results.length
-          ).toFixed(2))
-        : 0;
-
-    const highRiskUsers =
-      results.filter(r => r.level === "HIGH");
-
     res.json({
       ok: true,
-      churnRisk: {
-        totalUsers: results.length,
-        riskIndex,
-        distribution,
-        highRiskUsers,
-      },
+      churnRisk: results,
       time: new Date().toISOString(),
     });
 
@@ -163,10 +154,10 @@ router.get("/churn-risk", (req, res) => {
 });
 
 /* =========================================================
-   REVENUE SUMMARY
+   🔥 REVENUE SUMMARY (Finance + Admin)
 ========================================================= */
 
-router.get("/revenue/summary", (req, res) => {
+router.get("/revenue/summary", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
     res.json({
@@ -181,10 +172,10 @@ router.get("/revenue/summary", (req, res) => {
 });
 
 /* =========================================================
-   USERS / NOTIFICATIONS
+   🔐 USER LIST (Admin Only)
 ========================================================= */
 
-router.get("/users", (req, res) => {
+router.get("/users", requireAdmin, (req, res) => {
   try {
     res.json({ ok: true, users: users.listUsers() });
   } catch (e) {
@@ -192,7 +183,11 @@ router.get("/users", (req, res) => {
   }
 });
 
-router.get("/notifications", (req, res) => {
+/* =========================================================
+   🔐 NOTIFICATIONS (Admin Only)
+========================================================= */
+
+router.get("/notifications", requireAdmin, (req, res) => {
   try {
     res.json({
       ok: true,
