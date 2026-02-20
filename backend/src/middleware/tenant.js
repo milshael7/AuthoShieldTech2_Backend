@@ -1,6 +1,6 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v4)
-// Tenant + Plan + Suspension Enforcement Layer
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v5)
+// Strict Isolation • Suspension Aware • Restricted Aware
 
 const { readDb } = require("../lib/db");
 
@@ -33,12 +33,12 @@ function resolveFromSubdomain(req) {
 
 function tenantMiddleware(req, res, next) {
 
+  // Only enforce tenant for authenticated users
   if (!req.user) {
     return next();
   }
 
   const db = readDb();
-
   const role = normRole(req.user.role);
   const isAdmin = role === "admin";
 
@@ -98,6 +98,7 @@ function tenantMiddleware(req, res, next) {
       role: req.user.role,
       plan: "global",
       suspended: false,
+      restricted: false,
       scope: {
         isAdmin: true,
         isManager: false,
@@ -124,11 +125,14 @@ function tenantMiddleware(req, res, next) {
       });
     }
 
-    if (company.status !== "Active") {
+    // Hard suspension
+    if (company.status === "Suspended") {
       return res.status(403).json({
         error: "Company suspended",
       });
     }
+
+    const isRestricted = company.status === "Restricted";
 
     req.tenant = {
       id: companyId,
@@ -139,6 +143,7 @@ function tenantMiddleware(req, res, next) {
       role: req.user.role,
       plan: company.tier || "micro",
       suspended: false,
+      restricted: isRestricted,
       scope: {
         isAdmin,
         isManager: role === "manager",
