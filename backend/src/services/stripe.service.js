@@ -1,12 +1,12 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Enterprise Hardened • AutoProtect Synced • Webhook Authoritative
+// Stripe Service — Enterprise Hardened • Invoice Integrated • Revenue Synced
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const { markScanPaid, processScan, getScan } = require("./scan.service");
+const { createInvoice } = require("./invoice.service");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -42,7 +42,7 @@ function saveUser(updatedUser) {
 }
 
 /* =========================================================
-   🔥 AUTOPROTECT SYNC
+   AUTOPROTECT SYNC
 ========================================================= */
 
 function activateAutoProtectBilling(userId, nextBillingDate) {
@@ -63,7 +63,6 @@ function activateAutoProtectBilling(userId, nextBillingDate) {
 function markAutoProtectPastDue(userId) {
   updateDb((db) => {
     if (!db.autoprotek?.users?.[userId]) return;
-
     db.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
     db.autoprotek.users[userId].status = "INACTIVE";
   });
@@ -72,7 +71,6 @@ function markAutoProtectPastDue(userId) {
 function lockAutoProtect(userId) {
   updateDb((db) => {
     if (!db.autoprotek?.users?.[userId]) return;
-
     db.autoprotek.users[userId].subscriptionStatus = "LOCKED";
     db.autoprotek.users[userId].status = "INACTIVE";
   });
@@ -193,13 +191,13 @@ async function handleStripeWebhook(event) {
     }
   }
 
-  /* ---------------- PAYMENT EVENTS ---------------- */
+  /* ---------------- PAYMENT SUCCEEDED ---------------- */
 
   if (event.type === "invoice.payment_succeeded") {
-    const invoice = event.data.object;
+    const invoiceObj = event.data.object;
 
     const subscription = await stripe.subscriptions.retrieve(
-      invoice.subscription
+      invoiceObj.subscription
     );
 
     const nextBillingDate = new Date(
@@ -215,15 +213,27 @@ async function handleStripeWebhook(event) {
       user.subscriptionStatus = "Active";
       saveUser(user);
       activateAutoProtectBilling(user.id, nextBillingDate);
+
+      /* 🔥 CREATE INTERNAL INVOICE */
+      createInvoice({
+        userId: user.id,
+        type: "subscription",
+        stripeSessionId: null,
+        stripeSubscriptionId: subscription.id,
+        stripePaymentIntentId: invoiceObj.payment_intent,
+        amountPaidCents: invoiceObj.amount_paid,
+      });
     }
   }
 
+  /* ---------------- PAYMENT FAILED ---------------- */
+
   if (event.type === "invoice.payment_failed") {
-    const invoice = event.data.object;
+    const invoiceObj = event.data.object;
 
     const db2 = readDb();
     const user = db2.users.find(
-      (u) => u.stripeSubscriptionId === invoice.subscription
+      (u) => u.stripeSubscriptionId === invoiceObj.subscription
     );
 
     if (user) {
@@ -232,6 +242,8 @@ async function handleStripeWebhook(event) {
       markAutoProtectPastDue(user.id);
     }
   }
+
+  /* ---------------- SUBSCRIPTION CANCELLED ---------------- */
 
   if (event.type === "customer.subscription.deleted") {
     const subscription = event.data.object;
@@ -263,7 +275,6 @@ async function cancelSubscription(userId) {
 
   user.subscriptionStatus = "Locked";
   saveUser(user);
-
   lockAutoProtect(user.id);
 
   audit({
