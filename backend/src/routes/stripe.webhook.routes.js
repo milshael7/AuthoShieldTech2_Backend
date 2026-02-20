@@ -1,5 +1,5 @@
 // backend/src/routes/stripe.webhook.routes.js
-// Stripe Webhook — Production Hardened • Signature Verified • Subscription Engine
+// Stripe Webhook — Production Safe • Idempotent • Signature Verified
 
 const express = require("express");
 const router = express.Router();
@@ -19,42 +19,44 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
-/* =========================================================
-   IMPORTANT:
-   This route MUST use raw body
-========================================================= */
+/*
+IMPORTANT:
+Raw body is handled in server.js
+Do NOT use express.json() here.
+Do NOT use express.raw() here.
+*/
 
-router.post(
-  "/",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
+router.post("/", async (req, res) => {
+  const signature = req.headers["stripe-signature"];
 
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("[STRIPE] Signature verification failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    try {
-      await handleStripeWebhook(event);
-    } catch (err) {
-      console.error("[STRIPE] Webhook handler error:", err);
-      return res.status(500).json({
-        ok: false,
-        error: "Webhook processing failed",
-      });
-    }
-
-    return res.json({ received: true });
+  if (!signature) {
+    return res.status(400).send("Missing stripe-signature header");
   }
-);
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("[STRIPE] Invalid signature:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    await handleStripeWebhook(event);
+  } catch (err) {
+    console.error("[STRIPE] Webhook processing failed:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Webhook processing failed",
+    });
+  }
+
+  return res.json({ received: true });
+});
 
 module.exports = router;
