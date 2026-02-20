@@ -1,5 +1,5 @@
 // backend/src/routes/autoprotect.routes.js
-// AutoProtect Routes — Active Job Model • Subscription Based • Enterprise Safe
+// AutoProtect Routes — Billing Enforced • Active Job Model • Enterprise Safe
 
 const express = require("express");
 const router = express.Router();
@@ -11,7 +11,6 @@ const {
   activateAutoProtect,
   deactivateAutoProtect,
   canRunAutoProtect,
-  registerAutoProtectJob,
   isAutoProtectActive,
 } = require("../users/user.service");
 
@@ -54,6 +53,7 @@ router.get("/status", (req, res) => {
       scope: "global",
       totalSubscribers: apUsers.length,
       activeSubscribers: apUsers.filter(u => u.status === "ACTIVE").length,
+      pastDueSubscribers: apUsers.filter(u => u.subscriptionStatus === "PAST_DUE").length,
       time: nowISO(),
       readOnly: true,
     });
@@ -71,10 +71,15 @@ router.get("/status", (req, res) => {
   return res.json({
     scope: "user",
     status: userAP?.status || "INACTIVE",
+    subscriptionStatus: userAP?.subscriptionStatus || "INACTIVE",
     activeJobs: userAP?.activeJobsCount || 0,
     activeLimit: userAP?.activeJobLimit || 10,
     nextBillingDate: userAP?.nextBillingDate || null,
-    price: userAP?.priceLocked || 550,
+    pricing: userAP?.pricing || {
+      automationService: 500,
+      platformFee: 50,
+      total: 550,
+    },
     time: nowISO(),
   });
 });
@@ -98,7 +103,11 @@ router.post("/enable", (req, res) => {
   return res.json({
     ok: true,
     status: "ACTIVE",
-    price: 550,
+    pricing: {
+      automationService: 500,
+      platformFee: 50,
+      total: 550,
+    },
     limit: 10,
     time: nowISO(),
   });
@@ -134,11 +143,10 @@ router.post("/disable", (req, res) => {
 router.post("/run", (req, res) => {
   const user = req.user;
 
-  // Admin / Manager → unlimited
   if (!canRunAutoProtect(user)) {
     return res.status(400).json({
       ok: false,
-      error: "AutoProtect inactive or active job limit reached (10).",
+      error: "AutoProtect inactive, expired, or active job limit reached (10).",
     });
   }
 
@@ -158,9 +166,6 @@ router.post("/run", (req, res) => {
       title,
       issue,
     });
-
-    // register active job for individuals
-    registerAutoProtectJob(user);
 
     return res.status(201).json({
       ok: true,
