@@ -6,7 +6,7 @@ const { audit } = require("../lib/audit");
 const { createNotification } = require("../lib/notify");
 
 /* =========================================================
-   TIER CONFIG (USER LIMIT BASED)
+   TIER CONFIG
 ========================================================= */
 
 const TIERS = {
@@ -49,7 +49,6 @@ function getCompanyById(db, id) {
 function normalizeMembers(company) {
   if (!Array.isArray(company.members)) company.members = [];
 
-  // Convert legacy string members to structured objects
   company.members = company.members.map((m) => {
     if (typeof m === "string") {
       return {
@@ -73,6 +72,19 @@ function enforceUserLimit(company) {
     throw new Error(
       "User limit reached for current plan. Please upgrade."
     );
+  }
+}
+
+function evaluateRestriction(company) {
+  const tier = normalizeTier(company.tier);
+  const limit = TIERS[tier].maxUsers;
+
+  normalizeMembers(company);
+
+  if (company.members.length > limit) {
+    company.status = "Restricted";
+  } else if (company.status === "Restricted") {
+    company.status = "Active";
   }
 }
 
@@ -106,10 +118,8 @@ function createCompany({
     industry: safeStr(industry, 120),
     contactEmail: safeStr(contactEmail, 160),
     contactPhone: safeStr(contactPhone, 60),
-
     tier: normalizedTier,
     maxUsers: TIERS[normalizedTier].maxUsers,
-
     createdAt: nowISO(),
     status: "Active",
     createdBy: createdBy ? String(createdBy) : null,
@@ -137,7 +147,7 @@ function createCompany({
 }
 
 /* =========================================================
-   UPGRADE COMPANY
+   UPGRADE / DOWNGRADE COMPANY
 ========================================================= */
 
 function upgradeCompany(companyId, newTier, actorId) {
@@ -149,18 +159,36 @@ function upgradeCompany(companyId, newTier, actorId) {
 
   const normalizedTier = normalizeTier(newTier);
 
+  const oldTier = c.tier;
+
   c.tier = normalizedTier;
   c.maxUsers = TIERS[normalizedTier].maxUsers;
+
+  evaluateRestriction(c);
 
   writeDb(db);
 
   audit({
     actorId: actorId ? String(actorId) : null,
-    action: "COMPANY_UPGRADED",
+    action: "COMPANY_TIER_CHANGED",
     targetType: "Company",
     targetId: c.id,
-    metadata: { newTier: normalizedTier },
+    metadata: {
+      oldTier,
+      newTier: normalizedTier,
+      status: c.status,
+    },
   });
+
+  if (c.status === "Restricted") {
+    createNotification({
+      companyId: c.id,
+      severity: "warn",
+      title: "Company restricted",
+      message:
+        "Member count exceeds new plan limit. Remove extra users or upgrade.",
+    });
+  }
 
   return c;
 }
@@ -181,7 +209,7 @@ function getCompany(id) {
 }
 
 /* =========================================================
-   MEMBER MANAGEMENT (STRUCTURED)
+   MEMBER MANAGEMENT
 ========================================================= */
 
 function addMember(companyId, userId, actorId, position = "member") {
@@ -193,10 +221,10 @@ function addMember(companyId, userId, actorId, position = "member") {
 
   normalizeMembers(c);
 
+  enforceUserLimit(c);
+
   const uid = String(userId || "").trim();
   if (!uid) throw new Error("Missing userId");
-
-  enforceUserLimit(c);
 
   const exists = c.members.find(
     (m) => String(m.userId) === uid
@@ -210,6 +238,7 @@ function addMember(companyId, userId, actorId, position = "member") {
       assignedBy: actorId ? String(actorId) : null,
     });
 
+    evaluateRestriction(c);
     writeDb(db);
 
     audit({
@@ -218,13 +247,6 @@ function addMember(companyId, userId, actorId, position = "member") {
       targetType: "Company",
       targetId: c.id,
       metadata: { userId: uid, position },
-    });
-
-    createNotification({
-      companyId: c.id,
-      severity: "info",
-      title: "Member added",
-      message: `User ${uid} assigned as ${position}.`,
     });
   }
 
@@ -243,30 +265,20 @@ function removeMember(companyId, userId, actorId) {
   const uid = String(userId || "").trim();
   if (!uid) throw new Error("Missing userId");
 
-  const before = c.members.length;
-
   c.members = c.members.filter(
     (m) => String(m.userId) !== uid
   );
 
-  if (c.members.length !== before) {
-    writeDb(db);
+  evaluateRestriction(c);
+  writeDb(db);
 
-    audit({
-      actorId: actorId ? String(actorId) : null,
-      action: "COMPANY_REMOVE_MEMBER",
-      targetType: "Company",
-      targetId: c.id,
-      metadata: { userId: uid },
-    });
-
-    createNotification({
-      companyId: c.id,
-      severity: "warn",
-      title: "Member removed",
-      message: `User ${uid} removed from company.`,
-    });
-  }
+  audit({
+    actorId: actorId ? String(actorId) : null,
+    action: "COMPANY_REMOVE_MEMBER",
+    targetType: "Company",
+    targetId: c.id,
+    metadata: { userId: uid },
+  });
 
   return c;
 }
