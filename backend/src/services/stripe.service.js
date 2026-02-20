@@ -1,5 +1,5 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Enterprise Hardened • Payment Authoritative • Webhook Safe
+// Stripe Service — Enterprise Hardened • AutoProtect Synced • Webhook Authoritative
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
@@ -42,6 +42,43 @@ function saveUser(updatedUser) {
 }
 
 /* =========================================================
+   🔥 AUTOPROTECT SYNC
+========================================================= */
+
+function activateAutoProtectBilling(userId, nextBillingDate) {
+  updateDb((db) => {
+    db.autoprotek = db.autoprotek || { users: {} };
+
+    const existing = db.autoprotek.users[userId] || {};
+
+    db.autoprotek.users[userId] = {
+      ...existing,
+      status: "ACTIVE",
+      subscriptionStatus: "ACTIVE",
+      nextBillingDate,
+    };
+  });
+}
+
+function markAutoProtectPastDue(userId) {
+  updateDb((db) => {
+    if (!db.autoprotek?.users?.[userId]) return;
+
+    db.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
+    db.autoprotek.users[userId].status = "INACTIVE";
+  });
+}
+
+function lockAutoProtect(userId) {
+  updateDb((db) => {
+    if (!db.autoprotek?.users?.[userId]) return;
+
+    db.autoprotek.users[userId].subscriptionStatus = "LOCKED";
+    db.autoprotek.users[userId].status = "INACTIVE";
+  });
+}
+
+/* =========================================================
    SUBSCRIPTION CHECKOUT
 ========================================================= */
 
@@ -81,56 +118,6 @@ async function createCheckoutSession({
 }
 
 /* =========================================================
-   TOOL ONE-TIME CHECKOUT (SERVER AUTHORITATIVE)
-========================================================= */
-
-async function createToolCheckoutSession({
-  scanId,
-  amount,
-  successUrl,
-  cancelUrl,
-}) {
-  const scan = getScan(scanId);
-  if (!scan) throw new Error("Scan not found");
-
-  if (amount !== scan.finalPrice) {
-    throw new Error("Price mismatch");
-  }
-
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    payment_method_types: ["card"],
-    line_items: [
-      {
-        price_data: {
-          currency: "usd",
-          product_data: {
-            name: scan.toolName,
-          },
-          unit_amount: amount * 100,
-        },
-        quantity: 1,
-      },
-    ],
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    metadata: {
-      scanId,
-      type: "tool_payment",
-    },
-  });
-
-  audit({
-    actorId: "system",
-    action: "STRIPE_TOOL_CHECKOUT_CREATED",
-    targetType: "Scan",
-    targetId: scanId,
-  });
-
-  return session.url;
-}
-
-/* =========================================================
    ACTIVATE SUBSCRIPTION
 ========================================================= */
 
@@ -144,11 +131,17 @@ async function activateSubscription({
 
   const subscription = await stripe.subscriptions.retrieve(subscriptionId);
 
+  const nextBillingDate = new Date(
+    subscription.current_period_end * 1000
+  ).toISOString();
+
   user.subscriptionStatus = "Active";
   user.stripeCustomerId = subscription.customer;
   user.stripeSubscriptionId = subscriptionId;
 
   saveUser(user);
+
+  activateAutoProtectBilling(user.id, nextBillingDate);
 
   if (user.companyId && PRICE_MAP[planType]) {
     companies.upgradeCompany(user.companyId, planType, user.id);
@@ -185,14 +178,12 @@ async function handleStripeWebhook(event) {
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
 
-    /* ---- Subscription ---- */
-
     if (session.mode === "subscription") {
       const userId = session.metadata?.userId;
       const planType = session.metadata?.planType;
       const subscriptionId = session.subscription;
 
-      if (userId && planType && subscriptionId) {
+      if (userId && subscriptionId) {
         await activateSubscription({
           userId,
           planType,
@@ -200,105 +191,62 @@ async function handleStripeWebhook(event) {
         });
       }
     }
-
-    /* ---- Tool Payment ---- */
-
-    if (
-      session.mode === "payment" &&
-      session.metadata?.type === "tool_payment"
-    ) {
-      const scanId = session.metadata?.scanId;
-      if (!scanId) return;
-
-      const scan = getScan(scanId);
-      if (!scan) return;
-
-      /* 🔒 Extra payment validation */
-      const paidAmount = session.amount_total / 100;
-
-      if (paidAmount !== scan.finalPrice) {
-        audit({
-          actorId: "system",
-          action: "PAYMENT_AMOUNT_MISMATCH",
-          targetType: "Scan",
-          targetId: scanId,
-        });
-        return;
-      }
-
-      /* 🔥 Save paymentIntent ID */
-      updateDb((db2) => {
-        const s = db2.scans?.find((x) => x.id === scanId);
-        if (s) {
-          s.stripePaymentIntentId = session.payment_intent;
-        }
-      });
-
-      markScanPaid(scanId);
-      processScan(scanId);
-
-      audit({
-        actorId: "system",
-        action: "TOOL_PAYMENT_COMPLETED",
-        targetType: "Scan",
-        targetId: scanId,
-      });
-    }
   }
 
-  /* ---------------- SUBSCRIPTION STATUS SYNC ---------------- */
+  /* ---------------- PAYMENT EVENTS ---------------- */
 
-  if (
-    event.type === "customer.subscription.updated" ||
-    event.type === "customer.subscription.deleted"
-  ) {
-    const subscription = event.data.object;
-    await syncSubscriptionStatus(subscription.id, subscription.status);
+  if (event.type === "invoice.payment_succeeded") {
+    const invoice = event.data.object;
+
+    const subscription = await stripe.subscriptions.retrieve(
+      invoice.subscription
+    );
+
+    const nextBillingDate = new Date(
+      subscription.current_period_end * 1000
+    ).toISOString();
+
+    const db2 = readDb();
+    const user = db2.users.find(
+      (u) => u.stripeSubscriptionId === subscription.id
+    );
+
+    if (user) {
+      user.subscriptionStatus = "Active";
+      saveUser(user);
+      activateAutoProtectBilling(user.id, nextBillingDate);
+    }
   }
 
   if (event.type === "invoice.payment_failed") {
     const invoice = event.data.object;
-    await syncSubscriptionStatus(invoice.subscription, "past_due");
+
+    const db2 = readDb();
+    const user = db2.users.find(
+      (u) => u.stripeSubscriptionId === invoice.subscription
+    );
+
+    if (user) {
+      user.subscriptionStatus = "PastDue";
+      saveUser(user);
+      markAutoProtectPastDue(user.id);
+    }
   }
 
-  if (event.type === "invoice.payment_succeeded") {
-    const invoice = event.data.object;
-    await syncSubscriptionStatus(invoice.subscription, "active");
+  if (event.type === "customer.subscription.deleted") {
+    const subscription = event.data.object;
+
+    const db2 = readDb();
+    const user = db2.users.find(
+      (u) => u.stripeSubscriptionId === subscription.id
+    );
+
+    if (user) {
+      user.subscriptionStatus = "Locked";
+      saveUser(user);
+      lockAutoProtect(user.id);
+    }
   }
-}
-
-/* =========================================================
-   SYNC SUBSCRIPTION STATUS
-========================================================= */
-
-async function syncSubscriptionStatus(subscriptionId, stripeStatus) {
-  if (!subscriptionId) return;
-
-  const db = readDb();
-  const user = db.users.find(
-    (u) => u.stripeSubscriptionId === subscriptionId
-  );
-
-  if (!user) return;
-
-  let mappedStatus = "Inactive";
-
-  switch (stripeStatus) {
-    case "active":
-    case "trialing":
-      mappedStatus = "Active";
-      break;
-    case "past_due":
-      mappedStatus = "PastDue";
-      break;
-    case "canceled":
-    case "unpaid":
-      mappedStatus = "Locked";
-      break;
-  }
-
-  user.subscriptionStatus = mappedStatus;
-  saveUser(user);
 }
 
 /* =========================================================
@@ -316,6 +264,8 @@ async function cancelSubscription(userId) {
   user.subscriptionStatus = "Locked";
   saveUser(user);
 
+  lockAutoProtect(user.id);
+
   audit({
     actorId: user.id,
     action: "SUBSCRIPTION_CANCELLED",
@@ -326,7 +276,6 @@ async function cancelSubscription(userId) {
 
 module.exports = {
   createCheckoutSession,
-  createToolCheckoutSession,
   activateSubscription,
   cancelSubscription,
   handleStripeWebhook,
