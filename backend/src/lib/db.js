@@ -1,5 +1,5 @@
 // backend/src/lib/db.js
-// File-based JSON DB with schema + safe writes (atomic) so "brain" survives deploys.
+// File-based JSON DB with schema + safe writes (atomic)
 
 const fs = require('fs');
 const path = require('path');
@@ -7,11 +7,11 @@ const path = require('path');
 const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
 const TMP_PATH = DB_PATH + '.tmp';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /* ======================================================
    UTIL
-   ====================================================== */
+====================================================== */
 
 function ensureDir(p) {
   const dir = path.dirname(p);
@@ -24,7 +24,7 @@ function now() {
 
 /* ======================================================
    DEFAULT DB
-   ====================================================== */
+====================================================== */
 
 function defaultDb() {
   return {
@@ -34,6 +34,10 @@ function defaultDb() {
     companies: [],
     audit: [],
     notifications: [],
+
+    // 🔥 NEW
+    tools: [],
+    scans: [],
 
     brain: {
       memory: [],
@@ -66,7 +70,7 @@ function defaultDb() {
 
 /* ======================================================
    MIGRATION
-   ====================================================== */
+====================================================== */
 
 function migrate(db) {
   if (!db || typeof db !== 'object') return defaultDb();
@@ -77,6 +81,10 @@ function migrate(db) {
   if (!Array.isArray(db.companies)) db.companies = [];
   if (!Array.isArray(db.audit)) db.audit = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
+
+  // 🔥 NEW
+  if (!Array.isArray(db.tools)) db.tools = [];
+  if (!Array.isArray(db.scans)) db.scans = [];
 
   if (!db.brain) db.brain = {};
   if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
@@ -98,6 +106,7 @@ function migrate(db) {
       lastTradeTs: 0,
     };
   }
+
   if (!Array.isArray(db.paper.trades)) db.paper.trades = [];
   if (!Array.isArray(db.paper.daily)) db.paper.daily = [];
 
@@ -110,7 +119,7 @@ function migrate(db) {
 
 /* ======================================================
    CORE IO
-   ====================================================== */
+====================================================== */
 
 function ensureDb() {
   ensureDir(DB_PATH);
@@ -153,19 +162,9 @@ function updateDb(mutator) {
 }
 
 /* ======================================================
-   AUDIT WRITES (NEW)
-   ====================================================== */
+   AUDIT WRITES
+====================================================== */
 
-/**
- * writeAudit({
- *   actorId,
- *   actorRole,
- *   companyId,
- *   action,
- *   target,
- *   meta
- * })
- */
 function writeAudit(event = {}) {
   try {
     updateDb((db) => {
@@ -179,7 +178,6 @@ function writeAudit(event = {}) {
         meta: event.meta || {},
       });
 
-      // hard cap (prevents unbounded growth)
       if (db.audit.length > 5000) {
         db.audit = db.audit.slice(-4000);
       }
@@ -191,7 +189,7 @@ function writeAudit(event = {}) {
 
 /* ======================================================
    EXPORTS
-   ====================================================== */
+====================================================== */
 
 module.exports = {
   DB_PATH,
@@ -199,5 +197,5 @@ module.exports = {
   readDb,
   writeDb,
   updateDb,
-  writeAudit, // ✅ NEW
+  writeAudit,
 };
