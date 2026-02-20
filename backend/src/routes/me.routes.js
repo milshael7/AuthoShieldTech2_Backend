@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Subscription Enforced • Branch Controlled • Scan History Enabled
+// Me Endpoints — Subscription Enforced • Usage Meter Enabled
 
 const express = require("express");
 const router = express.Router();
@@ -12,6 +12,7 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
 const { createProject } = require("../autoprotect/autoprotect.service");
+const { getUserEffectivePlan } = require("../users/user.service");
 
 router.use(authRequired);
 
@@ -43,78 +44,48 @@ function requireActiveSubscription(dbUser) {
   }
 }
 
-function requireActiveCompany(company) {
-  if (!company || company.status !== "Active") {
-    const err = new Error("Company not active");
-    err.status = 403;
-    throw err;
-  }
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}`;
 }
 
 /* =========================================================
-   DASHBOARD
+   USAGE METER (NEW)
 ========================================================= */
 
-router.get("/dashboard", (req, res) => {
+router.get("/usage", (req, res) => {
   try {
     const dbUser = users.findById(req.user.id);
-    if (!dbUser) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
     requireActiveSubscription(dbUser);
 
-    let dashboardType = "individual";
-    let branch = "member";
-    let companyInfo = null;
-    let visibleTools = [];
-    let plan = null;
+    const db = readDb();
+    const plan = getUserEffectivePlan(dbUser);
+    const included = plan.includedScans || 0;
 
-    if (dbUser.companyId) {
-      const company = companies.getCompany(dbUser.companyId);
-      requireActiveCompany(company);
+    const monthKey = currentMonthKey();
 
-      const memberRecord = company.members?.find(
-        (m) => String(m.userId || m) === String(dbUser.id)
-      );
+    let used = 0;
 
-      if (memberRecord) {
-        dashboardType = "company_member";
-        branch =
-          typeof memberRecord === "object"
-            ? memberRecord.position || "member"
-            : "member";
-
-        plan = company.tier;
-
-        companyInfo = {
-          id: company.id,
-          name: company.name,
-          tier: company.tier,
-          maxUsers: company.maxUsers,
-          currentUsers: Array.isArray(company.members)
-            ? company.members.length
-            : 0,
-        };
-
-        visibleTools =
-          securityTools.getVisibleToolsForBranch(
-            company.id,
-            branch
-          );
+    if (db.scanCredits && db.scanCredits[dbUser.id]) {
+      const record = db.scanCredits[dbUser.id];
+      if (record.month === monthKey) {
+        used = record.used;
       }
     }
 
+    const remaining =
+      included === Infinity
+        ? Infinity
+        : Math.max(0, included - used);
+
     return res.json({
       ok: true,
-      dashboard: {
-        role: dbUser.role,
-        type: dashboardType,
-        branch,
-        plan,
-        company: companyInfo,
-        subscriptionStatus: dbUser.subscriptionStatus,
-        visibleTools,
+      usage: {
+        planLabel: plan.label,
+        included,
+        used,
+        remaining,
+        month: monthKey,
       },
     });
 
@@ -127,7 +98,32 @@ router.get("/dashboard", (req, res) => {
 });
 
 /* =========================================================
-   SCAN HISTORY (NEW)
+   DASHBOARD
+========================================================= */
+
+router.get("/dashboard", (req, res) => {
+  try {
+    const dbUser = users.findById(req.user.id);
+    requireActiveSubscription(dbUser);
+
+    return res.json({
+      ok: true,
+      dashboard: {
+        role: dbUser.role,
+        subscriptionStatus: dbUser.subscriptionStatus,
+      },
+    });
+
+  } catch (e) {
+    return res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   SCAN HISTORY
 ========================================================= */
 
 router.get("/scans", (req, res) => {
@@ -136,29 +132,9 @@ router.get("/scans", (req, res) => {
     requireActiveSubscription(dbUser);
 
     const db = readDb();
-    const allScans = Array.isArray(db.scans) ? db.scans : [];
-
-    let scans = [];
-
-    // Individual scans (by email)
-    scans = allScans.filter(
-      (s) => s.email === dbUser.email
-    );
-
-    // Company-level scans (future-ready)
-    if (dbUser.companyId) {
-      scans = allScans.filter(
-        (s) =>
-          s.email === dbUser.email ||
-          s.companyId === dbUser.companyId
-      );
-    }
-
-    // Sort newest first
-    scans.sort(
-      (a, b) =>
-        new Date(b.createdAt) - new Date(a.createdAt)
-    );
+    const scans = (db.scans || [])
+      .filter((s) => s.userId === dbUser.id)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     return res.json({
       ok: true,
@@ -186,38 +162,7 @@ router.get("/notifications", (req, res) => {
     const notifications =
       listNotifications({ userId: req.user.id }) || [];
 
-    return res.json({
-      ok: true,
-      notifications,
-    });
-
-  } catch (e) {
-    return res.status(e.status || 500).json({
-      ok: false,
-      error: e.message,
-    });
-  }
-});
-
-router.post("/notifications/:id/read", (req, res) => {
-  try {
-    const dbUser = users.findById(req.user.id);
-    requireActiveSubscription(dbUser);
-
-    const id = cleanStr(req.params.id, 100);
-    if (!id) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing notification id",
-      });
-    }
-
-    const n = markRead(id, req.user.id);
-
-    return res.json({
-      ok: true,
-      notification: n,
-    });
+    return res.json({ ok: true, notifications });
 
   } catch (e) {
     return res.status(e.status || 500).json({
@@ -236,13 +181,6 @@ router.post("/projects", (req, res) => {
     const dbUser = users.findById(req.user.id);
     requireActiveSubscription(dbUser);
 
-    if (dbUser.role !== users.ROLES.INDIVIDUAL) {
-      return res.status(403).json({
-        ok: false,
-        error: "Upgrade required",
-      });
-    }
-
     if (!isObject(req.body)) {
       return res.status(400).json({
         ok: false,
@@ -258,24 +196,11 @@ router.post("/projects", (req, res) => {
       });
     }
 
-    const issueType = cleanStr(req.body.issue?.type, 100);
-    const details = cleanStr(req.body.issue?.details, 2000);
-
-    if (!issueType) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing issue.type",
-      });
-    }
-
     const project = createProject({
       actorId: dbUser.id,
       companyId: dbUser.companyId || null,
       title,
-      issue: {
-        type: issueType,
-        details,
-      },
+      issue: req.body.issue || {},
     });
 
     audit({
@@ -285,10 +210,7 @@ router.post("/projects", (req, res) => {
       targetId: project.id,
     });
 
-    return res.status(201).json({
-      ok: true,
-      project,
-    });
+    return res.status(201).json({ ok: true, project });
 
   } catch (e) {
     return res.status(e.status || 500).json({
