@@ -1,9 +1,32 @@
 // backend/src/middleware/auth.js
-// JWT Auth Middleware — Enterprise Hardened • Tier Aligned • Restriction Aware
+// Phase 26 — Enterprise Access Governance Layer
+// JWT Auth • Subscription Enforcement • Exposure Tier Tagging • Privilege Auditing
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
+const { writeAudit } = require("../lib/audit");
 const users = require("../users/user.service");
+
+/* ======================================================
+   ROLE CLASSIFICATION
+====================================================== */
+
+const ACCESS_TIERS = {
+  ADMIN: "ADMIN",
+  FINANCE: "FINANCE",
+  MANAGER: "MANAGER",
+  STANDARD: "STANDARD",
+};
+
+function classifyAccessTier(role) {
+  const r = String(role || "").toLowerCase();
+
+  if (r === "admin") return ACCESS_TIERS.ADMIN;
+  if (r === "finance") return ACCESS_TIERS.FINANCE;
+  if (r === "manager") return ACCESS_TIERS.MANAGER;
+
+  return ACCESS_TIERS.STANDARD;
+}
 
 /* ======================================================
    HELPERS
@@ -67,6 +90,12 @@ function authRequired(req, res, next) {
   -------------------------------------------------- */
 
   if (user.locked === true) {
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "ACCESS_DENIED_ACCOUNT_LOCKED",
+    });
+
     return error(res, 403, "Account locked");
   }
 
@@ -83,12 +112,17 @@ function authRequired(req, res, next) {
     user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
 
   if (subscriptionInactive && !isBillingRoute(req)) {
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "ACCESS_DENIED_SUBSCRIPTION_INACTIVE",
+    });
+
     return error(res, 403, "Subscription inactive");
   }
 
   /* --------------------------------------------------
      COMPANY STATUS ENFORCEMENT
-     (Aligned with tenant v5)
   -------------------------------------------------- */
 
   if (user.companyId && Array.isArray(db.companies)) {
@@ -101,13 +135,21 @@ function authRequired(req, res, next) {
     }
 
     if (company.status === "Suspended") {
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "ACCESS_DENIED_COMPANY_SUSPENDED",
+      });
+
       return error(res, 403, "Company suspended");
     }
   }
 
   /* --------------------------------------------------
-     ATTACH CLEAN CONTEXT
+     ACCESS CONTEXT INJECTION
   -------------------------------------------------- */
+
+  const accessTier = classifyAccessTier(user.role);
 
   req.user = {
     id: user.id,
@@ -116,6 +158,30 @@ function authRequired(req, res, next) {
     subscriptionStatus: user.subscriptionStatus,
     status: user.status,
   };
+
+  req.accessContext = {
+    tier: accessTier,
+    isHighPrivilege:
+      accessTier === ACCESS_TIERS.ADMIN ||
+      accessTier === ACCESS_TIERS.FINANCE,
+    requestedAt: Date.now(),
+  };
+
+  /* --------------------------------------------------
+     HIGH PRIVILEGE ACCESS TELEMETRY
+  -------------------------------------------------- */
+
+  if (req.accessContext.isHighPrivilege) {
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "HIGH_PRIVILEGE_ACCESS",
+      detail: {
+        path: req.originalUrl,
+        method: req.method,
+      },
+    });
+  }
 
   return next();
 }
@@ -153,6 +219,16 @@ function requireRole(...args) {
     }
 
     if (!allow.has(userRole)) {
+      writeAudit({
+        actor: req.user.id,
+        role: req.user.role,
+        action: "ACCESS_DENIED_ROLE_MISMATCH",
+        detail: {
+          requiredRoles: rawRoles,
+          attemptedPath: req.originalUrl,
+        },
+      });
+
       return error(res, 403, "Forbidden");
     }
 
@@ -163,4 +239,5 @@ function requireRole(...args) {
 module.exports = {
   authRequired,
   requireRole,
+  ACCESS_TIERS,
 };
