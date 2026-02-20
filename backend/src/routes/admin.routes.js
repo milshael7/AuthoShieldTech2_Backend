@@ -1,7 +1,6 @@
 // backend/src/routes/admin.routes.js
-// Phase 19 — Governance + SOC2 Compliance Layer
-// Admin + Finance Separation
-// Revenue • Forecast • Churn • Audit • Compliance Engine
+// Phase 28 + 29 — Enterprise Security & Governance Intelligence
+// SOC2 • Risk Index • Anomaly Engine • Privilege Mapping • Compliance
 
 const express = require("express");
 const router = express.Router();
@@ -10,7 +9,6 @@ const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
 const { verifyAuditIntegrity } = require("../lib/audit");
 const { generateComplianceReport } = require("../services/compliance.service");
-
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
 
@@ -44,78 +42,72 @@ function requireFinanceOrAdmin(req, res, next) {
 }
 
 /* =========================================================
-   EXECUTIVE METRICS (Finance + Admin)
+   🧠 SECURITY ANOMALY ENGINE
 ========================================================= */
 
-router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
+function computeSecurityRisk(db) {
+  const audit = db.audit || [];
+  const usersList = db.users || [];
+  const refunds = db.refunds || [];
+  const disputes = db.disputes || [];
+
+  let risk = 0;
+
+  // Audit integrity
+  const auditIntegrity = verifyAuditIntegrity();
+  if (!auditIntegrity.ok) risk += 30;
+
+  // High privilege spikes
+  const highPrivilegeAccess = audit.filter(
+    (a) => a.action === "HIGH_PRIVILEGE_ACCESS"
+  );
+  if (highPrivilegeAccess.length > 50) risk += 15;
+
+  // Refund anomaly
+  if (refunds.length > usersList.length * 0.2) risk += 10;
+
+  // Dispute anomaly
+  if (disputes.length > 5) risk += 15;
+
+  // Locked user ratio
+  const lockedUsers = usersList.filter(
+    (u) => u.subscriptionStatus === "Locked"
+  );
+  if (lockedUsers.length > usersList.length * 0.3) risk += 10;
+
+  return Math.min(risk, 100);
+}
+
+/* =========================================================
+   📊 SECURITY POSTURE
+========================================================= */
+
+router.get("/security/posture", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
-    const usersList = db.users || [];
-    const invoices = db.invoices || [];
+    const riskIndex = computeSecurityRisk(db);
 
-    const activeUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Active"
-    );
-
-    const trialUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Trial"
-    );
-
-    const lockedUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Locked"
-    );
-
-    const totalRevenue = db.revenueSummary?.totalRevenue || 0;
-
-    const now = Date.now();
-    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
-
-    const mrr = invoices
-      .filter(
-        (i) =>
-          i.type === "subscription" &&
-          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
-      )
-      .reduce((sum, i) => sum + i.amount, 0);
-
-    const arr = mrr * 12;
-
-    const payingUsers = new Set(
-      invoices
-        .filter((i) => i.type === "subscription")
-        .map((i) => i.userId)
-    ).size;
-
-    const arpu =
-      payingUsers > 0
-        ? Number((totalRevenue / payingUsers).toFixed(2))
-        : 0;
-
-    const churnRate =
-      usersList.length > 0
-        ? Number((lockedUsers.length / usersList.length).toFixed(4))
-        : 0;
-
-    const estimatedLTV =
-      churnRate > 0
-        ? Number((arpu / churnRate).toFixed(2))
-        : 0;
+    const roleDistribution = {
+      admin: db.users.filter(u => u.role === "Admin").length,
+      finance: db.users.filter(u => u.role === "Finance").length,
+      manager: db.users.filter(u => u.role === "Manager").length,
+      standard: db.users.filter(
+        u =>
+          !["Admin", "Finance", "Manager"].includes(u.role)
+      ).length,
+    };
 
     res.json({
       ok: true,
-      metrics: {
-        totalUsers: usersList.length,
-        activeSubscribers: activeUsers.length,
-        trialUsers: trialUsers.length,
-        lockedUsers: lockedUsers.length,
-        totalRevenue,
-        MRR: Number(mrr.toFixed(2)),
-        ARR: Number(arr.toFixed(2)),
-        ARPU: arpu,
-        churnRate,
-        estimatedLTV,
+      posture: {
+        riskIndex,
+        auditIntegrity: verifyAuditIntegrity(),
+        totalUsers: db.users.length,
+        roleDistribution,
+        refunds: db.refunds.length,
+        disputes: db.disputes.length,
       },
-      time: new Date().toISOString(),
+      generatedAt: new Date().toISOString(),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -123,48 +115,30 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   CHURN RISK (Finance + Admin)
+   🔎 SECURITY ANOMALIES DETAIL
 ========================================================= */
 
-router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
+router.get("/security/anomalies", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
-    const usersList = db.users || [];
-    const invoices = db.invoices || [];
+    const audit = db.audit || [];
 
-    const now = Date.now();
-    const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
-
-    const results = usersList.map((user) => {
-      let riskScore = 0;
-
-      if (user.subscriptionStatus === "Locked") riskScore += 50;
-      if (user.subscriptionStatus === "Trial") riskScore += 10;
-
-      const recentPayment = invoices.find(
-        (i) =>
-          i.userId === user.id &&
-          now - new Date(i.createdAt).getTime() <= SIXTY_DAYS
-      );
-
-      if (!recentPayment) riskScore += 20;
-
-      let level = "LOW";
-      if (riskScore >= 60) level = "HIGH";
-      else if (riskScore >= 30) level = "MEDIUM";
-
-      return {
-        userId: user.id,
-        email: user.email,
-        riskScore,
-        level,
-      };
-    });
+    const anomalies = {
+      brokenAuditChain: !verifyAuditIntegrity().ok,
+      highPrivilegeAccessCount: audit.filter(
+        (a) => a.action === "HIGH_PRIVILEGE_ACCESS"
+      ).length,
+      accessDeniedEvents: audit.filter(
+        (a) => a.action?.includes("ACCESS_DENIED")
+      ).length,
+      refundCount: db.refunds.length,
+      disputeCount: db.disputes.length,
+    };
 
     res.json({
       ok: true,
-      churnRisk: results,
-      time: new Date().toISOString(),
+      anomalies,
+      generatedAt: new Date().toISOString(),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -172,50 +146,33 @@ router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   REVENUE SUMMARY (Finance + Admin)
+   🔐 PRIVILEGE MAP
 ========================================================= */
 
-router.get(
-  "/revenue/summary",
-  requireFinanceOrAdmin,
-  (req, res) => {
-    try {
-      const db = readDb();
-      res.json({
-        ok: true,
-        revenue: db.revenueSummary || {},
-        invoices: db.invoices?.length || 0,
-        time: new Date().toISOString(),
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+router.get("/security/privilege-map", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+
+    const privilegeMap = db.users.map((u) => ({
+      id: u.id,
+      email: u.email,
+      role: u.role,
+      companyId: u.companyId,
+      subscriptionStatus: u.subscriptionStatus,
+    }));
+
+    res.json({
+      ok: true,
+      privilegeMap,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
 
 /* =========================================================
-   🔐 AUDIT INTEGRITY CHECK (Finance + Admin)
-========================================================= */
-
-router.get(
-  "/audit/verify",
-  requireFinanceOrAdmin,
-  (req, res) => {
-    try {
-      const result = verifyAuditIntegrity();
-      res.json({
-        ok: true,
-        integrity: result,
-        time: new Date().toISOString(),
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
-  }
-);
-
-/* =========================================================
-   🔎 SOC2 COMPLIANCE REPORT (Finance + Admin)
+   🔎 SOC2 COMPLIANCE REPORT
 ========================================================= */
 
 router.get(
@@ -224,16 +181,9 @@ router.get(
   async (req, res) => {
     try {
       const report = await generateComplianceReport();
-
-      res.json({
-        ok: true,
-        complianceReport: report,
-      });
+      res.json({ ok: true, complianceReport: report });
     } catch (e) {
-      res.status(500).json({
-        ok: false,
-        error: e.message,
-      });
+      res.status(500).json({ ok: false, error: e.message });
     }
   }
 );
@@ -246,7 +196,7 @@ router.get("/users", requireAdmin, (req, res) => {
   try {
     res.json({
       ok: true,
-      users: users.listUsers(),
+      users: users.listUsersForAccess(req.accessContext),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -257,19 +207,15 @@ router.get("/users", requireAdmin, (req, res) => {
    🔐 NOTIFICATIONS (Admin Only)
 ========================================================= */
 
-router.get(
-  "/notifications",
-  requireAdmin,
-  (req, res) => {
-    try {
-      res.json({
-        ok: true,
-        notifications: listNotifications({}),
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+router.get("/notifications", requireAdmin, (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      notifications: listNotifications({}),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
 
 module.exports = router;
