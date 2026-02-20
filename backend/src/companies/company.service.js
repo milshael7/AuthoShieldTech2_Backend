@@ -1,4 +1,5 @@
 // backend/src/companies/company.service.js
+// Company Service — Tier Enforced • Billing Safe • Enterprise Hardened
 
 const { nanoid } = require("nanoid");
 const { readDb, writeDb } = require("../lib/db");
@@ -6,7 +7,7 @@ const { audit } = require("../lib/audit");
 const { createNotification } = require("../lib/notify");
 
 /* =========================================================
-   TIER CONFIG
+   TIER CONFIG (SYNCED WITH BILLING)
 ========================================================= */
 
 const TIERS = {
@@ -14,12 +15,16 @@ const TIERS = {
   small: { maxUsers: 15 },
   mid: { maxUsers: 50 },
   enterprise: { maxUsers: 150 },
-  unlimited: { maxUsers: Infinity },
 };
+
+const VALID_TIERS = Object.keys(TIERS);
 
 function normalizeTier(tier) {
   const t = String(tier || "").toLowerCase();
-  return TIERS[t] ? t : "micro";
+  if (!VALID_TIERS.includes(t)) {
+    throw new Error("Invalid tier");
+  }
+  return t;
 }
 
 /* =========================================================
@@ -31,8 +36,7 @@ function ensureCompanies(db) {
 }
 
 function safeStr(v, maxLen = 160) {
-  const s = String(v || "").trim();
-  return s ? s.slice(0, maxLen) : "";
+  return String(v || "").trim().slice(0, maxLen);
 }
 
 function nowISO() {
@@ -41,9 +45,7 @@ function nowISO() {
 
 function getCompanyById(db, id) {
   ensureCompanies(db);
-  const cid = String(id || "").trim();
-  if (!cid) return null;
-  return db.companies.find((c) => String(c.id) === cid) || null;
+  return db.companies.find((c) => c.id === id) || null;
 }
 
 function normalizeMembers(company) {
@@ -63,10 +65,9 @@ function normalizeMembers(company) {
 }
 
 function enforceUserLimit(company) {
-  const tier = normalizeTier(company.tier);
-  const limit = TIERS[tier].maxUsers;
-
   normalizeMembers(company);
+
+  const limit = TIERS[company.tier].maxUsers;
 
   if (company.members.length >= limit) {
     throw new Error(
@@ -76,14 +77,15 @@ function enforceUserLimit(company) {
 }
 
 function evaluateRestriction(company) {
-  const tier = normalizeTier(company.tier);
-  const limit = TIERS[tier].maxUsers;
-
   normalizeMembers(company);
 
-  if (company.members.length > limit) {
+  const limit = TIERS[company.tier].maxUsers;
+
+  company.isOverLimit = company.members.length > limit;
+
+  if (company.isOverLimit) {
     company.status = "Restricted";
-  } else if (company.status === "Restricted") {
+  } else {
     company.status = "Active";
   }
 }
@@ -106,7 +108,7 @@ function createCompany({
   ensureCompanies(db);
 
   const cleanName = safeStr(name, 120);
-  if (!cleanName) throw new Error("Company name is required");
+  if (!cleanName) throw new Error("Company name required");
 
   const normalizedTier = normalizeTier(tier);
 
@@ -122,7 +124,8 @@ function createCompany({
     maxUsers: TIERS[normalizedTier].maxUsers,
     createdAt: nowISO(),
     status: "Active",
-    createdBy: createdBy ? String(createdBy) : null,
+    isOverLimit: false,
+    createdBy: createdBy || null,
     members: [],
   };
 
@@ -147,7 +150,7 @@ function createCompany({
 }
 
 /* =========================================================
-   UPGRADE / DOWNGRADE COMPANY
+   UPGRADE / DOWNGRADE
 ========================================================= */
 
 function upgradeCompany(companyId, newTier, actorId) {
@@ -169,26 +172,97 @@ function upgradeCompany(companyId, newTier, actorId) {
   writeDb(db);
 
   audit({
-    actorId: actorId ? String(actorId) : null,
+    actorId: actorId || null,
     action: "COMPANY_TIER_CHANGED",
     targetType: "Company",
     targetId: c.id,
     metadata: {
       oldTier,
       newTier: normalizedTier,
-      status: c.status,
+      isOverLimit: c.isOverLimit,
     },
   });
 
-  if (c.status === "Restricted") {
+  if (c.isOverLimit) {
     createNotification({
       companyId: c.id,
       severity: "warn",
-      title: "Company restricted",
+      title: "Plan downgrade restriction",
       message:
-        "Member count exceeds new plan limit. Remove extra users or upgrade.",
+        "Member count exceeds current plan limit. Remove users or upgrade.",
     });
   }
+
+  return c;
+}
+
+/* =========================================================
+   MEMBER MANAGEMENT
+========================================================= */
+
+function addMember(companyId, userId, actorId, position = "member") {
+  const db = readDb();
+  ensureCompanies(db);
+
+  const c = getCompanyById(db, companyId);
+  if (!c) throw new Error("Company not found");
+
+  normalizeMembers(c);
+  enforceUserLimit(c);
+
+  const uid = String(userId || "").trim();
+  if (!uid) throw new Error("Missing userId");
+
+  const exists = c.members.find(
+    (m) => String(m.userId) === uid
+  );
+
+  if (!exists) {
+    c.members.push({
+      userId: uid,
+      position: safeStr(position, 80) || "member",
+      assignedAt: nowISO(),
+      assignedBy: actorId || null,
+    });
+
+    evaluateRestriction(c);
+    writeDb(db);
+
+    audit({
+      actorId: actorId || null,
+      action: "COMPANY_ADD_MEMBER",
+      targetType: "Company",
+      targetId: c.id,
+      metadata: { userId: uid },
+    });
+  }
+
+  return c;
+}
+
+function removeMember(companyId, userId, actorId) {
+  const db = readDb();
+  ensureCompanies(db);
+
+  const c = getCompanyById(db, companyId);
+  if (!c) throw new Error("Company not found");
+
+  normalizeMembers(c);
+
+  c.members = c.members.filter(
+    (m) => String(m.userId) !== String(userId)
+  );
+
+  evaluateRestriction(c);
+  writeDb(db);
+
+  audit({
+    actorId: actorId || null,
+    action: "COMPANY_REMOVE_MEMBER",
+    targetType: "Company",
+    targetId: c.id,
+    metadata: { userId },
+  });
 
   return c;
 }
@@ -208,87 +282,9 @@ function getCompany(id) {
   return getCompanyById(db, id);
 }
 
-/* =========================================================
-   MEMBER MANAGEMENT
-========================================================= */
-
-function addMember(companyId, userId, actorId, position = "member") {
-  const db = readDb();
-  ensureCompanies(db);
-
-  const c = getCompanyById(db, companyId);
-  if (!c) throw new Error("Company not found");
-
-  normalizeMembers(c);
-
-  enforceUserLimit(c);
-
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("Missing userId");
-
-  const exists = c.members.find(
-    (m) => String(m.userId) === uid
-  );
-
-  if (!exists) {
-    c.members.push({
-      userId: uid,
-      position: safeStr(position, 80) || "member",
-      assignedAt: nowISO(),
-      assignedBy: actorId ? String(actorId) : null,
-    });
-
-    evaluateRestriction(c);
-    writeDb(db);
-
-    audit({
-      actorId: actorId ? String(actorId) : null,
-      action: "COMPANY_ADD_MEMBER",
-      targetType: "Company",
-      targetId: c.id,
-      metadata: { userId: uid, position },
-    });
-  }
-
-  return c;
-}
-
-function removeMember(companyId, userId, actorId) {
-  const db = readDb();
-  ensureCompanies(db);
-
-  const c = getCompanyById(db, companyId);
-  if (!c) throw new Error("Company not found");
-
-  normalizeMembers(c);
-
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("Missing userId");
-
-  c.members = c.members.filter(
-    (m) => String(m.userId) !== uid
-  );
-
-  evaluateRestriction(c);
-  writeDb(db);
-
-  audit({
-    actorId: actorId ? String(actorId) : null,
-    action: "COMPANY_REMOVE_MEMBER",
-    targetType: "Company",
-    targetId: c.id,
-    metadata: { userId: uid },
-  });
-
-  return c;
-}
-
-/* =========================================================
-   EXPORT
-========================================================= */
-
 module.exports = {
   TIERS,
+  VALID_TIERS,
   createCompany,
   upgradeCompany,
   listCompanies,
