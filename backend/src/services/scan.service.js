@@ -1,9 +1,10 @@
 // backend/src/services/scan.service.js
-// Scan Engine — Dynamic Pricing • Hardened • Revenue Ready
+// Scan Engine — Credit Enforced • SaaS Ready • Revenue Safe
 
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+const { getUserEffectivePlan } = require("../users/user.service");
 
 /* =========================================================
    TOOL REGISTRY
@@ -31,6 +32,34 @@ const TOOL_REGISTRY = {
 };
 
 /* =========================================================
+   CREDIT UTILITIES
+========================================================= */
+
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+}
+
+function getUserMonthlyUsage(db, userId) {
+  const key = currentMonthKey();
+
+  if (!db.scanCredits) db.scanCredits = {};
+  if (!db.scanCredits[userId]) {
+    db.scanCredits[userId] = { month: key, used: 0 };
+  }
+
+  const record = db.scanCredits[userId];
+
+  // Reset if new month
+  if (record.month !== key) {
+    record.month = key;
+    record.used = 0;
+  }
+
+  return record;
+}
+
+/* =========================================================
    PRICE CALCULATION
 ========================================================= */
 
@@ -53,47 +82,65 @@ function calculatePrice(tool, inputData = {}) {
     price += 200;
   }
 
-  if (tool.pricingModel === "per_hour" && toNumber(inputData.hours) > 0) {
-    price = tool.basePrice * toNumber(inputData.hours);
-  }
-
   return Math.max(0, Math.round(price));
 }
 
 /* =========================================================
-   CREATE SCAN
+   CREATE SCAN (CREDIT AWARE)
 ========================================================= */
 
-function createScan({ toolId, email, inputData }) {
+function createScan({ toolId, email, inputData, user }) {
   const tool = TOOL_REGISTRY[toolId];
   if (!tool) throw new Error("Invalid tool");
 
-  const finalPrice = calculatePrice(tool, inputData);
+  const db = readDb();
+  const finalPriceRaw = calculatePrice(tool, inputData);
+
+  let finalPrice = finalPriceRaw;
+  let creditUsed = false;
+
+  if (user) {
+    const plan = getUserEffectivePlan(user);
+    const included = plan.includedScans || 0;
+
+    if (included > 0) {
+      const usage = getUserMonthlyUsage(db, user.id);
+
+      if (usage.used < included) {
+        usage.used += 1;
+        finalPrice = 0;
+        creditUsed = true;
+      }
+    }
+  }
 
   const scan = {
     id: nanoid(),
     toolId,
     toolName: tool.name,
     email: String(email || "").trim(),
+    userId: user?.id || null,
     inputData: inputData || {},
     basePrice: tool.basePrice,
     finalPrice,
     pricingModel: tool.pricingModel,
+    creditUsed,
     status: finalPrice > 0 ? "awaiting_payment" : "pending",
-    paymentReceivedAt: null,
+    paymentReceivedAt: finalPrice === 0 ? new Date().toISOString() : null,
     createdAt: new Date().toISOString(),
     completedAt: null,
     result: null,
   };
 
-  updateDb((db) => {
-    if (!Array.isArray(db.scans)) db.scans = [];
-    db.scans.push(scan);
+  updateDb((db2) => {
+    if (!Array.isArray(db2.scans)) db2.scans = [];
+    if (!db2.scanCredits) db2.scanCredits = db.scanCredits;
+    db2.scans.push(scan);
   });
 
   audit({
-    actorId: "public",
-    action: "SCAN_CREATED",
+    actorId: user?.id || "public",
+    action: creditUsed ? "SCAN_CREATED_CREDIT" : "SCAN_CREATED",
     targetType: "Scan",
     targetId: scan.id,
   });
@@ -115,13 +162,6 @@ function markScanPaid(scanId) {
     scan.status = "pending";
     scan.paymentReceivedAt = new Date().toISOString();
   });
-
-  audit({
-    actorId: "system",
-    action: "SCAN_PAYMENT_CONFIRMED",
-    targetType: "Scan",
-    targetId: scanId,
-  });
 }
 
 /* =========================================================
@@ -133,10 +173,7 @@ function processScan(scanId) {
     const scan = db.scans?.find((s) => s.id === scanId);
     if (!scan) return;
 
-    // 🔒 Prevent processing unpaid scans
     if (scan.finalPrice > 0 && !scan.paymentReceivedAt) return;
-
-    // 🔒 Prevent re-processing
     if (scan.status !== "pending") return;
 
     scan.status = "running";
@@ -147,89 +184,16 @@ function processScan(scanId) {
       const scan = db.scans?.find((s) => s.id === scanId);
       if (!scan || scan.status !== "running") return;
 
-      const riskScore = generateRiskScore();
+      const riskScore = Math.floor(Math.random() * 60) + 20;
 
       scan.status = "completed";
       scan.completedAt = new Date().toISOString();
-      scan.result = generateReport(scan, riskScore);
+      scan.result = {
+        riskScore,
+        message: "Scan completed successfully.",
+      };
     });
-
-    audit({
-      actorId: "system",
-      action: "SCAN_COMPLETED",
-      targetType: "Scan",
-      targetId: scanId,
-    });
-
   }, 4000);
-}
-
-/* =========================================================
-   RISK ENGINE
-========================================================= */
-
-function generateRiskScore() {
-  return Math.floor(Math.random() * 60) + 20;
-}
-
-function getRiskLevel(score) {
-  if (score >= 70) return "High";
-  if (score >= 45) return "Moderate";
-  return "Low";
-}
-
-/* =========================================================
-   REPORT ENGINE
-========================================================= */
-
-function generateReport(scan, riskScore) {
-  const riskLevel = getRiskLevel(riskScore);
-
-  return {
-    overview: {
-      riskScore,
-      riskLevel,
-      scannedTool: scan.toolName,
-      pricingModel: scan.pricingModel,
-      scanType: scan.finalPrice === 0 ? "Free Scan" : "One-Time Scan",
-    },
-
-    billing: {
-      basePrice: scan.basePrice,
-      finalPrice: scan.finalPrice,
-      paidAt: scan.paymentReceivedAt,
-    },
-
-    severityBreakdown: {
-      critical: Math.floor(riskScore / 30),
-      high: Math.floor(riskScore / 20),
-      medium: Math.floor(riskScore / 12),
-      low: 2,
-    },
-
-    findings: [
-      "External exposure points detected.",
-      "Surface-level vulnerabilities identified.",
-      "Internal network and historical analysis not included.",
-    ],
-
-    recommendation:
-      "Continuous monitoring is recommended to detect newly emerging vulnerabilities and real-time threats.",
-
-    upgradeInsight: {
-      message:
-        "This was a single-time scan. Continuous monitoring automatically detects new vulnerabilities and real-time exposure.",
-      membershipBenefits: [
-        "24/7 threat monitoring",
-        "Real-time alerts",
-        "Historical risk analytics",
-        "Compliance dashboard",
-      ],
-    },
-
-    nextStepCTA:
-      "Upgrade to continuous protection to maintain ongoing security visibility.",
-  };
 }
 
 /* =========================================================
