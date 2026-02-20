@@ -1,5 +1,6 @@
 // backend/src/services/invoice.service.js
-// Invoice Engine — Enterprise Grade • PDF Ready • Revenue Separated • Audit Safe
+// Invoice Engine — Enterprise Financial Integrity Layer
+// Refund Safe • Dispute Safe • Revenue Reconciliation Ready • PDF Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -47,15 +48,12 @@ function formatUsd(amount) {
 function generateInvoicePdf(invoice) {
   const filePath = path.join(INVOICE_DIR, `${invoice.invoiceNumber}.pdf`);
 
-  if (fs.existsSync(filePath)) {
-    return filePath;
-  }
+  if (fs.existsSync(filePath)) return filePath;
 
   const doc = new PDFDocument({ margin: 50 });
   const stream = fs.createWriteStream(filePath);
   doc.pipe(stream);
 
-  /* HEADER */
   doc.fontSize(20).text("INVOICE", { align: "right" });
   doc.moveDown();
 
@@ -63,40 +61,36 @@ function generateInvoicePdf(invoice) {
   doc.text(`Invoice Number: ${invoice.invoiceNumber}`);
   doc.text(`Date: ${invoice.createdAt}`);
   doc.text(`User ID: ${invoice.userId}`);
+  doc.text(`Type: ${invoice.type}`);
   doc.moveDown();
 
   doc.moveTo(50, doc.y).lineTo(550, doc.y).stroke();
   doc.moveDown();
 
-  /* LINE ITEMS */
   doc.fontSize(14).text("Service Breakdown", { underline: true });
   doc.moveDown();
 
-  if (invoice.type === "subscription") {
-    doc.text(`Automation Service: ${formatUsd(invoice.amount)}`);
-  }
+  doc.text(`Amount: ${formatUsd(invoice.amount)}`);
 
-  if (invoice.type === "autoprotect") {
-    doc.text(`Automation Service: ${formatUsd(invoice.amount - 50)}`);
-    doc.text(`Platform Fee: ${formatUsd(50)}`);
-  }
-
-  if (invoice.type === "tool") {
-    doc.text(`Security Tool Service: ${formatUsd(invoice.amount)}`);
+  if (invoice.type === "refund") {
+    doc.moveDown();
+    doc.fillColor("red").text("Refund Adjustment Applied");
+    doc.fillColor("black");
   }
 
   doc.moveDown();
   doc.moveTo(50, doc.y).lineTo(550, doc.y).stroke();
   doc.moveDown();
 
-  doc.fontSize(16).text(`Total Paid: ${formatUsd(invoice.amount)}`, {
-    align: "right",
-  });
+  doc.fontSize(16).text(
+    `Total: ${formatUsd(invoice.amount)}`,
+    { align: "right" }
+  );
 
   doc.moveDown(2);
 
   doc.fontSize(10).text(
-    "This invoice reflects payment for platform services rendered. Platform fees are service-based charges and not tax representations.",
+    "This invoice reflects platform service transactions. Platform fees are service-based charges and not tax representations.",
     { align: "left" }
   );
 
@@ -118,7 +112,7 @@ function createInvoice({
   amountPaidCents,
   meta = {},
 }) {
-  if (!userId || !amountPaidCents) {
+  if (!userId || typeof amountPaidCents !== "number") {
     throw new Error("Invalid invoice payload");
   }
 
@@ -140,17 +134,18 @@ function createInvoice({
   };
 
   updateDb((db) => {
+    // 🔐 Idempotency protection
     const duplicate = db.invoices.find(
       (i) =>
-        i.stripeSessionId &&
-        stripeSessionId &&
-        i.stripeSessionId === stripeSessionId
+        stripePaymentIntentId &&
+        i.stripePaymentIntentId === stripePaymentIntentId
     );
 
     if (duplicate) return;
 
     db.invoices.push(invoice);
 
+    // 🔥 Revenue reconciliation
     db.revenueSummary.totalRevenue += amountUsd;
 
     if (type === "autoprotect")
@@ -161,6 +156,10 @@ function createInvoice({
 
     if (type === "tool")
       db.revenueSummary.toolRevenue += amountUsd;
+
+    if (type === "refund") {
+      db.revenueSummary.totalRevenue -= Math.abs(amountUsd);
+    }
   });
 
   audit({
@@ -172,6 +171,25 @@ function createInvoice({
   });
 
   return invoice;
+}
+
+/* =========================================================
+   REFUND ENGINE
+========================================================= */
+
+function createRefundInvoice({
+  userId,
+  stripePaymentIntentId,
+  amountRefundedCents,
+  reason = "refund",
+}) {
+  return createInvoice({
+    userId,
+    type: "refund",
+    stripePaymentIntentId,
+    amountPaidCents: -Math.abs(amountRefundedCents),
+    meta: { reason },
+  });
 }
 
 /* =========================================================
@@ -209,6 +227,7 @@ function getAllInvoices() {
 
 module.exports = {
   createInvoice,
+  createRefundInvoice,
   getInvoicePdf,
   getUserInvoices,
   getAllInvoices,
