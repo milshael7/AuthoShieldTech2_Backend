@@ -1,13 +1,21 @@
 // backend/src/autoprotect/autoprotect.service.js
-// Project Engine — Hardened • Branch Aware • Company Safe
+// AutoProtect Engine — Fully Hardened • Schedule Aware • Limit Enforced
 
 const { audit } = require("../lib/audit");
 const { createNotification } = require("../lib/notify");
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
+const {
+  canRunAutoProtect,
+  registerAutoProtectJob,
+} = require("../users/user.service");
 
 /* =========================================================
-   HELPERS
+   UTIL
 ========================================================= */
+
+function now() {
+  return new Date();
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -21,10 +29,13 @@ function isObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
 }
 
-function ensureCompanyMembership(actorId, companyId) {
-  if (!companyId) return true;
+/* =========================================================
+   MEMBERSHIP ENFORCEMENT
+========================================================= */
 
+function ensureCompanyMembership(actorId, companyId) {
   const db = readDb();
+
   const company = (db.companies || []).find(
     (c) => c.id === companyId
   );
@@ -45,120 +56,170 @@ function ensureCompanyMembership(actorId, companyId) {
 }
 
 /* =========================================================
-   RESPONSE PLAYBOOK
+   SCHEDULE + VACATION CHECK
 ========================================================= */
 
-function guidanceForIssue(issue) {
-  const type = clean(issue?.type, 100).toLowerCase();
+function withinWorkingWindow(userAPCompany) {
+  if (!userAPCompany?.schedule) return false;
 
-  const base = [
-    "Confirm scope (what, who, when).",
-    "Preserve evidence (logs, timestamps).",
-    "Contain (isolate impacted accounts/systems).",
-    "Eradicate (patch, rotate credentials, remove artifacts).",
-    "Recover (restore services and monitor).",
-    "Document findings and actions taken.",
-  ];
+  const { workingDays, startTime, endTime } =
+    userAPCompany.schedule;
 
-  if (type === "phishing") {
-    base.unshift(
-      "Send internal advisory to avoid suspicious links."
-    );
-  }
+  const nowDate = now();
 
-  if (type === "malware") {
-    base.unshift(
-      "Disconnect impacted endpoint from the network immediately."
-    );
-  }
+  const day = nowDate.getDay(); // 0-6
+  const hour = nowDate.getHours();
+  const minute = nowDate.getMinutes();
 
-  if (type === "ransomware") {
-    base.unshift(
-      "Disable lateral movement and isolate affected systems."
-    );
-  }
+  const timeNow = hour * 60 + minute;
 
-  return base;
+  const startParts = (startTime || "00:00").split(":");
+  const endParts = (endTime || "23:59").split(":");
+
+  const start = parseInt(startParts[0]) * 60 +
+    parseInt(startParts[1] || 0);
+  const end = parseInt(endParts[0]) * 60 +
+    parseInt(endParts[1] || 0);
+
+  const workingDayMatch =
+    Array.isArray(workingDays) &&
+    workingDays.includes(day);
+
+  return workingDayMatch && timeNow >= start && timeNow <= end;
+}
+
+function withinVacation(userAPCompany) {
+  if (!userAPCompany?.vacation?.from) return false;
+
+  const nowTs = Date.now();
+  const from = new Date(userAPCompany.vacation.from).getTime();
+  const to = new Date(userAPCompany.vacation.to).getTime();
+
+  return nowTs >= from && nowTs <= to;
 }
 
 /* =========================================================
-   PROJECT CREATION
+   RUN AUTOPROTECT JOB
 ========================================================= */
 
-function createProject({
+function runAutoProtectJob({
   actorId,
-  companyId = null,
+  companyId,
   title,
   issue,
 }) {
-  if (!actorId) {
-    throw new Error("Actor required");
-  }
-
-  if (!clean(title, 200)) {
-    throw new Error("Title required");
+  if (!actorId || !companyId) {
+    throw new Error("Actor and company required");
   }
 
   if (!isObject(issue)) {
     throw new Error("Invalid issue payload");
   }
 
-  const issueType = clean(issue.type, 100);
-  const details = clean(issue.details, 2000);
-
-  if (!issueType) {
-    throw new Error("Issue type required");
-  }
-
-  // 🔐 Membership enforcement
   ensureCompanyMembership(actorId, companyId);
 
-  const project = {
-    id: `PRJ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    title: clean(title, 200),
-    companyId: companyId || null,
-    issue: {
-      type: issueType,
-      details,
-    },
-    createdAt: nowIso(),
-    status: "Open",
-    steps: guidanceForIssue({ type: issueType }),
-    notes: [],
-  };
+  /* --------------------------------------------------
+     🔥 STATUS + LIMIT CHECK
+  -------------------------------------------------- */
+
+  if (!canRunAutoProtect(actorId)) {
+    throw new Error("AutoProtect inactive or limit reached");
+  }
+
+  const db = readDb();
+  const userAP = db.autoprotek?.users?.[actorId];
+
+  if (!userAP) {
+    throw new Error("AutoProtect not configured");
+  }
+
+  const companyContainer =
+    userAP.companies?.[companyId];
+
+  if (!companyContainer) {
+    throw new Error("Company schedule not configured");
+  }
+
+  if (!withinWorkingWindow(companyContainer)) {
+    throw new Error("Outside working schedule");
+  }
+
+  if (withinVacation(companyContainer)) {
+    throw new Error("User on vacation");
+  }
 
   /* --------------------------------------------------
-     AUDIT
+     🔥 JOB CREATION
+  -------------------------------------------------- */
+
+  const jobId = `AP-${Date.now()}-${Math.floor(
+    Math.random() * 1000
+  )}`;
+
+  const report = {
+    id: jobId,
+    title: clean(title, 200),
+    issueType: clean(issue.type, 100),
+    details: clean(issue.details, 2000),
+    createdAt: nowIso(),
+    completedAt: nowIso(),
+    status: "Completed",
+  };
+
+  updateDb((db2) => {
+    const ap = db2.autoprotek.users[actorId];
+    const companyData =
+      ap.companies[companyId];
+
+    companyData.reports = companyData.reports || [];
+    companyData.emailDrafts =
+      companyData.emailDrafts || [];
+
+    companyData.reports.push(report);
+
+    companyData.emailDrafts.push({
+      id: `EMAIL-${jobId}`,
+      reportId: jobId,
+      createdAt: nowIso(),
+      sent: false,
+    });
+  });
+
+  /* --------------------------------------------------
+     🔥 REGISTER JOB COUNT
+  -------------------------------------------------- */
+
+  registerAutoProtectJob(actorId);
+
+  /* --------------------------------------------------
+     🔥 AUDIT
   -------------------------------------------------- */
 
   audit({
     actorId,
-    action: "PROJECT_CREATED",
-    targetType: "Project",
-    targetId: project.id,
+    action: "AUTOPROTECT_JOB_EXECUTED",
+    targetType: "Company",
+    targetId: companyId,
     metadata: {
-      companyId,
-      issueType,
+      jobId,
+      timestamp: nowIso(),
     },
   });
 
   /* --------------------------------------------------
-     NOTIFY (COMPANY SCOPED)
+     🔥 NOTIFY OWNER
   -------------------------------------------------- */
 
-  if (companyId) {
-    createNotification({
-      companyId,
-      severity: "info",
-      title: "New project created",
-      message: `Project "${project.title}" opened.`,
-    });
-  }
+  createNotification({
+    companyId,
+    severity: "info",
+    title: "AutoProtect completed job",
+    message: `Job ${jobId} completed at ${nowIso()}`,
+  });
 
-  return project;
+  return report;
 }
 
 module.exports = {
-  guidanceForIssue,
-  createProject,
+  runAutoProtectJob,
 };
