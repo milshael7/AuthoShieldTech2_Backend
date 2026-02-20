@@ -1,218 +1,179 @@
 // backend/src/routes/autoprotect.routes.js
-// AutoProtect Routes — FINAL LOCKED VERSION
-//
-// RULES ENFORCED:
-// ✅ AutoProtect = INDIVIDUAL USERS ONLY
-// ❌ Companies CANNOT enable AutoProtect
-// ❌ Managers/Admins CANNOT modify AutoProtect (mirror view only)
-// ✅ No room leakage
-// ✅ Admin sees GLOBAL status (read-only)
-// ✅ Creates guided security projects (no silent actions)
-//
-// THIS FILE IS COMPLETE. DO NOT PATCH LATER.
+// AutoProtect Routes — Engine Integrated • Limit Enforced • Individual Only
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-const { authRequired } = require('../middleware/auth');
-const users = require('../users/user.service');
-const { readDb, writeDb } = require('../lib/db');
-const { audit } = require('../lib/audit');
-const { createNotification } = require('../lib/notify');
-const { createProject } = require('../services/autoprotect.project');
+const { authRequired } = require("../middleware/auth");
+const users = require("../users/user.service");
+const {
+  activateAutoProtect,
+  deactivateAutoProtect,
+  canRunAutoProtect,
+} = require("../users/user.service");
 
-// -------------------- helpers --------------------
+const { runAutoProtectJob } = require("../autoprotect/autoprotect.service");
+const { readDb } = require("../lib/db");
+
+router.use(authRequired);
+
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function nowISO() {
   return new Date().toISOString();
 }
 
-function roleOf(u) {
-  return String(u?.role || '');
+function isIndividual(user) {
+  return user.role === users.ROLES.INDIVIDUAL;
 }
 
-function isAdmin(u) {
-  return roleOf(u) === users.ROLES.ADMIN;
-}
-function isManager(u) {
-  return roleOf(u) === users.ROLES.MANAGER;
-}
-function isCompany(u) {
-  return roleOf(u) === users.ROLES.COMPANY;
-}
-function isIndividual(u) {
-  return roleOf(u) === users.ROLES.INDIVIDUAL;
+function isAdmin(user) {
+  return user.role === users.ROLES.ADMIN;
 }
 
-// 🚨 HARD RULE: ONLY INDIVIDUAL USERS
-function assertIndividualOnly(user) {
-  if (!isIndividual(user)) {
-    return {
-      allowed: false,
-      reason: 'AutoProtect is available to Individual users only.',
-    };
-  }
-  return { allowed: true };
+function isManager(user) {
+  return user.role === users.ROLES.MANAGER;
 }
 
-// -------------------- middleware --------------------
-router.use(authRequired);
+/* =========================================================
+   STATUS
+========================================================= */
 
-// -------------------- ROUTES --------------------
-
-/**
- * GET /api/autoprotect/status
- * - Individual: sees own status
- * - Admin/Manager: GLOBAL MIRROR (read-only)
- */
-router.get('/status', (req, res) => {
-  const db = readDb();
+router.get("/status", (req, res) => {
   const user = req.user;
+  const db = readDb();
 
-  // ADMIN / MANAGER = GLOBAL READ-ONLY
+  // Admin / Manager = read-only mirror
   if (isAdmin(user) || isManager(user)) {
-    const individuals = (db.users || []).filter(u => u.role === users.ROLES.INDIVIDUAL);
+    const apUsers = Object.keys(
+      db.autoprotek?.users || {}
+    );
 
     return res.json({
-      scope: 'global',
-      totals: {
-        individuals: individuals.length,
-        enabled: individuals.filter(u => u.autoprotectEnabled).length,
-        disabled: individuals.filter(u => !u.autoprotectEnabled).length,
-      },
+      scope: "global",
+      totalActive: apUsers.length,
       time: nowISO(),
       readOnly: true,
     });
   }
 
-  // COMPANY = NOT ALLOWED
-  if (isCompany(user)) {
+  if (!isIndividual(user)) {
     return res.status(403).json({
       ok: false,
-      error: 'Companies cannot use AutoProtect.',
+      error: "AutoProtect available to Individuals only.",
     });
   }
 
-  // INDIVIDUAL
+  const userAP =
+    db.autoprotek?.users?.[user.id];
+
   return res.json({
-    scope: 'user',
-    enabled: !!user.autoprotectEnabled,
-    message: user.autoprotectEnabled
-      ? 'AutoProtect is active.'
-      : 'AutoProtect is disabled.',
+    scope: "user",
+    status: userAP?.status || "INACTIVE",
+    monthlyLimit: userAP?.monthlyJobLimit || 0,
+    jobsUsed: userAP?.jobsUsedThisMonth || 0,
     time: nowISO(),
   });
 });
 
-/**
- * POST /api/autoprotect/enable
- * Individual ONLY
- */
-router.post('/enable', (req, res) => {
+/* =========================================================
+   ENABLE
+========================================================= */
+
+router.post("/enable", (req, res) => {
   const user = req.user;
 
-  const gate = assertIndividualOnly(user);
-  if (!gate.allowed) {
-    return res.status(403).json({ ok: false, error: gate.reason });
+  if (!isIndividual(user)) {
+    return res.status(403).json({
+      ok: false,
+      error: "AutoProtect available to Individuals only.",
+    });
   }
 
-  const db = readDb();
-  const u = db.users.find(x => x.id === user.id);
-  if (!u) return res.status(404).json({ ok: false, error: 'User not found.' });
-
-  u.autoprotectEnabled = true;
-  writeDb(db);
-
-  audit({
-    actorId: user.id,
-    action: 'AUTOPROTECT_ENABLED',
-    targetType: 'User',
-    targetId: user.id,
-  });
-
-  createNotification({
-    userId: user.id,
-    severity: 'info',
-    title: 'AutoProtect Enabled',
-    message: 'AutoProtect is now actively monitoring your account.',
-  });
+  activateAutoProtect(user.id);
 
   return res.json({
     ok: true,
-    enabled: true,
+    status: "ACTIVE",
     time: nowISO(),
   });
 });
 
-/**
- * POST /api/autoprotect/disable
- * Individual ONLY
- */
-router.post('/disable', (req, res) => {
+/* =========================================================
+   DISABLE
+========================================================= */
+
+router.post("/disable", (req, res) => {
   const user = req.user;
 
-  const gate = assertIndividualOnly(user);
-  if (!gate.allowed) {
-    return res.status(403).json({ ok: false, error: gate.reason });
+  if (!isIndividual(user)) {
+    return res.status(403).json({
+      ok: false,
+      error: "AutoProtect available to Individuals only.",
+    });
   }
 
-  const db = readDb();
-  const u = db.users.find(x => x.id === user.id);
-  if (!u) return res.status(404).json({ ok: false, error: 'User not found.' });
-
-  u.autoprotectEnabled = false;
-  writeDb(db);
-
-  audit({
-    actorId: user.id,
-    action: 'AUTOPROTECT_DISABLED',
-    targetType: 'User',
-    targetId: user.id,
-  });
+  deactivateAutoProtect(user.id);
 
   return res.json({
     ok: true,
-    enabled: false,
+    status: "INACTIVE",
     time: nowISO(),
   });
 });
 
-/**
- * POST /api/autoprotect/project
- * Creates a guided security project (NO silent fixes)
- * Individual ONLY
- */
-router.post('/project', (req, res) => {
+/* =========================================================
+   RUN JOB (ENGINE)
+========================================================= */
+
+router.post("/run", (req, res) => {
   const user = req.user;
 
-  const gate = assertIndividualOnly(user);
-  if (!gate.allowed) {
-    return res.status(403).json({ ok: false, error: gate.reason });
+  if (!isIndividual(user)) {
+    return res.status(403).json({
+      ok: false,
+      error: "AutoProtect available to Individuals only.",
+    });
   }
 
-  if (!user.autoprotectEnabled) {
+  if (!canRunAutoProtect(user.id)) {
     return res.status(400).json({
       ok: false,
-      error: 'Enable AutoProtect before creating projects.',
+      error: "AutoProtect inactive or monthly limit reached.",
     });
   }
 
-  const { title, issue } = req.body || {};
-  if (!title || !issue) {
-    return res.status(400).json({ ok: false, error: 'Missing title or issue.' });
+  const { companyId, title, issue } =
+    req.body || {};
+
+  if (!companyId || !title || !issue) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing companyId, title, or issue.",
+    });
   }
 
-  const project = createProject({
-    actorId: user.id,
-    title,
-    issue,
-  });
+  try {
+    const report = runAutoProtectJob({
+      actorId: user.id,
+      companyId,
+      title,
+      issue,
+    });
 
-  return res.status(201).json({
-    ok: true,
-    project,
-    time: nowISO(),
-  });
+    return res.status(201).json({
+      ok: true,
+      report,
+      time: nowISO(),
+    });
+  } catch (e) {
+    return res.status(400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
 });
 
 module.exports = router;
