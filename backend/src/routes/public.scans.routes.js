@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Credit Enforced • Discount Applied • Revenue Accurate
+// Public Scan Routes — Credit Enforced • Discount Accurate • Hardened
 
 const express = require("express");
 const router = express.Router();
@@ -39,6 +39,29 @@ function getOptionalUser(req) {
 }
 
 /* =========================================================
+   SAFE INPUT
+========================================================= */
+
+function sanitizeInput(input = {}) {
+  return {
+    depth:
+      input.depth === "deep" || input.depth === "enterprise"
+        ? input.depth
+        : "standard",
+
+    urgency:
+      input.urgency === "rush"
+        ? "rush"
+        : "normal",
+
+    targets: Math.max(
+      1,
+      Math.min(Number(input.targets) || 1, 100)
+    ),
+  };
+}
+
+/* =========================================================
    LIST TOOLS
 ========================================================= */
 
@@ -75,12 +98,29 @@ router.post("/", async (req, res) => {
       });
     }
 
+    if (!TOOL_REGISTRY[toolId]) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid tool",
+      });
+    }
+
     const user = getOptionalUser(req);
+
+    // 🔒 Prevent impersonation
+    if (user && user.email !== email) {
+      return res.status(403).json({
+        ok: false,
+        error: "Email mismatch",
+      });
+    }
+
+    const safeInput = sanitizeInput(inputData);
 
     const scan = createScan({
       toolId,
       email,
-      inputData: inputData || {},
+      inputData: safeInput,
       user,
     });
 
@@ -98,7 +138,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    /* ================= DISCOUNT ENGINE ================= */
+    /* ================= DISCOUNT ================= */
 
     let finalCharge = scan.finalPrice;
     let discountPercent = 0;
@@ -114,7 +154,6 @@ router.post("/", async (req, res) => {
           (scan.finalPrice * discountPercent) / 100
       );
 
-      /* 🔥 Update stored scan price to discounted amount */
       updateDb((db) => {
         const s = db.scans?.find((x) => x.id === scan.id);
         if (s) {
@@ -144,7 +183,6 @@ router.post("/", async (req, res) => {
       ok: true,
       scanId: scan.id,
       basePrice: scan.basePrice,
-      originalPrice: scan.basePrice,
       finalCharge,
       discountPercent,
       planLabel,
