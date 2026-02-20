@@ -1,18 +1,19 @@
 // backend/src/services/scan.service.js
-// Scan Engine — Dynamic Pricing • Queue Based • Revenue Optimized
+// Scan Engine — Dynamic Pricing • Hardened • Revenue Ready
 
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
 
 /* =========================================================
-   TOOL REGISTRY (BASE CONFIG)
+   TOOL REGISTRY
 ========================================================= */
 
 const TOOL_REGISTRY = {
   "vulnerability-scan": {
     name: "Vulnerability Scan",
     basePrice: 199,
-    pricingModel: "per_scan", // per_scan | per_hour
+    pricingModel: "per_scan",
     type: "paid",
   },
   "dark-web-scan": {
@@ -30,29 +31,30 @@ const TOOL_REGISTRY = {
 };
 
 /* =========================================================
-   PRICE CALCULATION ENGINE
+   PRICE CALCULATION
 ========================================================= */
 
-function calculatePrice(tool, inputData = {}) {
-  let price = tool.basePrice;
+function toNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 
-  // Depth multiplier
+function calculatePrice(tool, inputData = {}) {
+  let price = toNumber(tool.basePrice);
+
   if (inputData.depth === "deep") price += 150;
   if (inputData.depth === "enterprise") price += 400;
 
-  // Multiple targets
-  if (inputData.targets && Number(inputData.targets) > 1) {
-    price += (Number(inputData.targets) - 1) * 50;
+  if (toNumber(inputData.targets) > 1) {
+    price += (toNumber(inputData.targets) - 1) * 50;
   }
 
-  // Urgency
   if (inputData.urgency === "rush") {
     price += 200;
   }
 
-  // Hourly model support
-  if (tool.pricingModel === "per_hour" && inputData.hours) {
-    price = tool.basePrice * Number(inputData.hours);
+  if (tool.pricingModel === "per_hour" && toNumber(inputData.hours) > 0) {
+    price = tool.basePrice * toNumber(inputData.hours);
   }
 
   return Math.max(0, Math.round(price));
@@ -72,12 +74,13 @@ function createScan({ toolId, email, inputData }) {
     id: nanoid(),
     toolId,
     toolName: tool.name,
-    email,
-    inputData,
+    email: String(email || "").trim(),
+    inputData: inputData || {},
     basePrice: tool.basePrice,
     finalPrice,
     pricingModel: tool.pricingModel,
     status: finalPrice > 0 ? "awaiting_payment" : "pending",
+    paymentReceivedAt: null,
     createdAt: new Date().toISOString(),
     completedAt: null,
     result: null,
@@ -86,6 +89,13 @@ function createScan({ toolId, email, inputData }) {
   updateDb((db) => {
     if (!Array.isArray(db.scans)) db.scans = [];
     db.scans.push(scan);
+  });
+
+  audit({
+    actorId: "public",
+    action: "SCAN_CREATED",
+    targetType: "Scan",
+    targetId: scan.id,
   });
 
   return scan;
@@ -97,12 +107,20 @@ function createScan({ toolId, email, inputData }) {
 
 function markScanPaid(scanId) {
   updateDb((db) => {
-    const scan = db.scans.find((s) => s.id === scanId);
+    const scan = db.scans?.find((s) => s.id === scanId);
     if (!scan) return;
 
-    if (scan.status === "awaiting_payment") {
-      scan.status = "pending";
-    }
+    if (scan.status !== "awaiting_payment") return;
+
+    scan.status = "pending";
+    scan.paymentReceivedAt = new Date().toISOString();
+  });
+
+  audit({
+    actorId: "system",
+    action: "SCAN_PAYMENT_CONFIRMED",
+    targetType: "Scan",
+    targetId: scanId,
   });
 }
 
@@ -112,15 +130,22 @@ function markScanPaid(scanId) {
 
 function processScan(scanId) {
   updateDb((db) => {
-    const scan = db.scans.find((s) => s.id === scanId);
-    if (!scan || scan.status !== "pending") return;
+    const scan = db.scans?.find((s) => s.id === scanId);
+    if (!scan) return;
+
+    // 🔒 Prevent processing unpaid scans
+    if (scan.finalPrice > 0 && !scan.paymentReceivedAt) return;
+
+    // 🔒 Prevent re-processing
+    if (scan.status !== "pending") return;
+
     scan.status = "running";
   });
 
   setTimeout(() => {
     updateDb((db) => {
-      const scan = db.scans.find((s) => s.id === scanId);
-      if (!scan) return;
+      const scan = db.scans?.find((s) => s.id === scanId);
+      if (!scan || scan.status !== "running") return;
 
       const riskScore = generateRiskScore();
 
@@ -128,6 +153,14 @@ function processScan(scanId) {
       scan.completedAt = new Date().toISOString();
       scan.result = generateReport(scan, riskScore);
     });
+
+    audit({
+      actorId: "system",
+      action: "SCAN_COMPLETED",
+      targetType: "Scan",
+      targetId: scanId,
+    });
+
   }, 4000);
 }
 
@@ -164,6 +197,7 @@ function generateReport(scan, riskScore) {
     billing: {
       basePrice: scan.basePrice,
       finalPrice: scan.finalPrice,
+      paidAt: scan.paymentReceivedAt,
     },
 
     severityBreakdown: {
@@ -204,7 +238,7 @@ function generateReport(scan, riskScore) {
 
 function getScan(scanId) {
   const db = readDb();
-  return db.scans.find((s) => s.id === scanId);
+  return db.scans?.find((s) => s.id === scanId) || null;
 }
 
 module.exports = {
