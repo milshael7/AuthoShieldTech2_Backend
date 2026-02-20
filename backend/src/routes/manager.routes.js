@@ -1,41 +1,29 @@
 // backend/src/routes/manager.routes.js
-// Manager API — Phase 8 Hardened
-// Manager approval layer (non-final)
-// Admin inherits access
-// Strict hierarchy enforcement
+// Manager API — Tenant Scoped • Enterprise Hardened • Admin Override Safe
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
 const { readDb, writeDb } = require("../lib/db");
-
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { listNotifications } = require("../lib/notify");
 
-/* =========================================================
-   ROLE SAFETY
-========================================================= */
-
 const MANAGER = users?.ROLES?.MANAGER || "Manager";
 const ADMIN = users?.ROLES?.ADMIN || "Admin";
-
-/* =========================================================
-   MIDDLEWARE
-========================================================= */
 
 router.use(authRequired);
 router.use(requireRole(MANAGER, { adminAlso: true }));
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ========================================================= */
 
-function clampInt(n, min, max, fallback) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(x)));
+function requireTenant(req) {
+  if (!req.tenant || !req.tenant.id) {
+    const err = new Error("Tenant context required");
+    err.status = 403;
+    throw err;
+  }
 }
 
 function safeStr(v, maxLen = 120) {
@@ -43,58 +31,33 @@ function safeStr(v, maxLen = 120) {
   return s ? s.slice(0, maxLen) : "";
 }
 
-function requireId(id) {
-  const clean = safeStr(id, 100);
-  if (!clean) throw new Error("Invalid id");
-  return clean;
-}
-
-function ensureManagerActive(req) {
-  if (req.user?.locked) {
-    const err = new Error("Manager account suspended");
-    err.status = 403;
-    throw err;
-  }
-}
-
-function audit(action, actorId, targetId) {
-  const db = readDb();
-  db.audit = db.audit || [];
-
-  db.audit.push({
-    id: Date.now().toString(),
-    at: new Date().toISOString(),
-    action,
-    actorId,
-    targetId,
-  });
-
-  writeDb(db);
+function clampInt(n, min, max, fallback) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(x)));
 }
 
 /* =========================================================
-   APPROVAL SYSTEM (MANAGER LAYER)
+   PENDING USERS (Scoped)
 ========================================================= */
 
-/**
- * Manager sees ONLY strictly pending users
- */
 router.get("/pending-users", (req, res) => {
   try {
-    ensureManagerActive(req);
-
     const db = readDb();
+    const isAdmin = req.user.role === ADMIN;
 
-    const list = (db.users || []).filter(
-      (u) =>
-        u.status === users.APPROVAL_STATUS.PENDING &&
-        u.role !== ADMIN
+    let list = db.users.filter(
+      (u) => u.status === users.APPROVAL_STATUS.PENDING
     );
 
-    return res.json({
-      ok: true,
-      users: list,
-    });
+    if (!isAdmin) {
+      requireTenant(req);
+      list = list.filter(
+        (u) => u.companyId === req.tenant.id
+      );
+    }
+
+    return res.json({ ok: true, users: list });
 
   } catch (e) {
     return res.status(e.status || 400).json({
@@ -104,43 +67,43 @@ router.get("/pending-users", (req, res) => {
   }
 });
 
-/**
- * Manager approval (NOT FINAL)
- * Cannot approve Admin
- * Cannot approve already processed users
- */
+/* =========================================================
+   APPROVE USER (Scoped)
+========================================================= */
+
 router.post("/users/:id/approve", (req, res) => {
   try {
-    ensureManagerActive(req);
-
-    const id = requireId(req.params.id);
+    const id = safeStr(req.params.id, 100);
     const db = readDb();
+    const isAdmin = req.user.role === ADMIN;
 
-    const u = (db.users || []).find((x) => x.id === id);
+    const u = db.users.find((x) => x.id === id);
     if (!u) throw new Error("User not found");
 
     if (u.role === ADMIN) {
       throw new Error("Managers cannot approve admin accounts");
     }
 
+    if (!isAdmin) {
+      requireTenant(req);
+      if (u.companyId !== req.tenant.id) {
+        throw new Error("Cannot approve outside tenant");
+      }
+    }
+
     if (u.status !== users.APPROVAL_STATUS.PENDING) {
-      throw new Error("User not eligible for manager approval");
+      throw new Error("User not eligible");
     }
 
     u.status = users.APPROVAL_STATUS.MANAGER_APPROVED;
-    u.approvedBy = "manager";
+    u.approvedBy = req.user.id;
 
     writeDb(db);
 
-    audit("MANAGER_APPROVE_USER", req.user.id, id);
-
-    return res.json({
-      ok: true,
-      user: u,
-    });
+    return res.json({ ok: true, user: u });
 
   } catch (e) {
-    return res.status(e.status || 400).json({
+    return res.status(400).json({
       ok: false,
       error: e.message,
     });
@@ -148,45 +111,24 @@ router.post("/users/:id/approve", (req, res) => {
 });
 
 /* =========================================================
-   OVERVIEW
-========================================================= */
-
-router.get("/overview", (req, res) => {
-  try {
-    ensureManagerActive(req);
-
-    const db = readDb();
-
-    return res.json({
-      ok: true,
-      overview: {
-        users: db.users?.length || 0,
-        companies: db.companies?.length || 0,
-        auditEvents: db.audit?.length || 0,
-        notifications: db.notifications?.length || 0,
-      },
-      time: new Date().toISOString(),
-    });
-
-  } catch (e) {
-    return res.status(e.status || 500).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
-  }
-});
-
-/* =========================================================
-   USERS (READ-ONLY)
+   USERS (Scoped)
 ========================================================= */
 
 router.get("/users", (req, res) => {
   try {
-    ensureManagerActive(req);
+    const db = readDb();
+    const isAdmin = req.user.role === ADMIN;
 
-    const allUsers = users.listUsers() || [];
+    let list = db.users;
 
-    const sanitized = allUsers.map((u) => ({
+    if (!isAdmin) {
+      requireTenant(req);
+      list = list.filter(
+        (u) => u.companyId === req.tenant.id
+      );
+    }
+
+    const sanitized = list.map((u) => ({
       id: u.id,
       email: u.email,
       role: u.role,
@@ -195,101 +137,63 @@ router.get("/users", (req, res) => {
       status: u.status,
     }));
 
-    return res.json({
-      ok: true,
-      users: sanitized,
-    });
+    return res.json({ ok: true, users: sanitized });
 
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
 
 /* =========================================================
-   COMPANIES (READ-ONLY)
+   COMPANIES (Scoped)
 ========================================================= */
 
 router.get("/companies", (req, res) => {
   try {
-    ensureManagerActive(req);
+    const isAdmin = req.user.role === ADMIN;
 
-    const list = companies.listCompanies() || [];
-
-    const sanitized = list.map((c) => ({
-      id: c.id,
-      name: c.name,
-      suspended: !!c.suspended,
-      sizeTier: c.sizeTier || "standard",
-      createdAt: c.createdAt || null,
-    }));
+    if (!isAdmin) {
+      requireTenant(req);
+      return res.json({
+        ok: true,
+        companies: [
+          companies.getCompany(req.tenant.id),
+        ],
+      });
+    }
 
     return res.json({
       ok: true,
-      companies: sanitized,
+      companies: companies.listCompanies(),
     });
 
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
 
 /* =========================================================
-   NOTIFICATIONS
-========================================================= */
-
-router.get("/notifications", (req, res) => {
-  try {
-    ensureManagerActive(req);
-
-    const limit = clampInt(req.query.limit, 1, 1000, 200);
-    const all = listNotifications({}) || [];
-
-    return res.json({
-      ok: true,
-      notifications: all.slice(0, limit),
-    });
-
-  } catch (e) {
-    return res.status(e.status || 500).json({
-      ok: false,
-      error: e?.message || String(e),
-    });
-  }
-});
-
-/* =========================================================
-   AUDIT
+   AUDIT (Scoped)
 ========================================================= */
 
 router.get("/audit", (req, res) => {
   try {
-    ensureManagerActive(req);
-
     const db = readDb();
+    const isAdmin = req.user.role === ADMIN;
     const limit = clampInt(req.query.limit, 1, 1000, 200);
 
-    const actorId = safeStr(req.query.actorId);
-    const actionQ = safeStr(req.query.action).toLowerCase();
+    let items = db.audit.slice().reverse();
 
-    let items = (db.audit || []).slice().reverse();
-
-    if (actorId) {
+    if (!isAdmin) {
+      requireTenant(req);
       items = items.filter(
-        (ev) => String(ev.actorId || "") === actorId
-      );
-    }
-
-    if (actionQ) {
-      items = items.filter((ev) =>
-        String(ev.action || "")
-          .toLowerCase()
-          .includes(actionQ)
+        (ev) => ev.companyId === req.tenant.id
       );
     }
 
@@ -301,7 +205,7 @@ router.get("/audit", (req, res) => {
   } catch (e) {
     return res.status(e.status || 500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: e.message,
     });
   }
 });
