@@ -1,6 +1,7 @@
 // backend/src/lib/db.js
 // File-based JSON DB with schema + safe writes (atomic)
-// Fully Hardened • Stripe Ready • Scan Credit Ready • AutoProtect Ready • Invoice Ready
+// Enterprise Financial Ledger Enabled
+// Payments • Refunds • Disputes • Revenue Integrity
 
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +9,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 /* ======================================================
    UTIL
@@ -36,23 +37,29 @@ function defaultDb() {
     audit: [],
     notifications: [],
     scans: [],
-    scanCredits: {},
+    scanCredits: [],
     processedStripeEvents: [],
 
     /* ======================================================
-       🔥 INVOICES + REVENUE TRACKING
+       🔥 FINANCIAL LEDGER
     ====================================================== */
 
     invoices: [],
+    payments: [],
+    refunds: [],
+    disputes: [],
+
     revenueSummary: {
       totalRevenue: 0,
       autoprotekRevenue: 0,
       subscriptionRevenue: 0,
       toolRevenue: 0,
+      refundedAmount: 0,
+      disputedAmount: 0,
     },
 
     /* ======================================================
-       🔥 AUTOPROTECT (User Scoped)
+       🔥 AUTOPROTECT
     ====================================================== */
 
     autoprotek: {
@@ -102,12 +109,13 @@ function migrate(db) {
   if (!Array.isArray(db.audit)) db.audit = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
   if (!Array.isArray(db.scans)) db.scans = [];
-  if (!Array.isArray(db.processedStripeEvents)) db.processedStripeEvents = [];
-  if (!Array.isArray(db.invoices)) db.invoices = [];
+  if (!Array.isArray(db.processedStripeEvents))
+    db.processedStripeEvents = [];
 
-  if (!db.scanCredits || typeof db.scanCredits !== "object") {
-    db.scanCredits = {};
-  }
+  if (!Array.isArray(db.invoices)) db.invoices = [];
+  if (!Array.isArray(db.payments)) db.payments = [];
+  if (!Array.isArray(db.refunds)) db.refunds = [];
+  if (!Array.isArray(db.disputes)) db.disputes = [];
 
   if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
     db.revenueSummary = {
@@ -115,88 +123,24 @@ function migrate(db) {
       autoprotekRevenue: 0,
       subscriptionRevenue: 0,
       toolRevenue: 0,
+      refundedAmount: 0,
+      disputedAmount: 0,
     };
   }
 
-  /* ======================================================
-     🔥 AUTOPROTECT MIGRATION
-  ====================================================== */
+  /* Ensure new revenue fields exist */
+  db.revenueSummary.refundedAmount =
+    db.revenueSummary.refundedAmount || 0;
 
+  db.revenueSummary.disputedAmount =
+    db.revenueSummary.disputedAmount || 0;
+
+  /* AUTOPROTECT SAFETY */
   if (!db.autoprotek || typeof db.autoprotek !== "object") {
     db.autoprotek = { users: {} };
   }
 
-  if (!db.autoprotek.users || typeof db.autoprotek.users !== "object") {
-    db.autoprotek.users = {};
-  }
-
-  for (const userId of Object.keys(db.autoprotek.users)) {
-    const userContainer = db.autoprotek.users[userId];
-
-    if (!userContainer.status) userContainer.status = "INACTIVE";
-    if (!userContainer.monthlyJobLimit)
-      userContainer.monthlyJobLimit = 10;
-    if (!userContainer.jobsUsedThisMonth)
-      userContainer.jobsUsedThisMonth = 0;
-    if (!userContainer.lastResetMonth)
-      userContainer.lastResetMonth = "";
-    if (!userContainer.companies)
-      userContainer.companies = {};
-
-    for (const companyId of Object.keys(userContainer.companies)) {
-      const c = userContainer.companies[companyId];
-
-      if (!c.schedule)
-        c.schedule = {
-          timezone: "",
-          workingDays: [],
-          startTime: "",
-          endTime: "",
-        };
-
-      if (!c.vacation)
-        c.vacation = {
-          from: "",
-          to: "",
-        };
-
-      if (!Array.isArray(c.jobs)) c.jobs = [];
-      if (!Array.isArray(c.reports)) c.reports = [];
-      if (!Array.isArray(c.emailDrafts)) c.emailDrafts = [];
-      if (!Array.isArray(c.emailSent)) c.emailSent = [];
-    }
-  }
-
-  /* ======================================================
-     OTHER SYSTEM MIGRATION
-  ====================================================== */
-
-  if (!db.brain) db.brain = {};
-  if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
-  if (!Array.isArray(db.brain.notes)) db.brain.notes = [];
-
-  if (!db.paper) db.paper = {};
-  if (!db.paper.summary) {
-    db.paper.summary = {
-      startBalance: 0,
-      balance: 0,
-      pnl: 0,
-      wins: 0,
-      losses: 0,
-      totalGain: 0,
-      totalLoss: 0,
-      fees: 0,
-      slippage: 0,
-      spread: 0,
-      lastTradeTs: 0,
-    };
-  }
-
-  if (!Array.isArray(db.paper.trades)) db.paper.trades = [];
-  if (!Array.isArray(db.paper.daily)) db.paper.daily = [];
-
-  if (!db.live) db.live = {};
-  if (!Array.isArray(db.live.events)) db.live.events = [];
+  if (!db.autoprotek.users) db.autoprotek.users = {};
 
   db.schemaVersion = SCHEMA_VERSION;
   return db;
