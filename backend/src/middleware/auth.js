@@ -1,5 +1,5 @@
 // backend/src/middleware/auth.js
-// JWT Auth Middleware — Enterprise Hardened • Tier Enforced • Billing Safe
+// JWT Auth Middleware — Enterprise Hardened • Tier Aligned • Restriction Aware
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -76,7 +76,6 @@ function authRequired(req, res, next) {
 
   /* --------------------------------------------------
      SUBSCRIPTION ENFORCEMENT
-     Allow billing routes even if inactive
   -------------------------------------------------- */
 
   const subscriptionInactive =
@@ -89,6 +88,7 @@ function authRequired(req, res, next) {
 
   /* --------------------------------------------------
      COMPANY STATUS ENFORCEMENT
+     (Aligned with tenant v5)
   -------------------------------------------------- */
 
   if (user.companyId && Array.isArray(db.companies)) {
@@ -100,8 +100,8 @@ function authRequired(req, res, next) {
       return error(res, 403, "Company not found");
     }
 
-    if (company.status !== "Active") {
-      return error(res, 403, "Company not active");
+    if (company.status === "Suspended") {
+      return error(res, 403, "Company suspended");
     }
   }
 
@@ -148,7 +148,6 @@ function requireRole(...args) {
 
     const userRole = normRole(req.user.role);
 
-    // Admin bypass
     if (userRole === adminRole && adminAlso) {
       return next();
     }
