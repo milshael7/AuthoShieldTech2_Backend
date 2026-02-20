@@ -1,6 +1,6 @@
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
-const { readDb, writeDb } = require("../lib/db");
+const { readDb, writeDb, updateDb } = require("../lib/db");
 
 /* ======================================================
    CONSTANTS
@@ -35,46 +35,16 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   PLAN ENGINE (HARDENED)
+   PLAN ENGINE
 ====================================================== */
 
 const PLAN_BENEFITS = {
-  trial: {
-    planKey: "trial",
-    discountPercent: 0,
-    includedScans: 0,
-    label: "Trial",
-  },
-  individual: {
-    planKey: "individual",
-    discountPercent: 30,
-    includedScans: 1,
-    label: "Individual Active",
-  },
-  micro: {
-    planKey: "micro",
-    discountPercent: 35,
-    includedScans: 2,
-    label: "Micro Plan",
-  },
-  small: {
-    planKey: "small",
-    discountPercent: 40,
-    includedScans: 5,
-    label: "Small Plan",
-  },
-  mid: {
-    planKey: "mid",
-    discountPercent: 45,
-    includedScans: 10,
-    label: "Mid Plan",
-  },
-  enterprise: {
-    planKey: "enterprise",
-    discountPercent: 50,
-    includedScans: Infinity,
-    label: "Enterprise Plan",
-  },
+  trial: { planKey: "trial", discountPercent: 0, includedScans: 0 },
+  individual: { planKey: "individual", discountPercent: 30, includedScans: 1 },
+  micro: { planKey: "micro", discountPercent: 35, includedScans: 2 },
+  small: { planKey: "small", discountPercent: 40, includedScans: 5 },
+  mid: { planKey: "mid", discountPercent: 45, includedScans: 10 },
+  enterprise: { planKey: "enterprise", discountPercent: 50, includedScans: Infinity },
 };
 
 function getUserEffectivePlan(user) {
@@ -86,23 +56,15 @@ function getUserEffectivePlan(user) {
 
   const db = readDb();
 
-  /* ================= COMPANY OVERRIDE ================= */
-
   if (user.companyId) {
-    const company = db.companies?.find(
-      (c) => c.id === user.companyId
-    );
-
-    if (company && company.tier) {
+    const company = db.companies?.find((c) => c.id === user.companyId);
+    if (company?.tier) {
       const tierKey = String(company.tier).toLowerCase();
-
       if (PLAN_BENEFITS[tierKey]) {
         return PLAN_BENEFITS[tierKey];
       }
     }
   }
-
-  /* ================= INDIVIDUAL ACTIVE ================= */
 
   if (user.role === ROLES.INDIVIDUAL) {
     return PLAN_BENEFITS.individual;
@@ -122,7 +84,6 @@ function getPlanBenefits(planKey) {
 
 function ensureArrays(db) {
   if (!Array.isArray(db.users)) db.users = [];
-  if (!Array.isArray(db.approvals)) db.approvals = [];
 }
 
 function normEmail(email) {
@@ -135,60 +96,75 @@ function sanitize(u) {
   return rest;
 }
 
-function requireValidRole(role) {
-  const r = String(role || "").trim();
-  if (!Object.values(ROLES).includes(r)) {
-    throw new Error(`Invalid role: ${r}`);
-  }
-  return r;
-}
-
-function requireAuthority(actorRole, targetRole) {
-  const actorRank = ROLE_RANK[actorRole] || 0;
-  const targetRank = ROLE_RANK[targetRole] || 0;
-
-  if (actorRank <= targetRank) {
-    throw new Error("Insufficient authority");
-  }
-}
-
 /* ======================================================
-   ADMIN BOOTSTRAP
+   🔥 AUTOPROTECT CONTROL
 ====================================================== */
 
-function ensureAdminFromEnv() {
-  const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
+function activateAutoProtect(userId) {
+  updateDb((db) => {
+    db.autoprotek = db.autoprotek || { users: {} };
+    db.autoprotek.users[userId] = db.autoprotek.users[userId] || {
+      status: "ACTIVE",
+      activatedAt: new Date().toISOString(),
+      monthlyJobLimit: 30,
+      jobsUsedThisMonth: 0,
+      lastResetMonth: currentMonthKey(),
+      companies: {},
+    };
 
+    db.autoprotek.users[userId].status = "ACTIVE";
+    db.autoprotek.users[userId].activatedAt = new Date().toISOString();
+  });
+}
+
+function deactivateAutoProtect(userId) {
+  updateDb((db) => {
+    if (!db.autoprotek?.users?.[userId]) return;
+    db.autoprotek.users[userId].status = "INACTIVE";
+  });
+}
+
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function enforceMonthlyReset(userId) {
+  updateDb((db) => {
+    const userAP = db.autoprotek?.users?.[userId];
+    if (!userAP) return;
+
+    const current = currentMonthKey();
+
+    if (userAP.lastResetMonth !== current) {
+      userAP.jobsUsedThisMonth = 0;
+      userAP.lastResetMonth = current;
+    }
+  });
+}
+
+function canRunAutoProtect(userId) {
   const db = readDb();
-  ensureArrays(db);
+  const userAP = db.autoprotek?.users?.[userId];
 
-  const emailKey = normEmail(ADMIN_EMAIL);
+  if (!userAP) return false;
+  if (userAP.status !== "ACTIVE") return false;
 
-  const exists = db.users.find(
-    (u) => normEmail(u.email) === emailKey && u.role === ROLES.ADMIN
-  );
+  enforceMonthlyReset(userId);
 
-  if (exists) return;
+  if (userAP.jobsUsedThisMonth >= userAP.monthlyJobLimit) {
+    return false;
+  }
 
-  const admin = {
-    id: nanoid(),
-    platformId: `AS-${nanoid(10).toUpperCase()}`,
-    email: ADMIN_EMAIL.trim(),
-    passwordHash: bcrypt.hashSync(String(ADMIN_PASSWORD), 10),
-    role: ROLES.ADMIN,
-    companyId: null,
-    createdAt: new Date().toISOString(),
-    subscriptionStatus: SUBSCRIPTION.ACTIVE,
-    mustResetPassword: false,
-    locked: false,
-    status: APPROVAL_STATUS.APPROVED,
-    approvedBy: "system",
-    branch: null,
-  };
+  return true;
+}
 
-  db.users.push(admin);
-  writeDb(db);
+function registerAutoProtectJob(userId) {
+  updateDb((db) => {
+    const userAP = db.autoprotek?.users?.[userId];
+    if (!userAP) return;
+    userAP.jobsUsedThisMonth += 1;
+  });
 }
 
 /* ======================================================
@@ -201,8 +177,6 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
 
   const cleanEmail = String(email || "").trim();
   if (!cleanEmail) throw new Error("Email required");
-
-  const r = requireValidRole(role);
 
   if (db.users.find((u) => normEmail(u.email) === normEmail(cleanEmail))) {
     throw new Error("Email already exists");
@@ -217,9 +191,8 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     platformId: `AS-${nanoid(10).toUpperCase()}`,
     email: cleanEmail,
     passwordHash: bcrypt.hashSync(String(password), 10),
-    role: r,
+    role,
     companyId: companyId || null,
-    branch: null,
     createdAt: new Date().toISOString(),
     subscriptionStatus: SUBSCRIPTION.TRIAL,
     mustResetPassword: false,
@@ -272,10 +245,15 @@ module.exports = {
   APPROVAL_STATUS,
   getUserEffectivePlan,
   getPlanBenefits,
-  ensureAdminFromEnv,
   createUser,
   findByEmail,
   findById,
   listUsers,
   verifyPassword,
+
+  // 🔥 AutoProtect exports
+  activateAutoProtect,
+  deactivateAutoProtect,
+  canRunAutoProtect,
+  registerAutoProtectJob,
 };
