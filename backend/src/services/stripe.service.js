@@ -1,5 +1,5 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Production Ready • Tier Integrated • Portal Enabled
+// Stripe Service — Production Ready • Tier Integrated • Full Sync Engine
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
@@ -16,7 +16,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP (MATCH STRIPE DASHBOARD)
+   PRICE MAP
 ========================================================= */
 
 const PRICE_MAP = {
@@ -28,7 +28,7 @@ const PRICE_MAP = {
 };
 
 /* =========================================================
-   INTERNAL HELPERS
+   INTERNAL SAVE
 ========================================================= */
 
 function saveUser(updatedUser) {
@@ -117,7 +117,7 @@ async function createCustomerPortalSession({
 }
 
 /* =========================================================
-   ACTIVATE SUBSCRIPTION (Webhook Triggered)
+   ACTIVATE SUBSCRIPTION (CHECKOUT COMPLETE)
 ========================================================= */
 
 async function activateSubscription({
@@ -138,13 +138,8 @@ async function activateSubscription({
 
   saveUser(user);
 
-  // If company plan upgrade
   if (user.companyId && PRICE_MAP[planType]) {
-    companies.upgradeCompany(
-      user.companyId,
-      planType,
-      user.id
-    );
+    companies.upgradeCompany(user.companyId, planType, user.id);
   }
 
   audit({
@@ -154,6 +149,106 @@ async function activateSubscription({
     targetId: user.id,
     metadata: { planType },
   });
+}
+
+/* =========================================================
+   SYNC SUBSCRIPTION STATUS (AUTHORITATIVE)
+========================================================= */
+
+async function syncSubscriptionStatus(subscriptionId, stripeStatus) {
+  if (!subscriptionId) return;
+
+  const db = readDb();
+  const user = db.users.find(
+    (u) => u.stripeSubscriptionId === subscriptionId
+  );
+
+  if (!user) return;
+
+  let mappedStatus = "Inactive";
+
+  switch (stripeStatus) {
+    case "active":
+    case "trialing":
+      mappedStatus = "Active";
+      break;
+    case "past_due":
+      mappedStatus = "Past_Due";
+      break;
+    case "canceled":
+    case "unpaid":
+      mappedStatus = "Locked";
+      break;
+    default:
+      mappedStatus = "Inactive";
+  }
+
+  user.subscriptionStatus = mappedStatus;
+  saveUser(user);
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_STATUS_SYNCED",
+    targetType: "User",
+    targetId: user.id,
+    metadata: { stripeStatus, mappedStatus },
+  });
+}
+
+/* =========================================================
+   STRIPE WEBHOOK HANDLER
+========================================================= */
+
+async function handleStripeWebhook(event) {
+
+  /* Checkout Complete */
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+
+    if (session.mode === "subscription") {
+      const userId = session.metadata?.userId;
+      const planType = session.metadata?.planType;
+      const subscriptionId = session.subscription;
+
+      if (userId && planType && subscriptionId) {
+        await activateSubscription({
+          userId,
+          planType,
+          subscriptionId,
+        });
+      }
+    }
+  }
+
+  /* Subscription Updated / Deleted */
+  if (
+    event.type === "customer.subscription.updated" ||
+    event.type === "customer.subscription.deleted"
+  ) {
+    const subscription = event.data.object;
+    await syncSubscriptionStatus(
+      subscription.id,
+      subscription.status
+    );
+  }
+
+  /* Payment Failed */
+  if (event.type === "invoice.payment_failed") {
+    const invoice = event.data.object;
+    await syncSubscriptionStatus(
+      invoice.subscription,
+      "past_due"
+    );
+  }
+
+  /* Payment Succeeded */
+  if (event.type === "invoice.payment_succeeded") {
+    const invoice = event.data.object;
+    await syncSubscriptionStatus(
+      invoice.subscription,
+      "active"
+    );
+  }
 }
 
 /* =========================================================
@@ -168,7 +263,7 @@ async function cancelSubscription(userId) {
 
   await stripe.subscriptions.cancel(user.stripeSubscriptionId);
 
-  user.subscriptionStatus = "Cancelled";
+  user.subscriptionStatus = "Locked";
   saveUser(user);
 
   audit({
@@ -184,4 +279,5 @@ module.exports = {
   createCustomerPortalSession,
   activateSubscription,
   cancelSubscription,
+  handleStripeWebhook,
 };
