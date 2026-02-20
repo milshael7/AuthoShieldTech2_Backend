@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Phase 13 Enterprise Hardened
-// Revenue Analytics • Invoice Intelligence • Scan Control • Audit Safe
+// Admin API — Phase 14 Enterprise Intelligence
+// Revenue • MRR • ARR • Churn • Conversion • Invoice Intelligence
 
 const express = require("express");
 const router = express.Router();
@@ -12,23 +12,14 @@ const companies = require("../companies/company.service");
 const { listNotifications } = require("../lib/notify");
 const { nanoid } = require("nanoid");
 
-/* =========================================================
-   ROLE SAFETY
-========================================================= */
-
 const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
 
 router.use(authRequired);
 router.use(requireRole(ADMIN_ROLE));
 
 /* =========================================================
-   HELPERS
+   AUDIT
 ========================================================= */
-
-function requireId(id) {
-  if (!id) throw new Error("Invalid id");
-  return String(id).trim();
-}
 
 function audit(action, actorId, targetType, targetId, meta = {}) {
   const db = readDb();
@@ -45,38 +36,93 @@ function audit(action, actorId, targetType, targetId, meta = {}) {
 }
 
 /* =========================================================
-   🔥 REVENUE SUMMARY (REAL DATA)
+   🔥 EXECUTIVE METRICS
 ========================================================= */
 
-router.get("/revenue/summary", (req, res) => {
+router.get("/metrics", (req, res) => {
   try {
     const db = readDb();
 
+    const allUsers = db.users || [];
     const invoices = db.invoices || [];
-    const revenue = db.revenueSummary || {};
 
-    const totalInvoices = invoices.length;
-    const totalRevenue = revenue.totalRevenue || 0;
-    const autoprotekRevenue = revenue.autoprotekRevenue || 0;
-    const subscriptionRevenue = revenue.subscriptionRevenue || 0;
-    const toolRevenue = revenue.toolRevenue || 0;
+    const activeUsers = allUsers.filter(
+      (u) => u.subscriptionStatus === "Active"
+    );
 
-    const uniqueUsers = new Set(invoices.map(i => i.userId)).size;
+    const trialUsers = allUsers.filter(
+      (u) => u.subscriptionStatus === "Trial"
+    );
 
-    const avgRevenuePerUser =
-      uniqueUsers > 0
-        ? Number((totalRevenue / uniqueUsers).toFixed(2))
+    const lockedUsers = allUsers.filter(
+      (u) => u.subscriptionStatus === "Locked"
+    );
+
+    const totalRevenue = db.revenueSummary?.totalRevenue || 0;
+
+    // MRR calculation (sum of last 30 days subscription invoices)
+    const now = Date.now();
+    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+
+    const mrr = invoices
+      .filter(
+        (i) =>
+          i.type === "subscription" &&
+          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
+      )
+      .reduce((sum, i) => sum + i.amount, 0);
+
+    const arr = mrr * 12;
+
+    const payingUsers = new Set(
+      invoices
+        .filter((i) => i.type === "subscription")
+        .map((i) => i.userId)
+    ).size;
+
+    const arpu =
+      payingUsers > 0
+        ? Number((totalRevenue / payingUsers).toFixed(2))
         : 0;
+
+    const churnRate =
+      allUsers.length > 0
+        ? Number(
+            (
+              lockedUsers.length /
+              allUsers.length
+            ).toFixed(4)
+          )
+        : 0;
+
+    const conversionRate =
+      trialUsers.length + activeUsers.length > 0
+        ? Number(
+            (
+              activeUsers.length /
+              (trialUsers.length + activeUsers.length)
+            ).toFixed(4)
+          )
+        : 0;
+
+    const estimatedLTV =
+      churnRate > 0 ? Number((arpu / churnRate).toFixed(2)) : 0;
 
     res.json({
       ok: true,
-      totalRevenue,
-      totalInvoices,
-      autoprotekRevenue,
-      subscriptionRevenue,
-      toolRevenue,
-      uniquePayingUsers: uniqueUsers,
-      averageRevenuePerUser: avgRevenuePerUser,
+      metrics: {
+        totalUsers: allUsers.length,
+        activeSubscribers: activeUsers.length,
+        trialUsers: trialUsers.length,
+        lockedUsers: lockedUsers.length,
+        totalRevenue,
+        MRR: Number(mrr.toFixed(2)),
+        ARR: Number(arr.toFixed(2)),
+        ARPU: arpu,
+        churnRate,
+        conversionRate,
+        estimatedLTV,
+      },
       time: new Date().toISOString(),
     });
 
@@ -86,14 +132,31 @@ router.get("/revenue/summary", (req, res) => {
 });
 
 /* =========================================================
-   🔥 MONTHLY REVENUE BREAKDOWN
+   REVENUE SUMMARY
+========================================================= */
+
+router.get("/revenue/summary", (req, res) => {
+  try {
+    const db = readDb();
+    res.json({
+      ok: true,
+      revenue: db.revenueSummary || {},
+      invoices: db.invoices?.length || 0,
+      time: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   MONTHLY BREAKDOWN
 ========================================================= */
 
 router.get("/revenue/monthly", (req, res) => {
   try {
     const db = readDb();
     const invoices = db.invoices || [];
-
     const monthly = {};
 
     for (const inv of invoices) {
@@ -103,79 +166,16 @@ router.get("/revenue/monthly", (req, res) => {
       ).padStart(2, "0")}`;
 
       if (!monthly[key]) {
-        monthly[key] = {
-          total: 0,
-          subscription: 0,
-          autoprotek: 0,
-          tool: 0,
-        };
+        monthly[key] = 0;
       }
 
-      monthly[key].total += inv.amount;
-
-      if (inv.type === "subscription")
-        monthly[key].subscription += inv.amount;
-      if (inv.type === "autoprotect")
-        monthly[key].autoprotek += inv.amount;
-      if (inv.type === "tool")
-        monthly[key].tool += inv.amount;
+      monthly[key] += inv.amount;
     }
 
-    res.json({
-      ok: true,
-      monthly,
-    });
+    res.json({ ok: true, monthly });
 
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   🔥 INVOICE LISTING
-========================================================= */
-
-router.get("/invoices", (req, res) => {
-  try {
-    const db = readDb();
-    res.json({
-      ok: true,
-      invoices: db.invoices || [],
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   🔥 SCAN CONTROL
-========================================================= */
-
-router.post("/scan/:id/force-complete", (req, res) => {
-  try {
-    const scanId = requireId(req.params.id);
-
-    updateDb((db) => {
-      const scan = db.scans.find((s) => s.id === scanId);
-      if (!scan) throw new Error("Scan not found");
-      if (scan.status === "completed")
-        throw new Error("Already completed");
-
-      scan.status = "completed";
-      scan.completedAt = new Date().toISOString();
-    });
-
-    audit(
-      "ADMIN_FORCE_COMPLETE_SCAN",
-      req.user.id,
-      "Scan",
-      scanId
-    );
-
-    res.json({ ok: true });
-
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
