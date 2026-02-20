@@ -1,6 +1,6 @@
 // backend/src/lib/db.js
 // File-based JSON DB with schema + safe writes (atomic)
-// Fully Hardened • Stripe Ready • Scan Credit Ready
+// Fully Hardened • Stripe Ready • Scan Credit Ready • AutoProtect Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +8,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 /* ======================================================
    UTIL
@@ -36,8 +36,47 @@ function defaultDb() {
     audit: [],
     notifications: [],
     scans: [],
-    scanCredits: {},              // ✅ NEW
-    processedStripeEvents: [],    // ✅ NEW
+    scanCredits: {},
+    processedStripeEvents: [],
+
+    /* ======================================================
+       🔥 AUTOPROTECT (User Scoped)
+    ====================================================== */
+
+    autoprotek: {
+      users: {
+        /*
+        USER_ID: {
+          status: "ACTIVE" | "INACTIVE",
+          activatedAt: "",
+          expiresAt: "",
+          monthlyJobLimit: 30,
+          jobsUsedThisMonth: 0,
+          lastResetMonth: "2026-02",
+
+          companies: {
+            COMPANY_ID: {
+              schedule: {
+                timezone: "",
+                workingDays: [],
+                startTime: "",
+                endTime: ""
+              },
+              vacation: {
+                from: "",
+                to: ""
+              },
+              email: "",
+              jobs: [],
+              reports: [],
+              emailDrafts: [],
+              emailSent: []
+            }
+          }
+        }
+        */
+      }
+    },
 
     brain: {
       memory: [],
@@ -91,6 +130,56 @@ function migrate(db) {
     db.processedStripeEvents = [];
   }
 
+  /* ======================================================
+     🔥 AUTOPROTECT MIGRATION
+  ====================================================== */
+
+  if (!db.autoprotek || typeof db.autoprotek !== "object") {
+    db.autoprotek = { users: {} };
+  }
+
+  if (!db.autoprotek.users || typeof db.autoprotek.users !== "object") {
+    db.autoprotek.users = {};
+  }
+
+  for (const userId of Object.keys(db.autoprotek.users)) {
+    const userContainer = db.autoprotek.users[userId];
+
+    if (!userContainer.status) userContainer.status = "INACTIVE";
+    if (!userContainer.monthlyJobLimit)
+      userContainer.monthlyJobLimit = 30;
+    if (!userContainer.jobsUsedThisMonth)
+      userContainer.jobsUsedThisMonth = 0;
+    if (!userContainer.lastResetMonth)
+      userContainer.lastResetMonth = "";
+
+    if (!userContainer.companies)
+      userContainer.companies = {};
+
+    for (const companyId of Object.keys(userContainer.companies)) {
+      const c = userContainer.companies[companyId];
+
+      if (!c.schedule)
+        c.schedule = {
+          timezone: "",
+          workingDays: [],
+          startTime: "",
+          endTime: "",
+        };
+
+      if (!c.vacation)
+        c.vacation = {
+          from: "",
+          to: "",
+        };
+
+      if (!Array.isArray(c.jobs)) c.jobs = [];
+      if (!Array.isArray(c.reports)) c.reports = [];
+      if (!Array.isArray(c.emailDrafts)) c.emailDrafts = [];
+      if (!Array.isArray(c.emailSent)) c.emailSent = [];
+    }
+  }
+
   if (!db.brain) db.brain = {};
   if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
   if (!Array.isArray(db.brain.notes)) db.brain.notes = [];
@@ -111,6 +200,7 @@ function migrate(db) {
       lastTradeTs: 0,
     };
   }
+
   if (!Array.isArray(db.paper.trades)) db.paper.trades = [];
   if (!Array.isArray(db.paper.daily)) db.paper.daily = [];
 
@@ -164,10 +254,6 @@ function updateDb(mutator) {
   writeDb(out);
   return out;
 }
-
-/* ======================================================
-   AUDIT WRITES
-====================================================== */
 
 function writeAudit(event = {}) {
   try {
