@@ -1,5 +1,6 @@
-// Company Routes — Clean Layered Architecture
-// Routes ONLY — Business logic lives in company.service.js
+// backend/src/routes/company.routes.js
+// Company Routes — Enterprise Hardened
+// Tenant Safe • Role Scoped • No Cross-Company Escalation
 
 const express = require("express");
 const router = express.Router();
@@ -7,15 +8,32 @@ const router = express.Router();
 const { authRequired, requireRole } = require("../middleware/auth");
 const companyService = require("../companies/company.service");
 
-/* =========================================================
-   ROLE SETUP
-========================================================= */
-
 router.use(authRequired);
 
 /* =========================================================
-   CREATE COMPANY
-   Admin only
+   HELPERS
+========================================================= */
+
+function requireCompanyAccess(req, companyId) {
+  const isAdmin = req.user.role === "Admin";
+
+  if (isAdmin) return;
+
+  if (!req.user.companyId) {
+    const err = new Error("No company access");
+    err.status = 403;
+    throw err;
+  }
+
+  if (String(req.user.companyId) !== String(companyId)) {
+    const err = new Error("Access denied to this company");
+    err.status = 403;
+    throw err;
+  }
+}
+
+/* =========================================================
+   CREATE COMPANY (ADMIN ONLY)
 ========================================================= */
 
 router.post(
@@ -44,13 +62,13 @@ router.post(
         createdBy: req.user.id,
       });
 
-      return res.status(201).json({
+      res.status(201).json({
         ok: true,
         company,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
@@ -60,23 +78,36 @@ router.post(
 
 /* =========================================================
    LIST COMPANIES
-   Admin + Manager
+   Admin → all
+   Manager → all
+   Company → only their own
 ========================================================= */
 
 router.get(
   "/",
-  requireRole("Admin", "Manager", { adminAlso: true }),
+  requireRole("Admin", "Manager", "Company", { adminAlso: true }),
   (req, res) => {
     try {
-      const companies = companyService.listCompanies();
+      const all = companyService.listCompanies();
 
-      return res.json({
+      if (req.user.role === "Company") {
+        const own = all.filter(
+          (c) => String(c.id) === String(req.user.companyId)
+        );
+
+        return res.json({
+          ok: true,
+          companies: own,
+        });
+      }
+
+      res.json({
         ok: true,
-        companies,
+        companies: all,
       });
 
     } catch (e) {
-      return res.status(500).json({
+      res.status(500).json({
         ok: false,
         error: e.message,
       });
@@ -85,11 +116,13 @@ router.get(
 );
 
 /* =========================================================
-   GET COMPANY
+   GET COMPANY (TENANT SAFE)
 ========================================================= */
 
-router.get("/:id", authRequired, (req, res) => {
+router.get("/:id", (req, res) => {
   try {
+    requireCompanyAccess(req, req.params.id);
+
     const company = companyService.getCompany(req.params.id);
 
     if (!company) {
@@ -99,13 +132,13 @@ router.get("/:id", authRequired, (req, res) => {
       });
     }
 
-    return res.json({
+    res.json({
       ok: true,
       company,
     });
 
   } catch (e) {
-    return res.status(400).json({
+    res.status(e.status || 403).json({
       ok: false,
       error: e.message,
     });
@@ -113,8 +146,7 @@ router.get("/:id", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   UPGRADE COMPANY
-   Admin only
+   UPGRADE COMPANY (ADMIN ONLY)
 ========================================================= */
 
 router.post(
@@ -130,13 +162,13 @@ router.post(
         req.user.id
       );
 
-      return res.json({
+      res.json({
         ok: true,
         company,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
@@ -145,8 +177,7 @@ router.post(
 );
 
 /* =========================================================
-   ADD MEMBER
-   Admin or Company owner
+   ADD MEMBER (ADMIN OR SAME COMPANY OWNER)
 ========================================================= */
 
 router.post(
@@ -154,6 +185,8 @@ router.post(
   requireRole("Admin", "Company", { adminAlso: true }),
   (req, res) => {
     try {
+      requireCompanyAccess(req, req.params.id);
+
       const { userId, position } = req.body;
 
       const company = companyService.addMember(
@@ -163,13 +196,13 @@ router.post(
         position
       );
 
-      return res.json({
+      res.json({
         ok: true,
         company,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
@@ -186,19 +219,21 @@ router.delete(
   requireRole("Admin", "Company", { adminAlso: true }),
   (req, res) => {
     try {
+      requireCompanyAccess(req, req.params.id);
+
       const company = companyService.removeMember(
         req.params.id,
         req.params.userId,
         req.user.id
       );
 
-      return res.json({
+      res.json({
         ok: true,
         company,
       });
 
     } catch (e) {
-      return res.status(400).json({
+      res.status(e.status || 400).json({
         ok: false,
         error: e.message,
       });
