@@ -1,12 +1,13 @@
 // backend/src/routes/company.routes.js
 // Company Routes — Enterprise Hardened
-// Tenant Safe • Role Scoped • No Cross-Company Escalation
+// Tenant Safe • Role Scoped • AutoProtect Layer Added
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
 const companyService = require("../companies/company.service");
+const { updateDb } = require("../lib/db");
 
 router.use(authRequired);
 
@@ -32,55 +33,48 @@ function requireCompanyAccess(req, companyId) {
   }
 }
 
+function clean(v, max = 200) {
+  return String(v ?? "").trim().slice(0, max);
+}
+
 /* =========================================================
    CREATE COMPANY (ADMIN ONLY)
 ========================================================= */
 
-router.post(
-  "/",
-  requireRole("Admin"),
-  (req, res) => {
-    try {
-      const {
-        name,
-        country,
-        website,
-        industry,
-        contactEmail,
-        contactPhone,
-        tier,
-      } = req.body;
+router.post("/", requireRole("Admin"), (req, res) => {
+  try {
+    const {
+      name,
+      country,
+      website,
+      industry,
+      contactEmail,
+      contactPhone,
+      tier,
+    } = req.body;
 
-      const company = companyService.createCompany({
-        name,
-        country,
-        website,
-        industry,
-        contactEmail,
-        contactPhone,
-        tier,
-        createdBy: req.user.id,
-      });
+    const company = companyService.createCompany({
+      name,
+      country,
+      website,
+      industry,
+      contactEmail,
+      contactPhone,
+      tier,
+      createdBy: req.user.id,
+    });
 
-      res.status(201).json({
-        ok: true,
-        company,
-      });
-
-    } catch (e) {
-      res.status(e.status || 400).json({
-        ok: false,
-        error: e.message,
-      });
-    }
+    res.status(201).json({ ok: true, company });
+  } catch (e) {
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
   }
-);
+});
 
 /* =========================================================
    LIST COMPANIES
-   Admin → all
-   Manager → all
-   Company → only their own
 ========================================================= */
 
 router.get(
@@ -95,17 +89,10 @@ router.get(
           (c) => String(c.id) === String(req.user.companyId)
         );
 
-        return res.json({
-          ok: true,
-          companies: own,
-        });
+        return res.json({ ok: true, companies: own });
       }
 
-      res.json({
-        ok: true,
-        companies: all,
-      });
-
+      res.json({ ok: true, companies: all });
     } catch (e) {
       res.status(500).json({
         ok: false,
@@ -116,7 +103,7 @@ router.get(
 );
 
 /* =========================================================
-   GET COMPANY (TENANT SAFE)
+   GET COMPANY
 ========================================================= */
 
 router.get("/:id", (req, res) => {
@@ -132,11 +119,7 @@ router.get("/:id", (req, res) => {
       });
     }
 
-    res.json({
-      ok: true,
-      company,
-    });
-
+    res.json({ ok: true, company });
   } catch (e) {
     res.status(e.status || 403).json({
       ok: false,
@@ -146,38 +129,30 @@ router.get("/:id", (req, res) => {
 });
 
 /* =========================================================
-   UPGRADE COMPANY (ADMIN ONLY)
+   UPGRADE COMPANY
 ========================================================= */
 
-router.post(
-  "/:id/upgrade",
-  requireRole("Admin"),
-  (req, res) => {
-    try {
-      const { tier } = req.body;
+router.post("/:id/upgrade", requireRole("Admin"), (req, res) => {
+  try {
+    const { tier } = req.body;
 
-      const company = companyService.upgradeCompany(
-        req.params.id,
-        tier,
-        req.user.id
-      );
+    const company = companyService.upgradeCompany(
+      req.params.id,
+      tier,
+      req.user.id
+    );
 
-      res.json({
-        ok: true,
-        company,
-      });
-
-    } catch (e) {
-      res.status(e.status || 400).json({
-        ok: false,
-        error: e.message,
-      });
-    }
+    res.json({ ok: true, company });
+  } catch (e) {
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
   }
-);
+});
 
 /* =========================================================
-   ADD MEMBER (ADMIN OR SAME COMPANY OWNER)
+   ADD MEMBER
 ========================================================= */
 
 router.post(
@@ -196,11 +171,7 @@ router.post(
         position
       );
 
-      res.json({
-        ok: true,
-        company,
-      });
-
+      res.json({ ok: true, company });
     } catch (e) {
       res.status(e.status || 400).json({
         ok: false,
@@ -227,11 +198,7 @@ router.delete(
         req.user.id
       );
 
-      res.json({
-        ok: true,
-        company,
-      });
-
+      res.json({ ok: true, company });
     } catch (e) {
       res.status(e.status || 400).json({
         ok: false,
@@ -240,5 +207,153 @@ router.delete(
     }
   }
 );
+
+/* =========================================================
+   🔥 AUTOPROTECT — SET SCHEDULE (PER COMPANY / PER USER)
+========================================================= */
+
+router.post("/:id/autoprotect/schedule", (req, res) => {
+  try {
+    requireCompanyAccess(req, req.params.id);
+
+    const {
+      timezone,
+      workingDays,
+      startTime,
+      endTime,
+    } = req.body;
+
+    updateDb((db) => {
+      db.autoprotek = db.autoprotek || { users: {} };
+      db.autoprotek.users = db.autoprotek.users || {};
+
+      const userId = req.user.id;
+
+      if (!db.autoprotek.users[userId]) {
+        db.autoprotek.users[userId] = {
+          companies: {},
+        };
+      }
+
+      const container =
+        db.autoprotek.users[userId];
+
+      container.companies =
+        container.companies || {};
+
+      if (!container.companies[req.params.id]) {
+        container.companies[req.params.id] = {};
+      }
+
+      container.companies[req.params.id].schedule = {
+        timezone: clean(timezone, 100),
+        workingDays: Array.isArray(workingDays)
+          ? workingDays
+          : [],
+        startTime: clean(startTime, 20),
+        endTime: clean(endTime, 20),
+      };
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   🔥 AUTOPROTECT — SET VACATION
+========================================================= */
+
+router.post("/:id/autoprotect/vacation", (req, res) => {
+  try {
+    requireCompanyAccess(req, req.params.id);
+
+    const { from, to } = req.body;
+
+    updateDb((db) => {
+      db.autoprotek = db.autoprotek || { users: {} };
+      db.autoprotek.users = db.autoprotek.users || {};
+
+      const userId = req.user.id;
+
+      if (!db.autoprotek.users[userId]) {
+        db.autoprotek.users[userId] = {
+          companies: {},
+        };
+      }
+
+      const container =
+        db.autoprotek.users[userId];
+
+      container.companies =
+        container.companies || {};
+
+      if (!container.companies[req.params.id]) {
+        container.companies[req.params.id] = {};
+      }
+
+      container.companies[req.params.id].vacation = {
+        from: clean(from, 50),
+        to: clean(to, 50),
+      };
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   🔥 AUTOPROTECT — SET COMPANY EMAIL
+========================================================= */
+
+router.post("/:id/autoprotect/email", (req, res) => {
+  try {
+    requireCompanyAccess(req, req.params.id);
+
+    const { email } = req.body;
+
+    updateDb((db) => {
+      db.autoprotek = db.autoprotek || { users: {} };
+      db.autoprotek.users = db.autoprotek.users || {};
+
+      const userId = req.user.id;
+
+      if (!db.autoprotek.users[userId]) {
+        db.autoprotek.users[userId] = {
+          companies: {},
+        };
+      }
+
+      const container =
+        db.autoprotek.users[userId];
+
+      container.companies =
+        container.companies || {};
+
+      if (!container.companies[req.params.id]) {
+        container.companies[req.params.id] = {};
+      }
+
+      container.companies[req.params.id].email =
+        clean(email, 200);
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
 
 module.exports = router;
