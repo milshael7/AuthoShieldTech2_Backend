@@ -28,7 +28,7 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   AUTOPROTECT PRICING (SERVICE-SCOPED)
+   AUTOPROTECT PRICING (SERVICE SCOPED)
 ====================================================== */
 
 const AUTOPROTECT_PRICING = {
@@ -38,6 +38,37 @@ const AUTOPROTECT_PRICING = {
 };
 
 const AUTOPROTECT_ACTIVE_LIMIT = 10;
+
+/* ======================================================
+   BILLING VALIDATION
+====================================================== */
+
+function validateBilling(userId) {
+  const db = readDb();
+  const userAP = db.autoprotek?.users?.[userId];
+
+  if (!userAP) return false;
+
+  if (userAP.subscriptionStatus !== "ACTIVE") {
+    return false;
+  }
+
+  const now = Date.now();
+  const nextBilling = new Date(userAP.nextBillingDate).getTime();
+
+  if (now > nextBilling) {
+    // mark past due
+    updateDb(db2 => {
+      if (!db2.autoprotek?.users?.[userId]) return;
+      db2.autoprotek.users[userId].subscriptionStatus = "PAST_DUE";
+      db2.autoprotek.users[userId].status = "INACTIVE";
+    });
+
+    return false;
+  }
+
+  return true;
+}
 
 /* ======================================================
    AUTOPROTECT ENGINE
@@ -72,12 +103,13 @@ function deactivateAutoProtect(userId) {
 }
 
 function isAutoProtectActive(userId) {
+  if (!validateBilling(userId)) return false;
+
   const db = readDb();
   const userAP = db.autoprotek?.users?.[userId];
 
   if (!userAP) return false;
   if (userAP.status !== "ACTIVE") return false;
-  if (userAP.subscriptionStatus !== "ACTIVE") return false;
 
   return true;
 }
@@ -92,8 +124,13 @@ function canRunAutoProtect(user) {
   const userAP = db.autoprotek?.users?.[user.id];
 
   if (!userAP) return false;
+
+  // Billing enforcement
+  if (!validateBilling(user.id)) {
+    return false;
+  }
+
   if (userAP.status !== "ACTIVE") return false;
-  if (userAP.subscriptionStatus !== "ACTIVE") return false;
 
   if (userAP.activeJobsCount >= AUTOPROTECT_ACTIVE_LIMIT) {
     return false;
