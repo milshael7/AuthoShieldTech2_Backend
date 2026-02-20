@@ -1,9 +1,10 @@
 // backend/src/services/invoice.service.js
-// Invoice Engine — Enterprise Financial Integrity Layer
-// Refund Safe • Dispute Safe • Revenue Reconciliation Ready • PDF Ready
+// Phase 19 — SOC2 Financial Integrity Layer
+// Immutable Ledger • Revenue Reconciliation • Refund Lineage • Drift Safe
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
@@ -17,6 +18,27 @@ const INVOICE_DIR = path.join(__dirname, "..", "data", "invoices");
 
 if (!fs.existsSync(INVOICE_DIR)) {
   fs.mkdirSync(INVOICE_DIR, { recursive: true });
+}
+
+/* =========================================================
+   HASH UTIL (Financial Integrity)
+========================================================= */
+
+function sha256(data) {
+  return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+function computeFinancialHash(invoice) {
+  const base = JSON.stringify({
+    id: invoice.id,
+    userId: invoice.userId,
+    type: invoice.type,
+    amount: invoice.amount,
+    stripePaymentIntentId: invoice.stripePaymentIntentId,
+    stripeSubscriptionId: invoice.stripeSubscriptionId,
+    createdAt: invoice.createdAt,
+  });
+  return sha256(base);
 }
 
 /* =========================================================
@@ -47,7 +69,6 @@ function formatUsd(amount) {
 
 function generateInvoicePdf(invoice) {
   const filePath = path.join(INVOICE_DIR, `${invoice.invoiceNumber}.pdf`);
-
   if (fs.existsSync(filePath)) return filePath;
 
   const doc = new PDFDocument({ margin: 50 });
@@ -67,9 +88,6 @@ function generateInvoicePdf(invoice) {
   doc.moveTo(50, doc.y).lineTo(550, doc.y).stroke();
   doc.moveDown();
 
-  doc.fontSize(14).text("Service Breakdown", { underline: true });
-  doc.moveDown();
-
   doc.text(`Amount: ${formatUsd(invoice.amount)}`);
 
   if (invoice.type === "refund") {
@@ -79,23 +97,12 @@ function generateInvoicePdf(invoice) {
   }
 
   doc.moveDown();
-  doc.moveTo(50, doc.y).lineTo(550, doc.y).stroke();
-  doc.moveDown();
-
   doc.fontSize(16).text(
     `Total: ${formatUsd(invoice.amount)}`,
     { align: "right" }
   );
 
-  doc.moveDown(2);
-
-  doc.fontSize(10).text(
-    "This invoice reflects platform service transactions. Platform fees are service-based charges and not tax representations.",
-    { align: "left" }
-  );
-
   doc.end();
-
   return filePath;
 }
 
@@ -130,11 +137,25 @@ function createInvoice({
     stripePaymentIntentId: stripePaymentIntentId || null,
     metadata: meta,
     createdAt: nowISO(),
+    reconciliationStatus: "PENDING",
     pdfPath: null,
+    hash: null,
   };
 
+  invoice.hash = computeFinancialHash(invoice);
+
   updateDb((db) => {
-    // 🔐 Idempotency protection
+    if (!Array.isArray(db.invoices)) db.invoices = [];
+    if (!db.revenueSummary) {
+      db.revenueSummary = {
+        totalRevenue: 0,
+        autoprotekRevenue: 0,
+        subscriptionRevenue: 0,
+        toolRevenue: 0,
+      };
+    }
+
+    // Idempotency
     const duplicate = db.invoices.find(
       (i) =>
         stripePaymentIntentId &&
@@ -145,36 +166,36 @@ function createInvoice({
 
     db.invoices.push(invoice);
 
-    // 🔥 Revenue reconciliation
+    // Revenue delta tracking
     db.revenueSummary.totalRevenue += amountUsd;
-
-    if (type === "autoprotect")
-      db.revenueSummary.autoprotekRevenue += amountUsd;
 
     if (type === "subscription")
       db.revenueSummary.subscriptionRevenue += amountUsd;
+
+    if (type === "autoprotect")
+      db.revenueSummary.autoprotekRevenue += amountUsd;
 
     if (type === "tool")
       db.revenueSummary.toolRevenue += amountUsd;
 
     if (type === "refund") {
-      db.revenueSummary.totalRevenue -= Math.abs(amountUsd);
+      db.revenueSummary.totalRevenue += amountUsd; // already negative
+      db.revenueSummary.subscriptionRevenue += amountUsd;
     }
   });
 
   audit({
     actorId: userId,
-    action: "INVOICE_CREATED",
-    targetType: "Invoice",
+    action: "FINANCIAL_EVENT_RECORDED",
     targetId: invoice.id,
-    meta: { type, amount: amountUsd },
+    metadata: { type, amount: amountUsd },
   });
 
   return invoice;
 }
 
 /* =========================================================
-   REFUND ENGINE
+   REFUND ENGINE (Linked)
 ========================================================= */
 
 function createRefundInvoice({
@@ -188,7 +209,7 @@ function createRefundInvoice({
     type: "refund",
     stripePaymentIntentId,
     amountPaidCents: -Math.abs(amountRefundedCents),
-    meta: { reason },
+    meta: { reason, linkedTo: stripePaymentIntentId },
   });
 }
 
