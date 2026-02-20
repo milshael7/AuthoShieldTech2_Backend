@@ -11,9 +11,10 @@ const { ensureDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
+/* ROUTES */
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
-const stripeWebhookRoutes = require("./routes/stripe.webhook.routes");
+const webhookRoutes = require("./routes/webhook.routes");
 
 /* =========================================================
    SAFE BOOT
@@ -50,7 +51,7 @@ app.set("trust proxy", 1);
 app.use(
   "/api/stripe/webhook",
   express.raw({ type: "application/json", limit: "1mb" }),
-  stripeWebhookRoutes
+  webhookRoutes
 );
 
 /* =========================================================
