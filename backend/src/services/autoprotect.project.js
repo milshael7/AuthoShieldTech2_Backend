@@ -1,24 +1,22 @@
 // backend/src/services/autoprotect.project.js
 // AutoProtect Project Engine — FINAL LOCKED VERSION
 //
-// PURPOSE:
-// - AutoProtect NEVER performs silent fixes
-// - It CREATES GUIDED PROJECTS for users to act on
-// - Each project explains WHAT happened + WHAT to do
-//
-// RULES:
-// ✅ Individual users only
-// ❌ Companies cannot use AutoProtect
-// ❌ No background changes without user action
+// ENFORCEMENTS ADDED:
+// ✅ Individual only
+// ✅ Must be enabled
+// ✅ 10 active job limit
+// ✅ Persisted in DB
 // ✅ Audited + Notified
-// ✅ Stable data structure for UI
-//
-// THIS FILE IS COMPLETE. DO NOT PATCH LATER.
+// ✅ No silent fixes
 
 const { audit } = require('../lib/audit');
 const { createNotification } = require('../lib/notify');
+const { readDb, writeDb } = require('../lib/db');
+const { ROLES } = require('../users/user.service');
 
-// -------------------- helpers --------------------
+const AUTOPROTECT_LIMIT = 10;
+
+/* ================= HELPERS ================= */
 
 function nowISO() {
   return new Date().toISOString();
@@ -28,7 +26,6 @@ function projectId() {
   return `AP-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-// Step-by-step guidance (human + AI readable)
 function guidanceForIssue(issue) {
   const base = [
     'Confirm scope (what happened, when, which account).',
@@ -63,11 +60,54 @@ function guidanceForIssue(issue) {
   return base;
 }
 
-// -------------------- main creator --------------------
+/* ================= MAIN CREATOR ================= */
 
 function createProject({ actorId, title, issue }) {
+  if (!actorId) {
+    throw new Error('Actor required');
+  }
+
+  const db = readDb();
+
+  if (!Array.isArray(db.autoprotectProjects)) {
+    db.autoprotectProjects = [];
+  }
+
+  const user = (db.users || []).find(u => u.id === actorId);
+
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  /* ===== ROLE ENFORCEMENT ===== */
+
+  if (user.role !== ROLES.INDIVIDUAL) {
+    throw new Error('AutoProtect is available to Individual users only.');
+  }
+
+  /* ===== ENABLED ENFORCEMENT ===== */
+
+  if (!user.autoprotectEnabled) {
+    throw new Error('Enable AutoProtect before creating projects.');
+  }
+
+  /* ===== ACTIVE LIMIT ENFORCEMENT ===== */
+
+  const activeProjects = db.autoprotectProjects.filter(
+    p => p.actorId === actorId && p.status === 'Open'
+  );
+
+  if (activeProjects.length >= AUTOPROTECT_LIMIT) {
+    throw new Error(
+      `AutoProtect limit reached (${AUTOPROTECT_LIMIT}). Complete existing projects before creating more.`
+    );
+  }
+
+  /* ===== CREATE PROJECT ===== */
+
   const project = {
     id: projectId(),
+    actorId,
     title: String(title).trim(),
     issue: {
       type: issue?.type || 'unknown',
@@ -82,7 +122,11 @@ function createProject({ actorId, title, issue }) {
     completedAt: null,
   };
 
-  // ---------------- audit ----------------
+  db.autoprotectProjects.push(project);
+  writeDb(db);
+
+  /* ===== AUDIT ===== */
+
   audit({
     actorId,
     action: 'AUTOPROTECT_PROJECT_CREATED',
@@ -94,7 +138,8 @@ function createProject({ actorId, title, issue }) {
     },
   });
 
-  // ---------------- notify user ----------------
+  /* ===== NOTIFY USER ===== */
+
   createNotification({
     userId: actorId,
     severity: 'warn',
@@ -105,7 +150,6 @@ function createProject({ actorId, title, issue }) {
   return project;
 }
 
-// -------------------- exports --------------------
 module.exports = {
   createProject,
 };
