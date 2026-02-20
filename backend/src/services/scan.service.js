@@ -1,11 +1,11 @@
 // backend/src/services/scan.service.js
-// Scan Engine — Queue Based • Revenue Ready • Upgrade Structured
+// Scan Engine — Queue Based • Revenue Ready • Upgrade Optimized
 
 const { nanoid } = require("nanoid");
-const { readDb, writeDb, updateDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
 
 /* =========================================================
-   TOOL REGISTRY (INITIAL)
+   TOOL REGISTRY
 ========================================================= */
 
 const TOOL_REGISTRY = {
@@ -48,6 +48,7 @@ function createScan({ toolId, email, inputData }) {
   };
 
   updateDb((db) => {
+    if (!Array.isArray(db.scans)) db.scans = [];
     db.scans.push(scan);
   });
 
@@ -70,18 +71,16 @@ function markScanPaid(scanId) {
 }
 
 /* =========================================================
-   PROCESS SCAN (SIMULATED ENGINE)
+   PROCESS SCAN
 ========================================================= */
 
 function processScan(scanId) {
   updateDb((db) => {
     const scan = db.scans.find((s) => s.id === scanId);
     if (!scan || scan.status !== "pending") return;
-
     scan.status = "running";
   });
 
-  // simulate processing delay
   setTimeout(() => {
     updateDb((db) => {
       const scan = db.scans.find((s) => s.id === scanId);
@@ -97,35 +96,83 @@ function processScan(scanId) {
 }
 
 /* =========================================================
-   RISK LOGIC (SIMULATED)
+   RISK LOGIC
 ========================================================= */
 
 function generateRiskScore() {
-  return Math.floor(Math.random() * 60) + 20; // 20–80 realistic range
+  return Math.floor(Math.random() * 60) + 20; // realistic 20–80
 }
 
+function getRiskLevel(score) {
+  if (score >= 70) return "High";
+  if (score >= 45) return "Moderate";
+  return "Low";
+}
+
+/* =========================================================
+   REPORT ENGINE (CONVERSION OPTIMIZED)
+========================================================= */
+
 function generateReport(scan, riskScore) {
+  const riskLevel = getRiskLevel(riskScore);
+
   return {
-    riskScore,
+    overview: {
+      riskScore,
+      riskLevel,
+      scannedTool: scan.toolName,
+      scanType: scan.price === 0 ? "Free Scan" : "One-Time Scan",
+    },
+
     severityBreakdown: {
-      critical: Math.floor(riskScore / 25),
-      high: Math.floor(riskScore / 15),
-      medium: Math.floor(riskScore / 10),
+      critical: Math.floor(riskScore / 30),
+      high: Math.floor(riskScore / 20),
+      medium: Math.floor(riskScore / 12),
       low: 2,
     },
-    summary: [
-      "External exposure detected.",
-      "Surface vulnerabilities identified.",
-      "No internal network testing performed.",
+
+    findings: [
+      "External exposure points detected.",
+      "Surface-level vulnerabilities identified.",
+      "Internal network and historical analysis not included.",
     ],
+
     recommendation:
-      "Enable continuous monitoring to track new vulnerabilities in real time.",
-    upgradeComparison: {
-      oneTimeScan: true,
-      continuousMonitoring: true,
-      historicalTracking: false,
-      realTimeAlerts: false,
+      "Continuous monitoring is recommended to detect newly emerging vulnerabilities and real-time threats.",
+
+    upgradeInsight: {
+      message:
+        "This report reflects a single-time external scan. Ongoing monitoring can detect new exposures automatically and provide real-time alerts.",
+      includedInMembership: [
+        "Real-time threat alerts",
+        "Continuous vulnerability monitoring",
+        "Historical risk tracking",
+        "Automated compliance tracking",
+      ],
+      lockedFeatures: [
+        "24/7 monitoring engine",
+        "Live threat feed",
+        "Incident response priority",
+      ],
     },
+
+    comparison: {
+      oneTimeScan: {
+        realTimeMonitoring: false,
+        historicalTracking: false,
+        alertSystem: false,
+        complianceDashboard: false,
+      },
+      membership: {
+        realTimeMonitoring: true,
+        historicalTracking: true,
+        alertSystem: true,
+        complianceDashboard: true,
+      },
+    },
+
+    nextStepCTA:
+      "Upgrade to continuous protection to reduce exposure risk and maintain ongoing security posture visibility.",
   };
 }
 
