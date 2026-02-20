@@ -1,9 +1,15 @@
 // backend/src/lib/audit.js
-// Enterprise Immutable Audit Ledger
-// Tamper-Evident • Hash Chained • Safe • Backward Compatible
+// Enterprise Immutable Audit Ledger — Phase 23
+// Cryptographic Hash Chain • Sequence Locked • Tamper Evident • SOC2 Ready
 
 const crypto = require("crypto");
 const { updateDb, readDb } = require("./db");
+
+/* =========================================================
+   CONSTANTS
+========================================================= */
+
+const GENESIS_HASH = "GENESIS";
 
 /* =========================================================
    HASH UTIL
@@ -15,6 +21,7 @@ function sha256(data) {
 
 function computeRecordHash(record) {
   const base = JSON.stringify({
+    seq: record.seq,
     ts: record.ts,
     actor: record.actor,
     role: record.role,
@@ -29,19 +36,30 @@ function computeRecordHash(record) {
 }
 
 /* =========================================================
-   WRITE AUDIT (IMMUTABLE CHAIN)
+   WRITE AUDIT (IMMUTABLE + SEQUENCE LOCKED)
 ========================================================= */
 
 function writeAudit(input = {}) {
   try {
     const db = readDb();
-    if (!Array.isArray(db.audit)) db.audit = [];
 
-    const prev = db.audit[db.audit.length - 1];
-    const prevHash = prev ? prev.hash : "GENESIS";
+    if (!Array.isArray(db.audit)) db.audit = [];
+    if (!db.auditMeta) {
+      db.auditMeta = {
+        lastHash: null,
+        lastSequence: 0,
+        integrityVersion: 1,
+      };
+    }
+
+    const prevHash =
+      db.auditMeta.lastHash || GENESIS_HASH;
+
+    const seq = db.auditMeta.lastSequence + 1;
 
     const record = {
       id: crypto.randomUUID(),
+      seq,
       ts: Date.now(),
 
       actor: String(input.actor || "system"),
@@ -57,19 +75,25 @@ function writeAudit(input = {}) {
           : {},
 
       prevHash,
-      hash: null, // calculated below
+      hash: null,
     };
 
     record.hash = computeRecordHash(record);
 
     updateDb((db2) => {
       if (!Array.isArray(db2.audit)) db2.audit = [];
+      if (!db2.auditMeta) {
+        db2.auditMeta = {
+          lastHash: null,
+          lastSequence: 0,
+          integrityVersion: 1,
+        };
+      }
+
       db2.audit.push(record);
 
-      // Hard cap: keep last 10,000 events
-      if (db2.audit.length > 10_000) {
-        db2.audit = db2.audit.slice(-10_000);
-      }
+      db2.auditMeta.lastHash = record.hash;
+      db2.auditMeta.lastSequence = seq;
 
       return db2;
     });
@@ -89,46 +113,86 @@ function verifyAuditIntegrity() {
   try {
     const db = readDb();
     const logs = db.audit || [];
+    const meta = db.auditMeta || {};
 
     if (logs.length === 0) {
-      return { ok: true, message: "No audit records" };
+      return {
+        ok: true,
+        message: "No audit records",
+      };
     }
+
+    let expectedPrevHash = GENESIS_HASH;
+    let expectedSeq = 1;
 
     for (let i = 0; i < logs.length; i++) {
       const current = logs[i];
 
-      const expectedHash = computeRecordHash(current);
-
-      if (current.hash !== expectedHash) {
+      /* Sequence validation */
+      if (current.seq !== expectedSeq) {
         return {
           ok: false,
-          tamperedAt: current.id,
+          error: "Sequence mismatch",
+          index: i,
+          expectedSeq,
+          foundSeq: current.seq,
+        };
+      }
+
+      /* Chain validation */
+      if (current.prevHash !== expectedPrevHash) {
+        return {
+          ok: false,
+          error: "Broken hash chain",
           index: i,
         };
       }
 
-      if (i > 0) {
-        if (current.prevHash !== logs[i - 1].hash) {
-          return {
-            ok: false,
-            brokenChainAt: current.id,
-            index: i,
-          };
-        }
+      /* Hash recalculation */
+      const expectedHash = computeRecordHash(current);
+      if (current.hash !== expectedHash) {
+        return {
+          ok: false,
+          error: "Tampered record",
+          index: i,
+          recordId: current.id,
+        };
       }
+
+      expectedPrevHash = current.hash;
+      expectedSeq++;
+    }
+
+    /* Meta validation */
+    if (meta.lastHash !== expectedPrevHash) {
+      return {
+        ok: false,
+        error: "Meta hash mismatch",
+      };
+    }
+
+    if (meta.lastSequence !== logs.length) {
+      return {
+        ok: false,
+        error: "Meta sequence mismatch",
+      };
     }
 
     return {
       ok: true,
       totalRecords: logs.length,
+      lastHash: meta.lastHash,
     };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return {
+      ok: false,
+      error: err.message,
+    };
   }
 }
 
 /* =========================================================
-   BACKWARD COMPATIBILITY
+   BACKWARD COMPATIBILITY LAYER
 ========================================================= */
 
 function audit(input = {}) {
