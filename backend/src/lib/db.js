@@ -1,6 +1,6 @@
 // backend/src/lib/db.js
 // File-based JSON DB with schema + safe writes (atomic)
-// Upgraded to support scans + hardened migration
+// Fully Hardened • Stripe Ready • Scan Credit Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +8,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /* ======================================================
    UTIL
@@ -35,7 +35,9 @@ function defaultDb() {
     companies: [],
     audit: [],
     notifications: [],
-    scans: [], // ✅ NEW
+    scans: [],
+    scanCredits: {},              // ✅ NEW
+    processedStripeEvents: [],    // ✅ NEW
 
     brain: {
       memory: [],
@@ -79,7 +81,15 @@ function migrate(db) {
   if (!Array.isArray(db.companies)) db.companies = [];
   if (!Array.isArray(db.audit)) db.audit = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
-  if (!Array.isArray(db.scans)) db.scans = []; // ✅ ensure scans
+  if (!Array.isArray(db.scans)) db.scans = [];
+
+  if (!db.scanCredits || typeof db.scanCredits !== "object") {
+    db.scanCredits = {};
+  }
+
+  if (!Array.isArray(db.processedStripeEvents)) {
+    db.processedStripeEvents = [];
+  }
 
   if (!db.brain) db.brain = {};
   if (!Array.isArray(db.brain.memory)) db.brain.memory = [];
@@ -180,10 +190,6 @@ function writeAudit(event = {}) {
     console.error("AUDIT WRITE FAILED:", e);
   }
 }
-
-/* ======================================================
-   EXPORTS
-====================================================== */
 
 module.exports = {
   DB_PATH,
