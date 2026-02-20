@@ -1,5 +1,5 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Enterprise Hardened • Invoice Integrated • Revenue Synced
+// Stripe Service — Enterprise Revenue Hardened • Invoice Authoritative • Idempotent Safe
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
@@ -17,7 +17,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   SUBSCRIPTION PRICE MAP
+   PRICE MAP
 ========================================================= */
 
 const PRICE_MAP = {
@@ -48,7 +48,6 @@ function saveUser(updatedUser) {
 function activateAutoProtectBilling(userId, nextBillingDate) {
   updateDb((db) => {
     db.autoprotek = db.autoprotek || { users: {} };
-
     const existing = db.autoprotek.users[userId] || {};
 
     db.autoprotek.users[userId] = {
@@ -77,7 +76,7 @@ function lockAutoProtect(userId) {
 }
 
 /* =========================================================
-   SUBSCRIPTION CHECKOUT
+   CHECKOUT SESSION
 ========================================================= */
 
 async function createCheckoutSession({
@@ -138,7 +137,6 @@ async function activateSubscription({
   user.stripeSubscriptionId = subscriptionId;
 
   saveUser(user);
-
   activateAutoProtectBilling(user.id, nextBillingDate);
 
   if (user.companyId && PRICE_MAP[planType]) {
@@ -171,7 +169,9 @@ async function handleStripeWebhook(event) {
   db.processedStripeEvents.push(event.id);
   writeDb(db);
 
-  /* ---------------- CHECKOUT COMPLETED ---------------- */
+  /* =====================================================
+     CHECKOUT COMPLETED (INITIAL SUBSCRIPTION)
+  ====================================================== */
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
@@ -187,11 +187,29 @@ async function handleStripeWebhook(event) {
           planType,
           subscriptionId,
         });
+
+        // 🔥 Create initial invoice (first payment)
+        if (session.amount_total) {
+          createInvoice({
+            userId,
+            type: "subscription",
+            stripeSessionId: session.id,
+            stripeSubscriptionId: subscriptionId,
+            stripePaymentIntentId: session.payment_intent,
+            amountPaidCents: session.amount_total,
+            meta: {
+              phase: "initial_subscription_payment",
+              planType,
+            },
+          });
+        }
       }
     }
   }
 
-  /* ---------------- PAYMENT SUCCEEDED ---------------- */
+  /* =====================================================
+     RECURRING SUBSCRIPTION PAYMENT
+  ====================================================== */
 
   if (event.type === "invoice.payment_succeeded") {
     const invoiceObj = event.data.object;
@@ -214,19 +232,22 @@ async function handleStripeWebhook(event) {
       saveUser(user);
       activateAutoProtectBilling(user.id, nextBillingDate);
 
-      /* 🔥 CREATE INTERNAL INVOICE */
       createInvoice({
         userId: user.id,
         type: "subscription",
-        stripeSessionId: null,
         stripeSubscriptionId: subscription.id,
         stripePaymentIntentId: invoiceObj.payment_intent,
         amountPaidCents: invoiceObj.amount_paid,
+        meta: {
+          phase: "recurring_subscription",
+        },
       });
     }
   }
 
-  /* ---------------- PAYMENT FAILED ---------------- */
+  /* =====================================================
+     PAYMENT FAILED
+  ====================================================== */
 
   if (event.type === "invoice.payment_failed") {
     const invoiceObj = event.data.object;
@@ -243,7 +264,9 @@ async function handleStripeWebhook(event) {
     }
   }
 
-  /* ---------------- SUBSCRIPTION CANCELLED ---------------- */
+  /* =====================================================
+     SUBSCRIPTION CANCELLED
+  ====================================================== */
 
   if (event.type === "customer.subscription.deleted") {
     const subscription = event.data.object;
