@@ -35,26 +35,72 @@ const APPROVAL_STATUS = {
 };
 
 /* ======================================================
-   COMPANY BRANCH REGISTRY
+   PLAN ENGINE
 ====================================================== */
 
-const BRANCHES = [
-  "soc",
-  "analyst",
-  "consultant",
-  "incident_response",
-  "compliance",
-  "threat_intel",
-  "vulnerability",
-  "forensics",
-];
+const PLAN_BENEFITS = {
+  trial: {
+    discountPercent: 0,
+    includedScans: 0,
+    label: "Trial",
+  },
+  individual: {
+    discountPercent: 30,
+    includedScans: 1,
+    label: "Individual Active",
+  },
+  micro: {
+    discountPercent: 35,
+    includedScans: 2,
+    label: "Micro Plan",
+  },
+  small: {
+    discountPercent: 40,
+    includedScans: 5,
+    label: "Small Plan",
+  },
+  mid: {
+    discountPercent: 45,
+    includedScans: 10,
+    label: "Mid Plan",
+  },
+  enterprise: {
+    discountPercent: 50,
+    includedScans: 999,
+    label: "Enterprise Plan",
+  },
+};
 
-function validateBranch(branch) {
-  const b = String(branch || "").toLowerCase().trim();
-  if (!BRANCHES.includes(b)) {
-    throw new Error("Invalid branch");
+function getUserEffectivePlan(user) {
+  if (!user) return PLAN_BENEFITS.trial;
+
+  if (user.subscriptionStatus !== SUBSCRIPTION.ACTIVE) {
+    return PLAN_BENEFITS.trial;
   }
-  return b;
+
+  const db = readDb();
+
+  // Company plan overrides individual
+  if (user.companyId) {
+    const company = db.companies.find(
+      (c) => c.id === user.companyId
+    );
+
+    if (company && PLAN_BENEFITS[company.tier]) {
+      return PLAN_BENEFITS[company.tier];
+    }
+  }
+
+  // Individual active
+  if (user.role === ROLES.INDIVIDUAL) {
+    return PLAN_BENEFITS.individual;
+  }
+
+  return PLAN_BENEFITS.trial;
+}
+
+function getPlanBenefits(planKey) {
+  return PLAN_BENEFITS[planKey] || PLAN_BENEFITS.trial;
 }
 
 /* ======================================================
@@ -160,7 +206,7 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
     passwordHash: bcrypt.hashSync(String(password), 10),
     role: r,
     companyId: companyId || null,
-    branch: null, // NEW
+    branch: null,
     createdAt: new Date().toISOString(),
     subscriptionStatus: SUBSCRIPTION.TRIAL,
     mustResetPassword: false,
@@ -174,40 +220,6 @@ function createUser({ email, password, role, profile = {}, companyId = null }) {
   writeDb(db);
 
   return sanitize(u);
-}
-
-/* ======================================================
-   BRANCH ASSIGNMENT
-====================================================== */
-
-function assignBranch(userId, branch, actorRole) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const user = db.users.find((u) => u.id === userId);
-  if (!user) throw new Error("User not found");
-
-  requireAuthority(actorRole, user.role);
-
-  user.branch = validateBranch(branch);
-
-  writeDb(db);
-  return sanitize(user);
-}
-
-function removeBranch(userId, actorRole) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const user = db.users.find((u) => u.id === userId);
-  if (!user) throw new Error("User not found");
-
-  requireAuthority(actorRole, user.role);
-
-  user.branch = null;
-
-  writeDb(db);
-  return sanitize(user);
 }
 
 /* ======================================================
@@ -245,11 +257,10 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
-  BRANCHES,
+  getUserEffectivePlan,
+  getPlanBenefits,
   ensureAdminFromEnv,
   createUser,
-  assignBranch,
-  removeBranch,
   findByEmail,
   findById,
   listUsers,
