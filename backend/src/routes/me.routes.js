@@ -1,6 +1,6 @@
 // backend/src/routes/me.routes.js
 // Me Endpoints — Enterprise Hardened
-// Subscription Enforced • Tenant Safe • Audit Enabled
+// Subscription Enforced • Invoice PDF Enabled • Tenant Safe • Audit Enabled
 
 const express = require("express");
 const router = express.Router();
@@ -15,6 +15,10 @@ const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
 const { createProject } = require("../autoprotect/autoprotect.service");
 const { getUserEffectivePlan } = require("../users/user.service");
+const {
+  getUserInvoices,
+  getInvoicePdf,
+} = require("../services/invoice.service");
 
 router.use(authRequired);
 
@@ -60,7 +64,74 @@ function getDbUser(id) {
 }
 
 /* =========================================================
-   USAGE METER
+   🔥 INVOICE LIST
+========================================================= */
+
+router.get("/invoices", (req, res) => {
+  try {
+    const dbUser = getDbUser(req.user.id);
+    requireActiveSubscription(dbUser);
+
+    const invoices = getUserInvoices(dbUser.id);
+
+    res.json({
+      ok: true,
+      total: invoices.length,
+      invoices,
+    });
+
+  } catch (e) {
+    res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   🔥 INVOICE PDF DOWNLOAD
+========================================================= */
+
+router.get("/invoices/:id/pdf", (req, res) => {
+  try {
+    const dbUser = getDbUser(req.user.id);
+    requireActiveSubscription(dbUser);
+
+    const invoiceId = clean(req.params.id, 100);
+
+    const db = readDb();
+    const invoice = db.invoices.find(
+      (i) => i.id === invoiceId && i.userId === dbUser.id
+    );
+
+    if (!invoice) {
+      return res.status(404).json({
+        ok: false,
+        error: "Invoice not found",
+      });
+    }
+
+    const filePath = getInvoicePdf(invoiceId);
+
+    audit({
+      actorId: dbUser.id,
+      action: "DOWNLOAD_INVOICE_PDF",
+      targetType: "Invoice",
+      targetId: invoiceId,
+    });
+
+    res.download(filePath);
+
+  } catch (e) {
+    res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   USAGE
 ========================================================= */
 
 router.get("/usage", (req, res) => {
@@ -83,13 +154,6 @@ router.get("/usage", (req, res) => {
       included === Infinity
         ? Infinity
         : Math.max(0, included - used);
-
-    audit({
-      actorId: dbUser.id,
-      action: "VIEW_USAGE",
-      targetType: "User",
-      targetId: dbUser.id,
-    });
 
     res.json({
       ok: true,
@@ -126,89 +190,6 @@ router.get("/dashboard", (req, res) => {
         subscriptionStatus: dbUser.subscriptionStatus,
         companyId: dbUser.companyId || null,
       },
-    });
-
-  } catch (e) {
-    res.status(e.status || 500).json({
-      ok: false,
-      error: e.message,
-    });
-  }
-});
-
-/* =========================================================
-   SCAN HISTORY (Tenant Safe)
-========================================================= */
-
-router.get("/scans", (req, res) => {
-  try {
-    const dbUser = getDbUser(req.user.id);
-    requireActiveSubscription(dbUser);
-
-    const db = readDb();
-
-    const scans = (db.scans || [])
-      .filter((s) => s.userId === dbUser.id)
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    audit({
-      actorId: dbUser.id,
-      action: "VIEW_SCAN_HISTORY",
-      targetType: "User",
-      targetId: dbUser.id,
-    });
-
-    res.json({
-      ok: true,
-      total: scans.length,
-      scans,
-    });
-
-  } catch (e) {
-    res.status(e.status || 500).json({
-      ok: false,
-      error: e.message,
-    });
-  }
-});
-
-/* =========================================================
-   TOOL VISIBILITY (NEW)
-========================================================= */
-
-router.get("/tools", (req, res) => {
-  try {
-    const dbUser = getDbUser(req.user.id);
-    requireActiveSubscription(dbUser);
-
-    if (!dbUser.companyId) {
-      return res.json({
-        ok: true,
-        tools: [],
-      });
-    }
-
-    const company = companies.getCompany(dbUser.companyId);
-    const branchRecord =
-      company?.members?.find(
-        (m) => String(m.userId) === String(dbUser.id)
-      ) || null;
-
-    const branch =
-      typeof branchRecord === "object"
-        ? branchRecord.position
-        : "member";
-
-    const visible =
-      securityTools.getVisibleToolsForBranch(
-        dbUser.companyId,
-        branch
-      );
-
-    res.json({
-      ok: true,
-      branch,
-      tools: visible,
     });
 
   } catch (e) {
