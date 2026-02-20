@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Credit Enforced • Plan Discount Integrated
+// Public Scan Routes — Credit Enforced • Discount Applied • Revenue Accurate
 
 const express = require("express");
 const router = express.Router();
@@ -16,7 +16,7 @@ const {
 } = require("../services/stripe.service");
 
 const { verify } = require("../lib/jwt");
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
 const { getUserEffectivePlan } = require("../users/user.service");
 
 /* =========================================================
@@ -77,7 +77,6 @@ router.post("/", async (req, res) => {
 
     const user = getOptionalUser(req);
 
-    // 🔥 Pass user for credit enforcement
     const scan = createScan({
       toolId,
       email,
@@ -85,7 +84,7 @@ router.post("/", async (req, res) => {
       user,
     });
 
-    /* ================= CREDIT USED OR FREE TOOL ================= */
+    /* ================= CREDIT OR FREE ================= */
 
     if (scan.finalPrice === 0) {
       processScan(scan.id);
@@ -99,7 +98,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    /* ================= PLAN DISCOUNT ================= */
+    /* ================= DISCOUNT ENGINE ================= */
 
     let finalCharge = scan.finalPrice;
     let discountPercent = 0;
@@ -114,6 +113,16 @@ router.post("/", async (req, res) => {
         scan.finalPrice -
           (scan.finalPrice * discountPercent) / 100
       );
+
+      /* 🔥 Update stored scan price to discounted amount */
+      updateDb((db) => {
+        const s = db.scans?.find((x) => x.id === scan.id);
+        if (s) {
+          s.finalPrice = finalCharge;
+          s.discountPercent = discountPercent;
+          s.planLabel = planLabel;
+        }
+      });
     }
 
     const successUrl =
@@ -135,7 +144,7 @@ router.post("/", async (req, res) => {
       ok: true,
       scanId: scan.id,
       basePrice: scan.basePrice,
-      originalPrice: scan.finalPrice,
+      originalPrice: scan.basePrice,
       finalCharge,
       discountPercent,
       planLabel,
@@ -158,6 +167,7 @@ router.post("/", async (req, res) => {
 router.get("/:id", (req, res) => {
   try {
     const scan = getScan(req.params.id);
+
     if (!scan) {
       return res.status(404).json({
         ok: false,
