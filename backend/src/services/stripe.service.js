@@ -1,12 +1,12 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Subscriptions + One-Time Tool Sales • Full Sync Engine
+// Stripe Service — Subscriptions + One-Time Tool Sales • Hardened
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
-const { readDb, writeDb } = require("../lib/db");
+const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const { markScanPaid, processScan } = require("./scan.service");
+const { markScanPaid, processScan, getScan } = require("./scan.service");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -17,7 +17,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PRICE MAP (SUBSCRIPTIONS)
+   SUBSCRIPTION PRICE MAP
 ========================================================= */
 
 const PRICE_MAP = {
@@ -67,7 +67,6 @@ async function createCheckoutSession({
     metadata: {
       userId: user.id,
       planType: type,
-      companyId: user.companyId || "",
     },
   });
 
@@ -76,14 +75,13 @@ async function createCheckoutSession({
     action: "STRIPE_SUBSCRIPTION_CHECKOUT_CREATED",
     targetType: "Billing",
     targetId: session.id,
-    metadata: { planType: type },
   });
 
   return session.url;
 }
 
 /* =========================================================
-   TOOL ONE-TIME CHECKOUT
+   TOOL ONE-TIME CHECKOUT (SERVER AUTHORITATIVE)
 ========================================================= */
 
 async function createToolCheckoutSession({
@@ -92,6 +90,14 @@ async function createToolCheckoutSession({
   successUrl,
   cancelUrl,
 }) {
+  const scan = getScan(scanId);
+  if (!scan) throw new Error("Scan not found");
+
+  // 🔒 Never trust client amount
+  if (amount !== scan.finalPrice) {
+    throw new Error("Price mismatch");
+  }
+
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     payment_method_types: ["card"],
@@ -100,7 +106,7 @@ async function createToolCheckoutSession({
         price_data: {
           currency: "usd",
           product_data: {
-            name: "Security Scan",
+            name: scan.toolName,
           },
           unit_amount: amount * 100,
         },
@@ -120,7 +126,6 @@ async function createToolCheckoutSession({
     action: "STRIPE_TOOL_CHECKOUT_CREATED",
     targetType: "Scan",
     targetId: scanId,
-    metadata: { amount },
   });
 
   return session.url;
@@ -155,8 +160,88 @@ async function activateSubscription({
     action: "SUBSCRIPTION_ACTIVATED",
     targetType: "User",
     targetId: user.id,
-    metadata: { planType },
   });
+}
+
+/* =========================================================
+   WEBHOOK HANDLER
+========================================================= */
+
+async function handleStripeWebhook(event) {
+  const db = readDb();
+
+  // 🛑 Prevent duplicate webhook processing
+  if (!Array.isArray(db.processedStripeEvents)) {
+    db.processedStripeEvents = [];
+  }
+
+  if (db.processedStripeEvents.includes(event.id)) {
+    return;
+  }
+
+  db.processedStripeEvents.push(event.id);
+  writeDb(db);
+
+  /* ---------------- CHECKOUT COMPLETED ---------------- */
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+
+    // Subscription
+    if (session.mode === "subscription") {
+      const userId = session.metadata?.userId;
+      const planType = session.metadata?.planType;
+      const subscriptionId = session.subscription;
+
+      if (userId && planType && subscriptionId) {
+        await activateSubscription({
+          userId,
+          planType,
+          subscriptionId,
+        });
+      }
+    }
+
+    // Tool Payment
+    if (
+      session.mode === "payment" &&
+      session.metadata?.type === "tool_payment"
+    ) {
+      const scanId = session.metadata?.scanId;
+
+      if (scanId) {
+        markScanPaid(scanId);
+        processScan(scanId);
+
+        audit({
+          actorId: "system",
+          action: "TOOL_PAYMENT_COMPLETED",
+          targetType: "Scan",
+          targetId: scanId,
+        });
+      }
+    }
+  }
+
+  /* ---------------- SUBSCRIPTION STATUS ---------------- */
+
+  if (
+    event.type === "customer.subscription.updated" ||
+    event.type === "customer.subscription.deleted"
+  ) {
+    const subscription = event.data.object;
+    await syncSubscriptionStatus(subscription.id, subscription.status);
+  }
+
+  if (event.type === "invoice.payment_failed") {
+    const invoice = event.data.object;
+    await syncSubscriptionStatus(invoice.subscription, "past_due");
+  }
+
+  if (event.type === "invoice.payment_succeeded") {
+    const invoice = event.data.object;
+    await syncSubscriptionStatus(invoice.subscription, "active");
+  }
 }
 
 /* =========================================================
@@ -181,91 +266,16 @@ async function syncSubscriptionStatus(subscriptionId, stripeStatus) {
       mappedStatus = "Active";
       break;
     case "past_due":
-      mappedStatus = "Past_Due";
+      mappedStatus = "PastDue";
       break;
     case "canceled":
     case "unpaid":
       mappedStatus = "Locked";
       break;
-    default:
-      mappedStatus = "Inactive";
   }
 
   user.subscriptionStatus = mappedStatus;
   saveUser(user);
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_STATUS_SYNCED",
-    targetType: "User",
-    targetId: user.id,
-    metadata: { stripeStatus, mappedStatus },
-  });
-}
-
-/* =========================================================
-   STRIPE WEBHOOK HANDLER
-========================================================= */
-
-async function handleStripeWebhook(event) {
-
-  /* ---------------- SUBSCRIPTION ---------------- */
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-
-    if (session.mode === "subscription") {
-      const userId = session.metadata?.userId;
-      const planType = session.metadata?.planType;
-      const subscriptionId = session.subscription;
-
-      if (userId && planType && subscriptionId) {
-        await activateSubscription({
-          userId,
-          planType,
-          subscriptionId,
-        });
-      }
-    }
-
-    /* ---------------- TOOL PAYMENT ---------------- */
-
-    if (session.mode === "payment" && session.metadata?.type === "tool_payment") {
-      const scanId = session.metadata?.scanId;
-
-      if (scanId) {
-        markScanPaid(scanId);
-        processScan(scanId);
-
-        audit({
-          actorId: "system",
-          action: "TOOL_PAYMENT_COMPLETED",
-          targetType: "Scan",
-          targetId: scanId,
-        });
-      }
-    }
-  }
-
-  /* Subscription updates */
-
-  if (
-    event.type === "customer.subscription.updated" ||
-    event.type === "customer.subscription.deleted"
-  ) {
-    const subscription = event.data.object;
-    await syncSubscriptionStatus(subscription.id, subscription.status);
-  }
-
-  if (event.type === "invoice.payment_failed") {
-    const invoice = event.data.object;
-    await syncSubscriptionStatus(invoice.subscription, "past_due");
-  }
-
-  if (event.type === "invoice.payment_succeeded") {
-    const invoice = event.data.object;
-    await syncSubscriptionStatus(invoice.subscription, "active");
-  }
 }
 
 /* =========================================================
@@ -282,20 +292,12 @@ async function cancelSubscription(userId) {
 
   user.subscriptionStatus = "Locked";
   saveUser(user);
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_CANCELLED",
-    targetType: "User",
-    targetId: user.id,
-  });
 }
 
 module.exports = {
   createCheckoutSession,
-  createCustomerPortalSession,
+  createToolCheckoutSession,
   activateSubscription,
   cancelSubscription,
   handleStripeWebhook,
-  createToolCheckoutSession, // NEW
 };
