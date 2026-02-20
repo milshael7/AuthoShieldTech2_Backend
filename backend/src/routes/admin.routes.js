@@ -1,13 +1,14 @@
 // backend/src/routes/admin.routes.js
-// Admin API — Phase 17 Governance Layer
-// Admin + Finance Role Separation
-// Revenue • Forecast • Cashflow • Predictive Churn Engine
+// Phase 18 — Governance + Audit Integrity Layer
+// Admin + Finance Separation
+// Revenue • Forecast • Churn • Audit Verification
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
+const { verifyAuditIntegrity } = require("../lib/audit");
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
 
@@ -38,7 +39,7 @@ function requireFinanceOrAdmin(req, res, next) {
 }
 
 /* =========================================================
-   🔥 EXECUTIVE METRICS (Finance + Admin)
+   EXECUTIVE METRICS (Finance + Admin)
 ========================================================= */
 
 router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
@@ -69,13 +70,15 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       invoices.filter(i => i.type === "subscription").map(i => i.userId)
     ).size;
 
-    const arpu = payingUsers > 0
-      ? Number((totalRevenue / payingUsers).toFixed(2))
-      : 0;
+    const arpu =
+      payingUsers > 0
+        ? Number((totalRevenue / payingUsers).toFixed(2))
+        : 0;
 
-    const churnRate = usersList.length > 0
-      ? Number((lockedUsers.length / usersList.length).toFixed(4))
-      : 0;
+    const churnRate =
+      usersList.length > 0
+        ? Number((lockedUsers.length / usersList.length).toFixed(4))
+        : 0;
 
     const estimatedLTV =
       churnRate > 0 ? Number((arpu / churnRate).toFixed(2)) : 0;
@@ -96,14 +99,13 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       },
       time: new Date().toISOString(),
     });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   🔥 PREDICTIVE CHURN RISK (Finance + Admin)
+   CHURN RISK (Finance + Admin)
 ========================================================= */
 
 router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
@@ -115,9 +117,7 @@ router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
     const now = Date.now();
     const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
 
-    const results = [];
-
-    for (const user of usersList) {
+    const results = usersList.map(user => {
       let riskScore = 0;
 
       if (user.subscriptionStatus === "Locked") riskScore += 50;
@@ -134,27 +134,26 @@ router.get("/churn-risk", requireFinanceOrAdmin, (req, res) => {
       if (riskScore >= 60) level = "HIGH";
       else if (riskScore >= 30) level = "MEDIUM";
 
-      results.push({
+      return {
         userId: user.id,
         email: user.email,
         riskScore,
         level,
-      });
-    }
+      };
+    });
 
     res.json({
       ok: true,
       churnRisk: results,
       time: new Date().toISOString(),
     });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   🔥 REVENUE SUMMARY (Finance + Admin)
+   REVENUE SUMMARY (Finance + Admin)
 ========================================================= */
 
 router.get("/revenue/summary", requireFinanceOrAdmin, (req, res) => {
@@ -172,7 +171,24 @@ router.get("/revenue/summary", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   🔐 USER LIST (Admin Only)
+   🔐 AUDIT INTEGRITY CHECK (Finance + Admin)
+========================================================= */
+
+router.get("/audit/verify", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const result = verifyAuditIntegrity();
+    res.json({
+      ok: true,
+      integrity: result,
+      time: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   🔐 USERS (Admin Only)
 ========================================================= */
 
 router.get("/users", requireAdmin, (req, res) => {
