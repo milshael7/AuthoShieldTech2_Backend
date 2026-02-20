@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Tool Sales Engine • Stripe Integrated
+// Public Scan Routes — Tool Sales Engine • Dynamic Pricing Ready
 
 const express = require("express");
 const router = express.Router();
@@ -25,7 +25,8 @@ router.get("/tools", (req, res) => {
       ([id, tool]) => ({
         id,
         name: tool.name,
-        price: tool.price,
+        basePrice: tool.basePrice,
+        pricingModel: tool.pricingModel,
         type: tool.type,
       })
     );
@@ -65,13 +66,13 @@ router.post("/", async (req, res) => {
 
     /* ---------------- FREE TOOL ---------------- */
 
-    if (scan.price === 0) {
+    if (scan.finalPrice === 0) {
       processScan(scan.id);
 
       return res.json({
         ok: true,
         scanId: scan.id,
-        price: 0,
+        finalPrice: 0,
         status: "processing",
       });
     }
@@ -88,7 +89,7 @@ router.post("/", async (req, res) => {
 
     const checkoutUrl = await createToolCheckoutSession({
       scanId: scan.id,
-      amount: scan.price,
+      amount: scan.finalPrice,
       successUrl,
       cancelUrl,
     });
@@ -96,7 +97,9 @@ router.post("/", async (req, res) => {
     return res.json({
       ok: true,
       scanId: scan.id,
-      price: scan.price,
+      basePrice: scan.basePrice,
+      finalPrice: scan.finalPrice,
+      pricingModel: scan.pricingModel,
       checkoutUrl,
       status: "awaiting_payment",
     });
