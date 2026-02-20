@@ -1,15 +1,18 @@
 // backend/src/routes/autoprotect.routes.js
-// AutoProtect Routes — Engine Integrated • Limit Enforced • Individual Only
+// AutoProtect Routes — Active Job Model • Subscription Based • Enterprise Safe
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
 const users = require("../users/user.service");
+
 const {
   activateAutoProtect,
   deactivateAutoProtect,
   canRunAutoProtect,
+  registerAutoProtectJob,
+  isAutoProtectActive,
 } = require("../users/user.service");
 
 const { runAutoProtectJob } = require("../autoprotect/autoprotect.service");
@@ -17,16 +20,10 @@ const { readDb } = require("../lib/db");
 
 router.use(authRequired);
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ========================================================= */
 
 function nowISO() {
   return new Date().toISOString();
-}
-
-function isIndividual(user) {
-  return user.role === users.ROLES.INDIVIDUAL;
 }
 
 function isAdmin(user) {
@@ -37,6 +34,10 @@ function isManager(user) {
   return user.role === users.ROLES.MANAGER;
 }
 
+function isIndividual(user) {
+  return user.role === users.ROLES.INDIVIDUAL;
+}
+
 /* =========================================================
    STATUS
 ========================================================= */
@@ -45,15 +46,14 @@ router.get("/status", (req, res) => {
   const user = req.user;
   const db = readDb();
 
-  // Admin / Manager = read-only mirror
+  // Admin / Manager → read-only global mirror
   if (isAdmin(user) || isManager(user)) {
-    const apUsers = Object.keys(
-      db.autoprotek?.users || {}
-    );
+    const apUsers = Object.values(db.autoprotek?.users || {});
 
     return res.json({
       scope: "global",
-      totalActive: apUsers.length,
+      totalSubscribers: apUsers.length,
+      activeSubscribers: apUsers.filter(u => u.status === "ACTIVE").length,
       time: nowISO(),
       readOnly: true,
     });
@@ -66,14 +66,15 @@ router.get("/status", (req, res) => {
     });
   }
 
-  const userAP =
-    db.autoprotek?.users?.[user.id];
+  const userAP = db.autoprotek?.users?.[user.id];
 
   return res.json({
     scope: "user",
     status: userAP?.status || "INACTIVE",
-    monthlyLimit: userAP?.monthlyJobLimit || 0,
-    jobsUsed: userAP?.jobsUsedThisMonth || 0,
+    activeJobs: userAP?.activeJobsCount || 0,
+    activeLimit: userAP?.activeJobLimit || 10,
+    nextBillingDate: userAP?.nextBillingDate || null,
+    price: userAP?.priceLocked || 550,
     time: nowISO(),
   });
 });
@@ -97,6 +98,8 @@ router.post("/enable", (req, res) => {
   return res.json({
     ok: true,
     status: "ACTIVE",
+    price: 550,
+    limit: 10,
     time: nowISO(),
   });
 });
@@ -125,28 +128,21 @@ router.post("/disable", (req, res) => {
 });
 
 /* =========================================================
-   RUN JOB (ENGINE)
+   RUN JOB
 ========================================================= */
 
 router.post("/run", (req, res) => {
   const user = req.user;
 
-  if (!isIndividual(user)) {
-    return res.status(403).json({
-      ok: false,
-      error: "AutoProtect available to Individuals only.",
-    });
-  }
-
-  if (!canRunAutoProtect(user.id)) {
+  // Admin / Manager → unlimited
+  if (!canRunAutoProtect(user)) {
     return res.status(400).json({
       ok: false,
-      error: "AutoProtect inactive or monthly limit reached.",
+      error: "AutoProtect inactive or active job limit reached (10).",
     });
   }
 
-  const { companyId, title, issue } =
-    req.body || {};
+  const { companyId, title, issue } = req.body || {};
 
   if (!companyId || !title || !issue) {
     return res.status(400).json({
@@ -162,6 +158,9 @@ router.post("/run", (req, res) => {
       title,
       issue,
     });
+
+    // register active job for individuals
+    registerAutoProtectJob(user);
 
     return res.status(201).json({
       ok: true,
