@@ -1,5 +1,5 @@
 // backend/src/routes/me.routes.js
-// Me Endpoints — Subscription Enforced • Branch Controlled • Hardened
+// Me Endpoints — Subscription Enforced • Branch Controlled • Scan History Enabled
 
 const express = require("express");
 const router = express.Router();
@@ -7,6 +7,7 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { listNotifications, markRead } = require("../lib/notify");
 const { audit } = require("../lib/audit");
+const { readDb } = require("../lib/db");
 const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
@@ -51,7 +52,7 @@ function requireActiveCompany(company) {
 }
 
 /* =========================================================
-   DASHBOARD (SUBSCRIPTION ENFORCED)
+   DASHBOARD
 ========================================================= */
 
 router.get("/dashboard", (req, res) => {
@@ -68,8 +69,6 @@ router.get("/dashboard", (req, res) => {
     let companyInfo = null;
     let visibleTools = [];
     let plan = null;
-
-    /* ================= COMPANY CONTEXT ================= */
 
     if (dbUser.companyId) {
       const company = companies.getCompany(dbUser.companyId);
@@ -117,6 +116,54 @@ router.get("/dashboard", (req, res) => {
         subscriptionStatus: dbUser.subscriptionStatus,
         visibleTools,
       },
+    });
+
+  } catch (e) {
+    return res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   SCAN HISTORY (NEW)
+========================================================= */
+
+router.get("/scans", (req, res) => {
+  try {
+    const dbUser = users.findById(req.user.id);
+    requireActiveSubscription(dbUser);
+
+    const db = readDb();
+    const allScans = Array.isArray(db.scans) ? db.scans : [];
+
+    let scans = [];
+
+    // Individual scans (by email)
+    scans = allScans.filter(
+      (s) => s.email === dbUser.email
+    );
+
+    // Company-level scans (future-ready)
+    if (dbUser.companyId) {
+      scans = allScans.filter(
+        (s) =>
+          s.email === dbUser.email ||
+          s.companyId === dbUser.companyId
+      );
+    }
+
+    // Sort newest first
+    scans.sort(
+      (a, b) =>
+        new Date(b.createdAt) - new Date(a.createdAt)
+    );
+
+    return res.json({
+      ok: true,
+      total: scans.length,
+      scans,
     });
 
   } catch (e) {
@@ -181,7 +228,7 @@ router.post("/notifications/:id/read", (req, res) => {
 });
 
 /* =========================================================
-   PROJECT CREATION (SUBSCRIPTION REQUIRED)
+   PROJECT CREATION
 ========================================================= */
 
 router.post("/projects", (req, res) => {
