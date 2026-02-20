@@ -1,5 +1,6 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Hardened • Stripe Safe • Revenue Protected
+// Billing & Subscription Control — Enterprise Hardened
+// Stripe Safe • Plan Scoped • Revenue Protected
 
 const express = require("express");
 const router = express.Router();
@@ -17,20 +18,11 @@ const {
 } = require("../services/stripe.service");
 
 /* =========================================================
-   VALID PLAN TYPES
+   PLAN CONTROL
 ========================================================= */
 
-const VALID_PLANS = [
-  "individual_autodev",
-  "micro",
-  "small",
-  "mid",
-  "enterprise",
-];
-
-/* =========================================================
-   HELPERS
-========================================================= */
+const INDIVIDUAL_PLANS = ["individual_autodev"];
+const COMPANY_PLANS = ["micro", "small", "mid", "enterprise"];
 
 function clean(v, max = 200) {
   return String(v || "").trim().slice(0, max);
@@ -38,7 +30,7 @@ function clean(v, max = 200) {
 
 function requireUser(req, res) {
   if (!req.user?.id) {
-    res.status(401).json({ error: "Invalid auth context" });
+    res.status(401).json({ ok: false, error: "Invalid auth context" });
     return null;
   }
   return req.user;
@@ -53,6 +45,18 @@ function saveUser(updatedUser) {
   }
 }
 
+function validatePlanForUser(dbUser, type) {
+  if (INDIVIDUAL_PLANS.includes(type)) {
+    return true;
+  }
+
+  if (COMPANY_PLANS.includes(type) && dbUser.companyId) {
+    return true;
+  }
+
+  throw new Error("Plan not allowed for this user type");
+}
+
 /* =========================================================
    GET CURRENT SUBSCRIPTION
 ========================================================= */
@@ -64,7 +68,7 @@ router.get("/me", authRequired, (req, res) => {
 
     const dbUser = users.findById(user.id);
     if (!dbUser) {
-      return res.status(404).json({ error: "User not found" });
+      return res.status(404).json({ ok: false, error: "User not found" });
     }
 
     let companyPlan = null;
@@ -80,7 +84,7 @@ router.get("/me", authRequired, (req, res) => {
       }
     }
 
-    return res.json({
+    res.json({
       ok: true,
       subscription: {
         status: dbUser.subscriptionStatus,
@@ -91,7 +95,7 @@ router.get("/me", authRequired, (req, res) => {
     });
 
   } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -106,15 +110,17 @@ router.post("/checkout", authRequired, async (req, res) => {
 
     const type = clean(req.body?.type, 50);
 
-    if (!VALID_PLANS.includes(type)) {
-      return res.status(400).json({ error: "Invalid plan type" });
+    const dbUser = users.findById(user.id);
+    if (!dbUser) {
+      return res.status(404).json({ ok: false, error: "User not found" });
     }
 
-    const dbUser = users.findById(user.id);
+    validatePlanForUser(dbUser, type);
 
     if (dbUser.subscriptionStatus === users.SUBSCRIPTION.ACTIVE) {
       return res.status(400).json({
-        error: "Already subscribed. Manage subscription instead.",
+        ok: false,
+        error: "Already subscribed",
       });
     }
 
@@ -126,6 +132,7 @@ router.post("/checkout", authRequired, async (req, res) => {
 
     if (!successUrl || !cancelUrl) {
       return res.status(400).json({
+        ok: false,
         error: "Missing success or cancel URL",
       });
     }
@@ -144,10 +151,10 @@ router.post("/checkout", authRequired, async (req, res) => {
       targetId: type,
     });
 
-    return res.json({ ok: true, checkoutUrl });
+    res.json({ ok: true, checkoutUrl });
 
   } catch (e) {
-    return res.status(400).json({ error: e?.message || String(e) });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
@@ -166,6 +173,7 @@ router.post("/portal", authRequired, async (req, res) => {
 
     if (!returnUrl) {
       return res.status(400).json({
+        ok: false,
         error: "Missing return URL",
       });
     }
@@ -175,10 +183,10 @@ router.post("/portal", authRequired, async (req, res) => {
       returnUrl,
     });
 
-    return res.json({ ok: true, portalUrl });
+    res.json({ ok: true, portalUrl });
 
   } catch (e) {
-    return res.status(400).json({ error: e?.message || String(e) });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
@@ -192,9 +200,9 @@ router.post("/cancel", authRequired, async (req, res) => {
     if (!user) return;
 
     const dbUser = users.findById(user.id);
-
     if (!dbUser?.stripeSubscriptionId) {
       return res.status(400).json({
+        ok: false,
         error: "No active subscription",
       });
     }
@@ -210,13 +218,13 @@ router.post("/cancel", authRequired, async (req, res) => {
       targetId: subId,
     });
 
-    return res.json({
+    res.json({
       ok: true,
       message: "Subscription cancelled",
     });
 
   } catch (e) {
-    return res.status(400).json({ error: e?.message || String(e) });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
@@ -235,13 +243,17 @@ router.post(
 
       if (!Object.values(users.SUBSCRIPTION).includes(status)) {
         return res.status(400).json({
+          ok: false,
           error: "Invalid subscription status",
         });
       }
 
       const dbUser = users.findById(userId);
       if (!dbUser) {
-        return res.status(404).json({ error: "User not found" });
+        return res.status(404).json({
+          ok: false,
+          error: "User not found",
+        });
       }
 
       dbUser.subscriptionStatus = status;
@@ -255,10 +267,10 @@ router.post(
         metadata: { status },
       });
 
-      return res.json({ ok: true, userId, status });
+      res.json({ ok: true, userId, status });
 
     } catch (e) {
-      return res.status(400).json({ error: e?.message || String(e) });
+      res.status(400).json({ ok: false, error: e.message });
     }
   }
 );
