@@ -1,16 +1,12 @@
 // backend/src/services/stripe.service.js
-// Stripe Service — Enterprise Financial Integrity Layer
-// Invoice Synced • Refund Safe • Dispute Safe • Revenue Reconciled
+// Stripe Service — Enterprise Financial Ledger Integrated
+// Payments • Refunds • Disputes • Revenue Reversal Safe
 
 const Stripe = require("stripe");
 const users = require("../users/user.service");
-const companies = require("../companies/company.service");
 const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const {
-  createInvoice,
-  createRefundInvoice,
-} = require("./invoice.service");
+const { nanoid } = require("nanoid");
 
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -54,7 +50,6 @@ function activateAutoProtectBilling(userId, nextBillingDate) {
 function lockUserBilling(userId) {
   updateDb((db) => {
     if (!db.autoprotek?.users?.[userId]) return;
-
     db.autoprotek.users[userId].status = "INACTIVE";
     db.autoprotek.users[userId].subscriptionStatus = "LOCKED";
   });
@@ -79,7 +74,7 @@ async function handleStripeWebhook(event) {
   writeDb(db);
 
   /* =====================================================
-     SUBSCRIPTION PAYMENT SUCCEEDED
+     PAYMENT SUCCEEDED
   ====================================================== */
 
   if (event.type === "invoice.payment_succeeded") {
@@ -98,91 +93,147 @@ async function handleStripeWebhook(event) {
       (u) => u.stripeSubscriptionId === subscription.id
     );
 
-    if (user) {
-      user.subscriptionStatus = "Active";
-      saveUser(user);
-      activateAutoProtectBilling(user.id, nextBillingDate);
+    if (!user) return;
 
-      createInvoice({
+    const amount = invoiceObj.amount_paid / 100;
+
+    // Activate subscription
+    user.subscriptionStatus = "Active";
+    saveUser(user);
+    activateAutoProtectBilling(user.id, nextBillingDate);
+
+    // Write payment ledger
+    updateDb((ledgerDb) => {
+      ledgerDb.payments.push({
+        id: nanoid(),
         userId: user.id,
-        type: "subscription",
-        stripeSubscriptionId: subscription.id,
         stripePaymentIntentId: invoiceObj.payment_intent,
-        amountPaidCents: invoiceObj.amount_paid,
-        meta: { phase: "recurring" },
+        stripeSubscriptionId: subscription.id,
+        amount,
+        status: "paid",
+        createdAt: new Date().toISOString(),
       });
-    }
+
+      ledgerDb.revenueSummary.totalRevenue += amount;
+      ledgerDb.revenueSummary.subscriptionRevenue += amount;
+    });
+
+    audit({
+      actorId: user.id,
+      action: "PAYMENT_RECORDED",
+      targetType: "User",
+      targetId: user.id,
+      meta: { amount },
+    });
   }
 
   /* =====================================================
-     REFUND ISSUED (FULL OR PARTIAL)
+     REFUND ISSUED
   ====================================================== */
 
   if (event.type === "charge.refunded") {
     const charge = event.data.object;
-
     if (!charge.payment_intent) return;
 
-    const db2 = readDb();
-    const user = db2.users.find(
-      (u) => u.stripePaymentIntentId === charge.payment_intent
-    );
+    const refundAmount = charge.amount_refunded / 100;
 
-    if (!user) return;
+    updateDb((ledgerDb) => {
+      const payment = ledgerDb.payments.find(
+        (p) => p.stripePaymentIntentId === charge.payment_intent
+      );
 
-    createRefundInvoice({
-      userId: user.id,
-      stripePaymentIntentId: charge.payment_intent,
-      amountRefundedCents: charge.amount_refunded,
-      reason: "stripe_refund",
+      if (!payment) return;
+
+      payment.status = "refunded";
+
+      ledgerDb.refunds.push({
+        id: nanoid(),
+        userId: payment.userId,
+        stripePaymentIntentId: charge.payment_intent,
+        amount: refundAmount,
+        createdAt: new Date().toISOString(),
+      });
+
+      ledgerDb.revenueSummary.totalRevenue -= refundAmount;
+      ledgerDb.revenueSummary.subscriptionRevenue -= refundAmount;
+      ledgerDb.revenueSummary.refundedAmount += refundAmount;
     });
 
-    lockUserBilling(user.id);
+    lockUserBilling(
+      db.users.find(
+        (u) => u.stripeSubscriptionId === charge.invoice?.subscription
+      )?.id
+    );
 
     audit({
-      actorId: user.id,
-      action: "PAYMENT_REFUNDED",
-      targetType: "User",
-      targetId: user.id,
+      actorId: "system",
+      action: "REFUND_RECORDED",
+      targetType: "StripePayment",
+      targetId: charge.payment_intent,
+      meta: { refundAmount },
     });
   }
 
   /* =====================================================
-     DISPUTE CREATED (CHARGEBACK)
+     DISPUTE CREATED
   ====================================================== */
 
   if (event.type === "charge.dispute.created") {
     const dispute = event.data.object;
 
-    if (!dispute.payment_intent) return;
+    updateDb((ledgerDb) => {
+      const payment = ledgerDb.payments.find(
+        (p) => p.stripePaymentIntentId === dispute.payment_intent
+      );
 
-    const db2 = readDb();
-    const user = db2.users.find(
-      (u) => u.stripePaymentIntentId === dispute.payment_intent
+      if (!payment) return;
+
+      payment.status = "disputed";
+
+      ledgerDb.disputes.push({
+        id: nanoid(),
+        userId: payment.userId,
+        stripePaymentIntentId: dispute.payment_intent,
+        amount: dispute.amount / 100,
+        status: dispute.status,
+        createdAt: new Date().toISOString(),
+      });
+
+      ledgerDb.revenueSummary.disputedAmount +=
+        dispute.amount / 100;
+    });
+
+    lockUserBilling(
+      db.users.find(
+        (u) => u.stripePaymentIntentId === dispute.payment_intent
+      )?.id
     );
 
-    if (!user) return;
-
-    lockUserBilling(user.id);
-
     audit({
-      actorId: user.id,
-      action: "PAYMENT_DISPUTE_CREATED",
-      targetType: "User",
-      targetId: user.id,
+      actorId: "system",
+      action: "DISPUTE_CREATED",
+      targetType: "StripeDispute",
+      targetId: dispute.id,
     });
   }
 
   /* =====================================================
-     DISPUTE CLOSED (WON OR LOST)
+     DISPUTE CLOSED
   ====================================================== */
 
   if (event.type === "charge.dispute.closed") {
     const dispute = event.data.object;
 
+    updateDb((ledgerDb) => {
+      const record = ledgerDb.disputes.find(
+        (d) => d.stripePaymentIntentId === dispute.payment_intent
+      );
+      if (record) record.status = dispute.status;
+    });
+
     audit({
       actorId: "system",
-      action: "PAYMENT_DISPUTE_CLOSED",
+      action: "DISPUTE_CLOSED",
       targetType: "StripeDispute",
       targetId: dispute.id,
       meta: { status: dispute.status },
