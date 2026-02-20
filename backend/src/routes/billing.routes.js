@@ -1,5 +1,5 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Stripe Integrated • Persistent • Tenant Safe
+// Billing & Subscription Control — Hardened • Stripe Safe • Revenue Protected
 
 const express = require("express");
 const router = express.Router();
@@ -15,6 +15,18 @@ const {
   createCustomerPortalSession,
   cancelSubscription,
 } = require("../services/stripe.service");
+
+/* =========================================================
+   VALID PLAN TYPES
+========================================================= */
+
+const VALID_PLANS = [
+  "individual_autodev",
+  "micro",
+  "small",
+  "mid",
+  "enterprise",
+];
 
 /* =========================================================
    HELPERS
@@ -72,7 +84,6 @@ router.get("/me", authRequired, (req, res) => {
       ok: true,
       subscription: {
         status: dbUser.subscriptionStatus,
-        role: dbUser.role,
         stripeCustomerId: dbUser.stripeCustomerId || null,
         stripeSubscriptionId: dbUser.stripeSubscriptionId || null,
         companyPlan,
@@ -80,14 +91,12 @@ router.get("/me", authRequired, (req, res) => {
     });
 
   } catch (e) {
-    return res.status(500).json({
-      error: e?.message || String(e),
-    });
+    return res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
 /* =========================================================
-   CREATE STRIPE CHECKOUT SESSION
+   CREATE CHECKOUT
 ========================================================= */
 
 router.post("/checkout", authRequired, async (req, res) => {
@@ -96,8 +105,17 @@ router.post("/checkout", authRequired, async (req, res) => {
     if (!user) return;
 
     const type = clean(req.body?.type, 50);
-    if (!type) {
-      return res.status(400).json({ error: "Missing plan type" });
+
+    if (!VALID_PLANS.includes(type)) {
+      return res.status(400).json({ error: "Invalid plan type" });
+    }
+
+    const dbUser = users.findById(user.id);
+
+    if (dbUser.subscriptionStatus === users.SUBSCRIPTION.ACTIVE) {
+      return res.status(400).json({
+        error: "Already subscribed. Manage subscription instead.",
+      });
     }
 
     const successUrl =
@@ -119,20 +137,22 @@ router.post("/checkout", authRequired, async (req, res) => {
       cancelUrl,
     });
 
-    return res.json({
-      ok: true,
-      checkoutUrl,
+    audit({
+      actorId: user.id,
+      action: "SUBSCRIPTION_CHECKOUT_STARTED",
+      targetType: "Plan",
+      targetId: type,
     });
 
+    return res.json({ ok: true, checkoutUrl });
+
   } catch (e) {
-    return res.status(400).json({
-      error: e?.message || String(e),
-    });
+    return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
 /* =========================================================
-   OPEN STRIPE CUSTOMER PORTAL
+   STRIPE CUSTOMER PORTAL
 ========================================================= */
 
 router.post("/portal", authRequired, async (req, res) => {
@@ -155,15 +175,10 @@ router.post("/portal", authRequired, async (req, res) => {
       returnUrl,
     });
 
-    return res.json({
-      ok: true,
-      portalUrl,
-    });
+    return res.json({ ok: true, portalUrl });
 
   } catch (e) {
-    return res.status(400).json({
-      error: e?.message || String(e),
-    });
+    return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
@@ -176,7 +191,24 @@ router.post("/cancel", authRequired, async (req, res) => {
     const user = requireUser(req, res);
     if (!user) return;
 
+    const dbUser = users.findById(user.id);
+
+    if (!dbUser?.stripeSubscriptionId) {
+      return res.status(400).json({
+        error: "No active subscription",
+      });
+    }
+
+    const subId = dbUser.stripeSubscriptionId;
+
     await cancelSubscription(user.id);
+
+    audit({
+      actorId: user.id,
+      action: "SUBSCRIPTION_CANCEL_REQUESTED",
+      targetType: "StripeSubscription",
+      targetId: subId,
+    });
 
     return res.json({
       ok: true,
@@ -184,14 +216,12 @@ router.post("/cancel", authRequired, async (req, res) => {
     });
 
   } catch (e) {
-    return res.status(400).json({
-      error: e?.message || String(e),
-    });
+    return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
 /* =========================================================
-   ADMIN SET SUBSCRIPTION STATUS (MANUAL OVERRIDE)
+   ADMIN MANUAL STATUS OVERRIDE
 ========================================================= */
 
 router.post(
@@ -203,17 +233,15 @@ router.post(
       const userId = clean(req.body?.userId, 100);
       const status = clean(req.body?.status, 50);
 
-      if (!userId || !status) {
+      if (!Object.values(users.SUBSCRIPTION).includes(status)) {
         return res.status(400).json({
-          error: "Missing userId or status",
+          error: "Invalid subscription status",
         });
       }
 
       const dbUser = users.findById(userId);
       if (!dbUser) {
-        return res.status(404).json({
-          error: "User not found",
-        });
+        return res.status(404).json({ error: "User not found" });
       }
 
       dbUser.subscriptionStatus = status;
@@ -227,16 +255,10 @@ router.post(
         metadata: { status },
       });
 
-      return res.json({
-        ok: true,
-        userId,
-        status,
-      });
+      return res.json({ ok: true, userId, status });
 
     } catch (e) {
-      return res.status(400).json({
-        error: e?.message || String(e),
-      });
+      return res.status(400).json({ error: e?.message || String(e) });
     }
   }
 );
