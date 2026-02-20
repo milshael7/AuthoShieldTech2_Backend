@@ -1,5 +1,5 @@
 // backend/src/routes/public.scans.routes.js
-// Public Scan Routes — Tool Sales Engine • Queue Based
+// Public Scan Routes — Tool Sales Engine • Stripe Integrated
 
 const express = require("express");
 const router = express.Router();
@@ -10,6 +10,10 @@ const {
   getScan,
   TOOL_REGISTRY,
 } = require("../services/scan.service");
+
+const {
+  createToolCheckoutSession,
+} = require("../services/stripe.service");
 
 /* =========================================================
    LIST PUBLIC TOOLS
@@ -59,17 +63,44 @@ router.post("/", async (req, res) => {
       inputData: inputData || {},
     });
 
-    // If free tool → process immediately
+    /* ---------------- FREE TOOL ---------------- */
+
     if (scan.price === 0) {
       processScan(scan.id);
+
+      return res.json({
+        ok: true,
+        scanId: scan.id,
+        price: 0,
+        status: "processing",
+      });
     }
+
+    /* ---------------- PAID TOOL ---------------- */
+
+    const successUrl =
+      process.env.STRIPE_TOOL_SUCCESS_URL ||
+      "https://yourdomain.com/scan-success";
+
+    const cancelUrl =
+      process.env.STRIPE_TOOL_CANCEL_URL ||
+      "https://yourdomain.com/scan-cancel";
+
+    const checkoutUrl = await createToolCheckoutSession({
+      scanId: scan.id,
+      amount: scan.price,
+      successUrl,
+      cancelUrl,
+    });
 
     return res.json({
       ok: true,
       scanId: scan.id,
       price: scan.price,
-      status: scan.status,
+      checkoutUrl,
+      status: "awaiting_payment",
     });
+
   } catch (e) {
     return res.status(400).json({
       ok: false,
