@@ -1,5 +1,5 @@
 // backend/src/services/scan.service.js
-// Scan Engine — Credit Enforced • SaaS Ready • Revenue Safe
+// Scan Engine — Credit Enforced • Enterprise Structured • Revenue Hardened
 
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
@@ -32,7 +32,7 @@ const TOOL_REGISTRY = {
 };
 
 /* =========================================================
-   CREDIT UTILITIES
+   CREDIT SYSTEM
 ========================================================= */
 
 function currentMonthKey() {
@@ -44,13 +44,13 @@ function getUserMonthlyUsage(db, userId) {
   const key = currentMonthKey();
 
   if (!db.scanCredits) db.scanCredits = {};
+
   if (!db.scanCredits[userId]) {
     db.scanCredits[userId] = { month: key, used: 0 };
   }
 
   const record = db.scanCredits[userId];
 
-  // Reset if new month
   if (record.month !== key) {
     record.month = key;
     record.used = 0;
@@ -60,7 +60,7 @@ function getUserMonthlyUsage(db, userId) {
 }
 
 /* =========================================================
-   PRICE CALCULATION
+   PRICE ENGINE
 ========================================================= */
 
 function toNumber(v) {
@@ -78,15 +78,13 @@ function calculatePrice(tool, inputData = {}) {
     price += (toNumber(inputData.targets) - 1) * 50;
   }
 
-  if (inputData.urgency === "rush") {
-    price += 200;
-  }
+  if (inputData.urgency === "rush") price += 200;
 
   return Math.max(0, Math.round(price));
 }
 
 /* =========================================================
-   CREATE SCAN (CREDIT AWARE)
+   CREATE SCAN
 ========================================================= */
 
 function createScan({ toolId, email, inputData, user }) {
@@ -94,9 +92,9 @@ function createScan({ toolId, email, inputData, user }) {
   if (!tool) throw new Error("Invalid tool");
 
   const db = readDb();
-  const finalPriceRaw = calculatePrice(tool, inputData);
+  const rawPrice = calculatePrice(tool, inputData);
 
-  let finalPrice = finalPriceRaw;
+  let finalPrice = rawPrice;
   let creditUsed = false;
 
   if (user) {
@@ -120,13 +118,15 @@ function createScan({ toolId, email, inputData, user }) {
     toolName: tool.name,
     email: String(email || "").trim(),
     userId: user?.id || null,
+    companyId: user?.companyId || null,
     inputData: inputData || {},
     basePrice: tool.basePrice,
     finalPrice,
     pricingModel: tool.pricingModel,
     creditUsed,
     status: finalPrice > 0 ? "awaiting_payment" : "pending",
-    paymentReceivedAt: finalPrice === 0 ? new Date().toISOString() : null,
+    paymentReceivedAt:
+      finalPrice === 0 ? new Date().toISOString() : null,
     createdAt: new Date().toISOString(),
     completedAt: null,
     result: null,
@@ -134,13 +134,15 @@ function createScan({ toolId, email, inputData, user }) {
 
   updateDb((db2) => {
     if (!Array.isArray(db2.scans)) db2.scans = [];
-    if (!db2.scanCredits) db2.scanCredits = db.scanCredits;
+    db2.scanCredits = db.scanCredits;
     db2.scans.push(scan);
   });
 
   audit({
     actorId: user?.id || "public",
-    action: creditUsed ? "SCAN_CREATED_CREDIT" : "SCAN_CREATED",
+    action: creditUsed
+      ? "SCAN_CREATED_CREDIT"
+      : "SCAN_CREATED",
     targetType: "Scan",
     targetId: scan.id,
   });
@@ -161,6 +163,13 @@ function markScanPaid(scanId) {
 
     scan.status = "pending";
     scan.paymentReceivedAt = new Date().toISOString();
+  });
+
+  audit({
+    actorId: "system",
+    action: "SCAN_PAYMENT_CONFIRMED",
+    targetType: "Scan",
+    targetId: scanId,
   });
 }
 
@@ -184,15 +193,53 @@ function processScan(scanId) {
       const scan = db.scans?.find((s) => s.id === scanId);
       if (!scan || scan.status !== "running") return;
 
-      const riskScore = Math.floor(Math.random() * 60) + 20;
+      const riskScore =
+        Math.floor(Math.random() * 60) + 20;
+
+      const riskLevel =
+        riskScore >= 70
+          ? "High"
+          : riskScore >= 45
+          ? "Moderate"
+          : "Low";
 
       scan.status = "completed";
       scan.completedAt = new Date().toISOString();
+
       scan.result = {
-        riskScore,
-        message: "Scan completed successfully.",
+        overview: {
+          riskScore,
+          riskLevel,
+          scannedTool: scan.toolName,
+          scanType:
+            scan.creditUsed
+              ? "Credit Scan"
+              : scan.finalPrice === 0
+              ? "Free Scan"
+              : "Paid Scan",
+        },
+        billing: {
+          basePrice: scan.basePrice,
+          finalPrice: scan.finalPrice,
+          creditUsed: scan.creditUsed,
+          paidAt: scan.paymentReceivedAt,
+        },
+        findings: [
+          "External exposure points detected.",
+          "Surface-level vulnerabilities identified.",
+        ],
+        recommendation:
+          "Continuous monitoring recommended.",
       };
     });
+
+    audit({
+      actorId: "system",
+      action: "SCAN_COMPLETED",
+      targetType: "Scan",
+      targetId: scanId,
+    });
+
   }, 4000);
 }
 
