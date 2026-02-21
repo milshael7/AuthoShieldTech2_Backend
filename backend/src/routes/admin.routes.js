@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
-// Phase 28 + 29 — Enterprise Security & Governance Intelligence
-// SOC2 • Risk Index • Anomaly Engine • Privilege Mapping • Compliance
+// Phase 30 — Unified Executive Intelligence Layer
+// SOC2 • Revenue • Metrics • Risk • Compliance History
 
 const express = require("express");
 const router = express.Router();
@@ -8,7 +8,11 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
 const { verifyAuditIntegrity } = require("../lib/audit");
-const { generateComplianceReport } = require("../services/compliance.service");
+const {
+  generateComplianceReport,
+  getComplianceHistory
+} = require("../services/compliance.service");
+
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
 
@@ -42,128 +46,78 @@ function requireFinanceOrAdmin(req, res, next) {
 }
 
 /* =========================================================
-   🧠 SECURITY ANOMALY ENGINE
+   📊 EXECUTIVE METRICS (RESTORED)
 ========================================================= */
 
-function computeSecurityRisk(db) {
-  const audit = db.audit || [];
-  const usersList = db.users || [];
-  const refunds = db.refunds || [];
-  const disputes = db.disputes || [];
-
-  let risk = 0;
-
-  // Audit integrity
-  const auditIntegrity = verifyAuditIntegrity();
-  if (!auditIntegrity.ok) risk += 30;
-
-  // High privilege spikes
-  const highPrivilegeAccess = audit.filter(
-    (a) => a.action === "HIGH_PRIVILEGE_ACCESS"
-  );
-  if (highPrivilegeAccess.length > 50) risk += 15;
-
-  // Refund anomaly
-  if (refunds.length > usersList.length * 0.2) risk += 10;
-
-  // Dispute anomaly
-  if (disputes.length > 5) risk += 15;
-
-  // Locked user ratio
-  const lockedUsers = usersList.filter(
-    (u) => u.subscriptionStatus === "Locked"
-  );
-  if (lockedUsers.length > usersList.length * 0.3) risk += 10;
-
-  return Math.min(risk, 100);
-}
-
-/* =========================================================
-   📊 SECURITY POSTURE
-========================================================= */
-
-router.get("/security/posture", requireFinanceOrAdmin, (req, res) => {
+router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
-    const riskIndex = computeSecurityRisk(db);
 
-    const roleDistribution = {
-      admin: db.users.filter(u => u.role === "Admin").length,
-      finance: db.users.filter(u => u.role === "Finance").length,
-      manager: db.users.filter(u => u.role === "Manager").length,
-      standard: db.users.filter(
-        u =>
-          !["Admin", "Finance", "Manager"].includes(u.role)
-      ).length,
-    };
+    const usersList = db.users || [];
+    const invoices = db.invoices || [];
+
+    const activeSubscribers = usersList.filter(
+      (u) => u.subscriptionStatus === "Active"
+    ).length;
+
+    const trialUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Trial"
+    ).length;
+
+    const lockedUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Locked"
+    ).length;
+
+    const totalRevenue = db.revenueSummary?.totalRevenue || 0;
+
+    const now = Date.now();
+    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+
+    const mrr = invoices
+      .filter(
+        (i) =>
+          i.type === "subscription" &&
+          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
+      )
+      .reduce((sum, i) => sum + i.amount, 0);
+
+    const arr = mrr * 12;
+
+    const payingUsers = new Set(
+      invoices
+        .filter((i) => i.type === "subscription")
+        .map((i) => i.userId)
+    ).size;
+
+    const arpu =
+      payingUsers > 0
+        ? Number((totalRevenue / payingUsers).toFixed(2))
+        : 0;
+
+    const churnRate =
+      usersList.length > 0
+        ? Number((lockedUsers / usersList.length).toFixed(4))
+        : 0;
+
+    const estimatedLTV =
+      churnRate > 0
+        ? Number((arpu / churnRate).toFixed(2))
+        : 0;
 
     res.json({
       ok: true,
-      posture: {
-        riskIndex,
-        auditIntegrity: verifyAuditIntegrity(),
-        totalUsers: db.users.length,
-        roleDistribution,
-        refunds: db.refunds.length,
-        disputes: db.disputes.length,
+      metrics: {
+        totalUsers: usersList.length,
+        activeSubscribers,
+        trialUsers,
+        lockedUsers,
+        totalRevenue,
+        MRR: Number(mrr.toFixed(2)),
+        ARR: Number(arr.toFixed(2)),
+        ARPU: arpu,
+        churnRate,
+        estimatedLTV,
       },
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   🔎 SECURITY ANOMALIES DETAIL
-========================================================= */
-
-router.get("/security/anomalies", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const audit = db.audit || [];
-
-    const anomalies = {
-      brokenAuditChain: !verifyAuditIntegrity().ok,
-      highPrivilegeAccessCount: audit.filter(
-        (a) => a.action === "HIGH_PRIVILEGE_ACCESS"
-      ).length,
-      accessDeniedEvents: audit.filter(
-        (a) => a.action?.includes("ACCESS_DENIED")
-      ).length,
-      refundCount: db.refunds.length,
-      disputeCount: db.disputes.length,
-    };
-
-    res.json({
-      ok: true,
-      anomalies,
-      generatedAt: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   🔐 PRIVILEGE MAP
-========================================================= */
-
-router.get("/security/privilege-map", requireAdmin, (req, res) => {
-  try {
-    const db = readDb();
-
-    const privilegeMap = db.users.map((u) => ({
-      id: u.id,
-      email: u.email,
-      role: u.role,
-      companyId: u.companyId,
-      subscriptionStatus: u.subscriptionStatus,
-    }));
-
-    res.json({
-      ok: true,
-      privilegeMap,
       generatedAt: new Date().toISOString(),
     });
   } catch (e) {
@@ -189,14 +143,37 @@ router.get(
 );
 
 /* =========================================================
-   🔐 USERS (Admin Only)
+   📚 COMPLIANCE HISTORY
+========================================================= */
+
+router.get(
+  "/compliance/history",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 20);
+      const history = getComplianceHistory(limit);
+
+      res.json({
+        ok: true,
+        history,
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  }
+);
+
+/* =========================================================
+   🔐 USERS
 ========================================================= */
 
 router.get("/users", requireAdmin, (req, res) => {
   try {
     res.json({
       ok: true,
-      users: users.listUsersForAccess(req.accessContext),
+      users: users.listUsers(),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -204,7 +181,7 @@ router.get("/users", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   🔐 NOTIFICATIONS (Admin Only)
+   🔐 NOTIFICATIONS
 ========================================================= */
 
 router.get("/notifications", requireAdmin, (req, res) => {
