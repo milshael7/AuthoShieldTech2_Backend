@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
 // Phase 32+ — Executive Finance Intelligence Layer
-// + Executive Risk Index • Revenue/Refund Overlay • Predictive Churn
+// + Executive Risk Index • Revenue/Refund Overlay • Predictive Churn • Subscriber Growth
 
 const express = require("express");
 const router = express.Router();
@@ -54,7 +54,6 @@ function clamp(n, min, max) {
 
 function dayKey(iso) {
   if (!iso) return null;
-  // expects ISO timestamps; tolerate Date strings
   try {
     return String(iso).slice(0, 10);
   } catch {
@@ -67,7 +66,14 @@ function parseDaysParam(req, fallback = 90, min = 7, max = 365) {
   return clamp(raw, min, max);
 }
 
-function buildDailySeries({ startISO, endISO, invoices = [], refunds = [], disputes = [] }) {
+// Builds daily points ONLY for days with data (simple + fast)
+function buildDailySeries({
+  startISO,
+  endISO,
+  invoices = [],
+  refunds = [],
+  disputes = [],
+}) {
   const start = new Date(startISO).getTime();
   const end = new Date(endISO).getTime();
 
@@ -89,11 +95,10 @@ function buildDailySeries({ startISO, endISO, invoices = [], refunds = [], dispu
     if (!day) continue;
     ensure(day);
 
-    // invoices can include refund invoices with negative amounts in your invoice engine
     const amt = Number(inv.amount || 0);
     if (!Number.isFinite(amt)) continue;
 
-    // treat subscription/tool/autoprotect as revenue; treat refund type separately
+    // Refund invoices may be negative — treat as refunds pressure
     if (inv.type === "refund") map[day].refunds += Math.abs(amt);
     else map[day].revenue += amt;
   }
@@ -103,6 +108,7 @@ function buildDailySeries({ startISO, endISO, invoices = [], refunds = [], dispu
     const day = dayKey(r.createdAt);
     if (!day) continue;
     ensure(day);
+
     const amt = Math.abs(Number(r.amount || 0));
     if (Number.isFinite(amt)) map[day].refunds += amt;
   }
@@ -112,6 +118,7 @@ function buildDailySeries({ startISO, endISO, invoices = [], refunds = [], dispu
     const day = dayKey(d.createdAt);
     if (!day) continue;
     ensure(day);
+
     const amt = Math.abs(Number(d.amount || 0));
     if (Number.isFinite(amt)) map[day].disputes += amt;
   }
@@ -126,6 +133,70 @@ function buildDailySeries({ startISO, endISO, invoices = [], refunds = [], dispu
 }
 
 /* =========================================================
+   ✅ REQUIRED BY FRONTEND — SUBSCRIBER GROWTH
+   GET /api/admin/subscriber-growth
+========================================================= */
+
+router.get("/subscriber-growth", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const days = parseDaysParam(req, 90, 7, 365);
+
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - days);
+
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+
+    // day -> { newUsers, newActive }
+    const daily = {};
+
+    function ensure(day) {
+      if (!daily[day]) daily[day] = { newUsers: 0, newActive: 0 };
+    }
+
+    for (const u of db.users || []) {
+      if (!u?.createdAt) continue;
+      const t = new Date(u.createdAt).getTime();
+      if (!Number.isFinite(t) || t < startMs || t > endMs) continue;
+
+      const day = dayKey(u.createdAt);
+      if (!day) continue;
+      ensure(day);
+
+      daily[day].newUsers += 1;
+      if (u.subscriptionStatus === "Active") daily[day].newActive += 1;
+    }
+
+    const daysSorted = Object.keys(daily).sort();
+
+    let totalUsers = 0;
+    let activeSubscribers = 0;
+
+    const growth = daysSorted.map((date) => {
+      totalUsers += daily[date].newUsers;
+      activeSubscribers += daily[date].newActive;
+
+      return {
+        date,
+        totalUsers,
+        activeSubscribers,
+      };
+    });
+
+    res.json({
+      ok: true,
+      window: { days, start: start.toISOString(), end: end.toISOString() },
+      growth,
+      time: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
    LAYER 1 — EXECUTIVE RISK INDEX (0–100)
 ========================================================= */
 
@@ -133,8 +204,10 @@ router.get("/executive-risk", requireFinanceOrAdmin, async (req, res) => {
   try {
     const db = readDb();
 
-    // Compliance drift + audit integrity
-    const compliance = await generateComplianceReport();
+    // Use latest snapshot if available (avoids generating a new snapshot every call)
+    const latest = (db.complianceSnapshots || []).slice(-1)[0];
+    const compliance = latest || (await generateComplianceReport());
+
     const revenueDrift = Number(
       compliance?.financialIntegrity?.revenueDrift ?? 0
     );
@@ -142,18 +215,13 @@ router.get("/executive-risk", requireFinanceOrAdmin, async (req, res) => {
     const auditIntegrity = verifyAuditIntegrity();
     const auditOK = !!auditIntegrity?.ok;
 
-    // Refund + dispute pressure (based on ledger)
     const totalRevenue = Number(db.revenueSummary?.totalRevenue || 0);
     const refundedAmount = Number(db.revenueSummary?.refundedAmount || 0);
     const disputedAmount = Number(db.revenueSummary?.disputedAmount || 0);
 
-    const refundsRatio =
-      totalRevenue > 0 ? refundedAmount / totalRevenue : 0;
+    const refundsRatio = totalRevenue > 0 ? refundedAmount / totalRevenue : 0;
+    const disputesRatio = totalRevenue > 0 ? disputedAmount / totalRevenue : 0;
 
-    const disputesRatio =
-      totalRevenue > 0 ? disputedAmount / totalRevenue : 0;
-
-    // Subscriber / churn signals
     const usersList = db.users || [];
     const locked = usersList.filter((u) => u.subscriptionStatus === "Locked")
       .length;
@@ -162,33 +230,33 @@ router.get("/executive-risk", requireFinanceOrAdmin, async (req, res) => {
     const trial = usersList.filter((u) => u.subscriptionStatus === "Trial")
       .length;
 
-    const lockedRatio =
-      usersList.length > 0 ? locked / usersList.length : 0;
+    const lockedRatio = usersList.length > 0 ? locked / usersList.length : 0;
 
-    // Risk scoring (simple, explainable, stable)
     let risk = 0;
 
-    // Drift: any non-zero drift hurts; large drift hurts more
+    // Drift sensitivity
     risk += clamp(Math.abs(revenueDrift) * 2, 0, 30);
 
-    // Audit chain failure is major
+    // Audit chain failure
     if (!auditOK) risk += 30;
 
     // Refund/dispute pressure
-    risk += clamp(refundsRatio * 100 * 0.35, 0, 20); // up to 20
-    risk += clamp(disputesRatio * 100 * 0.5, 0, 20); // up to 20
+    risk += clamp(refundsRatio * 100 * 0.35, 0, 20);
+    risk += clamp(disputesRatio * 100 * 0.5, 0, 20);
 
     // Locked ratio pressure
-    risk += clamp(lockedRatio * 100 * 0.25, 0, 20); // up to 20
+    risk += clamp(lockedRatio * 100 * 0.25, 0, 20);
 
-    // Keep it bounded
     risk = clamp(risk, 0, 100);
 
     const level =
-      risk >= 75 ? "CRITICAL" :
-      risk >= 50 ? "ELEVATED" :
-      risk >= 25 ? "MODERATE" :
-      "LOW";
+      risk >= 75
+        ? "CRITICAL"
+        : risk >= 50
+        ? "ELEVATED"
+        : risk >= 25
+        ? "MODERATE"
+        : "LOW";
 
     res.json({
       ok: true,
@@ -285,12 +353,11 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
     const locked = usersList.filter((u) => u.subscriptionStatus === "Locked")
       .length;
 
-    const lockedRatio =
-      usersList.length > 0 ? locked / usersList.length : 0;
+    const lockedRatio = usersList.length > 0 ? locked / usersList.length : 0;
 
-    // activity: who paid in last 60 days
     const now = Date.now();
     const SIXTY_DAYS = 60 * 24 * 60 * 60 * 1000;
+
     const recentPayers = new Set(
       invoices
         .filter(
@@ -303,27 +370,26 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
         .map((i) => i.userId)
     ).size;
 
-    // pressure: refunds/disputes relative to actives
-    const refundRate =
-      active > 0 ? refunds.length / active : refunds.length;
-
+    const refundRate = active > 0 ? refunds.length / active : refunds.length;
     const disputeRate =
       active > 0 ? disputes.length / active : disputes.length;
 
-    // score (0–100): explainable weights
     let score = 0;
-    score += clamp(lockedRatio * 100 * 0.6, 0, 60); // locked pressure heavy
-    score += clamp(refundRate * 20, 0, 20); // refund volume pressure
-    score += clamp(disputeRate * 30, 0, 30); // disputes stronger signal
+    score += clamp(lockedRatio * 100 * 0.6, 0, 60);
+    score += clamp(refundRate * 20, 0, 20);
+    score += clamp(disputeRate * 30, 0, 30);
     if (recentPayers === 0 && (active > 0 || trial > 0)) score += 15;
 
     score = clamp(score, 0, 100);
 
     const level =
-      score >= 75 ? "CRITICAL" :
-      score >= 50 ? "ELEVATED" :
-      score >= 25 ? "MODERATE" :
-      "LOW";
+      score >= 75
+        ? "CRITICAL"
+        : score >= 50
+        ? "ELEVATED"
+        : score >= 25
+        ? "MODERATE"
+        : "LOW";
 
     res.json({
       ok: true,
@@ -339,8 +405,14 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
             lockedRatio: Number(lockedRatio.toFixed(4)),
           },
           recentPayers60d: recentPayers,
-          refunds: { count: refunds.length, perActive: Number(refundRate.toFixed(4)) },
-          disputes: { count: disputes.length, perActive: Number(disputeRate.toFixed(4)) },
+          refunds: {
+            count: refunds.length,
+            perActive: Number(refundRate.toFixed(4)),
+          },
+          disputes: {
+            count: disputes.length,
+            perActive: Number(disputeRate.toFixed(4)),
+          },
         },
       },
       time: new Date().toISOString(),
@@ -351,7 +423,7 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   REFUND + DISPUTE TIMELINE
+   REFUND + DISPUTE TIMELINE (CUMULATIVE)
 ========================================================= */
 
 router.get("/refund-dispute-timeline", requireFinanceOrAdmin, (req, res) => {
@@ -366,23 +438,16 @@ router.get("/refund-dispute-timeline", requireFinanceOrAdmin, (req, res) => {
       if (!entry?.createdAt) return;
 
       const day = entry.createdAt.slice(0, 10);
-
       if (!dailyMap[day]) {
-        dailyMap[day] = {
-          refundAmount: 0,
-          disputeAmount: 0,
-        };
+        dailyMap[day] = { refundAmount: 0, disputeAmount: 0 };
       }
 
-      const amount = Number(entry.amount || 0);
+      // Always treat these as positive “risk exposure” values
+      const amount = Math.abs(Number(entry.amount || 0));
+      if (!Number.isFinite(amount)) return;
 
-      if (type === "refund") {
-        dailyMap[day].refundAmount += amount;
-      }
-
-      if (type === "dispute") {
-        dailyMap[day].disputeAmount += amount;
-      }
+      if (type === "refund") dailyMap[day].refundAmount += amount;
+      if (type === "dispute") dailyMap[day].disputeAmount += amount;
     }
 
     refunds.forEach((r) => addEntry(r, "refund"));
@@ -399,15 +464,12 @@ router.get("/refund-dispute-timeline", requireFinanceOrAdmin, (req, res) => {
 
       return {
         date: day,
-        cumulativeRefund,
-        cumulativeDispute,
+        cumulativeRefund: Number(cumulativeRefund.toFixed(2)),
+        cumulativeDispute: Number(cumulativeDispute.toFixed(2)),
       };
     });
 
-    res.json({
-      ok: true,
-      timeline: result,
-    });
+    res.json({ ok: true, timeline: result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -427,9 +489,9 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       (u) => u.subscriptionStatus === "Active"
     ).length;
 
-    // lightweight MRR (30d subscription invoices)
     const now = Date.now();
     const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+
     const mrr = invoices
       .filter(
         (i) =>
