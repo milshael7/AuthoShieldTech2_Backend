@@ -7,9 +7,11 @@ const rateLimit = require("express-rate-limit");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-const { ensureDb } = require("./lib/db");
+const { ensureDb, readDb, updateDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
+
+const { generateComplianceReport } = require("./services/compliance.service");
 
 /* ROUTES */
 const securityRoutes = require("./routes/security.routes");
@@ -34,6 +36,19 @@ requireEnv("STRIPE_WEBHOOK_SECRET");
 ensureDb();
 users.ensureAdminFromEnv();
 
+/* =========================================================
+   SYSTEM STATE INIT
+========================================================= */
+
+updateDb((db) => {
+  db.systemState = db.systemState || {
+    securityStatus: "NORMAL", // NORMAL | WARNING | LOCKDOWN
+    lastComplianceCheck: null,
+    lastDriftAmount: 0,
+  };
+  return db;
+});
+
 console.log("[BOOT] Backend initialized");
 
 /* =========================================================
@@ -44,8 +59,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   STRIPE WEBHOOK (RAW BODY ONLY)
-   MUST BE BEFORE express.json()
+   STRIPE WEBHOOK
 ========================================================= */
 
 app.use(
@@ -81,13 +95,38 @@ const authLimiter = rateLimit({
 });
 
 /* =========================================================
+   LOCKDOWN ENFORCEMENT MIDDLEWARE
+========================================================= */
+
+app.use((req, res, next) => {
+  const db = readDb();
+  const state = db.systemState || {};
+
+  if (
+    state.securityStatus === "LOCKDOWN" &&
+    !req.originalUrl.startsWith("/api/admin") &&
+    !req.originalUrl.startsWith("/api/billing") &&
+    !req.originalUrl.startsWith("/health")
+  ) {
+    return res.status(503).json({
+      ok: false,
+      error: "System temporarily locked due to compliance anomaly",
+    });
+  }
+
+  next();
+});
+
+/* =========================================================
    HEALTH
 ========================================================= */
 
 app.get("/health", (req, res) => {
+  const db = readDb();
   res.json({
     ok: true,
     uptime: process.uptime(),
+    systemState: db.systemState,
     time: new Date().toISOString(),
   });
 });
@@ -120,6 +159,45 @@ app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/voice", require("./routes/voice.routes"));
 app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
+
+/* =========================================================
+   AUTOMATED COMPLIANCE RUNNER
+========================================================= */
+
+async function runComplianceCheck() {
+  try {
+    const snapshot = generateComplianceReport();
+
+    updateDb((db) => {
+      const drift = snapshot.financialIntegrity.revenueDrift;
+      const auditOk = snapshot.auditIntegrity?.ok;
+
+      let status = "NORMAL";
+
+      if (!auditOk) status = "LOCKDOWN";
+      else if (Math.abs(drift) > 5) status = "WARNING";
+      else if (Math.abs(drift) > 25) status = "LOCKDOWN";
+
+      db.systemState = {
+        securityStatus: status,
+        lastComplianceCheck: new Date().toISOString(),
+        lastDriftAmount: drift,
+      };
+
+      return db;
+    });
+
+    console.log("[COMPLIANCE] Check completed");
+  } catch (err) {
+    console.error("[COMPLIANCE ERROR]", err);
+  }
+}
+
+/* Run every 6 hours */
+setInterval(runComplianceCheck, 6 * 60 * 60 * 1000);
+
+/* Run once at startup */
+runComplianceCheck();
 
 /* =========================================================
    SERVER
