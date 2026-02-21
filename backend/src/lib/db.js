@@ -263,4 +263,3 @@ module.exports = {
   readDb,
   writeDb,
   updateDb,
-};
