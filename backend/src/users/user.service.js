@@ -1,220 +1,207 @@
-// backend/src/users/user.service.js
-// Phase 27 — Enterprise User Service
-// Role Separation • Finance Governance • Field-Level Masking • Exposure Control
+// backend/src/routes/admin.routes.js
+// Phase 31 — Executive Intelligence + Growth Analytics
 
-const bcrypt = require("bcryptjs");
-const { nanoid } = require("nanoid");
-const { readDb, writeDb } = require("../lib/db");
+const express = require("express");
+const router = express.Router();
 
-/* ======================================================
-   CONSTANTS
-====================================================== */
+const { authRequired } = require("../middleware/auth");
+const { readDb } = require("../lib/db");
+const { verifyAuditIntegrity } = require("../lib/audit");
+const {
+  generateComplianceReport,
+  getComplianceHistory
+} = require("../services/compliance.service");
 
-const ROLES = {
-  ADMIN: "Admin",
-  MANAGER: "Manager",
-  COMPANY: "Company",
-  INDIVIDUAL: "Individual",
-  FINANCE: "Finance",
-};
+const users = require("../users/user.service");
+const { listNotifications } = require("../lib/notify");
 
-const ROLE_ALLOWLIST = Object.values(ROLES);
+const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
+const FINANCE_ROLE = users?.ROLES?.FINANCE || "Finance";
 
-const SUBSCRIPTION = {
-  TRIAL: "Trial",
-  ACTIVE: "Active",
-  PAST_DUE: "PastDue",
-  LOCKED: "Locked",
-};
+router.use(authRequired);
 
-const APPROVAL_STATUS = {
-  PENDING: "pending",
-  MANAGER_APPROVED: "manager_approved",
-  APPROVED: "approved",
-  DENIED: "denied",
-};
+/* =========================================================
+   ROLE GUARDS
+========================================================= */
 
-/* ======================================================
-   HELPERS
-====================================================== */
-
-function ensureArrays(db) {
-  if (!Array.isArray(db.users)) db.users = [];
-}
-
-function normEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
-function validateRole(role) {
-  if (!ROLE_ALLOWLIST.includes(role)) {
-    throw new Error("Invalid role assignment");
+function requireAdmin(req, res, next) {
+  if (req.user.role !== ADMIN_ROLE) {
+    return res.status(403).json({ ok: false, error: "Admin only" });
   }
+  next();
 }
 
-function maskEmail(email) {
-  const [name, domain] = String(email).split("@");
-  if (!domain) return "***";
-  return `${name.slice(0, 2)}***@${domain}`;
-}
-
-/* ======================================================
-   FIELD-LEVEL MASKING ENGINE
-====================================================== */
-
-function maskUserForRole(user, accessTier) {
-  if (!user) return null;
-
-  const base = {
-    id: user.id,
-    platformId: user.platformId,
-    role: user.role,
-    companyId: user.companyId,
-    subscriptionStatus: user.subscriptionStatus,
-    createdAt: user.createdAt,
-  };
-
-  // ADMIN → full visibility (except passwordHash)
-  if (accessTier === "ADMIN") {
-    return {
-      ...base,
-      email: user.email,
-      status: user.status,
-      approvedBy: user.approvedBy,
-      trialStartAt: user.trialStartAt,
-      trialExpiresAt: user.trialExpiresAt,
-      profile: user.profile || {},
-    };
+function requireFinanceOrAdmin(req, res, next) {
+  if (
+    req.user.role !== ADMIN_ROLE &&
+    req.user.role !== FINANCE_ROLE
+  ) {
+    return res.status(403).json({
+      ok: false,
+      error: "Finance or Admin only",
+    });
   }
+  next();
+}
 
-  // FINANCE → see email + billing state, but not approval metadata
-  if (accessTier === "FINANCE") {
-    return {
-      ...base,
-      email: user.email,
-      subscriptionStatus: user.subscriptionStatus,
-      profile: {},
-    };
+/* =========================================================
+   EXECUTIVE METRICS
+========================================================= */
+
+router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+
+    const usersList = db.users || [];
+    const invoices = db.invoices || [];
+
+    const activeSubscribers = usersList.filter(
+      (u) => u.subscriptionStatus === "Active"
+    ).length;
+
+    const trialUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Trial"
+    ).length;
+
+    const lockedUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Locked"
+    ).length;
+
+    const totalRevenue = db.revenueSummary?.totalRevenue || 0;
+
+    res.json({
+      ok: true,
+      metrics: {
+        totalUsers: usersList.length,
+        activeSubscribers,
+        trialUsers,
+        lockedUsers,
+        totalRevenue,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
+});
 
-  // MANAGER → limited internal visibility
-  if (accessTier === "MANAGER") {
-    return {
-      ...base,
-      email: maskEmail(user.email),
-      subscriptionStatus: user.subscriptionStatus,
-    };
+/* =========================================================
+   SUBSCRIBER GROWTH ANALYTICS
+========================================================= */
+
+router.get(
+  "/subscriber-growth",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const db = readDb();
+      const usersList = db.users || [];
+
+      const dailyMap = {};
+
+      usersList.forEach((u) => {
+        if (!u.createdAt) return;
+        const day = u.createdAt.slice(0, 10);
+
+        if (!dailyMap[day]) {
+          dailyMap[day] = {
+            newUsers: 0,
+            newActive: 0,
+          };
+        }
+
+        dailyMap[day].newUsers++;
+
+        if (u.subscriptionStatus === "Active") {
+          dailyMap[day].newActive++;
+        }
+      });
+
+      const sortedDays = Object.keys(dailyMap).sort();
+
+      let cumulativeUsers = 0;
+      let cumulativeActive = 0;
+
+      const result = sortedDays.map((day) => {
+        cumulativeUsers += dailyMap[day].newUsers;
+        cumulativeActive += dailyMap[day].newActive;
+
+        return {
+          date: day,
+          totalUsers: cumulativeUsers,
+          activeSubscribers: cumulativeActive,
+        };
+      });
+
+      res.json({
+        ok: true,
+        growth: result,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
+);
 
-  // STANDARD → strict masking
-  return {
-    id: user.id,
-    email: maskEmail(user.email),
-    role: user.role,
-    subscriptionStatus: user.subscriptionStatus,
-  };
-}
+/* =========================================================
+   COMPLIANCE
+========================================================= */
 
-function listUsersForAccess(accessContext) {
-  const db = readDb();
-  ensureArrays(db);
-
-  const tier = accessContext?.tier || "STANDARD";
-
-  return db.users.map((u) =>
-    maskUserForRole(u, tier)
-  );
-}
-
-/* ======================================================
-   USER CREATION
-====================================================== */
-
-function createUser({ email, password, role, profile = {}, companyId = null }) {
-  const db = readDb();
-  ensureArrays(db);
-
-  validateRole(role);
-
-  const cleanEmail = String(email || "").trim();
-  if (!cleanEmail) throw new Error("Email required");
-
-  if (db.users.find(u => normEmail(u.email) === normEmail(cleanEmail))) {
-    throw new Error("Email already exists");
+router.get(
+  "/compliance/report",
+  requireFinanceOrAdmin,
+  async (req, res) => {
+    try {
+      const report = await generateComplianceReport();
+      res.json({ ok: true, complianceReport: report });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
+);
 
-  if (!password || String(password).length < 6) {
-    throw new Error("Password must be at least 6 characters");
+router.get(
+  "/compliance/history",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 20);
+      const history = getComplianceHistory(limit);
+
+      res.json({ ok: true, history });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
+);
 
-  const now = new Date();
+/* =========================================================
+   USERS
+========================================================= */
 
-  const user = {
-    id: nanoid(),
-    platformId: `AS-${nanoid(10).toUpperCase()}`,
-    email: cleanEmail,
-    passwordHash: bcrypt.hashSync(String(password), 10),
-    role,
-    companyId,
-    createdAt: now.toISOString(),
-    subscriptionStatus: SUBSCRIPTION.TRIAL,
-    trialStartAt: now.toISOString(),
-    trialExpiresAt: null,
-    locked: false,
-    status: APPROVAL_STATUS.PENDING,
-    approvedBy: null,
-    profile: typeof profile === "object" ? profile : {},
-  };
+router.get("/users", requireAdmin, (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      users: users.listUsers(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-  db.users.push(user);
-  writeDb(db);
+/* =========================================================
+   NOTIFICATIONS
+========================================================= */
 
-  return maskUserForRole(user, "ADMIN");
-}
+router.get("/notifications", requireAdmin, (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      notifications: listNotifications({}),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-/* ======================================================
-   QUERIES
-====================================================== */
-
-function findByEmail(email) {
-  const db = readDb();
-  ensureArrays(db);
-  return db.users.find(u => normEmail(u.email) === normEmail(email)) || null;
-}
-
-function findById(id) {
-  const db = readDb();
-  ensureArrays(db);
-  return db.users.find(u => u.id === id) || null;
-}
-
-function listUsers() {
-  const db = readDb();
-  ensureArrays(db);
-  return db.users.map(u => {
-    const { passwordHash, ...safe } = u;
-    return safe;
-  });
-}
-
-function verifyPassword(user, password) {
-  if (!user) return false;
-  if (user.locked) throw new Error("Account locked");
-  if (user.status !== APPROVAL_STATUS.APPROVED)
-    throw new Error("Account not approved");
-
-  return bcrypt.compareSync(password, user.passwordHash);
-}
-
-module.exports = {
-  ROLES,
-  SUBSCRIPTION,
-  APPROVAL_STATUS,
-  createUser,
-  findByEmail,
-  findById,
-  listUsers,
-  listUsersForAccess,
-  maskUserForRole,
-  verifyPassword,
-};
+module.exports = router;
