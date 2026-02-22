@@ -1,90 +1,132 @@
 // backend/src/users/user.service.js
-// AuthoShieldTech — User Service (Hardened)
-// Roles • Subscription States • Core User Access
+// Enterprise User Service — Roles + Subscription + Admin Bootstrap
+// Single source of truth for ROLES / SUBSCRIPTION / APPROVAL_STATUS
 
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
 const { readDb, updateDb } = require("../lib/db");
 
-/* =========================================================
-   ROLES
-========================================================= */
-
-const ROLES = {
+const ROLES = Object.freeze({
   ADMIN: "Admin",
+  FINANCE: "Finance",
   MANAGER: "Manager",
   COMPANY: "Company",
   SMALL_COMPANY: "Small_Company",
   INDIVIDUAL: "Individual",
-  FINANCE: "Finance",
-};
+});
 
-/* =========================================================
-   SUBSCRIPTION STATES
-========================================================= */
-
-const SUBSCRIPTION = {
-  ACTIVE: "Active",
+const SUBSCRIPTION = Object.freeze({
   TRIAL: "Trial",
+  ACTIVE: "Active",
+  PAST_DUE: "Past Due",
   LOCKED: "Locked",
-  PAST_DUE: "Past_Due",
-  CANCELED: "Canceled",
-};
+});
 
-/* =========================================================
-   HELPERS
-========================================================= */
+const APPROVAL_STATUS = Object.freeze({
+  PENDING: "Pending",
+  APPROVED: "Approved",
+  REJECTED: "Rejected",
+});
 
-function normalizeRole(role) {
-  return String(role || "").trim();
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function makeId(prefix = "usr") {
+  return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function safeUser(u) {
+  if (!u) return null;
+  const { passwordHash, ...rest } = u;
+  return rest;
 }
 
 /* =========================================================
-   USER READ
+   CRUD
 ========================================================= */
 
 function listUsers() {
   const db = readDb();
-  return db.users || [];
+  return (db.users || []).map(safeUser);
 }
 
 function findById(id) {
   const db = readDb();
-  return (db.users || []).find((u) => String(u.id) === String(id));
+  return (db.users || []).find((u) => String(u.id) === String(id)) || null;
 }
 
 function findByEmail(email) {
   const db = readDb();
-  return (db.users || []).find(
-    (u) => String(u.email).toLowerCase() === String(email).toLowerCase()
-  );
+  const e = normEmail(email);
+  return (db.users || []).find((u) => normEmail(u.email) === e) || null;
 }
 
-/* =========================================================
-   USER WRITE
-========================================================= */
+async function createUser({
+  email,
+  password,
+  role = ROLES.INDIVIDUAL,
+  companyId = null,
+  subscriptionStatus = SUBSCRIPTION.TRIAL,
+  status = APPROVAL_STATUS.PENDING,
+}) {
+  const e = normEmail(email);
+  if (!e) throw new Error("Email required");
+  if (!password || String(password).length < 6) throw new Error("Password too short");
 
-function createUser(userData) {
-  return updateDb((db) => {
-    const newUser = {
-      id: String(Date.now()),
-      createdAt: new Date().toISOString(),
-      role: ROLES.INDIVIDUAL,
-      subscriptionStatus: SUBSCRIPTION.TRIAL,
-      ...userData,
-    };
+  const exists = findByEmail(e);
+  if (exists) throw new Error("Email already exists");
 
-    db.users.push(newUser);
+  const passwordHash = await bcrypt.hash(String(password), 10);
+
+  const user = {
+    id: makeId(),
+    email: e,
+    role,
+    companyId,
+    locked: false,
+    subscriptionStatus,
+    status,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+
+  updateDb((db) => {
+    db.users = Array.isArray(db.users) ? db.users : [];
+    db.users.push({ ...user, passwordHash });
+    return db;
+  });
+
+  return safeUser(user);
+}
+
+async function verifyPassword(user, password) {
+  if (!user?.passwordHash) return false;
+  return bcrypt.compare(String(password || ""), user.passwordHash);
+}
+
+function setSubscriptionStatus(userId, subscriptionStatus) {
+  updateDb((db) => {
+    db.users = Array.isArray(db.users) ? db.users : [];
+    const u = db.users.find((x) => String(x.id) === String(userId));
+    if (!u) return db;
+    u.subscriptionStatus = subscriptionStatus;
+    u.updatedAt = nowIso();
     return db;
   });
 }
 
-function updateUser(id, updates) {
-  return updateDb((db) => {
-    const user = db.users.find((u) => String(u.id) === String(id));
-    if (!user) return db;
-
-    Object.assign(user, updates);
-    user.updatedAt = new Date().toISOString();
-
+function setApprovalStatus(userId, status) {
+  updateDb((db) => {
+    db.users = Array.isArray(db.users) ? db.users : [];
+    const u = db.users.find((x) => String(x.id) === String(userId));
+    if (!u) return db;
+    u.status = status;
+    u.updatedAt = nowIso();
     return db;
   });
 }
@@ -94,35 +136,52 @@ function updateUser(id, updates) {
 ========================================================= */
 
 function ensureAdminFromEnv() {
-  const email = process.env.ADMIN_EMAIL;
-  const password = process.env.ADMIN_PASSWORD;
+  const email = normEmail(process.env.ADMIN_EMAIL || "");
+  const password = String(process.env.ADMIN_PASSWORD || "");
 
-  if (!email || !password) return;
+  if (!email || !password) {
+    // Not configured — do nothing
+    return;
+  }
 
-  const existing = findByEmail(email);
-  if (existing) return;
+  updateDb((db) => {
+    db.users = Array.isArray(db.users) ? db.users : [];
 
-  createUser({
-    email,
-    password,
-    role: ROLES.ADMIN,
-    subscriptionStatus: SUBSCRIPTION.ACTIVE,
+    const existing = db.users.find((u) => normEmail(u.email) === email);
+    if (existing) return db;
+
+    const passwordHash = bcrypt.hashSync(password, 10);
+
+    db.users.push({
+      id: makeId("admin"),
+      email,
+      passwordHash,
+      role: ROLES.ADMIN,
+      companyId: null,
+      locked: false,
+      subscriptionStatus: SUBSCRIPTION.ACTIVE,
+      status: APPROVAL_STATUS.APPROVED,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+
+    return db;
   });
-
-  console.log("[BOOT] Admin user ensured from ENV");
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   ROLES,
   SUBSCRIPTION,
+  APPROVAL_STATUS,
+
   listUsers,
   findById,
   findByEmail,
   createUser,
-  updateUser,
+  verifyPassword,
+
+  setSubscriptionStatus,
+  setApprovalStatus,
+
   ensureAdminFromEnv,
 };
