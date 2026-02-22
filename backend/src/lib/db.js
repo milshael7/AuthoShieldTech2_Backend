@@ -19,10 +19,6 @@ function ensureDir(p) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function now() {
-  return new Date().toISOString();
-}
-
 /* ======================================================
    DEFAULT DB
 ====================================================== */
@@ -31,8 +27,6 @@ function defaultDb() {
   return {
     schemaVersion: SCHEMA_VERSION,
 
-    /* ================= CORE ================= */
-
     users: [],
     companies: [],
     notifications: [],
@@ -40,16 +34,12 @@ function defaultDb() {
     scanCredits: [],
     processedStripeEvents: [],
 
-    /* ================= AUDIT ================= */
-
     audit: [],
     auditMeta: {
       lastHash: null,
       lastSequence: 0,
       integrityVersion: 1,
     },
-
-    /* ================= FINANCIAL LEDGER ================= */
 
     invoices: [],
     payments: [],
@@ -65,13 +55,9 @@ function defaultDb() {
       disputedAmount: 0,
     },
 
-    /* ================= AUTOPROTECT ================= */
-
     autoprotek: {
       users: {},
     },
-
-    /* ================= COMPLIANCE ================= */
 
     complianceSnapshots: [],
     retentionPolicy: {
@@ -79,8 +65,6 @@ function defaultDb() {
       financialRetentionDays: 365 * 7,
       snapshotRetentionDays: 365 * 3,
     },
-
-    /* ================= OTHER SYSTEMS ================= */
 
     brain: {
       memory: [],
@@ -117,10 +101,7 @@ function defaultDb() {
 
 function migrate(db) {
   if (!db || typeof db !== "object") return defaultDb();
-
   if (!db.schemaVersion) db.schemaVersion = 1;
-
-  /* Ensure arrays */
 
   const arrayFields = [
     "users",
@@ -141,8 +122,6 @@ function migrate(db) {
     if (!Array.isArray(db[field])) db[field] = [];
   }
 
-  /* Revenue summary */
-
   if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
     db.revenueSummary = {
       totalRevenue: 0,
@@ -157,25 +136,14 @@ function migrate(db) {
   db.revenueSummary.refundedAmount = db.revenueSummary.refundedAmount || 0;
   db.revenueSummary.disputedAmount = db.revenueSummary.disputedAmount || 0;
 
-  /* Audit metadata */
-
   if (!db.auditMeta || typeof db.auditMeta !== "object") {
-    db.auditMeta = {
-      lastHash: null,
-      lastSequence: 0,
-      integrityVersion: 1,
-    };
+    db.auditMeta = { lastHash: null, lastSequence: 0, integrityVersion: 1 };
   }
-
-  /* Autoprotect */
 
   if (!db.autoprotek || typeof db.autoprotek !== "object") {
     db.autoprotek = { users: {} };
   }
-
   if (!db.autoprotek.users) db.autoprotek.users = {};
-
-  /* Retention policy */
 
   if (!db.retentionPolicy) {
     db.retentionPolicy = {
@@ -223,7 +191,6 @@ function readDb() {
 
 function writeDb(db) {
   const safe = migrate(db);
-
   fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
   fs.renameSync(TMP_PATH, DB_PATH);
 }
@@ -235,20 +202,10 @@ function updateDb(mutator) {
   return out;
 }
 
-/* ======================================================
-   EXPORTS
-====================================================== */
-
 module.exports = {
   DB_PATH,
-  TMP_PATH,
-  SCHEMA_VERSION,
   ensureDb,
   readDb,
   writeDb,
   updateDb,
-
-  // optional exports (safe to keep)
-  migrate,
-  defaultDb,
 };
