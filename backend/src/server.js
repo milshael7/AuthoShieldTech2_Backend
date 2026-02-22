@@ -13,6 +13,11 @@ const tenantMiddleware = require("./middleware/tenant");
 
 const { generateComplianceReport } = require("./services/compliance.service");
 
+/* ================= TRADING ENGINES ================= */
+
+const liveTrader = require("./services/liveTrader");
+const aiBrain = require("./services/aiBrain");
+
 /* ROUTES */
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
@@ -42,7 +47,7 @@ users.ensureAdminFromEnv();
 
 updateDb((db) => {
   db.systemState = db.systemState || {
-    securityStatus: "NORMAL", // NORMAL | WARNING | LOCKDOWN
+    securityStatus: "NORMAL",
     lastComplianceCheck: null,
     lastDriftAmount: 0,
   };
@@ -95,7 +100,7 @@ const authLimiter = rateLimit({
 });
 
 /* =========================================================
-   LOCKDOWN ENFORCEMENT MIDDLEWARE
+   LOCKDOWN ENFORCEMENT
 ========================================================= */
 
 app.use((req, res, next) => {
@@ -132,7 +137,7 @@ app.get("/health", (req, res) => {
 });
 
 /* =========================================================
-   AUTH ROUTES
+   AUTH
 ========================================================= */
 
 app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
@@ -161,7 +166,7 @@ app.use("/api/live", require("./routes/live.routes"));
 app.use("/api/paper", require("./routes/paper.routes"));
 
 /* =========================================================
-   AUTOMATED COMPLIANCE RUNNER
+   COMPLIANCE RUNNER
 ========================================================= */
 
 async function runComplianceCheck() {
@@ -175,8 +180,8 @@ async function runComplianceCheck() {
       let status = "NORMAL";
 
       if (!auditOk) status = "LOCKDOWN";
-      else if (Math.abs(drift) > 5) status = "WARNING";
       else if (Math.abs(drift) > 25) status = "LOCKDOWN";
+      else if (Math.abs(drift) > 5) status = "WARNING";
 
       db.systemState = {
         securityStatus: status,
@@ -193,35 +198,75 @@ async function runComplianceCheck() {
   }
 }
 
-/* Run every 6 hours */
 setInterval(runComplianceCheck, 6 * 60 * 60 * 1000);
-
-/* Run once at startup */
 runComplianceCheck();
 
 /* =========================================================
-   SERVER
+   SERVER + WEBSOCKET
 ========================================================= */
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws/market" });
 
-let onlineUsers = 0;
-
-wss.on("connection", (ws) => {
-  onlineUsers++;
-
-  ws.on("close", () => {
-    onlineUsers = Math.max(onlineUsers - 1, 0);
+function broadcast(payload) {
+  const message = JSON.stringify(payload);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      try { client.send(message); } catch {}
+    }
   });
+}
 
-  ws.on("error", () => {
-    onlineUsers = Math.max(onlineUsers - 1, 0);
-  });
-});
+wss.on("connection", () => {});
 
 /* =========================================================
-   GLOBAL ERROR HANDLER
+   MARKET LOOP
+========================================================= */
+
+const SYMBOL = "BTCUSDT";
+let lastPrice = 40000;
+
+setInterval(async () => {
+
+  const delta = (Math.random() - 0.5) * 60;
+  lastPrice = Math.max(1000, lastPrice + delta);
+
+  const ts = Date.now();
+  const tenantId = "default";
+
+  broadcast({
+    type: "tick",
+    symbol: SYMBOL,
+    price: lastPrice,
+    ts,
+  });
+
+  try {
+    liveTrader.tick(tenantId, SYMBOL, lastPrice, ts);
+  } catch {}
+
+  try {
+    const decision = aiBrain.decide({
+      last: lastPrice,
+      paper: {},
+    });
+
+    if (decision.action !== "WAIT") {
+      broadcast({
+        type: "ai_signal",
+        symbol: SYMBOL,
+        action: decision.action,
+        confidence: decision.confidence,
+        edge: decision.edge,
+        ts,
+      });
+    }
+  } catch {}
+
+}, 2000);
+
+/* =========================================================
+   GLOBAL ERROR
 ========================================================= */
 
 app.use((err, req, res, next) => {
