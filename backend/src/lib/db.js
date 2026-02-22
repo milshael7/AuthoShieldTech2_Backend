@@ -154,11 +154,8 @@ function migrate(db) {
     };
   }
 
-  db.revenueSummary.refundedAmount =
-    db.revenueSummary.refundedAmount || 0;
-
-  db.revenueSummary.disputedAmount =
-    db.revenueSummary.disputedAmount || 0;
+  db.revenueSummary.refundedAmount = db.revenueSummary.refundedAmount || 0;
+  db.revenueSummary.disputedAmount = db.revenueSummary.disputedAmount || 0;
 
   /* Audit metadata */
 
@@ -176,8 +173,7 @@ function migrate(db) {
     db.autoprotek = { users: {} };
   }
 
-  if (!db.autoprotek.users)
-    db.autoprotek.users = {};
+  if (!db.autoprotek.users) db.autoprotek.users = {};
 
   /* Retention policy */
 
@@ -201,10 +197,7 @@ function ensureDb() {
   ensureDir(DB_PATH);
 
   if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(
-      DB_PATH,
-      JSON.stringify(defaultDb(), null, 2)
-    );
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
     return;
   }
 
@@ -212,41 +205,26 @@ function ensureDb() {
     const raw = fs.readFileSync(DB_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     const migrated = migrate(parsed);
-    fs.writeFileSync(
-      DB_PATH,
-      JSON.stringify(migrated, null, 2)
-    );
+    fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
   } catch {
     try {
       const bad = fs.readFileSync(DB_PATH, "utf-8");
-      fs.writeFileSync(
-        DB_PATH + ".corrupt." + Date.now(),
-        bad
-      );
+      fs.writeFileSync(DB_PATH + ".corrupt." + Date.now(), bad);
     } catch {}
 
-    fs.writeFileSync(
-      DB_PATH,
-      JSON.stringify(defaultDb(), null, 2)
-    );
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
   }
 }
 
 function readDb() {
   ensureDb();
-  return migrate(
-    JSON.parse(fs.readFileSync(DB_PATH, "utf-8"))
-  );
+  return migrate(JSON.parse(fs.readFileSync(DB_PATH, "utf-8")));
 }
 
 function writeDb(db) {
   const safe = migrate(db);
 
-  fs.writeFileSync(
-    TMP_PATH,
-    JSON.stringify(safe, null, 2)
-  );
-
+  fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
   fs.renameSync(TMP_PATH, DB_PATH);
 }
 
@@ -257,9 +235,20 @@ function updateDb(mutator) {
   return out;
 }
 
+/* ======================================================
+   EXPORTS
+====================================================== */
+
 module.exports = {
   DB_PATH,
+  TMP_PATH,
+  SCHEMA_VERSION,
   ensureDb,
   readDb,
   writeDb,
   updateDb,
+
+  // optional exports (safe to keep)
+  migrate,
+  defaultDb,
+};
