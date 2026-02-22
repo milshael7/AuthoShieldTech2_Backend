@@ -1,5 +1,7 @@
 // backend/src/routes/admin.routes.js
-// Phase 31 — Executive Intelligence + Growth Analytics
+// Phase 31 — Executive Intelligence + Growth Analytics (Hardened)
+// ✅ Case-safe role guards
+// ✅ Adds /audit/integrity endpoint (uses verifyAuditIntegrity)
 
 const express = require("express");
 const router = express.Router();
@@ -9,14 +11,27 @@ const { readDb } = require("../lib/db");
 const { verifyAuditIntegrity } = require("../lib/audit");
 const {
   generateComplianceReport,
-  getComplianceHistory
+  getComplianceHistory,
 } = require("../services/compliance.service");
 
 const users = require("../users/user.service");
 const { listNotifications } = require("../lib/notify");
 
-const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
-const FINANCE_ROLE = users?.ROLES?.FINANCE || "Finance";
+/* =========================================================
+   ROLE FALLBACKS (CRASH-PROOF + CASE SAFE)
+========================================================= */
+
+const ROLES = users?.ROLES || {};
+const ADMIN_ROLE = ROLES.ADMIN || "Admin";
+const FINANCE_ROLE = ROLES.FINANCE || "Finance";
+
+function normRole(r) {
+  return String(r || "").trim().toLowerCase();
+}
+
+function hasRole(reqUser, roleName) {
+  return normRole(reqUser?.role) === normRole(roleName);
+}
 
 router.use(authRequired);
 
@@ -25,17 +40,14 @@ router.use(authRequired);
 ========================================================= */
 
 function requireAdmin(req, res, next) {
-  if (req.user.role !== ADMIN_ROLE) {
+  if (!hasRole(req.user, ADMIN_ROLE)) {
     return res.status(403).json({ ok: false, error: "Admin only" });
   }
   next();
 }
 
 function requireFinanceOrAdmin(req, res, next) {
-  if (
-    req.user.role !== ADMIN_ROLE &&
-    req.user.role !== FINANCE_ROLE
-  ) {
+  if (!hasRole(req.user, ADMIN_ROLE) && !hasRole(req.user, FINANCE_ROLE)) {
     return res.status(403).json({
       ok: false,
       error: "Finance or Admin only",
@@ -53,7 +65,6 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
     const db = readDb();
 
     const usersList = db.users || [];
-    const invoices = db.invoices || [];
 
     const activeSubscribers = usersList.filter(
       (u) => u.subscriptionStatus === "Active"
@@ -69,7 +80,7 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
 
     const totalRevenue = db.revenueSummary?.totalRevenue || 0;
 
-    res.json({
+    return res.json({
       ok: true,
       metrics: {
         totalUsers: usersList.length,
@@ -80,7 +91,7 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -88,91 +99,85 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
    SUBSCRIBER GROWTH ANALYTICS
 ========================================================= */
 
-router.get(
-  "/subscriber-growth",
-  requireFinanceOrAdmin,
-  (req, res) => {
-    try {
-      const db = readDb();
-      const usersList = db.users || [];
+router.get("/subscriber-growth", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const usersList = db.users || [];
 
-      const dailyMap = {};
+    const dailyMap = {};
 
-      usersList.forEach((u) => {
-        if (!u.createdAt) return;
-        const day = u.createdAt.slice(0, 10);
+    usersList.forEach((u) => {
+      if (!u.createdAt) return;
+      const day = String(u.createdAt).slice(0, 10);
 
-        if (!dailyMap[day]) {
-          dailyMap[day] = {
-            newUsers: 0,
-            newActive: 0,
-          };
-        }
+      if (!dailyMap[day]) {
+        dailyMap[day] = { newUsers: 0, newActive: 0 };
+      }
 
-        dailyMap[day].newUsers++;
+      dailyMap[day].newUsers++;
 
-        if (u.subscriptionStatus === "Active") {
-          dailyMap[day].newActive++;
-        }
-      });
+      if (u.subscriptionStatus === "Active") {
+        dailyMap[day].newActive++;
+      }
+    });
 
-      const sortedDays = Object.keys(dailyMap).sort();
+    const sortedDays = Object.keys(dailyMap).sort();
 
-      let cumulativeUsers = 0;
-      let cumulativeActive = 0;
+    let cumulativeUsers = 0;
+    let cumulativeActive = 0;
 
-      const result = sortedDays.map((day) => {
-        cumulativeUsers += dailyMap[day].newUsers;
-        cumulativeActive += dailyMap[day].newActive;
+    const result = sortedDays.map((day) => {
+      cumulativeUsers += dailyMap[day].newUsers;
+      cumulativeActive += dailyMap[day].newActive;
 
-        return {
-          date: day,
-          totalUsers: cumulativeUsers,
-          activeSubscribers: cumulativeActive,
-        };
-      });
+      return {
+        date: day,
+        totalUsers: cumulativeUsers,
+        activeSubscribers: cumulativeActive,
+      };
+    });
 
-      res.json({
-        ok: true,
-        growth: result,
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+    return res.json({ ok: true, growth: result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
 
 /* =========================================================
    COMPLIANCE
 ========================================================= */
 
-router.get(
-  "/compliance/report",
-  requireFinanceOrAdmin,
-  async (req, res) => {
-    try {
-      const report = await generateComplianceReport();
-      res.json({ ok: true, complianceReport: report });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+router.get("/compliance/report", requireFinanceOrAdmin, async (req, res) => {
+  try {
+    const report = await generateComplianceReport();
+    return res.json({ ok: true, complianceReport: report });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
 
-router.get(
-  "/compliance/history",
-  requireFinanceOrAdmin,
-  (req, res) => {
-    try {
-      const limit = Number(req.query.limit || 20);
-      const history = getComplianceHistory(limit);
-
-      res.json({ ok: true, history });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+router.get("/compliance/history", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const limit = Number(req.query.limit || 20);
+    const history = getComplianceHistory(limit);
+    return res.json({ ok: true, history });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
+
+/* =========================================================
+   AUDIT INTEGRITY
+========================================================= */
+
+router.get("/audit/integrity", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const result = verifyAuditIntegrity();
+    return res.json({ ok: true, integrity: result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 /* =========================================================
    USERS
@@ -180,12 +185,12 @@ router.get(
 
 router.get("/users", requireAdmin, (req, res) => {
   try {
-    res.json({
+    return res.json({
       ok: true,
       users: users.listUsers(),
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -195,12 +200,12 @@ router.get("/users", requireAdmin, (req, res) => {
 
 router.get("/notifications", requireAdmin, (req, res) => {
   try {
-    res.json({
+    return res.json({
       ok: true,
       notifications: listNotifications({}),
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
