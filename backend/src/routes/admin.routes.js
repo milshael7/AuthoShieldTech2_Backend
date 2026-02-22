@@ -133,6 +133,66 @@ function buildDailySeries({
 }
 
 /* =========================================================
+   ✅ METRICS (SINGLE SOURCE OF TRUTH)
+   GET /api/admin/metrics
+========================================================= */
+
+router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const usersList = db.users || [];
+    const invoices = db.invoices || [];
+
+    const activeSubscribers = usersList.filter(
+      (u) => u.subscriptionStatus === "Active"
+    ).length;
+
+    const trialUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Trial"
+    ).length;
+
+    const lockedUsers = usersList.filter(
+      (u) => u.subscriptionStatus === "Locked"
+    ).length;
+
+    const totalRevenue = Number(db.revenueSummary?.totalRevenue || 0);
+
+    const now = Date.now();
+    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+
+    const mrr = invoices
+      .filter(
+        (i) =>
+          i?.type === "subscription" &&
+          i?.createdAt &&
+          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
+      )
+      .reduce((sum, i) => sum + Number(i.amount || 0), 0);
+
+    const churnRate =
+      usersList.length > 0
+        ? Number((lockedUsers / usersList.length).toFixed(4))
+        : 0;
+
+    res.json({
+      ok: true,
+      metrics: {
+        totalUsers: usersList.length,
+        activeSubscribers,
+        trialUsers,
+        lockedUsers,
+        totalRevenue: Number(totalRevenue.toFixed(2)),
+        MRR: Number(mrr.toFixed(2)),
+        churnRate,
+      },
+      time: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
    ✅ REQUIRED BY FRONTEND — SUBSCRIBER GROWTH
    GET /api/admin/subscriber-growth
 ========================================================= */
@@ -178,11 +238,7 @@ router.get("/subscriber-growth", requireFinanceOrAdmin, (req, res) => {
       totalUsers += daily[date].newUsers;
       activeSubscribers += daily[date].newActive;
 
-      return {
-        date,
-        totalUsers,
-        activeSubscribers,
-      };
+      return { date, totalUsers, activeSubscribers };
     });
 
     res.json({
@@ -223,12 +279,9 @@ router.get("/executive-risk", requireFinanceOrAdmin, async (req, res) => {
     const disputesRatio = totalRevenue > 0 ? disputedAmount / totalRevenue : 0;
 
     const usersList = db.users || [];
-    const locked = usersList.filter((u) => u.subscriptionStatus === "Locked")
-      .length;
-    const active = usersList.filter((u) => u.subscriptionStatus === "Active")
-      .length;
-    const trial = usersList.filter((u) => u.subscriptionStatus === "Trial")
-      .length;
+    const locked = usersList.filter((u) => u.subscriptionStatus === "Locked").length;
+    const active = usersList.filter((u) => u.subscriptionStatus === "Active").length;
+    const trial = usersList.filter((u) => u.subscriptionStatus === "Trial").length;
 
     const lockedRatio = usersList.length > 0 ? locked / usersList.length : 0;
 
@@ -250,13 +303,7 @@ router.get("/executive-risk", requireFinanceOrAdmin, async (req, res) => {
     risk = clamp(risk, 0, 100);
 
     const level =
-      risk >= 75
-        ? "CRITICAL"
-        : risk >= 50
-        ? "ELEVATED"
-        : risk >= 25
-        ? "MODERATE"
-        : "LOW";
+      risk >= 75 ? "CRITICAL" : risk >= 50 ? "ELEVATED" : risk >= 25 ? "MODERATE" : "LOW";
 
     res.json({
       ok: true,
@@ -346,12 +393,9 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
     const refunds = db.refunds || [];
     const disputes = db.disputes || [];
 
-    const active = usersList.filter((u) => u.subscriptionStatus === "Active")
-      .length;
-    const trial = usersList.filter((u) => u.subscriptionStatus === "Trial")
-      .length;
-    const locked = usersList.filter((u) => u.subscriptionStatus === "Locked")
-      .length;
+    const active = usersList.filter((u) => u.subscriptionStatus === "Active").length;
+    const trial = usersList.filter((u) => u.subscriptionStatus === "Trial").length;
+    const locked = usersList.filter((u) => u.subscriptionStatus === "Locked").length;
 
     const lockedRatio = usersList.length > 0 ? locked / usersList.length : 0;
 
@@ -371,8 +415,7 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
     ).size;
 
     const refundRate = active > 0 ? refunds.length / active : refunds.length;
-    const disputeRate =
-      active > 0 ? disputes.length / active : disputes.length;
+    const disputeRate = active > 0 ? disputes.length / active : disputes.length;
 
     let score = 0;
     score += clamp(lockedRatio * 100 * 0.6, 0, 60);
@@ -383,13 +426,7 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
     score = clamp(score, 0, 100);
 
     const level =
-      score >= 75
-        ? "CRITICAL"
-        : score >= 50
-        ? "ELEVATED"
-        : score >= 25
-        ? "MODERATE"
-        : "LOW";
+      score >= 75 ? "CRITICAL" : score >= 50 ? "ELEVATED" : score >= 25 ? "MODERATE" : "LOW";
 
     res.json({
       ok: true,
@@ -405,14 +442,8 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
             lockedRatio: Number(lockedRatio.toFixed(4)),
           },
           recentPayers60d: recentPayers,
-          refunds: {
-            count: refunds.length,
-            perActive: Number(refundRate.toFixed(4)),
-          },
-          disputes: {
-            count: disputes.length,
-            perActive: Number(disputeRate.toFixed(4)),
-          },
+          refunds: { count: refunds.length, perActive: Number(refundRate.toFixed(4)) },
+          disputes: { count: disputes.length, perActive: Number(disputeRate.toFixed(4)) },
         },
       },
       time: new Date().toISOString(),
@@ -442,7 +473,6 @@ router.get("/refund-dispute-timeline", requireFinanceOrAdmin, (req, res) => {
         dailyMap[day] = { refundAmount: 0, disputeAmount: 0 };
       }
 
-      // Always treat these as positive “risk exposure” values
       const amount = Math.abs(Number(entry.amount || 0));
       if (!Number.isFinite(amount)) return;
 
@@ -469,61 +499,15 @@ router.get("/refund-dispute-timeline", requireFinanceOrAdmin, (req, res) => {
       };
     });
 
-    res.json({ ok: true, timeline: result });
+    res.json({ ok: true, timeline: result, time: new Date().toISOString() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   EXISTING ROUTES PRESERVED
+   COMPLIANCE
 ========================================================= */
-
-router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const usersList = db.users || [];
-    const invoices = db.invoices || [];
-
-    const activeSubscribers = usersList.filter(
-      (u) => u.subscriptionStatus === "Active"
-    ).length;
-
-    const now = Date.now();
-    const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
-
-    const mrr = invoices
-      .filter(
-        (i) =>
-          i.type === "subscription" &&
-          i.createdAt &&
-          now - new Date(i.createdAt).getTime() <= THIRTY_DAYS
-      )
-      .reduce((sum, i) => sum + Number(i.amount || 0), 0);
-
-    const lockedUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Locked"
-    ).length;
-
-    const churnRate =
-      usersList.length > 0
-        ? Number((lockedUsers / usersList.length).toFixed(4))
-        : 0;
-
-    res.json({
-      ok: true,
-      metrics: {
-        totalUsers: usersList.length,
-        activeSubscribers,
-        totalRevenue: Number(db.revenueSummary?.totalRevenue || 0),
-        MRR: Number(mrr.toFixed(2)),
-        churnRate,
-      },
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 router.get("/compliance/report", requireFinanceOrAdmin, async (req, res) => {
   try {
@@ -544,23 +528,25 @@ router.get("/compliance/history", requireFinanceOrAdmin, (req, res) => {
   }
 });
 
+/* =========================================================
+   USERS
+========================================================= */
+
 router.get("/users", requireAdmin, (req, res) => {
   try {
-    res.json({
-      ok: true,
-      users: users.listUsers(),
-    });
+    res.json({ ok: true, users: users.listUsers() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+/* =========================================================
+   NOTIFICATIONS
+========================================================= */
+
 router.get("/notifications", requireAdmin, (req, res) => {
   try {
-    res.json({
-      ok: true,
-      notifications: listNotifications({}),
-    });
+    res.json({ ok: true, notifications: listNotifications({}) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
