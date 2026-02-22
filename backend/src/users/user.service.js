@@ -1,212 +1,128 @@
-// backend/src/routes/admin.routes.js
-// Phase 31 — Executive Intelligence + Growth Analytics (Hardened)
-// ✅ Case-safe role guards
-// ✅ Adds /audit/integrity endpoint (uses verifyAuditIntegrity)
+// backend/src/users/user.service.js
+// AuthoShieldTech — User Service (Hardened)
+// Roles • Subscription States • Core User Access
 
-const express = require("express");
-const router = express.Router();
-
-const { authRequired } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
-const { verifyAuditIntegrity } = require("../lib/audit");
-const {
-  generateComplianceReport,
-  getComplianceHistory,
-} = require("../services/compliance.service");
-
-const users = require("../users/user.service");
-const { listNotifications } = require("../lib/notify");
+const { readDb, updateDb } = require("../lib/db");
 
 /* =========================================================
-   ROLE FALLBACKS (CRASH-PROOF + CASE SAFE)
+   ROLES
 ========================================================= */
 
-const ROLES = users?.ROLES || {};
-const ADMIN_ROLE = ROLES.ADMIN || "Admin";
-const FINANCE_ROLE = ROLES.FINANCE || "Finance";
-
-function normRole(r) {
-  return String(r || "").trim().toLowerCase();
-}
-
-function hasRole(reqUser, roleName) {
-  return normRole(reqUser?.role) === normRole(roleName);
-}
-
-router.use(authRequired);
+const ROLES = {
+  ADMIN: "Admin",
+  MANAGER: "Manager",
+  COMPANY: "Company",
+  SMALL_COMPANY: "Small_Company",
+  INDIVIDUAL: "Individual",
+  FINANCE: "Finance",
+};
 
 /* =========================================================
-   ROLE GUARDS
+   SUBSCRIPTION STATES
 ========================================================= */
 
-function requireAdmin(req, res, next) {
-  if (!hasRole(req.user, ADMIN_ROLE)) {
-    return res.status(403).json({ ok: false, error: "Admin only" });
-  }
-  next();
-}
+const SUBSCRIPTION = {
+  ACTIVE: "Active",
+  TRIAL: "Trial",
+  LOCKED: "Locked",
+  PAST_DUE: "Past_Due",
+  CANCELED: "Canceled",
+};
 
-function requireFinanceOrAdmin(req, res, next) {
-  if (!hasRole(req.user, ADMIN_ROLE) && !hasRole(req.user, FINANCE_ROLE)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Finance or Admin only",
-    });
-  }
-  next();
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function normalizeRole(role) {
+  return String(role || "").trim();
 }
 
 /* =========================================================
-   EXECUTIVE METRICS
+   USER READ
 ========================================================= */
 
-router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
+function listUsers() {
+  const db = readDb();
+  return db.users || [];
+}
 
-    const usersList = db.users || [];
+function findById(id) {
+  const db = readDb();
+  return (db.users || []).find((u) => String(u.id) === String(id));
+}
 
-    const activeSubscribers = usersList.filter(
-      (u) => u.subscriptionStatus === "Active"
-    ).length;
-
-    const trialUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Trial"
-    ).length;
-
-    const lockedUsers = usersList.filter(
-      (u) => u.subscriptionStatus === "Locked"
-    ).length;
-
-    const totalRevenue = db.revenueSummary?.totalRevenue || 0;
-
-    return res.json({
-      ok: true,
-      metrics: {
-        totalUsers: usersList.length,
-        activeSubscribers,
-        trialUsers,
-        lockedUsers,
-        totalRevenue,
-      },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
+function findByEmail(email) {
+  const db = readDb();
+  return (db.users || []).find(
+    (u) => String(u.email).toLowerCase() === String(email).toLowerCase()
+  );
+}
 
 /* =========================================================
-   SUBSCRIBER GROWTH ANALYTICS
+   USER WRITE
 ========================================================= */
 
-router.get("/subscriber-growth", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const usersList = db.users || [];
+function createUser(userData) {
+  return updateDb((db) => {
+    const newUser = {
+      id: String(Date.now()),
+      createdAt: new Date().toISOString(),
+      role: ROLES.INDIVIDUAL,
+      subscriptionStatus: SUBSCRIPTION.TRIAL,
+      ...userData,
+    };
 
-    const dailyMap = {};
+    db.users.push(newUser);
+    return db;
+  });
+}
 
-    usersList.forEach((u) => {
-      if (!u.createdAt) return;
-      const day = String(u.createdAt).slice(0, 10);
+function updateUser(id, updates) {
+  return updateDb((db) => {
+    const user = db.users.find((u) => String(u.id) === String(id));
+    if (!user) return db;
 
-      if (!dailyMap[day]) {
-        dailyMap[day] = { newUsers: 0, newActive: 0 };
-      }
+    Object.assign(user, updates);
+    user.updatedAt = new Date().toISOString();
 
-      dailyMap[day].newUsers++;
-
-      if (u.subscriptionStatus === "Active") {
-        dailyMap[day].newActive++;
-      }
-    });
-
-    const sortedDays = Object.keys(dailyMap).sort();
-
-    let cumulativeUsers = 0;
-    let cumulativeActive = 0;
-
-    const result = sortedDays.map((day) => {
-      cumulativeUsers += dailyMap[day].newUsers;
-      cumulativeActive += dailyMap[day].newActive;
-
-      return {
-        date: day,
-        totalUsers: cumulativeUsers,
-        activeSubscribers: cumulativeActive,
-      };
-    });
-
-    return res.json({ ok: true, growth: result });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
+    return db;
+  });
+}
 
 /* =========================================================
-   COMPLIANCE
+   ADMIN BOOTSTRAP
 ========================================================= */
 
-router.get("/compliance/report", requireFinanceOrAdmin, async (req, res) => {
-  try {
-    const report = await generateComplianceReport();
-    return res.json({ ok: true, complianceReport: report });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
+function ensureAdminFromEnv() {
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
 
-router.get("/compliance/history", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const limit = Number(req.query.limit || 20);
-    const history = getComplianceHistory(limit);
-    return res.json({ ok: true, history });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
+  if (!email || !password) return;
+
+  const existing = findByEmail(email);
+  if (existing) return;
+
+  createUser({
+    email,
+    password,
+    role: ROLES.ADMIN,
+    subscriptionStatus: SUBSCRIPTION.ACTIVE,
+  });
+
+  console.log("[BOOT] Admin user ensured from ENV");
+}
 
 /* =========================================================
-   AUDIT INTEGRITY
+   EXPORTS
 ========================================================= */
 
-router.get("/audit/integrity", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const result = verifyAuditIntegrity();
-    return res.json({ ok: true, integrity: result });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   USERS
-========================================================= */
-
-router.get("/users", requireAdmin, (req, res) => {
-  try {
-    return res.json({
-      ok: true,
-      users: users.listUsers(),
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   NOTIFICATIONS
-========================================================= */
-
-router.get("/notifications", requireAdmin, (req, res) => {
-  try {
-    return res.json({
-      ok: true,
-      notifications: listNotifications({}),
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-module.exports = router;
+module.exports = {
+  ROLES,
+  SUBSCRIPTION,
+  listUsers,
+  findById,
+  findByEmail,
+  createUser,
+  updateUser,
+  ensureAdminFromEnv,
+};
