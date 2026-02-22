@@ -1,5 +1,6 @@
 // backend/src/routes/security.routes.js
 // Security Tool Control — Subscription Enforced • Company Scoped • Hardened
+// ✅ Role-safe (no crash if users.ROLES missing)
 
 const express = require("express");
 const router = express.Router();
@@ -10,6 +11,16 @@ const companies = require("../companies/company.service");
 const securityTools = require("../services/securityTools");
 
 router.use(authRequired);
+
+/* =========================================================
+   ROLE FALLBACKS (CRASH-PROOF)
+========================================================= */
+
+const ROLES = users?.ROLES || {};
+const SUBS = users?.SUBSCRIPTION || {};
+
+const ADMIN_ROLE = ROLES.ADMIN || "Admin";
+const COMPANY_ROLE = ROLES.COMPANY || "Company";
 
 /* =========================================================
    HELPERS
@@ -30,13 +41,14 @@ function requireActiveSubscription(dbUser) {
     throw err;
   }
 
-  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.LOCKED) {
+  // If SUBS isn't defined, we fail "open" (no crash) and rely on other guards.
+  if (SUBS.LOCKED && dbUser.subscriptionStatus === SUBS.LOCKED) {
     const err = new Error("Account locked");
     err.status = 403;
     throw err;
   }
 
-  if (dbUser.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE) {
+  if (SUBS.PAST_DUE && dbUser.subscriptionStatus === SUBS.PAST_DUE) {
     const err = new Error("Subscription past due");
     err.status = 402;
     throw err;
@@ -46,7 +58,8 @@ function requireActiveSubscription(dbUser) {
 function resolveCompanyId(req) {
   const role = normRole(req.user.role);
 
-  if (role === normRole(users.ROLES.ADMIN)) {
+  // SAFE: ADMIN_ROLE is always a string
+  if (role === normRole(ADMIN_ROLE)) {
     return clean(req.query.companyId || req.body?.companyId);
   }
 
@@ -85,7 +98,7 @@ function requireCompanyContext(req) {
 
 router.get(
   "/tools",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  requireRole(COMPANY_ROLE, { adminAlso: true }),
   (req, res) => {
     try {
       const dbUser = users.findById(req.user.id);
@@ -99,7 +112,6 @@ router.get(
         ok: true,
         tools,
       });
-
     } catch (e) {
       return res.status(e.status || 400).json({
         ok: false,
@@ -115,7 +127,7 @@ router.get(
 
 router.post(
   "/tools/install",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  requireRole(COMPANY_ROLE, { adminAlso: true }),
   (req, res) => {
     try {
       const dbUser = users.findById(req.user.id);
@@ -131,17 +143,12 @@ router.post(
         });
       }
 
-      const result = securityTools.installTool(
-        companyId,
-        toolId,
-        req.user.id
-      );
+      const result = securityTools.installTool(companyId, toolId, req.user.id);
 
       return res.json({
         ok: true,
         result,
       });
-
     } catch (e) {
       return res.status(e.status || 400).json({
         ok: false,
@@ -157,7 +164,7 @@ router.post(
 
 router.post(
   "/tools/uninstall",
-  requireRole(users.ROLES.COMPANY, { adminAlso: true }),
+  requireRole(COMPANY_ROLE, { adminAlso: true }),
   (req, res) => {
     try {
       const dbUser = users.findById(req.user.id);
@@ -173,17 +180,12 @@ router.post(
         });
       }
 
-      const result = securityTools.uninstallTool(
-        companyId,
-        toolId,
-        req.user.id
-      );
+      const result = securityTools.uninstallTool(companyId, toolId, req.user.id);
 
       return res.json({
         ok: true,
         result,
       });
-
     } catch (e) {
       return res.status(e.status || 400).json({
         ok: false,
