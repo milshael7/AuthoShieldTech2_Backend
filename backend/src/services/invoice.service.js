@@ -5,10 +5,21 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const PDFDocument = require("pdfkit");
 const { nanoid } = require("nanoid");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+
+/* =========================================================
+   OPTIONAL PDFKIT (SAFE LOAD)
+========================================================= */
+
+let PDFDocument = null;
+try {
+  PDFDocument = require("pdfkit");
+  console.log("[BOOT] PDFKit enabled");
+} catch {
+  console.log("[BOOT] PDFKit not installed — PDF generation disabled");
+}
 
 /* =========================================================
    CONFIG
@@ -21,7 +32,7 @@ if (!fs.existsSync(INVOICE_DIR)) {
 }
 
 /* =========================================================
-   HASH UTIL (Financial Integrity)
+   HASH UTIL
 ========================================================= */
 
 function sha256(data) {
@@ -64,10 +75,14 @@ function formatUsd(amount) {
 }
 
 /* =========================================================
-   PDF GENERATION
+   SAFE PDF GENERATION
 ========================================================= */
 
 function generateInvoicePdf(invoice) {
+  if (!PDFDocument) {
+    throw new Error("PDF generation not available (pdfkit not installed)");
+  }
+
   const filePath = path.join(INVOICE_DIR, `${invoice.invoiceNumber}.pdf`);
   if (fs.existsSync(filePath)) return filePath;
 
@@ -155,7 +170,6 @@ function createInvoice({
       };
     }
 
-    // Idempotency
     const duplicate = db.invoices.find(
       (i) =>
         stripePaymentIntentId &&
@@ -166,7 +180,6 @@ function createInvoice({
 
     db.invoices.push(invoice);
 
-    // Revenue delta tracking
     db.revenueSummary.totalRevenue += amountUsd;
 
     if (type === "subscription")
@@ -179,7 +192,7 @@ function createInvoice({
       db.revenueSummary.toolRevenue += amountUsd;
 
     if (type === "refund") {
-      db.revenueSummary.totalRevenue += amountUsd; // already negative
+      db.revenueSummary.totalRevenue += amountUsd;
       db.revenueSummary.subscriptionRevenue += amountUsd;
     }
   });
@@ -195,7 +208,7 @@ function createInvoice({
 }
 
 /* =========================================================
-   REFUND ENGINE (Linked)
+   REFUND ENGINE
 ========================================================= */
 
 function createRefundInvoice({
@@ -218,6 +231,10 @@ function createRefundInvoice({
 ========================================================= */
 
 function getInvoicePdf(invoiceId) {
+  if (!PDFDocument) {
+    throw new Error("PDF generation disabled");
+  }
+
   const db = readDb();
   const invoice = db.invoices.find((i) => i.id === invoiceId);
   if (!invoice) throw new Error("Invoice not found");
@@ -238,12 +255,12 @@ function getInvoicePdf(invoiceId) {
 
 function getUserInvoices(userId) {
   const db = readDb();
-  return db.invoices.filter((i) => i.userId === userId);
+  return (db.invoices || []).filter((i) => i.userId === userId);
 }
 
 function getAllInvoices() {
   const db = readDb();
-  return db.invoices;
+  return db.invoices || [];
 }
 
 module.exports = {
