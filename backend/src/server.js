@@ -80,6 +80,32 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
 /* =========================================================
+   HEALTH CHECK (REQUIRED FOR FRONTEND)
+========================================================= */
+
+app.get("/health", (req, res) => {
+  try {
+    const db = readDb();
+    const systemState = db.systemState || {
+      securityStatus: "NORMAL",
+      lastComplianceCheck: null,
+    };
+
+    res.json({
+      ok: true,
+      systemState,
+      uptime: process.uptime(),
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: "Health check failed",
+    });
+  }
+});
+
+/* =========================================================
    API ROUTES
 ========================================================= */
 
