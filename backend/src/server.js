@@ -6,8 +6,9 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const jwt = require("jsonwebtoken");
 
-const { ensureDb, readDb, updateDb } = require("./lib/db");
+const { ensureDb, readDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
@@ -46,9 +47,7 @@ users.ensureAdminFromEnv();
 const app = express();
 app.set("trust proxy", 1);
 
-/* =========================================================
-   STRIPE WEBHOOK (OPTIONAL ENABLE)
-========================================================= */
+/* ================= STRIPE WEBHOOK ================= */
 
 if (process.env.STRIPE_WEBHOOK_SECRET) {
   const webhookRoutes = require("./routes/stripe.webhook.routes");
@@ -64,9 +63,7 @@ if (process.env.STRIPE_WEBHOOK_SECRET) {
   console.log("[BOOT] Stripe webhook disabled (no STRIPE_WEBHOOK_SECRET)");
 }
 
-/* =========================================================
-   CORS
-========================================================= */
+/* ================= CORS ================= */
 
 app.use(
   cors({
@@ -79,9 +76,7 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* =========================================================
-   HEALTH CHECK (REQUIRED FOR FRONTEND)
-========================================================= */
+/* ================= HEALTH CHECK ================= */
 
 app.get("/health", (req, res) => {
   try {
@@ -105,9 +100,7 @@ app.get("/health", (req, res) => {
   }
 });
 
-/* =========================================================
-   API ROUTES
-========================================================= */
+/* ================= API ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use(tenantMiddleware);
@@ -130,16 +123,58 @@ app.use("/api/paper", require("./routes/paper.routes"));
 ========================================================= */
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws/market" });
 
-function broadcast(payload) {
-  const message = JSON.stringify(payload);
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1) {
-      try { client.send(message); } catch {}
+/* ================= SECURED WEBSOCKET ================= */
+
+const wss = new WebSocketServer({
+  server,
+  path: "/ws/market",
+});
+
+wss.on("connection", (ws, req) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const token = url.searchParams.get("token");
+
+    if (!token) {
+      ws.close(1008, "Missing token");
+      return;
     }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    ws.user = {
+      id: decoded.id,
+      role: decoded.role,
+      tenantId: decoded.tenantId || null,
+    };
+
+    console.log(
+      `[WS] Connected → ${ws.user.id} (${ws.user.role})`
+    );
+
+  } catch (err) {
+    console.warn("[WS] Authentication failed:", err.message);
+    ws.close(1008, "Invalid token");
+  }
+});
+
+/* ================= SAFE BROADCAST ================= */
+
+function broadcast(payload, filterFn = null) {
+  const message = JSON.stringify(payload);
+
+  wss.clients.forEach((client) => {
+    if (client.readyState !== 1) return;
+    if (filterFn && !filterFn(client)) return;
+
+    try {
+      client.send(message);
+    } catch {}
   });
 }
+
+/* ================= MARKET SIMULATION ================= */
 
 const SYMBOL = "BTCUSDT";
 let lastPrice = 40000;
@@ -156,6 +191,8 @@ setInterval(() => {
     ts,
   });
 }, 2000);
+
+/* ================= START ================= */
 
 const port = process.env.PORT || 5000;
 
