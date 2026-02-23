@@ -22,6 +22,7 @@ const aiBrain = require("./services/aiBrain");
 /* ROUTES */
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
+const incidentsRoutes = require("./routes/incidents.routes"); // ✅ ADDED
 
 /* =========================================================
    SAFE BOOT
@@ -77,7 +78,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
 /* =========================================================
-   REAL HEALTH CHECK (UPGRADED)
+   REAL HEALTH CHECK
 ========================================================= */
 
 app.get("/health", async (req, res) => {
@@ -91,25 +92,14 @@ app.get("/health", async (req, res) => {
   };
 
   try {
-    // Database check
     const db = readDb();
     if (db) checks.database = true;
-
-    // Auth check
     if (process.env.JWT_SECRET) checks.auth = true;
-
-    // Stripe check
     if (process.env.STRIPE_SECRET_KEY) checks.stripe = true;
-
-    // Trading engine check
-    if (liveTrader && typeof liveTrader === "object") {
+    if (liveTrader && typeof liveTrader === "object")
       checks.tradingEngine = true;
-    }
-
-    // AI engine check
-    if (aiBrain && typeof aiBrain === "object") {
+    if (aiBrain && typeof aiBrain === "object")
       checks.aiEngine = true;
-    }
 
     const allHealthy = Object.values(checks).every(Boolean);
     const partiallyHealthy = Object.values(checks).some(Boolean);
@@ -159,6 +149,8 @@ app.get("/health", async (req, res) => {
 /* ================= API ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
+
+/* Apply tenant middleware AFTER auth */
 app.use(tenantMiddleware);
 
 app.use("/api/admin", require("./routes/admin.routes"));
@@ -166,6 +158,7 @@ app.use("/api/manager", require("./routes/manager.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/me", require("./routes/me.routes"));
 app.use("/api/security", securityRoutes);
+app.use("/api/incidents", incidentsRoutes); // ✅ ADDED CORRECTLY
 app.use("/api/billing", billingRoutes);
 
 app.use("/api/trading", require("./routes/trading.routes"));
