@@ -1,5 +1,5 @@
 // backend/src/lib/db.js
-// Enterprise DB — Phase 22 Compliance Layer
+// Enterprise DB — Phase 23 Core Security Layer
 // Atomic Writes • Financial Ledger • Audit Hash Chain • Retention Policies
 
 const fs = require("fs");
@@ -8,7 +8,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 /* ======================================================
    UTIL
@@ -27,12 +27,30 @@ function defaultDb() {
   return {
     schemaVersion: SCHEMA_VERSION,
 
+    /* ================= CORE ================= */
+
     users: [],
     companies: [],
     notifications: [],
+
+    /* ================= SECURITY LAYER ================= */
+
+    incidents: [],
+    vulnerabilities: [],
+    securityEvents: [],
+
+    systemState: {
+      securityStatus: "NORMAL",
+      lastComplianceCheck: null,
+    },
+
+    /* ================= SCANNING ================= */
+
     scans: [],
     scanCredits: [],
     processedStripeEvents: [],
+
+    /* ================= AUDIT ================= */
 
     audit: [],
     auditMeta: {
@@ -40,6 +58,8 @@ function defaultDb() {
       lastSequence: 0,
       integrityVersion: 1,
     },
+
+    /* ================= FINANCIAL ================= */
 
     invoices: [],
     payments: [],
@@ -55,9 +75,13 @@ function defaultDb() {
       disputedAmount: 0,
     },
 
+    /* ================= AUTOPROTECT ================= */
+
     autoprotek: {
       users: {},
     },
+
+    /* ================= COMPLIANCE ================= */
 
     complianceSnapshots: [],
     retentionPolicy: {
@@ -66,10 +90,14 @@ function defaultDb() {
       snapshotRetentionDays: 365 * 3,
     },
 
+    /* ================= AI BRAIN ================= */
+
     brain: {
       memory: [],
       notes: [],
     },
+
+    /* ================= PAPER TRADING ================= */
 
     paper: {
       summary: {
@@ -88,6 +116,8 @@ function defaultDb() {
       trades: [],
       daily: [],
     },
+
+    /* ================= LIVE ================= */
 
     live: {
       events: [],
@@ -116,10 +146,20 @@ function migrate(db) {
     "refunds",
     "disputes",
     "complianceSnapshots",
+    "incidents",
+    "vulnerabilities",
+    "securityEvents",
   ];
 
   for (const field of arrayFields) {
     if (!Array.isArray(db[field])) db[field] = [];
+  }
+
+  if (!db.systemState) {
+    db.systemState = {
+      securityStatus: "NORMAL",
+      lastComplianceCheck: null,
+    };
   }
 
   if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
@@ -133,17 +173,17 @@ function migrate(db) {
     };
   }
 
-  db.revenueSummary.refundedAmount = db.revenueSummary.refundedAmount || 0;
-  db.revenueSummary.disputedAmount = db.revenueSummary.disputedAmount || 0;
-
   if (!db.auditMeta || typeof db.auditMeta !== "object") {
-    db.auditMeta = { lastHash: null, lastSequence: 0, integrityVersion: 1 };
+    db.auditMeta = {
+      lastHash: null,
+      lastSequence: 0,
+      integrityVersion: 1,
+    };
   }
 
   if (!db.autoprotek || typeof db.autoprotek !== "object") {
     db.autoprotek = { users: {} };
   }
-  if (!db.autoprotek.users) db.autoprotek.users = {};
 
   if (!db.retentionPolicy) {
     db.retentionPolicy = {
