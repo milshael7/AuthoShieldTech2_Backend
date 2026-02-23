@@ -76,26 +76,82 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* ================= HEALTH CHECK ================= */
+/* =========================================================
+   REAL HEALTH CHECK (UPGRADED)
+========================================================= */
 
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
+  const checks = {
+    api: true,
+    database: false,
+    auth: false,
+    stripe: false,
+    tradingEngine: false,
+    aiEngine: false,
+  };
+
   try {
+    // Database check
     const db = readDb();
-    const systemState = db.systemState || {
+    if (db) checks.database = true;
+
+    // Auth check
+    if (process.env.JWT_SECRET) checks.auth = true;
+
+    // Stripe check
+    if (process.env.STRIPE_SECRET_KEY) checks.stripe = true;
+
+    // Trading engine check
+    if (liveTrader && typeof liveTrader === "object") {
+      checks.tradingEngine = true;
+    }
+
+    // AI engine check
+    if (aiBrain && typeof aiBrain === "object") {
+      checks.aiEngine = true;
+    }
+
+    const allHealthy = Object.values(checks).every(Boolean);
+    const partiallyHealthy = Object.values(checks).some(Boolean);
+
+    const systemState = db?.systemState || {
       securityStatus: "NORMAL",
       lastComplianceCheck: null,
     };
 
-    res.json({
-      ok: true,
-      systemState,
-      uptime: process.uptime(),
-      time: new Date().toISOString(),
-    });
-  } catch (err) {
-    res.status(500).json({
+    if (allHealthy) {
+      return res.status(200).json({
+        ok: true,
+        level: "healthy",
+        checks,
+        systemState,
+        uptime: process.uptime(),
+        timestamp: Date.now(),
+      });
+    }
+
+    if (partiallyHealthy) {
+      return res.status(207).json({
+        ok: false,
+        level: "degraded",
+        checks,
+        systemState,
+        uptime: process.uptime(),
+        timestamp: Date.now(),
+      });
+    }
+
+    return res.status(500).json({
       ok: false,
-      error: "Health check failed",
+      level: "critical",
+      checks,
+    });
+
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      level: "critical",
+      error: err.message,
     });
   }
 });
@@ -149,9 +205,7 @@ wss.on("connection", (ws, req) => {
       tenantId: decoded.tenantId || null,
     };
 
-    console.log(
-      `[WS] Connected → ${ws.user.id} (${ws.user.role})`
-    );
+    console.log(`[WS] Connected → ${ws.user.id} (${ws.user.role})`);
 
   } catch (err) {
     console.warn("[WS] Authentication failed:", err.message);
