@@ -71,49 +71,27 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-/* ================= BROADCAST CORE ================= */
+/* ================= BROADCAST ================= */
 
-function broadcast(payload, filterFn = null) {
+function broadcast(payload) {
   const msg = JSON.stringify(payload);
-
   wss.clients.forEach((client) => {
-    if (client.readyState !== 1) return;
-    if (filterFn && !filterFn(client)) return;
-    try { client.send(msg); } catch {}
+    if (client.readyState === 1) {
+      try { client.send(msg); } catch {}
+    }
   });
 }
 
-function broadcastRiskUpdate(companyId, riskScore) {
-  broadcast(
-    { type: "risk_update", companyId, riskScore },
-    (client) => {
-      if (client.user?.role === "Admin") return true;
-      if (client.user?.companyId !== companyId) return false;
-      return true;
-    }
-  );
-}
-
-function broadcastForecast(companyId, forecast) {
-  broadcast(
-    { type: "risk_forecast", companyId, forecast },
-    () => true
-  );
-}
-
-/* =========================================================
-   🔥 ADAPTIVE AI + FORECAST ENGINE
-========================================================= */
+/* ================= INTELLIGENCE ENGINE ================= */
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
 
 const baselineMemory = new Map();
 const forecastMemory = new Map();
+const behaviorMemory = new Map();
 
-/* ================= MAIN LOOP ================= */
-
-function detectAnomalies() {
+function detectIntelligence() {
   const db = readDb();
   const events = db.securityEvents || [];
   const now = Date.now();
@@ -131,6 +109,24 @@ function detectAnomalies() {
   }
 
   for (const [companyId, list] of Object.entries(grouped)) {
+
+    /* ================= ASSET EXPOSURE ================= */
+
+    const assetExposure = {};
+    list.forEach(e => {
+      const asset = e.targetAsset || "unknown";
+      if (!assetExposure[asset]) assetExposure[asset] = 0;
+      assetExposure[asset] +=
+        e.severity === "critical" ? 25 :
+        e.severity === "high" ? 15 :
+        e.severity === "medium" ? 8 : 2;
+    });
+
+    broadcast({
+      type: "asset_exposure_update",
+      companyId,
+      exposure: assetExposure
+    });
 
     /* ================= ADAPTIVE RISK ================= */
 
@@ -173,70 +169,88 @@ function detectAnomalies() {
     if (risk < 5) risk = 5;
     baseline.riskScore = risk;
 
-    broadcastRiskUpdate(companyId, risk);
+    broadcast({ type: "risk_update", companyId, riskScore: risk });
 
-    /* ================= FORECASTING ================= */
+    /* ================= FORECAST ================= */
 
     if (!forecastMemory.has(companyId)) {
       forecastMemory.set(companyId, []);
     }
 
     const history = forecastMemory.get(companyId);
-
-    history.push({
-      risk,
-      timestamp: now
-    });
-
-    // keep last 10 samples (~2.5 minutes)
+    history.push({ risk, timestamp: now });
     if (history.length > 10) history.shift();
+
+    let forecastData = null;
 
     if (history.length >= 3) {
       const first = history[0];
       const last = history[history.length - 1];
+      const slope =
+        (last.risk - first.risk) /
+        ((last.timestamp - first.timestamp) / 1000 || 1);
 
-      const deltaRisk = last.risk - first.risk;
-      const deltaTime = (last.timestamp - first.timestamp) / 1000;
-
-      const slope = deltaRisk / (deltaTime || 1); // risk per second
-
-      let forecast = {
+      forecastData = {
         slope: Number(slope.toFixed(3)),
-        probability: 0,
-        estimatedMinutesToCritical: null
+        probability: Math.min(100, Math.round(slope * 100)),
       };
 
-      if (slope > 0) {
-        const remaining = 85 - risk;
-        const secondsToCritical = remaining / slope;
-
-        forecast.estimatedMinutesToCritical =
-          secondsToCritical > 0
-            ? Number((secondsToCritical / 60).toFixed(1))
-            : 0;
-
-        forecast.probability =
-          Math.min(100, Math.round((slope * 100)));
-      }
-
-      broadcastForecast(companyId, forecast);
+      broadcast({
+        type: "risk_forecast",
+        companyId,
+        forecast: forecastData
+      });
     }
-  }
 
-  /* Expire stale history */
-  for (const [key, history] of forecastMemory.entries()) {
-    forecastMemory.set(
-      key,
-      history.filter(h => now - h.timestamp < 5 * 60 * 1000)
+    /* ================= BEHAVIOR DRIFT ================= */
+
+    const signature = JSON.stringify(
+      Object.values(assetExposure).sort()
     );
+
+    if (!behaviorMemory.has(companyId)) {
+      behaviorMemory.set(companyId, signature);
+    } else {
+      const previous = behaviorMemory.get(companyId);
+      if (previous !== signature) {
+        broadcast({
+          type: "behavioral_drift",
+          companyId,
+          message: "Behavioral pattern deviation detected."
+        });
+        behaviorMemory.set(companyId, signature);
+      }
+    }
+
+    /* ================= EXECUTIVE HEAT INDEX ================= */
+
+    const exposureScore =
+      Object.values(assetExposure).reduce((a, b) => a + b, 0);
+
+    const forecastProbability =
+      forecastData?.probability || 0;
+
+    const heatIndex = Math.min(
+      100,
+      Math.round(
+        (risk * 0.4) +
+        (exposureScore * 0.2) +
+        (forecastProbability * 0.2) +
+        (criticalRatio * 100 * 0.2)
+      )
+    );
+
+    broadcast({
+      type: "executive_heat_index",
+      companyId,
+      heatIndex
+    });
   }
 }
 
-setInterval(detectAnomalies, CHECK_INTERVAL);
+setInterval(detectIntelligence, CHECK_INTERVAL);
 
-/* =========================================================
-   START
-========================================================= */
+/* ================= START ================= */
 
 const port = process.env.PORT || 5000;
 
