@@ -54,6 +54,8 @@ function autoEscalateIfNeeded(db, event, req) {
   db.incidents.push(newIncident);
   event.incidentId = newIncident.id;
 
+  writeDb(db);
+
   const broadcast = req.app.get("broadcastSecurityEvent");
   if (broadcast) broadcast(event);
 }
@@ -118,18 +120,15 @@ router.get("/posture-summary", (req, res) => {
 });
 
 /* =========================================================
-   POSTURE CHECKS (NEW – prevents 404)
+   POSTURE CHECKS
 ========================================================= */
 
 router.get("/posture-checks", (req, res) => {
-  res.json({
-    ok: true,
-    checks: []
-  });
+  res.json({ ok: true, checks: [] });
 });
 
 /* =========================================================
-   POSTURE RECENT (NEW – prevents 404)
+   POSTURE RECENT
 ========================================================= */
 
 router.get("/posture-recent", (req, res) => {
@@ -141,10 +140,7 @@ router.get("/posture-recent", (req, res) => {
       .slice(-limit)
       .reverse();
 
-    res.json({
-      ok: true,
-      recent
-    });
+    res.json({ ok: true, recent });
 
   } catch {
     res.status(500).json({ ok: false, error: "Failed to load recent posture data" });
@@ -152,7 +148,7 @@ router.get("/posture-recent", (req, res) => {
 });
 
 /* =========================================================
-   VULNERABILITIES (NEW – prevents 404)
+   VULNERABILITIES
 ========================================================= */
 
 router.get("/vulnerabilities", (req, res) => {
@@ -214,4 +210,25 @@ router.post("/events", (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-   
+    db.securityEvents.push(newEvent);
+
+    autoEscalateIfNeeded(db, newEvent, req);
+
+    writeDb(db);
+
+    const broadcast = req.app.get("broadcastSecurityEvent");
+    if (broadcast) broadcast(newEvent);
+
+    res.status(201).json({
+      ok: true,
+      event: newEvent,
+    });
+
+  } catch {
+    res.status(500).json({ ok: false, error: "Failed to create event" });
+  }
+});
+
+/* ========================================================= */
+
+module.exports = router;
