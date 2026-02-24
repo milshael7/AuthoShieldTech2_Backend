@@ -32,8 +32,7 @@ function isAdmin(role) {
 function autoEscalateIfNeeded(db, event, req) {
   if (event.severity !== "critical") return;
 
-  // Prevent duplicate escalation
-  const existing = db.incidents.find(
+  const existing = (db.incidents || []).find(
     (i) => i.sourceEventId === event.id
   );
 
@@ -51,14 +50,12 @@ function autoEscalateIfNeeded(db, event, req) {
     createdAt: new Date().toISOString(),
   };
 
+  if (!db.incidents) db.incidents = [];
   db.incidents.push(newIncident);
   event.incidentId = newIncident.id;
 
   const broadcast = req.app.get("broadcastSecurityEvent");
-
-  if (broadcast) {
-    broadcast(event);
-  }
+  if (broadcast) broadcast(event);
 }
 
 /* =========================================================
@@ -84,7 +81,6 @@ router.get("/posture-summary", (req, res) => {
       scopedVulns = vulnerabilitiesArr;
     } else {
       const companyId = req.user.companyId;
-
       scopedCompanies = companiesArr.filter(c => c.id === companyId);
       scopedUsers = usersArr.filter(u => u.companyId === companyId);
       scopedVulns = vulnerabilitiesArr.filter(v => v.companyId === companyId);
@@ -95,13 +91,11 @@ router.get("/posture-summary", (req, res) => {
     const medium = scopedVulns.filter(v => v.severity === "medium").length;
     const low = scopedVulns.filter(v => v.severity === "low").length;
 
-    let riskScore = 100 - (critical * 15 + high * 8 + medium * 4 + low * 1);
-    if (riskScore < 5) riskScore = 5;
-    if (riskScore > 100) riskScore = 100;
+    let riskScore = 100 - (critical * 15 + high * 8 + medium * 4 + low);
+    riskScore = Math.max(5, Math.min(100, riskScore));
 
     let complianceScore = 100 - (critical * 10 + high * 6 + medium * 3);
-    if (complianceScore < 10) complianceScore = 10;
-    if (complianceScore > 100) complianceScore = 100;
+    complianceScore = Math.max(10, Math.min(100, complianceScore));
 
     res.json({
       ok: true,
@@ -124,6 +118,56 @@ router.get("/posture-summary", (req, res) => {
 });
 
 /* =========================================================
+   POSTURE CHECKS (NEW – prevents 404)
+========================================================= */
+
+router.get("/posture-checks", (req, res) => {
+  res.json({
+    ok: true,
+    checks: []
+  });
+});
+
+/* =========================================================
+   POSTURE RECENT (NEW – prevents 404)
+========================================================= */
+
+router.get("/posture-recent", (req, res) => {
+  try {
+    const db = readDb();
+    const limit = Number(req.query.limit) || 20;
+
+    const recent = (db.securityEvents || [])
+      .slice(-limit)
+      .reverse();
+
+    res.json({
+      ok: true,
+      recent
+    });
+
+  } catch {
+    res.status(500).json({ ok: false, error: "Failed to load recent posture data" });
+  }
+});
+
+/* =========================================================
+   VULNERABILITIES (NEW – prevents 404)
+========================================================= */
+
+router.get("/vulnerabilities", (req, res) => {
+  try {
+    const db = readDb();
+    res.json({
+      ok: true,
+      vulnerabilities: db.vulnerabilities || []
+    });
+  } catch {
+    res.status(500).json({ ok: false, error: "Failed to load vulnerabilities" });
+  }
+});
+
+/* =========================================================
    SECURITY EVENTS
 ========================================================= */
 
@@ -140,9 +184,7 @@ router.get("/events", (req, res) => {
       );
     }
 
-    const events = eventsArr
-      .slice(-limit)
-      .reverse();
+    const events = eventsArr.slice(-limit).reverse();
 
     res.json({ ok: true, events });
 
@@ -152,13 +194,12 @@ router.get("/events", (req, res) => {
 });
 
 /* =========================================================
-   CREATE SECURITY EVENT (AUTO ESCALATION ENABLED)
+   CREATE SECURITY EVENT
 ========================================================= */
 
 router.post("/events", (req, res) => {
   try {
     const db = readDb();
-
     if (!db.securityEvents) db.securityEvents = [];
 
     const { title, description, severity = "low" } = req.body;
@@ -173,109 +214,4 @@ router.post("/events", (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    db.securityEvents.push(newEvent);
-
-    autoEscalateIfNeeded(db, newEvent, req);
-
-    writeDb(db);
-
-    const broadcast = req.app.get("broadcastSecurityEvent");
-    if (broadcast) {
-      broadcast(newEvent);
-    }
-
-    res.status(201).json({
-      ok: true,
-      event: newEvent,
-    });
-
-  } catch {
-    res.status(500).json({ ok: false, error: "Failed to create event" });
-  }
-});
-
-/* =========================================================
-   ACKNOWLEDGE EVENT
-========================================================= */
-
-router.patch("/events/:id/ack", (req, res) => {
-  try {
-    const db = readDb();
-    const { id } = req.params;
-
-    const event = db.securityEvents.find(e => e.id === id);
-
-    if (!event) {
-      return res.status(404).json({ ok: false, error: "Event not found" });
-    }
-
-    if (!isAdmin(req.user.role) &&
-        event.companyId !== req.user.companyId) {
-      return res.status(403).json({ ok: false, error: "Unauthorized" });
-    }
-
-    event.acknowledged = true;
-    event.acknowledgedBy = req.user.id;
-    event.acknowledgedAt = Date.now();
-
-    writeDb(db);
-
-    res.json({ ok: true, event });
-
-  } catch {
-    res.status(500).json({ ok: false, error: "Failed to acknowledge event" });
-  }
-});
-
-/* =========================================================
-   TOOL ROUTES
-========================================================= */
-
-router.get(
-  "/tools",
-  requireRole("Company", { adminAlso: true }),
-  (req, res) => {
-    try {
-      const tools = securityTools.listTools(req.user.companyId);
-      res.json({ ok: true, tools });
-    } catch (e) {
-      res.status(400).json({ ok: false, error: e.message });
-    }
-  }
-);
-
-router.post(
-  "/tools/install",
-  requireRole("Company", { adminAlso: true }),
-  (req, res) => {
-    try {
-      const result = securityTools.installTool(
-        req.user.companyId,
-        req.body.toolId,
-        req.user.id
-      );
-      res.json({ ok: true, result });
-    } catch (e) {
-      res.status(400).json({ ok: false, error: e.message });
-    }
-  }
-);
-
-router.post(
-  "/tools/uninstall",
-  requireRole("Company", { adminAlso: true }),
-  (req, res) => {
-    try {
-      const result = securityTools.uninstallTool(
-        req.user.companyId,
-        req.body.toolId,
-        req.user.id
-      );
-      res.json({ ok: true, result });
-    } catch (e) {
-      res.status(400).json({ ok: false, error: e.message });
-    }
-  }
-);
-
-module.exports = router;
+   
