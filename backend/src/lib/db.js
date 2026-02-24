@@ -1,6 +1,5 @@
 // backend/src/lib/db.js
-// Enterprise DB — Phase 23 Core Security Layer
-// Atomic Writes • Financial Ledger • Audit Hash Chain • Retention Policies
+// Enterprise DB — Phase 24 Asset Intelligence Layer
 
 const fs = require("fs");
 const path = require("path");
@@ -8,33 +7,26 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 10;
-
-/* ======================================================
-   UTIL
-====================================================== */
+const SCHEMA_VERSION = 11;
 
 function ensureDir(p) {
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-/* ======================================================
-   DEFAULT DB
-====================================================== */
-
 function defaultDb() {
   return {
     schemaVersion: SCHEMA_VERSION,
 
-    /* ================= CORE ================= */
-
+    /* CORE */
     users: [],
     companies: [],
     notifications: [],
 
-    /* ================= SECURITY LAYER ================= */
+    /* 🔥 NEW ASSET LAYER */
+    assets: [],
 
+    /* SECURITY */
     incidents: [],
     vulnerabilities: [],
     securityEvents: [],
@@ -44,13 +36,9 @@ function defaultDb() {
       lastComplianceCheck: null,
     },
 
-    /* ================= SCANNING ================= */
-
     scans: [],
     scanCredits: [],
     processedStripeEvents: [],
-
-    /* ================= AUDIT ================= */
 
     audit: [],
     auditMeta: {
@@ -58,8 +46,6 @@ function defaultDb() {
       lastSequence: 0,
       integrityVersion: 1,
     },
-
-    /* ================= FINANCIAL ================= */
 
     invoices: [],
     payments: [],
@@ -75,29 +61,20 @@ function defaultDb() {
       disputedAmount: 0,
     },
 
-    /* ================= AUTOPROTECT ================= */
-
-    autoprotek: {
-      users: {},
-    },
-
-    /* ================= COMPLIANCE ================= */
+    autoprotek: { users: {} },
 
     complianceSnapshots: [],
+
     retentionPolicy: {
       auditRetentionDays: 365 * 2,
       financialRetentionDays: 365 * 7,
       snapshotRetentionDays: 365 * 3,
     },
 
-    /* ================= AI BRAIN ================= */
-
     brain: {
       memory: [],
       notes: [],
     },
-
-    /* ================= PAPER TRADING ================= */
 
     paper: {
       summary: {
@@ -117,17 +94,9 @@ function defaultDb() {
       daily: [],
     },
 
-    /* ================= LIVE ================= */
-
-    live: {
-      events: [],
-    },
+    live: { events: [] },
   };
 }
-
-/* ======================================================
-   MIGRATION
-====================================================== */
 
 function migrate(db) {
   if (!db || typeof db !== "object") return defaultDb();
@@ -137,6 +106,7 @@ function migrate(db) {
     "users",
     "companies",
     "notifications",
+    "assets",            // 🔥 NEW
     "scans",
     "scanCredits",
     "processedStripeEvents",
@@ -155,14 +125,13 @@ function migrate(db) {
     if (!Array.isArray(db[field])) db[field] = [];
   }
 
-  if (!db.systemState) {
+  if (!db.systemState)
     db.systemState = {
       securityStatus: "NORMAL",
       lastComplianceCheck: null,
     };
-  }
 
-  if (!db.revenueSummary || typeof db.revenueSummary !== "object") {
+  if (!db.revenueSummary)
     db.revenueSummary = {
       totalRevenue: 0,
       autoprotekRevenue: 0,
@@ -171,35 +140,26 @@ function migrate(db) {
       refundedAmount: 0,
       disputedAmount: 0,
     };
-  }
 
-  if (!db.auditMeta || typeof db.auditMeta !== "object") {
+  if (!db.auditMeta)
     db.auditMeta = {
       lastHash: null,
       lastSequence: 0,
       integrityVersion: 1,
     };
-  }
 
-  if (!db.autoprotek || typeof db.autoprotek !== "object") {
-    db.autoprotek = { users: {} };
-  }
+  if (!db.autoprotek) db.autoprotek = { users: {} };
 
-  if (!db.retentionPolicy) {
+  if (!db.retentionPolicy)
     db.retentionPolicy = {
       auditRetentionDays: 365 * 2,
       financialRetentionDays: 365 * 7,
       snapshotRetentionDays: 365 * 3,
     };
-  }
 
   db.schemaVersion = SCHEMA_VERSION;
   return db;
 }
-
-/* ======================================================
-   CORE IO
-====================================================== */
 
 function ensureDb() {
   ensureDir(DB_PATH);
@@ -215,11 +175,6 @@ function ensureDb() {
     const migrated = migrate(parsed);
     fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
   } catch {
-    try {
-      const bad = fs.readFileSync(DB_PATH, "utf-8");
-      fs.writeFileSync(DB_PATH + ".corrupt." + Date.now(), bad);
-    } catch {}
-
     fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
   }
 }
