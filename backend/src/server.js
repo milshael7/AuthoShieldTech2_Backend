@@ -7,7 +7,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 
-const { ensureDb, readDb, writeDb } = require("./lib/db");
+const { ensureDb, readDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
@@ -71,18 +71,56 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-/* ================= BROADCAST ================= */
+/* ================= BROADCAST CORE ================= */
 
-function broadcast(payload) {
+function broadcast(payload, filterFn = null) {
   const msg = JSON.stringify(payload);
+
   wss.clients.forEach((client) => {
-    if (client.readyState === 1) {
-      try { client.send(msg); } catch {}
-    }
+    if (client.readyState !== 1) return;
+    if (filterFn && !filterFn(client)) return;
+    try { client.send(msg); } catch {}
   });
 }
 
-/* ================= INTELLIGENCE ENGINE ================= */
+function broadcastRiskUpdate(companyId, riskScore) {
+  broadcast(
+    { type: "risk_update", companyId, riskScore },
+    () => true
+  );
+}
+
+function broadcastForecast(companyId, forecast) {
+  broadcast(
+    { type: "risk_forecast", companyId, forecast },
+    () => true
+  );
+}
+
+function broadcastAssetExposure(companyId, exposure) {
+  broadcast(
+    { type: "asset_exposure_update", companyId, exposure },
+    () => true
+  );
+}
+
+function broadcastBehaviorDrift(companyId, message) {
+  broadcast(
+    { type: "behavioral_drift", companyId, message },
+    () => true
+  );
+}
+
+function broadcastHeatIndex(companyId, heatIndex) {
+  broadcast(
+    { type: "executive_heat_index", companyId, heatIndex },
+    () => true
+  );
+}
+
+/* =========================================================
+   🔥 ENTERPRISE INTELLIGENCE ENGINE
+========================================================= */
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
@@ -113,20 +151,20 @@ function detectIntelligence() {
     /* ================= ASSET EXPOSURE ================= */
 
     const assetExposure = {};
+
     list.forEach(e => {
       const asset = e.targetAsset || "unknown";
-      if (!assetExposure[asset]) assetExposure[asset] = 0;
-      assetExposure[asset] +=
+
+      const weight =
         e.severity === "critical" ? 25 :
         e.severity === "high" ? 15 :
         e.severity === "medium" ? 8 : 2;
+
+      assetExposure[asset] =
+        (assetExposure[asset] || 0) + weight;
     });
 
-    broadcast({
-      type: "asset_exposure_update",
-      companyId,
-      exposure: assetExposure
-    });
+    broadcastAssetExposure(companyId, assetExposure);
 
     /* ================= ADAPTIVE RISK ================= */
 
@@ -169,7 +207,7 @@ function detectIntelligence() {
     if (risk < 5) risk = 5;
     baseline.riskScore = risk;
 
-    broadcast({ type: "risk_update", companyId, riskScore: risk });
+    broadcastRiskUpdate(companyId, risk);
 
     /* ================= FORECAST ================= */
 
@@ -179,45 +217,42 @@ function detectIntelligence() {
 
     const history = forecastMemory.get(companyId);
     history.push({ risk, timestamp: now });
+
     if (history.length > 10) history.shift();
 
-    let forecastData = null;
+    let forecastProbability = 0;
 
     if (history.length >= 3) {
       const first = history[0];
       const last = history[history.length - 1];
+
       const slope =
         (last.risk - first.risk) /
         ((last.timestamp - first.timestamp) / 1000 || 1);
 
-      forecastData = {
-        slope: Number(slope.toFixed(3)),
-        probability: Math.min(100, Math.round(slope * 100)),
-      };
+      forecastProbability =
+        Math.min(100, Math.round(slope * 100));
 
-      broadcast({
-        type: "risk_forecast",
-        companyId,
-        forecast: forecastData
+      broadcastForecast(companyId, {
+        slope: Number(slope.toFixed(3)),
+        probability: forecastProbability
       });
     }
 
-    /* ================= BEHAVIOR DRIFT ================= */
+    /* ================= BEHAVIORAL DRIFT ================= */
 
-    const signature = JSON.stringify(
-      Object.values(assetExposure).sort()
-    );
+    const signature =
+      JSON.stringify(Object.keys(assetExposure).sort());
 
     if (!behaviorMemory.has(companyId)) {
       behaviorMemory.set(companyId, signature);
     } else {
       const previous = behaviorMemory.get(companyId);
       if (previous !== signature) {
-        broadcast({
-          type: "behavioral_drift",
+        broadcastBehaviorDrift(
           companyId,
-          message: "Behavioral pattern deviation detected."
-        });
+          "Behavioral asset targeting pattern changed."
+        );
         behaviorMemory.set(companyId, signature);
       }
     }
@@ -225,26 +260,27 @@ function detectIntelligence() {
     /* ================= EXECUTIVE HEAT INDEX ================= */
 
     const exposureScore =
-      Object.values(assetExposure).reduce((a, b) => a + b, 0);
-
-    const forecastProbability =
-      forecastData?.probability || 0;
+      Object.values(assetExposure)
+        .reduce((a, b) => a + b, 0);
 
     const heatIndex = Math.min(
       100,
       Math.round(
         (risk * 0.4) +
-        (exposureScore * 0.2) +
-        (forecastProbability * 0.2) +
-        (criticalRatio * 100 * 0.2)
+        (exposureScore * 0.3) +
+        (forecastProbability * 0.3)
       )
     );
 
-    broadcast({
-      type: "executive_heat_index",
-      companyId,
-      heatIndex
-    });
+    broadcastHeatIndex(companyId, heatIndex);
+  }
+
+  /* Expire forecast history */
+  for (const [key, history] of forecastMemory.entries()) {
+    forecastMemory.set(
+      key,
+      history.filter(h => now - h.timestamp < 5 * 60 * 1000)
+    );
   }
 }
 
