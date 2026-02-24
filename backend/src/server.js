@@ -3,7 +3,6 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
@@ -11,8 +10,6 @@ const jwt = require("jsonwebtoken");
 const { ensureDb, readDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
-
-const { generateComplianceReport } = require("./services/compliance.service");
 
 /* ================= TRADING ENGINES ================= */
 
@@ -22,7 +19,7 @@ const aiBrain = require("./services/aiBrain");
 /* ROUTES */
 const securityRoutes = require("./routes/security.routes");
 const billingRoutes = require("./routes/billing.routes");
-const incidentsRoutes = require("./routes/incidents.routes"); // ✅ ADDED
+const incidentsRoutes = require("./routes/incidents.routes");
 
 /* =========================================================
    SAFE BOOT
@@ -61,10 +58,10 @@ if (process.env.STRIPE_WEBHOOK_SECRET) {
 
   console.log("[BOOT] Stripe webhook enabled");
 } else {
-  console.log("[BOOT] Stripe webhook disabled (no STRIPE_WEBHOOK_SECRET)");
+  console.log("[BOOT] Stripe webhook disabled");
 }
 
-/* ================= CORS ================= */
+/* ================= MIDDLEWARE ================= */
 
 app.use(
   cors({
@@ -78,79 +75,31 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
 /* =========================================================
-   REAL HEALTH CHECK
+   HEALTH CHECK
 ========================================================= */
 
-app.get("/health", async (req, res) => {
-  const checks = {
-    api: true,
-    database: false,
-    auth: false,
-    stripe: false,
-    tradingEngine: false,
-    aiEngine: false,
-  };
-
+app.get("/health", (req, res) => {
   try {
     const db = readDb();
-    if (db) checks.database = true;
-    if (process.env.JWT_SECRET) checks.auth = true;
-    if (process.env.STRIPE_SECRET_KEY) checks.stripe = true;
-    if (liveTrader && typeof liveTrader === "object")
-      checks.tradingEngine = true;
-    if (aiBrain && typeof aiBrain === "object")
-      checks.aiEngine = true;
 
-    const allHealthy = Object.values(checks).every(Boolean);
-    const partiallyHealthy = Object.values(checks).some(Boolean);
-
-    const systemState = db?.systemState || {
-      securityStatus: "NORMAL",
-      lastComplianceCheck: null,
-    };
-
-    if (allHealthy) {
-      return res.status(200).json({
-        ok: true,
-        level: "healthy",
-        checks,
-        systemState,
-        uptime: process.uptime(),
-        timestamp: Date.now(),
-      });
-    }
-
-    if (partiallyHealthy) {
-      return res.status(207).json({
-        ok: false,
-        level: "degraded",
-        checks,
-        systemState,
-        uptime: process.uptime(),
-        timestamp: Date.now(),
-      });
-    }
-
-    return res.status(500).json({
-      ok: false,
-      level: "critical",
-      checks,
+    res.json({
+      ok: true,
+      database: !!db,
+      uptime: process.uptime(),
+      timestamp: Date.now(),
     });
-
   } catch (err) {
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
-      level: "critical",
       error: err.message,
     });
   }
 });
 
-/* ================= API ROUTES ================= */
+/* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* Apply tenant middleware AFTER auth */
 app.use(tenantMiddleware);
 
 app.use("/api/admin", require("./routes/admin.routes"));
@@ -158,9 +107,8 @@ app.use("/api/manager", require("./routes/manager.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/me", require("./routes/me.routes"));
 app.use("/api/security", securityRoutes);
-app.use("/api/incidents", incidentsRoutes); // ✅ ADDED CORRECTLY
+app.use("/api/incidents", incidentsRoutes);
 app.use("/api/billing", billingRoutes);
-
 app.use("/api/trading", require("./routes/trading.routes"));
 app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/voice", require("./routes/voice.routes"));
@@ -195,18 +143,19 @@ wss.on("connection", (ws, req) => {
     ws.user = {
       id: decoded.id,
       role: decoded.role,
-      tenantId: decoded.tenantId || null,
+      companyId: decoded.companyId || null,
     };
 
     console.log(`[WS] Connected → ${ws.user.id} (${ws.user.role})`);
 
   } catch (err) {
-    console.warn("[WS] Authentication failed:", err.message);
     ws.close(1008, "Invalid token");
   }
 });
 
-/* ================= SAFE BROADCAST ================= */
+/* =========================================================
+   SAFE BROADCAST CORE
+========================================================= */
 
 function broadcast(payload, filterFn = null) {
   const message = JSON.stringify(payload);
@@ -221,7 +170,35 @@ function broadcast(payload, filterFn = null) {
   });
 }
 
-/* ================= MARKET SIMULATION ================= */
+/* =========================================================
+   REAL-TIME SECURITY EVENT BROADCAST
+========================================================= */
+
+function broadcastSecurityEvent(event) {
+  broadcast(
+    {
+      type: "security_event",
+      event,
+    },
+    (client) => {
+      // Admin sees all
+      if (client.user?.role === "Admin") return true;
+
+      // Company isolation
+      if (event.companyId && client.user?.companyId !== event.companyId)
+        return false;
+
+      return true;
+    }
+  );
+}
+
+/* Make available to routes */
+app.set("broadcastSecurityEvent", broadcastSecurityEvent);
+
+/* =========================================================
+   MARKET SIMULATION
+========================================================= */
 
 const SYMBOL = "BTCUSDT";
 let lastPrice = 40000;
@@ -229,17 +206,18 @@ let lastPrice = 40000;
 setInterval(() => {
   const delta = (Math.random() - 0.5) * 60;
   lastPrice = Math.max(1000, lastPrice + delta);
-  const ts = Date.now();
 
   broadcast({
     type: "tick",
     symbol: SYMBOL,
     price: lastPrice,
-    ts,
+    ts: Date.now(),
   });
 }, 2000);
 
-/* ================= START ================= */
+/* =========================================================
+   START
+========================================================= */
 
 const port = process.env.PORT || 5000;
 
