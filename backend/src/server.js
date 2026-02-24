@@ -36,6 +36,19 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
+/* ================= HEALTH ROUTE (ADDED FIX) ================= */
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "healthy",
+    uptime: process.uptime(),
+    timestamp: Date.now()
+  });
+});
+
+/* ================= ROUTES ================= */
+
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use(tenantMiddleware);
 app.use("/api/admin", require("./routes/admin.routes"));
@@ -113,8 +126,6 @@ function detectIntelligence() {
 
   for (const [companyId, list] of Object.entries(grouped)) {
 
-    /* ================= ASSET EXPOSURE ================= */
-
     const assetExposure = {};
 
     list.forEach(e => {
@@ -130,8 +141,6 @@ function detectIntelligence() {
     });
 
     broadcast({ type: "asset_exposure_update", companyId, exposure: assetExposure });
-
-    /* ================= ADAPTIVE RISK ================= */
 
     const total = list.length;
     const critical = list.filter(e => e.severity === "critical").length;
@@ -174,8 +183,6 @@ function detectIntelligence() {
 
     broadcast({ type: "risk_update", companyId, riskScore: risk });
 
-    /* ================= FORECAST ================= */
-
     if (!forecastMemory.has(companyId)) {
       forecastMemory.set(companyId, []);
     }
@@ -208,8 +215,6 @@ function detectIntelligence() {
       });
     }
 
-    /* ================= BEHAVIORAL DRIFT ================= */
-
     const signature =
       JSON.stringify(Object.keys(assetExposure).sort());
 
@@ -226,8 +231,6 @@ function detectIntelligence() {
         behaviorMemory.set(companyId, signature);
       }
     }
-
-    /* ================= EXECUTIVE HEAT INDEX ================= */
 
     const exposureScore =
       Object.values(assetExposure).reduce((a, b) => a + b, 0);
@@ -246,8 +249,6 @@ function detectIntelligence() {
       companyId,
       heatIndex
     });
-
-    /* ================= AUTONOMOUS LOCKDOWN ================= */
 
     const lockdownKey = `${companyId}-lockdown`;
 
@@ -288,7 +289,6 @@ function detectIntelligence() {
     }
   }
 
-  /* Expire forecast history */
   for (const [key, history] of forecastMemory.entries()) {
     forecastMemory.set(
       key,
@@ -296,7 +296,6 @@ function detectIntelligence() {
     );
   }
 
-  /* Expire lockdown memory after 10 minutes */
   for (const [key, ts] of lockdownMemory.entries()) {
     if (now - ts > 10 * 60 * 1000) {
       lockdownMemory.delete(key);
