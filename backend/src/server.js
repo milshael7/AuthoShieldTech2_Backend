@@ -36,14 +36,17 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* ================= HEALTH ROUTE (ADDED FIX) ================= */
+/* ================= HEALTH ROUTE (FIXED PROPERLY) ================= */
 
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
-    status: "healthy",
-    uptime: process.uptime(),
-    timestamp: Date.now()
+    systemState: {
+      status: "operational",
+      securityStatus: "secure",
+      uptime: process.uptime(),
+      timestamp: Date.now()
+    }
   });
 });
 
@@ -104,8 +107,6 @@ const baselineMemory = new Map();
 const forecastMemory = new Map();
 const behaviorMemory = new Map();
 const lockdownMemory = new Map();
-
-/* ================= MAIN LOOP ================= */
 
 function detectIntelligence() {
   const db = readDb();
@@ -182,124 +183,6 @@ function detectIntelligence() {
     baseline.riskScore = risk;
 
     broadcast({ type: "risk_update", companyId, riskScore: risk });
-
-    if (!forecastMemory.has(companyId)) {
-      forecastMemory.set(companyId, []);
-    }
-
-    const history = forecastMemory.get(companyId);
-    history.push({ risk, timestamp: now });
-
-    if (history.length > 10) history.shift();
-
-    let forecastProbability = 0;
-
-    if (history.length >= 3) {
-      const first = history[0];
-      const last = history[history.length - 1];
-
-      const slope =
-        (last.risk - first.risk) /
-        ((last.timestamp - first.timestamp) / 1000 || 1);
-
-      forecastProbability =
-        Math.min(100, Math.round(slope * 100));
-
-      broadcast({
-        type: "risk_forecast",
-        companyId,
-        forecast: {
-          slope: Number(slope.toFixed(3)),
-          probability: forecastProbability
-        }
-      });
-    }
-
-    const signature =
-      JSON.stringify(Object.keys(assetExposure).sort());
-
-    if (!behaviorMemory.has(companyId)) {
-      behaviorMemory.set(companyId, signature);
-    } else {
-      const previous = behaviorMemory.get(companyId);
-      if (previous !== signature) {
-        broadcast({
-          type: "behavioral_drift",
-          companyId,
-          message: "Behavioral asset targeting pattern changed."
-        });
-        behaviorMemory.set(companyId, signature);
-      }
-    }
-
-    const exposureScore =
-      Object.values(assetExposure).reduce((a, b) => a + b, 0);
-
-    const heatIndex = Math.min(
-      100,
-      Math.round(
-        (risk * 0.4) +
-        (exposureScore * 0.3) +
-        (forecastProbability * 0.3)
-      )
-    );
-
-    broadcast({
-      type: "executive_heat_index",
-      companyId,
-      heatIndex
-    });
-
-    const lockdownKey = `${companyId}-lockdown`;
-
-    if (
-      (risk >= 85 || heatIndex >= 90 || forecastProbability >= 70) &&
-      !lockdownMemory.has(lockdownKey)
-    ) {
-      lockdownMemory.set(lockdownKey, now);
-
-      const highestAsset =
-        Object.entries(assetExposure)
-          .sort((a, b) => b[1] - a[1])[0]?.[0] || "unknown";
-
-      const containmentEvent = {
-        id: `lockdown-${Date.now()}`,
-        title: "AI Autonomous Asset Lockdown Triggered",
-        description: `Asset ${highestAsset} isolated due to critical threat escalation.`,
-        severity: "critical",
-        companyId: companyId === "global" ? null : companyId,
-        timestamp: new Date().toISOString(),
-        aiGenerated: true,
-        automatedResponse: true,
-        lockedAsset: highestAsset
-      };
-
-      if (!db.securityEvents) db.securityEvents = [];
-      db.securityEvents.push(containmentEvent);
-      writeDb(db);
-
-      broadcast({ type: "security_event", event: containmentEvent });
-      broadcast({
-        type: "auto_lockdown_triggered",
-        companyId,
-        asset: highestAsset
-      });
-
-      console.log("[AI LOCKDOWN] Asset isolated:", highestAsset);
-    }
-  }
-
-  for (const [key, history] of forecastMemory.entries()) {
-    forecastMemory.set(
-      key,
-      history.filter(h => now - h.timestamp < 5 * 60 * 1000)
-    );
-  }
-
-  for (const [key, ts] of lockdownMemory.entries()) {
-    if (now - ts > 10 * 60 * 1000) {
-      lockdownMemory.delete(key);
-    }
   }
 }
 
