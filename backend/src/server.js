@@ -31,13 +31,7 @@ users.ensureAdminFromEnv();
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN || true,
-    credentials: true,
-  })
-);
-
+app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
@@ -74,7 +68,6 @@ wss.on("connection", (ws, req) => {
       role: decoded.role,
       companyId: decoded.companyId || null,
     };
-
   } catch {
     ws.close(1008);
   }
@@ -106,59 +99,126 @@ function broadcastSecurityEvent(event) {
   );
 }
 
+function broadcastRiskUpdate(companyId, riskScore) {
+  broadcast(
+    {
+      type: "risk_update",
+      companyId,
+      riskScore,
+    },
+    (client) => {
+      if (client.user?.role === "Admin") return true;
+      if (client.user?.companyId !== companyId) return false;
+      return true;
+    }
+  );
+}
+
 app.set("broadcastSecurityEvent", broadcastSecurityEvent);
 
 /* =========================================================
-   🔥 AI ANOMALY ENGINE
+   🔥 ADAPTIVE AI ANOMALY ENGINE
 ========================================================= */
-
-/*
-  This engine runs every 15 seconds.
-  It analyzes the last 5 minutes of activity.
-  It compares spike intensity and clustering.
-*/
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
-const anomalyMemory = new Map(); // prevent duplicate spam
+const anomalyMemory = new Map();
+
+/*
+  baselineMemory:
+  {
+    companyId: {
+      avgWindowCount,
+      avgCriticalRatio,
+      riskScore
+    }
+  }
+*/
+
+const baselineMemory = new Map();
 
 function detectAnomalies() {
   const db = readDb();
   const events = db.securityEvents || [];
-
   const now = Date.now();
+
   const recent = events.filter(
     e => new Date(e.timestamp || e.createdAt).getTime() >= now - WINDOW_MS
   );
 
-  const byCompany = {};
+  const grouped = {};
 
   for (const e of recent) {
     const cid = e.companyId || "global";
-    if (!byCompany[cid]) byCompany[cid] = [];
-    byCompany[cid].push(e);
+    if (!grouped[cid]) grouped[cid] = [];
+    grouped[cid].push(e);
   }
 
-  for (const [companyId, list] of Object.entries(byCompany)) {
+  for (const [companyId, list] of Object.entries(grouped)) {
+    const total = list.length;
     const critical = list.filter(e => e.severity === "critical").length;
     const high = list.filter(e => e.severity === "high").length;
-    const total = list.length;
 
-    const baseline = (events.length / 24) || 1; // rough baseline
-    const spikeFactor = total / baseline;
+    const criticalRatio = total > 0 ? critical / total : 0;
+
+    if (!baselineMemory.has(companyId)) {
+      baselineMemory.set(companyId, {
+        avgWindowCount: total || 1,
+        avgCriticalRatio: criticalRatio,
+        riskScore: 10,
+      });
+    }
+
+    const baseline = baselineMemory.get(companyId);
+
+    /* ====== LEARNING (slow adaptive update) ====== */
+
+    baseline.avgWindowCount =
+      baseline.avgWindowCount * 0.95 + total * 0.05;
+
+    baseline.avgCriticalRatio =
+      baseline.avgCriticalRatio * 0.95 + criticalRatio * 0.05;
+
+    /* ====== DEVIATION DETECTION ====== */
+
+    const volumeDeviation =
+      total / (baseline.avgWindowCount || 1);
+
+    const criticalDeviation =
+      criticalRatio / (baseline.avgCriticalRatio || 0.01);
 
     let trigger = false;
     let reason = "";
 
-    if (critical >= 3) {
+    if (volumeDeviation > 4 && total > 8) {
       trigger = true;
-      reason = "Multiple critical events detected in short window.";
+      reason = "Behavioral volume anomaly detected.";
     }
 
-    if (spikeFactor > 5 && total > 10) {
+    if (criticalDeviation > 3 && critical >= 2) {
       trigger = true;
-      reason = "Abnormal spike in security activity detected.";
+      reason = "Critical severity pattern anomaly detected.";
     }
+
+    /* ====== RISK SCORING ====== */
+
+    let risk =
+      Math.min(
+        100,
+        Math.round(
+          baseline.riskScore +
+          (volumeDeviation * 5) +
+          (criticalDeviation * 10)
+        )
+      );
+
+    if (risk < 5) risk = 5;
+
+    baseline.riskScore = risk;
+
+    broadcastRiskUpdate(companyId, risk);
+
+    /* ====== AI EVENT TRIGGER ====== */
 
     const memoryKey = `${companyId}-${reason}`;
 
@@ -166,13 +226,14 @@ function detectAnomalies() {
       anomalyMemory.set(memoryKey, Date.now());
 
       const anomalyEvent = {
-        id: `anomaly-${Date.now()}`,
-        title: "AI Anomaly Detected",
+        id: `adaptive-${Date.now()}`,
+        title: "Adaptive AI Behavioral Anomaly",
         description: reason,
         severity: "critical",
         companyId: companyId === "global" ? null : companyId,
         timestamp: new Date().toISOString(),
         aiGenerated: true,
+        riskScore: risk,
       };
 
       db.securityEvents.push(anomalyEvent);
@@ -180,11 +241,12 @@ function detectAnomalies() {
 
       broadcastSecurityEvent(anomalyEvent);
 
-      console.log("[AI] Anomaly triggered:", reason);
+      console.log("[AI Adaptive] Triggered:", reason);
     }
   }
 
-  // expire memory after 10 minutes
+  /* ====== Memory expiration ====== */
+
   for (const [key, ts] of anomalyMemory.entries()) {
     if (now - ts > 10 * 60 * 1000) {
       anomalyMemory.delete(key);
