@@ -19,7 +19,7 @@ function generateId() {
 }
 
 /* =========================================================
-   INTELLIGENCE CALCULATOR
+   RISK CALC
 ========================================================= */
 
 function calculateRisk(assetId, vulnerabilities = []) {
@@ -46,17 +46,12 @@ function calculateRisk(assetId, vulnerabilities = []) {
   return {
     riskScore: Math.round(riskScore),
     status,
-    vulnerabilityBreakdown: {
-      critical,
-      high,
-      medium,
-      low,
-    },
+    vulnerabilityBreakdown: { critical, high, medium, low },
   };
 }
 
 /* =========================================================
-   GET ASSETS — ENTERPRISE SCOPED + ENRICHED
+   GET ASSETS
 ========================================================= */
 
 router.get("/", (req, res) => {
@@ -64,8 +59,6 @@ router.get("/", (req, res) => {
     const db = readDb();
     const assets = db.assets || [];
     const vulnerabilities = db.vulnerabilities || [];
-    const scans = db.scans || [];
-    const threats = db.threats || [];
 
     let scoped = assets;
 
@@ -74,22 +67,11 @@ router.get("/", (req, res) => {
     }
 
     const enriched = scoped.map(asset => {
-
       const intelligence = calculateRisk(asset.id, vulnerabilities);
-
-      const lastScan = scans
-        .filter(s => s.assetId === asset.id)
-        .sort((a, b) => b.timestamp - a.timestamp)[0];
-
-      const activeThreats = threats.filter(
-        t => t.assetId === asset.id && !t.resolved
-      );
 
       return {
         ...asset,
         ...intelligence,
-        lastScan: lastScan ? lastScan.timestamp : null,
-        activeThreats: activeThreats.length,
         monitoringEnabled: asset.monitoringEnabled ?? true,
         autoProtectEnabled: asset.autoProtectEnabled ?? true,
       };
@@ -97,7 +79,7 @@ router.get("/", (req, res) => {
 
     res.json({ ok: true, assets: enriched });
 
-  } catch (err) {
+  } catch {
     res.status(500).json({ ok: false, error: "Failed to load assets" });
   }
 });
@@ -111,25 +93,23 @@ router.post("/", (req, res) => {
     const { name, type, exposureLevel } = req.body;
 
     if (!name || !type) {
-      return res.status(400).json({
-        ok: false,
-        error: "Asset name and type required",
-      });
+      return res.status(400).json({ ok: false, error: "Name and type required" });
     }
 
     const db = readDb();
-
     if (!db.assets) db.assets = [];
 
     const newAsset = {
       id: generateId(),
-      name: String(name).trim(),
-      type: String(type).trim(),
+      name: name.trim(),
+      type: type.trim(),
       exposureLevel: exposureLevel || "internal",
       companyId: req.user.companyId || null,
       monitoringEnabled: true,
       autoProtectEnabled: true,
-      createdBy: req.user.id,
+      discovered: false,
+      confirmed: true,
+      sourceAssetId: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -145,10 +125,10 @@ router.post("/", (req, res) => {
 });
 
 /* =========================================================
-   UPDATE ASSET
+   DISCOVERY ENGINE
 ========================================================= */
 
-router.put("/:id", (req, res) => {
+router.post("/:id/discover", (req, res) => {
   try {
     const db = readDb();
     const asset = db.assets.find(a => a.id === req.params.id);
@@ -162,13 +142,65 @@ router.put("/:id", (req, res) => {
       return res.status(403).json({ ok: false, error: "Unauthorized" });
     }
 
-    const { name, exposureLevel, monitoringEnabled, autoProtectEnabled } = req.body;
+    if (asset.type !== "domain") {
+      return res.status(400).json({ ok: false, error: "Discovery only supports domain type" });
+    }
 
-    if (name !== undefined) asset.name = name;
-    if (exposureLevel !== undefined) asset.exposureLevel = exposureLevel;
-    if (monitoringEnabled !== undefined) asset.monitoringEnabled = monitoringEnabled;
-    if (autoProtectEnabled !== undefined) asset.autoProtectEnabled = autoProtectEnabled;
+    const subdomains = [
+      `api.${asset.name}`,
+      `admin.${asset.name}`,
+      `dev.${asset.name}`,
+      `staging.${asset.name}`
+    ];
 
+    if (!db.assets) db.assets = [];
+
+    subdomains.forEach(sub => {
+      const exists = db.assets.find(a => a.name === sub);
+      if (!exists) {
+        db.assets.push({
+          id: generateId(),
+          name: sub,
+          type: "domain",
+          exposureLevel: "public",
+          companyId: asset.companyId,
+          monitoringEnabled: true,
+          autoProtectEnabled: true,
+          discovered: true,
+          confirmed: false,
+          sourceAssetId: asset.id,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+    });
+
+    asset.lastDiscoveredAt = Date.now();
+    asset.updatedAt = Date.now();
+
+    writeDb(db);
+
+    res.json({ ok: true });
+
+  } catch {
+    res.status(500).json({ ok: false, error: "Discovery failed" });
+  }
+});
+
+/* =========================================================
+   CONFIRM DISCOVERED ASSET
+========================================================= */
+
+router.post("/:id/confirm", (req, res) => {
+  try {
+    const db = readDb();
+    const asset = db.assets.find(a => a.id === req.params.id);
+
+    if (!asset) {
+      return res.status(404).json({ ok: false, error: "Asset not found" });
+    }
+
+    asset.confirmed = true;
     asset.updatedAt = Date.now();
 
     writeDb(db);
@@ -176,38 +208,10 @@ router.put("/:id", (req, res) => {
     res.json({ ok: true, asset });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to update asset" });
+    res.status(500).json({ ok: false, error: "Confirmation failed" });
   }
 });
 
-/* =========================================================
-   DELETE ASSET
-========================================================= */
-
-router.delete("/:id", (req, res) => {
-  try {
-    const db = readDb();
-    const assetId = req.params.id;
-
-    const asset = db.assets.find(a => a.id === assetId);
-
-    if (!asset) {
-      return res.status(404).json({ ok: false, error: "Asset not found" });
-    }
-
-    if (!isAdmin(req.user.role) &&
-        asset.companyId !== req.user.companyId) {
-      return res.status(403).json({ ok: false, error: "Unauthorized" });
-    }
-
-    db.assets = db.assets.filter(a => a.id !== assetId);
-    writeDb(db);
-
-    res.json({ ok: true });
-
-  } catch {
-    res.status(500).json({ ok: false, error: "Failed to delete asset" });
-  }
-});
+/* ========================================================= */
 
 module.exports = router;
