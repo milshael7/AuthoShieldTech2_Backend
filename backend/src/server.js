@@ -85,7 +85,7 @@ function broadcast(payload, filterFn = null) {
   });
 }
 
-/* ================= SECURITY EVENT BROADCAST ================= */
+/* ================= BROADCAST HELPERS ================= */
 
 function broadcastSecurityEvent(event) {
   broadcast(
@@ -101,11 +101,7 @@ function broadcastSecurityEvent(event) {
 
 function broadcastRiskUpdate(companyId, riskScore) {
   broadcast(
-    {
-      type: "risk_update",
-      companyId,
-      riskScore,
-    },
+    { type: "risk_update", companyId, riskScore },
     (client) => {
       if (client.user?.role === "Admin") return true;
       if (client.user?.companyId !== companyId) return false;
@@ -114,28 +110,38 @@ function broadcastRiskUpdate(companyId, riskScore) {
   );
 }
 
+function broadcastAIAction(action) {
+  broadcast({ type: "ai_action", action }, () => true);
+}
+
 app.set("broadcastSecurityEvent", broadcastSecurityEvent);
 
 /* =========================================================
-   🔥 ADAPTIVE AI ANOMALY ENGINE
+   🔥 ADAPTIVE AI + AUTO RESPONSE ENGINE
 ========================================================= */
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
+
 const anomalyMemory = new Map();
-
-/*
-  baselineMemory:
-  {
-    companyId: {
-      avgWindowCount,
-      avgCriticalRatio,
-      riskScore
-    }
-  }
-*/
-
 const baselineMemory = new Map();
+const autoResponseMemory = new Map();
+
+/* ===== AI AUDIT LOGGER ===== */
+
+function logAIAction(db, action) {
+  if (!db.audit) db.audit = [];
+
+  db.audit.push({
+    id: `ai-action-${Date.now()}`,
+    type: "AI_AUTOMATED_ACTION",
+    actor: "AI_ENGINE",
+    action: action.type,
+    companyId: action.companyId || null,
+    details: action,
+    timestamp: new Date().toISOString(),
+  });
+}
 
 function detectAnomalies() {
   const db = readDb();
@@ -157,7 +163,6 @@ function detectAnomalies() {
   for (const [companyId, list] of Object.entries(grouped)) {
     const total = list.length;
     const critical = list.filter(e => e.severity === "critical").length;
-    const high = list.filter(e => e.severity === "high").length;
 
     const criticalRatio = total > 0 ? critical / total : 0;
 
@@ -171,36 +176,17 @@ function detectAnomalies() {
 
     const baseline = baselineMemory.get(companyId);
 
-    /* ====== LEARNING (slow adaptive update) ====== */
-
     baseline.avgWindowCount =
       baseline.avgWindowCount * 0.95 + total * 0.05;
 
     baseline.avgCriticalRatio =
       baseline.avgCriticalRatio * 0.95 + criticalRatio * 0.05;
 
-    /* ====== DEVIATION DETECTION ====== */
-
     const volumeDeviation =
       total / (baseline.avgWindowCount || 1);
 
     const criticalDeviation =
       criticalRatio / (baseline.avgCriticalRatio || 0.01);
-
-    let trigger = false;
-    let reason = "";
-
-    if (volumeDeviation > 4 && total > 8) {
-      trigger = true;
-      reason = "Behavioral volume anomaly detected.";
-    }
-
-    if (criticalDeviation > 3 && critical >= 2) {
-      trigger = true;
-      reason = "Critical severity pattern anomaly detected.";
-    }
-
-    /* ====== RISK SCORING ====== */
 
     let risk =
       Math.min(
@@ -218,38 +204,49 @@ function detectAnomalies() {
 
     broadcastRiskUpdate(companyId, risk);
 
-    /* ====== AI EVENT TRIGGER ====== */
+    /* ================= AUTO RESPONSE ================= */
 
-    const memoryKey = `${companyId}-${reason}`;
+    const autoKey = `${companyId}-risk-${Math.floor(risk / 10)}`;
 
-    if (trigger && !anomalyMemory.has(memoryKey)) {
-      anomalyMemory.set(memoryKey, Date.now());
+    if (risk >= 85 && !autoResponseMemory.has(autoKey)) {
+      autoResponseMemory.set(autoKey, now);
 
-      const anomalyEvent = {
-        id: `adaptive-${Date.now()}`,
-        title: "Adaptive AI Behavioral Anomaly",
-        description: reason,
-        severity: "critical",
+      const action = {
+        id: `ai-containment-${Date.now()}`,
+        type: "AUTO_CONTAINMENT_TRIGGERED",
         companyId: companyId === "global" ? null : companyId,
-        timestamp: new Date().toISOString(),
-        aiGenerated: true,
+        severity: "critical",
         riskScore: risk,
+        message: "AI triggered automated containment due to critical risk threshold.",
+        timestamp: new Date().toISOString(),
       };
 
-      db.securityEvents.push(anomalyEvent);
+      const containmentEvent = {
+        id: `containment-${Date.now()}`,
+        title: "AI Automated Containment Activated",
+        description: action.message,
+        severity: "critical",
+        companyId: action.companyId,
+        timestamp: action.timestamp,
+        aiGenerated: true,
+        automatedResponse: true,
+      };
+
+      db.securityEvents.push(containmentEvent);
+      logAIAction(db, action);
       writeDb(db);
 
-      broadcastSecurityEvent(anomalyEvent);
+      broadcastSecurityEvent(containmentEvent);
+      broadcastAIAction(action);
 
-      console.log("[AI Adaptive] Triggered:", reason);
+      console.log("[AI AUTO RESPONSE] Containment triggered.");
     }
   }
 
-  /* ====== Memory expiration ====== */
-
-  for (const [key, ts] of anomalyMemory.entries()) {
+  /* Expire memory */
+  for (const [key, ts] of autoResponseMemory.entries()) {
     if (now - ts > 10 * 60 * 1000) {
-      anomalyMemory.delete(key);
+      autoResponseMemory.delete(key);
     }
   }
 }
