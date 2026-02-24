@@ -73,7 +73,7 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-/* ================= BROADCAST ================= */
+/* ================= BROADCAST CORE ================= */
 
 function broadcast(payload, filterFn = null) {
   const msg = JSON.stringify(payload);
@@ -114,18 +114,20 @@ function broadcastAIAction(action) {
   broadcast({ type: "ai_action", action }, () => true);
 }
 
-app.set("broadcastSecurityEvent", broadcastSecurityEvent);
+function broadcastCluster(cluster) {
+  broadcast({ type: "cluster_created", cluster }, () => true);
+}
 
 /* =========================================================
-   🔥 ADAPTIVE AI + AUTO RESPONSE ENGINE
+   🔥 ADAPTIVE AI + CLUSTER + AUTO RESPONSE ENGINE
 ========================================================= */
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
 
-const anomalyMemory = new Map();
 const baselineMemory = new Map();
 const autoResponseMemory = new Map();
+const clusterMemory = new Map();
 
 /* ===== AI AUDIT LOGGER ===== */
 
@@ -142,6 +144,8 @@ function logAIAction(db, action) {
     timestamp: new Date().toISOString(),
   });
 }
+
+/* ================= MAIN ENGINE LOOP ================= */
 
 function detectAnomalies() {
   const db = readDb();
@@ -161,9 +165,59 @@ function detectAnomalies() {
   }
 
   for (const [companyId, list] of Object.entries(grouped)) {
+
+    /* ================= CLUSTERING ================= */
+
+    const titleGroups = {};
+
+    for (const e of list) {
+      const key = `${e.title || "unknown"}-${e.severity}`;
+      if (!titleGroups[key]) titleGroups[key] = [];
+      titleGroups[key].push(e);
+    }
+
+    for (const [clusterKey, clusterEvents] of Object.entries(titleGroups)) {
+      if (clusterEvents.length >= 5) {
+
+        const memoryKey = `${companyId}-${clusterKey}`;
+
+        if (!clusterMemory.has(memoryKey)) {
+          clusterMemory.set(memoryKey, now);
+
+          const cluster = {
+            id: `cluster-${Date.now()}`,
+            companyId: companyId === "global" ? null : companyId,
+            title: "Threat Cluster Detected",
+            description: `Cluster of ${clusterEvents.length} similar events detected.`,
+            severity: clusterEvents[0].severity,
+            eventIds: clusterEvents.map(e => e.id),
+            count: clusterEvents.length,
+            timestamp: new Date().toISOString(),
+            clustered: true,
+          };
+
+          db.securityEvents.push(cluster);
+
+          logAIAction(db, {
+            type: "CLUSTER_CREATED",
+            companyId: cluster.companyId,
+            count: cluster.count,
+          });
+
+          writeDb(db);
+
+          broadcastCluster(cluster);
+          broadcastSecurityEvent(cluster);
+
+          console.log("[AI CLUSTER] Created:", cluster.description);
+        }
+      }
+    }
+
+    /* ================= ADAPTIVE RISK ================= */
+
     const total = list.length;
     const critical = list.filter(e => e.severity === "critical").length;
-
     const criticalRatio = total > 0 ? critical / total : 0;
 
     if (!baselineMemory.has(companyId)) {
@@ -199,7 +253,6 @@ function detectAnomalies() {
       );
 
     if (risk < 5) risk = 5;
-
     baseline.riskScore = risk;
 
     broadcastRiskUpdate(companyId, risk);
@@ -217,14 +270,13 @@ function detectAnomalies() {
         companyId: companyId === "global" ? null : companyId,
         severity: "critical",
         riskScore: risk,
-        message: "AI triggered automated containment due to critical risk threshold.",
         timestamp: new Date().toISOString(),
       };
 
       const containmentEvent = {
         id: `containment-${Date.now()}`,
         title: "AI Automated Containment Activated",
-        description: action.message,
+        description: "AI triggered automated containment due to critical risk threshold.",
         severity: "critical",
         companyId: action.companyId,
         timestamp: action.timestamp,
@@ -243,11 +295,14 @@ function detectAnomalies() {
     }
   }
 
-  /* Expire memory */
+  /* ===== Expire Memory ===== */
+
+  for (const [key, ts] of clusterMemory.entries()) {
+    if (now - ts > 10 * 60 * 1000) clusterMemory.delete(key);
+  }
+
   for (const [key, ts] of autoResponseMemory.entries()) {
-    if (now - ts > 10 * 60 * 1000) {
-      autoResponseMemory.delete(key);
-    }
+    if (now - ts > 10 * 60 * 1000) autoResponseMemory.delete(key);
   }
 }
 
