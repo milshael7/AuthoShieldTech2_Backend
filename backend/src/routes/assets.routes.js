@@ -19,7 +19,44 @@ function generateId() {
 }
 
 /* =========================================================
-   GET ASSETS (SCOPED + INTELLIGENCE)
+   INTELLIGENCE CALCULATOR
+========================================================= */
+
+function calculateRisk(assetId, vulnerabilities = []) {
+  const assetVulns = vulnerabilities.filter(v => v.assetId === assetId);
+
+  const critical = assetVulns.filter(v => v.severity === "critical").length;
+  const high = assetVulns.filter(v => v.severity === "high").length;
+  const medium = assetVulns.filter(v => v.severity === "medium").length;
+  const low = assetVulns.filter(v => v.severity === "low").length;
+
+  let riskScore =
+    100 - (critical * 25 + high * 12 + medium * 6 + low * 3);
+
+  if (riskScore < 5) riskScore = 5;
+  if (riskScore > 100) riskScore = 100;
+
+  let status =
+    riskScore < 40
+      ? "CRITICAL"
+      : riskScore < 70
+      ? "ELEVATED"
+      : "HEALTHY";
+
+  return {
+    riskScore: Math.round(riskScore),
+    status,
+    vulnerabilityBreakdown: {
+      critical,
+      high,
+      medium,
+      low,
+    },
+  };
+}
+
+/* =========================================================
+   GET ASSETS — ENTERPRISE SCOPED + ENRICHED
 ========================================================= */
 
 router.get("/", (req, res) => {
@@ -28,6 +65,7 @@ router.get("/", (req, res) => {
     const assets = db.assets || [];
     const vulnerabilities = db.vulnerabilities || [];
     const scans = db.scans || [];
+    const threats = db.threats || [];
 
     let scoped = assets;
 
@@ -36,40 +74,24 @@ router.get("/", (req, res) => {
     }
 
     const enriched = scoped.map(asset => {
-      const assetVulns = vulnerabilities.filter(
-        v => v.assetId === asset.id
-      );
 
-      const critical = assetVulns.filter(v => v.severity === "critical").length;
-      const high = assetVulns.filter(v => v.severity === "high").length;
-      const medium = assetVulns.filter(v => v.severity === "medium").length;
-      const low = assetVulns.filter(v => v.severity === "low").length;
-
-      let riskScore =
-        100 -
-        (critical * 20 +
-          high * 10 +
-          medium * 5 +
-          low * 2);
-
-      if (riskScore < 5) riskScore = 5;
-      if (riskScore > 100) riskScore = 100;
+      const intelligence = calculateRisk(asset.id, vulnerabilities);
 
       const lastScan = scans
         .filter(s => s.assetId === asset.id)
         .sort((a, b) => b.timestamp - a.timestamp)[0];
 
+      const activeThreats = threats.filter(
+        t => t.assetId === asset.id && !t.resolved
+      );
+
       return {
         ...asset,
-        vulnerabilities: assetVulns.length,
-        riskScore: Math.round(riskScore),
+        ...intelligence,
         lastScan: lastScan ? lastScan.timestamp : null,
-        status:
-          riskScore < 50
-            ? "CRITICAL"
-            : riskScore < 75
-            ? "ELEVATED"
-            : "HEALTHY",
+        activeThreats: activeThreats.length,
+        monitoringEnabled: asset.monitoringEnabled ?? true,
+        autoProtectEnabled: asset.autoProtectEnabled ?? true,
       };
     });
 
@@ -86,7 +108,7 @@ router.get("/", (req, res) => {
 
 router.post("/", (req, res) => {
   try {
-    const { name, type } = req.body;
+    const { name, type, exposureLevel } = req.body;
 
     if (!name || !type) {
       return res.status(400).json({
@@ -97,13 +119,19 @@ router.post("/", (req, res) => {
 
     const db = readDb();
 
+    if (!db.assets) db.assets = [];
+
     const newAsset = {
       id: generateId(),
       name: String(name).trim(),
       type: String(type).trim(),
+      exposureLevel: exposureLevel || "internal",
       companyId: req.user.companyId || null,
+      monitoringEnabled: true,
+      autoProtectEnabled: true,
       createdBy: req.user.id,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
     };
 
     db.assets.push(newAsset);
@@ -113,6 +141,42 @@ router.post("/", (req, res) => {
 
   } catch {
     res.status(500).json({ ok: false, error: "Failed to create asset" });
+  }
+});
+
+/* =========================================================
+   UPDATE ASSET
+========================================================= */
+
+router.put("/:id", (req, res) => {
+  try {
+    const db = readDb();
+    const asset = db.assets.find(a => a.id === req.params.id);
+
+    if (!asset) {
+      return res.status(404).json({ ok: false, error: "Asset not found" });
+    }
+
+    if (!isAdmin(req.user.role) &&
+        asset.companyId !== req.user.companyId) {
+      return res.status(403).json({ ok: false, error: "Unauthorized" });
+    }
+
+    const { name, exposureLevel, monitoringEnabled, autoProtectEnabled } = req.body;
+
+    if (name !== undefined) asset.name = name;
+    if (exposureLevel !== undefined) asset.exposureLevel = exposureLevel;
+    if (monitoringEnabled !== undefined) asset.monitoringEnabled = monitoringEnabled;
+    if (autoProtectEnabled !== undefined) asset.autoProtectEnabled = autoProtectEnabled;
+
+    asset.updatedAt = Date.now();
+
+    writeDb(db);
+
+    res.json({ ok: true, asset });
+
+  } catch {
+    res.status(500).json({ ok: false, error: "Failed to update asset" });
   }
 });
 
