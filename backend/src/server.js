@@ -7,23 +7,11 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 
-const { ensureDb, readDb } = require("./lib/db");
+const { ensureDb, readDb, writeDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
-/* ================= TRADING ENGINES ================= */
-
-const liveTrader = require("./services/liveTrader");
-const aiBrain = require("./services/aiBrain");
-
-/* ROUTES */
-const securityRoutes = require("./routes/security.routes");
-const billingRoutes = require("./routes/billing.routes");
-const incidentsRoutes = require("./routes/incidents.routes");
-
-/* =========================================================
-   SAFE BOOT
-========================================================= */
+/* ================= SAFE BOOT ================= */
 
 function requireEnv(name) {
   if (!process.env[name]) {
@@ -38,30 +26,10 @@ requireEnv("STRIPE_SECRET_KEY");
 ensureDb();
 users.ensureAdminFromEnv();
 
-/* =========================================================
-   EXPRESS
-========================================================= */
+/* ================= EXPRESS ================= */
 
 const app = express();
 app.set("trust proxy", 1);
-
-/* ================= STRIPE WEBHOOK ================= */
-
-if (process.env.STRIPE_WEBHOOK_SECRET) {
-  const webhookRoutes = require("./routes/stripe.webhook.routes");
-
-  app.use(
-    "/api/stripe/webhook",
-    express.raw({ type: "application/json", limit: "1mb" }),
-    webhookRoutes
-  );
-
-  console.log("[BOOT] Stripe webhook enabled");
-} else {
-  console.log("[BOOT] Stripe webhook disabled");
-}
-
-/* ================= MIDDLEWARE ================= */
 
 app.use(
   cors({
@@ -74,54 +42,19 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
-
-app.get("/health", (req, res) => {
-  try {
-    const db = readDb();
-
-    res.json({
-      ok: true,
-      database: !!db,
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
 /* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
-
 app.use(tenantMiddleware);
-
 app.use("/api/admin", require("./routes/admin.routes"));
-app.use("/api/manager", require("./routes/manager.routes"));
-app.use("/api/company", require("./routes/company.routes"));
-app.use("/api/me", require("./routes/me.routes"));
-app.use("/api/security", securityRoutes);
-app.use("/api/incidents", incidentsRoutes);
-app.use("/api/billing", billingRoutes);
-app.use("/api/trading", require("./routes/trading.routes"));
-app.use("/api/ai", require("./routes/ai.routes"));
-app.use("/api/voice", require("./routes/voice.routes"));
-app.use("/api/live", require("./routes/live.routes"));
-app.use("/api/paper", require("./routes/paper.routes"));
+app.use("/api/security", require("./routes/security.routes"));
+app.use("/api/incidents", require("./routes/incidents.routes"));
 
-/* =========================================================
-   SERVER
-========================================================= */
+/* ================= SERVER ================= */
 
 const server = http.createServer(app);
 
-/* ================= SECURED WEBSOCKET ================= */
+/* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
   server,
@@ -132,11 +65,7 @@ wss.on("connection", (ws, req) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
-
-    if (!token) {
-      ws.close(1008, "Missing token");
-      return;
-    }
+    if (!token) return ws.close(1008);
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
@@ -146,74 +75,124 @@ wss.on("connection", (ws, req) => {
       companyId: decoded.companyId || null,
     };
 
-    console.log(`[WS] Connected → ${ws.user.id} (${ws.user.role})`);
-
-  } catch (err) {
-    ws.close(1008, "Invalid token");
+  } catch {
+    ws.close(1008);
   }
 });
 
-/* =========================================================
-   SAFE BROADCAST CORE
-========================================================= */
+/* ================= BROADCAST ================= */
 
 function broadcast(payload, filterFn = null) {
-  const message = JSON.stringify(payload);
+  const msg = JSON.stringify(payload);
 
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) return;
     if (filterFn && !filterFn(client)) return;
-
-    try {
-      client.send(message);
-    } catch {}
+    try { client.send(msg); } catch {}
   });
 }
 
-/* =========================================================
-   REAL-TIME SECURITY EVENT BROADCAST
-========================================================= */
+/* ================= SECURITY EVENT BROADCAST ================= */
 
 function broadcastSecurityEvent(event) {
   broadcast(
-    {
-      type: "security_event",
-      event,
-    },
+    { type: "security_event", event },
     (client) => {
-      // Admin sees all
       if (client.user?.role === "Admin") return true;
-
-      // Company isolation
       if (event.companyId && client.user?.companyId !== event.companyId)
         return false;
-
       return true;
     }
   );
 }
 
-/* Make available to routes */
 app.set("broadcastSecurityEvent", broadcastSecurityEvent);
 
 /* =========================================================
-   MARKET SIMULATION
+   🔥 AI ANOMALY ENGINE
 ========================================================= */
 
-const SYMBOL = "BTCUSDT";
-let lastPrice = 40000;
+/*
+  This engine runs every 15 seconds.
+  It analyzes the last 5 minutes of activity.
+  It compares spike intensity and clustering.
+*/
 
-setInterval(() => {
-  const delta = (Math.random() - 0.5) * 60;
-  lastPrice = Math.max(1000, lastPrice + delta);
+const WINDOW_MS = 5 * 60 * 1000;
+const CHECK_INTERVAL = 15000;
+const anomalyMemory = new Map(); // prevent duplicate spam
 
-  broadcast({
-    type: "tick",
-    symbol: SYMBOL,
-    price: lastPrice,
-    ts: Date.now(),
-  });
-}, 2000);
+function detectAnomalies() {
+  const db = readDb();
+  const events = db.securityEvents || [];
+
+  const now = Date.now();
+  const recent = events.filter(
+    e => new Date(e.timestamp || e.createdAt).getTime() >= now - WINDOW_MS
+  );
+
+  const byCompany = {};
+
+  for (const e of recent) {
+    const cid = e.companyId || "global";
+    if (!byCompany[cid]) byCompany[cid] = [];
+    byCompany[cid].push(e);
+  }
+
+  for (const [companyId, list] of Object.entries(byCompany)) {
+    const critical = list.filter(e => e.severity === "critical").length;
+    const high = list.filter(e => e.severity === "high").length;
+    const total = list.length;
+
+    const baseline = (events.length / 24) || 1; // rough baseline
+    const spikeFactor = total / baseline;
+
+    let trigger = false;
+    let reason = "";
+
+    if (critical >= 3) {
+      trigger = true;
+      reason = "Multiple critical events detected in short window.";
+    }
+
+    if (spikeFactor > 5 && total > 10) {
+      trigger = true;
+      reason = "Abnormal spike in security activity detected.";
+    }
+
+    const memoryKey = `${companyId}-${reason}`;
+
+    if (trigger && !anomalyMemory.has(memoryKey)) {
+      anomalyMemory.set(memoryKey, Date.now());
+
+      const anomalyEvent = {
+        id: `anomaly-${Date.now()}`,
+        title: "AI Anomaly Detected",
+        description: reason,
+        severity: "critical",
+        companyId: companyId === "global" ? null : companyId,
+        timestamp: new Date().toISOString(),
+        aiGenerated: true,
+      };
+
+      db.securityEvents.push(anomalyEvent);
+      writeDb(db);
+
+      broadcastSecurityEvent(anomalyEvent);
+
+      console.log("[AI] Anomaly triggered:", reason);
+    }
+  }
+
+  // expire memory after 10 minutes
+  for (const [key, ts] of anomalyMemory.entries()) {
+    if (now - ts > 10 * 60 * 1000) {
+      anomalyMemory.delete(key);
+    }
+  }
+}
+
+setInterval(detectAnomalies, CHECK_INTERVAL);
 
 /* =========================================================
    START
