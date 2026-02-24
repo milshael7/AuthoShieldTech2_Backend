@@ -1,11 +1,11 @@
 // backend/src/routes/admin.routes.js
-// Phase 32 Executive Intelligence – Fully Stable
+// Phase 33 — Admin Platform Control + Protection Scope
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
+const { readDb, writeDb } = require("../lib/db");
 const users = require("../users/user.service");
 
 const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
@@ -17,6 +17,13 @@ router.use(authRequired);
    ROLE GUARDS
 ========================================================= */
 
+function requireAdmin(req, res, next) {
+  if (req.user.role !== ADMIN_ROLE) {
+    return res.status(403).json({ ok: false, error: "Admin only" });
+  }
+  next();
+}
+
 function requireFinanceOrAdmin(req, res, next) {
   if (req.user.role !== ADMIN_ROLE && req.user.role !== FINANCE_ROLE) {
     return res.status(403).json({ ok: false, error: "Finance or Admin only" });
@@ -25,14 +32,29 @@ function requireFinanceOrAdmin(req, res, next) {
 }
 
 /* =========================================================
-   METRICS
+   INTERNAL HELPER — ENSURE ADMIN STATE
+========================================================= */
+
+function ensureAdminState(db) {
+  if (!db.adminState) {
+    db.adminState = {
+      defenseMode: "auto", // auto | manual
+      protectedTenants: []
+    };
+  }
+  if (!Array.isArray(db.adminState.protectedTenants)) {
+    db.adminState.protectedTenants = [];
+  }
+}
+
+/* =========================================================
+   METRICS (UNCHANGED)
 ========================================================= */
 
 router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
   try {
     const db = readDb();
     const usersList = db.users || [];
-    const invoices = db.invoices || [];
 
     const activeSubscribers = usersList.filter(u => u.subscriptionStatus === "Active").length;
     const trialUsers = usersList.filter(u => u.subscriptionStatus === "Trial").length;
@@ -57,7 +79,7 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   EXECUTIVE RISK INDEX
+   EXECUTIVE RISK
 ========================================================= */
 
 router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
@@ -117,28 +139,21 @@ router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   COMPLIANCE REPORT
+   PLATFORM TENANT LIST
 ========================================================= */
 
-router.get("/compliance/report", requireFinanceOrAdmin, (req, res) => {
+router.get("/tenants", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-    const events = db.securityEvents || [];
-
-    const critical = events.filter(e => e.severity === "critical").length;
-    const high = events.filter(e => e.severity === "high").length;
+    const companies = db.companies || [];
 
     res.json({
       ok: true,
-      complianceReport: {
-        totalEvents: events.length,
-        criticalFindings: critical,
-        highFindings: high,
-        status:
-          critical > 0 ? "Non-Compliant" :
-          high > 5 ? "Needs Review" :
-          "Compliant"
-      }
+      tenants: companies.map(c => ({
+        id: c.id,
+        name: c.name,
+        status: c.status || "Active"
+      }))
     });
 
   } catch (e) {
@@ -147,14 +162,132 @@ router.get("/compliance/report", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   COMPLIANCE HISTORY (SAFE EMPTY)
+   ADMIN PROTECTION SCOPE
 ========================================================= */
 
-router.get("/compliance/history", requireFinanceOrAdmin, (req, res) => {
-  res.json({
-    ok: true,
-    history: []
-  });
+router.get("/protection-scope", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    ensureAdminState(db);
+
+    res.json({
+      ok: true,
+      defenseMode: db.adminState.defenseMode,
+      protectedTenants: db.adminState.protectedTenants
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   TOGGLE DEFENSE MODE
+========================================================= */
+
+router.post("/defense-mode", requireAdmin, (req, res) => {
+  try {
+    const { mode } = req.body;
+    if (!["auto", "manual"].includes(mode)) {
+      return res.status(400).json({ ok: false, error: "Invalid mode" });
+    }
+
+    const db = readDb();
+    ensureAdminState(db);
+
+    db.adminState.defenseMode = mode;
+    writeDb(db);
+
+    res.json({
+      ok: true,
+      defenseMode: mode
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   ADD TENANT TO PROTECTION
+========================================================= */
+
+router.post("/protect/:tenantId", requireAdmin, (req, res) => {
+  try {
+    const { tenantId } = req.params;
+
+    const db = readDb();
+    ensureAdminState(db);
+
+    if (!db.adminState.protectedTenants.includes(tenantId)) {
+      db.adminState.protectedTenants.push(tenantId);
+    }
+
+    writeDb(db);
+
+    res.json({
+      ok: true,
+      protectedTenants: db.adminState.protectedTenants
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   REMOVE TENANT FROM PROTECTION
+========================================================= */
+
+router.delete("/protect/:tenantId", requireAdmin, (req, res) => {
+  try {
+    const { tenantId } = req.params;
+
+    const db = readDb();
+    ensureAdminState(db);
+
+    db.adminState.protectedTenants =
+      db.adminState.protectedTenants.filter(id => id !== tenantId);
+
+    writeDb(db);
+
+    res.json({
+      ok: true,
+      protectedTenants: db.adminState.protectedTenants
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   PLATFORM INTEGRITY SNAPSHOT
+========================================================= */
+
+router.get("/platform-health", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+
+    const usersList = db.users || [];
+    const events = db.securityEvents || [];
+
+    const activeUsers = usersList.filter(u => u.subscriptionStatus === "Active").length;
+    const criticalEvents = events.filter(e => e.severity === "critical").length;
+
+    res.json({
+      ok: true,
+      health: {
+        systemStatus: "Operational",
+        activeUsers,
+        criticalEvents,
+        totalEvents: events.length
+      }
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 module.exports = router;
