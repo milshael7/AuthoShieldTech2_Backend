@@ -36,8 +36,6 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* ================= ROUTES ================= */
-
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use(tenantMiddleware);
 app.use("/api/admin", require("./routes/admin.routes"));
@@ -85,20 +83,6 @@ function broadcast(payload, filterFn = null) {
   });
 }
 
-/* ================= BROADCAST HELPERS ================= */
-
-function broadcastSecurityEvent(event) {
-  broadcast(
-    { type: "security_event", event },
-    (client) => {
-      if (client.user?.role === "Admin") return true;
-      if (event.companyId && client.user?.companyId !== event.companyId)
-        return false;
-      return true;
-    }
-  );
-}
-
 function broadcastRiskUpdate(companyId, riskScore) {
   broadcast(
     { type: "risk_update", companyId, riskScore },
@@ -110,42 +94,24 @@ function broadcastRiskUpdate(companyId, riskScore) {
   );
 }
 
-function broadcastAIAction(action) {
-  broadcast({ type: "ai_action", action }, () => true);
-}
-
-function broadcastCluster(cluster) {
-  broadcast({ type: "cluster_created", cluster }, () => true);
+function broadcastForecast(companyId, forecast) {
+  broadcast(
+    { type: "risk_forecast", companyId, forecast },
+    () => true
+  );
 }
 
 /* =========================================================
-   🔥 ADAPTIVE AI + CLUSTER + AUTO RESPONSE ENGINE
+   🔥 ADAPTIVE AI + FORECAST ENGINE
 ========================================================= */
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
 
 const baselineMemory = new Map();
-const autoResponseMemory = new Map();
-const clusterMemory = new Map();
+const forecastMemory = new Map();
 
-/* ===== AI AUDIT LOGGER ===== */
-
-function logAIAction(db, action) {
-  if (!db.audit) db.audit = [];
-
-  db.audit.push({
-    id: `ai-action-${Date.now()}`,
-    type: "AI_AUTOMATED_ACTION",
-    actor: "AI_ENGINE",
-    action: action.type,
-    companyId: action.companyId || null,
-    details: action,
-    timestamp: new Date().toISOString(),
-  });
-}
-
-/* ================= MAIN ENGINE LOOP ================= */
+/* ================= MAIN LOOP ================= */
 
 function detectAnomalies() {
   const db = readDb();
@@ -165,54 +131,6 @@ function detectAnomalies() {
   }
 
   for (const [companyId, list] of Object.entries(grouped)) {
-
-    /* ================= CLUSTERING ================= */
-
-    const titleGroups = {};
-
-    for (const e of list) {
-      const key = `${e.title || "unknown"}-${e.severity}`;
-      if (!titleGroups[key]) titleGroups[key] = [];
-      titleGroups[key].push(e);
-    }
-
-    for (const [clusterKey, clusterEvents] of Object.entries(titleGroups)) {
-      if (clusterEvents.length >= 5) {
-
-        const memoryKey = `${companyId}-${clusterKey}`;
-
-        if (!clusterMemory.has(memoryKey)) {
-          clusterMemory.set(memoryKey, now);
-
-          const cluster = {
-            id: `cluster-${Date.now()}`,
-            companyId: companyId === "global" ? null : companyId,
-            title: "Threat Cluster Detected",
-            description: `Cluster of ${clusterEvents.length} similar events detected.`,
-            severity: clusterEvents[0].severity,
-            eventIds: clusterEvents.map(e => e.id),
-            count: clusterEvents.length,
-            timestamp: new Date().toISOString(),
-            clustered: true,
-          };
-
-          db.securityEvents.push(cluster);
-
-          logAIAction(db, {
-            type: "CLUSTER_CREATED",
-            companyId: cluster.companyId,
-            count: cluster.count,
-          });
-
-          writeDb(db);
-
-          broadcastCluster(cluster);
-          broadcastSecurityEvent(cluster);
-
-          console.log("[AI CLUSTER] Created:", cluster.description);
-        }
-      }
-    }
 
     /* ================= ADAPTIVE RISK ================= */
 
@@ -257,52 +175,60 @@ function detectAnomalies() {
 
     broadcastRiskUpdate(companyId, risk);
 
-    /* ================= AUTO RESPONSE ================= */
+    /* ================= FORECASTING ================= */
 
-    const autoKey = `${companyId}-risk-${Math.floor(risk / 10)}`;
+    if (!forecastMemory.has(companyId)) {
+      forecastMemory.set(companyId, []);
+    }
 
-    if (risk >= 85 && !autoResponseMemory.has(autoKey)) {
-      autoResponseMemory.set(autoKey, now);
+    const history = forecastMemory.get(companyId);
 
-      const action = {
-        id: `ai-containment-${Date.now()}`,
-        type: "AUTO_CONTAINMENT_TRIGGERED",
-        companyId: companyId === "global" ? null : companyId,
-        severity: "critical",
-        riskScore: risk,
-        timestamp: new Date().toISOString(),
+    history.push({
+      risk,
+      timestamp: now
+    });
+
+    // keep last 10 samples (~2.5 minutes)
+    if (history.length > 10) history.shift();
+
+    if (history.length >= 3) {
+      const first = history[0];
+      const last = history[history.length - 1];
+
+      const deltaRisk = last.risk - first.risk;
+      const deltaTime = (last.timestamp - first.timestamp) / 1000;
+
+      const slope = deltaRisk / (deltaTime || 1); // risk per second
+
+      let forecast = {
+        slope: Number(slope.toFixed(3)),
+        probability: 0,
+        estimatedMinutesToCritical: null
       };
 
-      const containmentEvent = {
-        id: `containment-${Date.now()}`,
-        title: "AI Automated Containment Activated",
-        description: "AI triggered automated containment due to critical risk threshold.",
-        severity: "critical",
-        companyId: action.companyId,
-        timestamp: action.timestamp,
-        aiGenerated: true,
-        automatedResponse: true,
-      };
+      if (slope > 0) {
+        const remaining = 85 - risk;
+        const secondsToCritical = remaining / slope;
 
-      db.securityEvents.push(containmentEvent);
-      logAIAction(db, action);
-      writeDb(db);
+        forecast.estimatedMinutesToCritical =
+          secondsToCritical > 0
+            ? Number((secondsToCritical / 60).toFixed(1))
+            : 0;
 
-      broadcastSecurityEvent(containmentEvent);
-      broadcastAIAction(action);
+        forecast.probability =
+          Math.min(100, Math.round((slope * 100)));
+      }
 
-      console.log("[AI AUTO RESPONSE] Containment triggered.");
+      broadcastForecast(companyId, forecast);
     }
   }
 
-  /* ===== Expire Memory ===== */
-
-  for (const [key, ts] of clusterMemory.entries()) {
-    if (now - ts > 10 * 60 * 1000) clusterMemory.delete(key);
-  }
-
-  for (const [key, ts] of autoResponseMemory.entries()) {
-    if (now - ts > 10 * 60 * 1000) autoResponseMemory.delete(key);
+  /* Expire stale history */
+  for (const [key, history] of forecastMemory.entries()) {
+    forecastMemory.set(
+      key,
+      history.filter(h => now - h.timestamp < 5 * 60 * 1000)
+    );
   }
 }
 
