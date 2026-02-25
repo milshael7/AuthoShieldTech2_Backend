@@ -1,9 +1,5 @@
 // backend/src/services/riskManager.js
-// Phase 23 — Dual Mode Institutional Risk Engine
-// Paper = Learning Mode (No Hard Stops)
-// Live = Capital Protection Mode
-// Drawdown Reactive • Volatility Adaptive • Margin Aware
-// Tenant Safe • Production Hardened
+// Phase 24 — Dual Mode Institutional Risk Engine (Stabilized)
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -75,7 +71,7 @@ function evaluate({
   marginUsed = 0,
   maintenanceRequired = 0,
   ts = Date.now(),
-  paperState = null,
+  mode = "live", // 🔥 explicit mode
 }) {
   const state = getState(tenantId);
   const dk = dayKey(ts);
@@ -90,11 +86,7 @@ function evaluate({
     };
   }
 
-  /* 🔥 Detect Paper Mode */
-  const isPaper =
-    paperState &&
-    paperState.cashBalance !== undefined &&
-    paperState.equity !== undefined;
+  const isPaper = mode === "paper";
 
   /* ================= DAILY RESET ================= */
 
@@ -123,11 +115,14 @@ function evaluate({
   state.rollingPeak =
     state.rollingPeak * 0.995 + equity * 0.005;
 
+  const safePeak = state.peakEquity || 1;
+  const safeRolling = state.rollingPeak || 1;
+
   const drawdown =
-    (state.peakEquity - equity) / state.peakEquity;
+    (safePeak - equity) / safePeak;
 
   const rollingDrawdown =
-    (state.rollingPeak - equity) / state.rollingPeak;
+    (safeRolling - equity) / safeRolling;
 
   /* =====================================================
      LIVE HARD STOPS ONLY
@@ -244,8 +239,6 @@ function evaluate({
     mode: isPaper ? "paper-learning" : "live-capital",
   };
 }
-
-/* ========================================================= */
 
 function resetTenant(tenantId) {
   RISK_STATE.delete(tenantId);
