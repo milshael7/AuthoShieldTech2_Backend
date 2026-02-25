@@ -10,6 +10,11 @@ const { WebSocketServer } = require("ws");
 const { ensureDb, readDb, updateDb } = require("./lib/db");
 const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
+const {
+  registerSession,
+  isRevoked
+} = require("./lib/sessionStore");
+
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 const rateLimiter = require("./middleware/rateLimiter");
@@ -45,9 +50,7 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
-app.use(rateLimiter); // 🔐 Global traffic shield
-
-/* ================= HEALTH ================= */
+app.use(rateLimiter);
 
 let globalSecurityStatus = integrityCheck.ok ? "secure" : "compromised";
 
@@ -63,15 +66,8 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* Liveness (for load balancers) */
-app.get("/live", (req, res) => {
-  res.status(200).json({ ok: true });
-});
-
-/* Readiness (future DB/redis checks go here) */
-app.get("/ready", (req, res) => {
-  res.status(200).json({ ready: true });
-});
+app.get("/live", (req, res) => res.status(200).json({ ok: true }));
+app.get("/ready", (req, res) => res.status(200).json({ ready: true }));
 
 /* ================= ROUTES ================= */
 
@@ -90,7 +86,7 @@ app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 const server = http.createServer(app);
 
-/* ================= WEBSOCKET (HARDENED) ================= */
+/* ================= WEBSOCKET (SESSION ENFORCED) ================= */
 
 const wss = new WebSocketServer({
   server,
@@ -105,16 +101,36 @@ wss.on("connection", (ws, req) => {
 
     const payload = verify(token, "access");
 
+    /* ===== JTI REVOCATION CHECK ===== */
+    if (!payload?.jti || isRevoked(payload.jti)) {
+      writeAudit({
+        actor: payload?.id || "unknown",
+        role: payload?.role || "unknown",
+        action: "WS_REJECTED_REVOKED_TOKEN"
+      });
+      return ws.close(1008);
+    }
+
     const db = readDb();
     const user = (db.users || []).find(u => u.id === payload.id);
     if (!user) return ws.close(1008);
 
-    /* ===== TOKEN VERSION ENFORCEMENT ===== */
+    /* ===== TOKEN VERSION CHECK ===== */
     if ((payload.tokenVersion || 0) !== (user.tokenVersion || 0)) {
       writeAudit({
         actor: user.id,
         role: user.role,
         action: "WS_TOKEN_VERSION_MISMATCH"
+      });
+      return ws.close(1008);
+    }
+
+    /* ===== ROLE TAMPER CHECK ===== */
+    if (String(payload.role) !== String(user.role)) {
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "WS_ROLE_TAMPER_DETECTED"
       });
       return ws.close(1008);
     }
@@ -139,10 +155,14 @@ wss.on("connection", (ws, req) => {
       }
     }
 
+    /* ===== REGISTER SESSION ===== */
+    registerSession(user.id, payload.jti);
+
     ws.user = {
       id: user.id,
       role: user.role,
       companyId: user.companyId || null,
+      jti: payload.jti
     };
 
     if (["Admin", "Finance"].includes(user.role)) {
@@ -162,12 +182,34 @@ wss.on("connection", (ws, req) => {
 
 function broadcast(payload) {
   const msg = JSON.stringify(payload);
+
   wss.clients.forEach(client => {
     if (client.readyState === 1) {
-      try { client.send(msg); } catch {}
+      try {
+        client.send(msg);
+      } catch {}
     }
   });
 }
+
+/* ================= AUTO DISCONNECT REVOKED SESSIONS ================= */
+
+setInterval(() => {
+  wss.clients.forEach(client => {
+    if (client.readyState !== 1) return;
+    if (!client.user?.jti) return;
+
+    if (isRevoked(client.user.jti)) {
+      writeAudit({
+        actor: client.user.id,
+        role: client.user.role,
+        action: "WS_SESSION_TERMINATED_REVOKED"
+      });
+
+      try { client.close(1008); } catch {}
+    }
+  });
+}, 10000);
 
 /* ================= INTELLIGENCE ENGINE ================= */
 
@@ -193,7 +235,6 @@ function detectIntelligence() {
   }
 
   for (const [companyId, list] of Object.entries(grouped)) {
-
     const assetExposure = {};
 
     list.forEach(e => {
@@ -263,7 +304,6 @@ function monitorAuditIntegrity() {
   const result = verifyAuditIntegrity();
 
   if (!result.ok && !integrityCompromised) {
-
     integrityCompromised = true;
     globalSecurityStatus = "compromised";
 
@@ -318,26 +358,6 @@ function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled Rejection:", err);
-  writeAudit({
-    actor: "system",
-    role: "system",
-    action: "UNHANDLED_REJECTION",
-    detail: { message: err?.message }
-  });
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-  writeAudit({
-    actor: "system",
-    role: "system",
-    action: "UNCAUGHT_EXCEPTION",
-    detail: { message: err?.message }
-  });
-});
 
 /* ================= START ================= */
 
