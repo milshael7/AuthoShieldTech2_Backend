@@ -1,30 +1,32 @@
 // backend/src/routes/security.routes.js
-// Enterprise Security Firewall — Completed v5
-// Public Risk Engine • Session Monitor • Compliance Layer • Escalation Engine
+// Enterprise Security Firewall — Hardened v6
+// Public Risk Engine • Scoped Data • Session Monitor • Escalation Engine • Audit Safe
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const users = require("../users/user.service");
 const { readDb, writeDb } = require("../lib/db");
+const { writeAudit } = require("../lib/audit");
 const { getActiveSessionCount } = require("../lib/sessionStore");
+const users = require("../users/user.service");
 
 /* =========================================================
    ROLE HELPERS
 ========================================================= */
 
-const ROLES = users?.ROLES || {};
-const ADMIN_ROLE = (ROLES.ADMIN || "Admin").toLowerCase();
+function normalize(role) {
+  return String(role || "").toLowerCase();
+}
+
+function isAdmin(user) {
+  return normalize(user.role) === normalize(users.ROLES.ADMIN);
+}
 
 function normalizeArray(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v;
   return Object.values(v);
-}
-
-function isAdmin(role) {
-  return String(role || "").toLowerCase() === ADMIN_ROLE;
 }
 
 /* =========================================================
@@ -63,13 +65,13 @@ router.post("/public-device-risk", (req, res) => {
 });
 
 /* =========================================================
-   AUTH REQUIRED BELOW THIS LINE
+   AUTH REQUIRED BELOW
 ========================================================= */
 
 router.use(authRequired);
 
 /* =========================================================
-   AUTO ESCALATION ENGINE
+   ESCALATION ENGINE
 ========================================================= */
 
 function autoEscalateIfNeeded(db, event, req) {
@@ -93,42 +95,39 @@ function autoEscalateIfNeeded(db, event, req) {
     createdAt: new Date().toISOString(),
   };
 
-  if (!db.incidents) db.incidents = [];
+  db.incidents = db.incidents || [];
   db.incidents.push(newIncident);
-  event.incidentId = newIncident.id;
 
-  writeDb(db);
-
-  const broadcast = req.app.get("broadcastSecurityEvent");
-  if (broadcast) broadcast(event);
+  writeAudit({
+    actor: "system",
+    role: "system",
+    action: "AUTO_ESCALATION_CREATED",
+    detail: { incidentId: newIncident.id }
+  });
 }
 
 /* =========================================================
-   POSTURE SUMMARY
+   POSTURE SUMMARY (SCOPED)
 ========================================================= */
 
 router.get("/posture-summary", (req, res) => {
   try {
     const db = readDb();
 
-    const companiesArr = normalizeArray(db.companies);
-    const usersArr = normalizeArray(db.users);
     const vulnerabilitiesArr = normalizeArray(db.vulnerabilities);
-    const incidentsArr = normalizeArray(db.incidents);
+    const usersArr = normalizeArray(db.users);
 
-    let scopedCompanies = [];
-    let scopedUsers = [];
-    let scopedVulns = [];
+    let scopedVulns = vulnerabilitiesArr;
+    let scopedUsers = usersArr;
 
-    if (isAdmin(req.user.role)) {
-      scopedCompanies = companiesArr;
-      scopedUsers = usersArr;
-      scopedVulns = vulnerabilitiesArr;
-    } else {
-      const companyId = req.user.companyId;
-      scopedCompanies = companiesArr.filter(c => c.id === companyId);
-      scopedUsers = usersArr.filter(u => u.companyId === companyId);
-      scopedVulns = vulnerabilitiesArr.filter(v => v.companyId === companyId);
+    if (!isAdmin(req.user)) {
+      scopedVulns = vulnerabilitiesArr.filter(
+        v => v.companyId === req.user.companyId
+      );
+
+      scopedUsers = usersArr.filter(
+        u => u.companyId === req.user.companyId
+      );
     }
 
     const critical = scopedVulns.filter(v => v.severity === "critical").length;
@@ -139,17 +138,11 @@ router.get("/posture-summary", (req, res) => {
     let riskScore = 100 - (critical * 15 + high * 8 + medium * 4 + low);
     riskScore = Math.max(5, Math.min(100, riskScore));
 
-    let complianceScore = 100 - (critical * 10 + high * 6 + medium * 3);
-    complianceScore = Math.max(10, Math.min(100, complianceScore));
-
     res.json({
       ok: true,
-      scope: isAdmin(req.user.role) ? "global" : "company",
-      totalCompanies: scopedCompanies.length,
+      scope: isAdmin(req.user) ? "global" : "company",
       totalUsers: scopedUsers.length,
-      incidents: incidentsArr.length,
       riskScore: Math.round(riskScore),
-      complianceScore: Math.round(complianceScore),
       critical,
       high,
       medium,
@@ -158,18 +151,24 @@ router.get("/posture-summary", (req, res) => {
     });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to generate posture summary" });
+    res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   COMPLIANCE SUMMARY
+   COMPLIANCE (SCOPED)
 ========================================================= */
 
 router.get("/compliance", (req, res) => {
   try {
     const db = readDb();
-    const vulns = db.vulnerabilities || [];
+    let vulns = db.vulnerabilities || [];
+
+    if (!isAdmin(req.user)) {
+      vulns = vulns.filter(
+        v => v.companyId === req.user.companyId
+      );
+    }
 
     const critical = vulns.filter(v => v.severity === "critical").length;
     const high = vulns.filter(v => v.severity === "high").length;
@@ -185,51 +184,57 @@ router.get("/compliance", (req, res) => {
     });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Compliance failed" });
+    res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   ACTIVE SESSIONS
+   ACTIVE SESSION MONITOR
 ========================================================= */
 
 router.get("/sessions", (req, res) => {
   try {
-    const count = getActiveSessionCount(req.user.id);
+    const activeSessions = getActiveSessionCount(req.user.id);
 
     res.json({
       ok: true,
-      activeSessions: count
+      userId: req.user.id,
+      activeSessions,
+      timestamp: Date.now()
     });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to load sessions" });
+    res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   SECURITY EVENTS
+   SECURITY EVENTS (SCOPED)
 ========================================================= */
 
 router.get("/events", (req, res) => {
   try {
     const db = readDb();
-    const limit = Number(req.query.limit) || 50;
+    let events = normalizeArray(db.securityEvents);
 
-    let eventsArr = normalizeArray(db.securityEvents);
-
-    if (!isAdmin(req.user.role)) {
-      eventsArr = eventsArr.filter(
+    if (!isAdmin(req.user)) {
+      events = events.filter(
         e => e.companyId === req.user.companyId
       );
     }
 
-    const events = eventsArr.slice(-limit).reverse();
+    events.sort(
+      (a, b) =>
+        new Date(b.createdAt) - new Date(a.createdAt)
+    );
 
-    res.json({ ok: true, events });
+    res.json({
+      ok: true,
+      events: events.slice(0, 100)
+    });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to load events" });
+    res.status(500).json({ ok: false });
   }
 });
 
@@ -239,16 +244,30 @@ router.get("/events", (req, res) => {
 
 router.post("/events", (req, res) => {
   try {
-    const db = readDb();
-    if (!db.securityEvents) db.securityEvents = [];
-
     const { title, description, severity = "low" } = req.body;
+
+    if (!title) {
+      return res.status(400).json({
+        ok: false,
+        error: "Title required"
+      });
+    }
+
+    const db = readDb();
+    db.securityEvents = db.securityEvents || [];
+
+    const normalizedSeverity =
+      ["low", "medium", "high", "critical"].includes(
+        severity.toLowerCase()
+      )
+        ? severity.toLowerCase()
+        : "low";
 
     const newEvent = {
       id: Date.now().toString(),
       title,
       description: description || "",
-      severity,
+      severity: normalizedSeverity,
       acknowledged: false,
       companyId: req.user.companyId || null,
       createdAt: new Date().toISOString(),
@@ -260,32 +279,45 @@ router.post("/events", (req, res) => {
 
     writeDb(db);
 
-    const broadcast = req.app.get("broadcastSecurityEvent");
-    if (broadcast) broadcast(newEvent);
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "SECURITY_EVENT_CREATED",
+      detail: { eventId: newEvent.id }
+    });
 
     res.status(201).json({
       ok: true,
-      event: newEvent,
+      event: newEvent
     });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to create event" });
+    res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   VULNERABILITIES
+   VULNERABILITIES (SCOPED)
 ========================================================= */
 
 router.get("/vulnerabilities", (req, res) => {
   try {
     const db = readDb();
+    let vulns = db.vulnerabilities || [];
+
+    if (!isAdmin(req.user)) {
+      vulns = vulns.filter(
+        v => v.companyId === req.user.companyId
+      );
+    }
+
     res.json({
       ok: true,
-      vulnerabilities: db.vulnerabilities || []
+      vulnerabilities: vulns
     });
+
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to load vulnerabilities" });
+    res.status(500).json({ ok: false });
   }
 });
 
