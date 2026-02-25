@@ -1,10 +1,13 @@
 // backend/src/users/user.service.js
-// Enterprise User Service — Roles + Subscription + Admin Bootstrap
-// + Autodev 6.5 Capability Extension (Safe Upgrade)
+// Enterprise User Authority Service — Hardened v2
+// Anti-Escalation • Audited • Subscription Safe • Tenant Validated
 
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { readDb, updateDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
+
+/* ========================================================= */
 
 const ROLES = Object.freeze({
   ADMIN: "Admin",
@@ -28,6 +31,11 @@ const APPROVAL_STATUS = Object.freeze({
   REJECTED: "Rejected",
 });
 
+const ROLE_VALUES = Object.values(ROLES);
+const SUB_VALUES = Object.values(SUBSCRIPTION);
+
+/* ========================================================= */
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -39,10 +47,6 @@ function normEmail(email) {
 function makeId(prefix = "usr") {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 }
-
-/* =========================================================
-   ACCOUNT TYPE RESOLUTION (Autodev Logic)
-========================================================= */
 
 function resolveAccountType(role) {
   switch (role) {
@@ -67,6 +71,35 @@ function safeUser(u) {
 }
 
 /* =========================================================
+   VALIDATION HELPERS
+========================================================= */
+
+function validateRole(role) {
+  if (!ROLE_VALUES.includes(role)) {
+    throw new Error("Invalid role");
+  }
+}
+
+function validateSubscription(status) {
+  if (!SUB_VALUES.includes(status)) {
+    throw new Error("Invalid subscription status");
+  }
+}
+
+function validateCompany(companyId) {
+  if (!companyId) return;
+
+  const db = readDb();
+  const exists = (db.companies || []).some(
+    c => String(c.id) === String(companyId)
+  );
+
+  if (!exists) {
+    throw new Error("Invalid company reference");
+  }
+}
+
+/* =========================================================
    CRUD
 ========================================================= */
 
@@ -77,14 +110,18 @@ function listUsers() {
 
 function findById(id) {
   const db = readDb();
-  return (db.users || []).find((u) => String(u.id) === String(id)) || null;
+  return (db.users || []).find(u => String(u.id) === String(id)) || null;
 }
 
 function findByEmail(email) {
   const db = readDb();
   const e = normEmail(email);
-  return (db.users || []).find((u) => normEmail(u.email) === e) || null;
+  return (db.users || []).find(u => normEmail(u.email) === e) || null;
 }
+
+/* =========================================================
+   CREATE USER (NO ADMIN ESCALATION)
+========================================================= */
 
 async function createUser({
   email,
@@ -96,29 +133,36 @@ async function createUser({
 }) {
   const e = normEmail(email);
   if (!e) throw new Error("Email required");
-  if (!password || String(password).length < 6)
+  if (!password || String(password).length < 8)
     throw new Error("Password too short");
+
+  validateRole(role);
+  validateSubscription(subscriptionStatus);
+  validateCompany(companyId);
+
+  if (role === ROLES.ADMIN) {
+    throw new Error("Admin creation not allowed here");
+  }
 
   const exists = findByEmail(e);
   if (exists) throw new Error("Email already exists");
 
-  const passwordHash = await bcrypt.hash(String(password), 10);
-
-  const accountType = resolveAccountType(role);
+  const passwordHash = await bcrypt.hash(String(password), 12);
 
   const user = {
     id: makeId(),
     email: e,
     role,
-    accountType,
+    accountType: resolveAccountType(role),
     companyId,
 
-    // 🔥 Autodev 6.5 Capability Fields
-    freedomEnabled: false,        // seat upgrade flag
-    autoprotectEnabled: false,    // Autodev 6.5 toggle
-    managedCompanies: [],         // companies under protection scope
+    freedomEnabled: false,
+    autoprotectEnabled: false,
+    managedCompanies: [],
 
-    locked: false,
+    securityFlags: {},
+
+    locked: subscriptionStatus === SUBSCRIPTION.LOCKED,
     subscriptionStatus,
     status,
     createdAt: nowIso(),
@@ -131,44 +175,80 @@ async function createUser({
     return db;
   });
 
+  audit({
+    actor: "system",
+    role: "system",
+    action: "USER_CREATED",
+    target: user.id
+  });
+
   return safeUser(user);
 }
+
+/* =========================================================
+   PASSWORD VERIFY
+========================================================= */
 
 async function verifyPassword(user, password) {
   if (!user?.passwordHash) return false;
   return bcrypt.compare(String(password || ""), user.passwordHash);
 }
 
+/* =========================================================
+   MUTATION METHODS (AUDITED)
+========================================================= */
+
 function setSubscriptionStatus(userId, subscriptionStatus) {
+  validateSubscription(subscriptionStatus);
+
   updateDb((db) => {
-    db.users = Array.isArray(db.users) ? db.users : [];
-    const u = db.users.find((x) => String(x.id) === String(userId));
+    const u = db.users.find(x => String(x.id) === String(userId));
     if (!u) return db;
+
     u.subscriptionStatus = subscriptionStatus;
+    u.locked = subscriptionStatus === SUBSCRIPTION.LOCKED;
     u.updatedAt = nowIso();
+
     return db;
+  });
+
+  audit({
+    actor: "system",
+    role: "system",
+    action: "SUBSCRIPTION_STATUS_CHANGED",
+    target: userId,
+    metadata: { subscriptionStatus }
   });
 }
 
 function setApprovalStatus(userId, status) {
   updateDb((db) => {
-    db.users = Array.isArray(db.users) ? db.users : [];
-    const u = db.users.find((x) => String(x.id) === String(userId));
+    const u = db.users.find(x => String(x.id) === String(userId));
     if (!u) return db;
+
     u.status = status;
     u.updatedAt = nowIso();
     return db;
   });
+
+  audit({
+    actor: "system",
+    role: "system",
+    action: "APPROVAL_STATUS_CHANGED",
+    target: userId,
+    metadata: { status }
+  });
 }
 
 /* =========================================================
-   AUTODEV 6.5 CONTROL METHODS
+   AUTODEV CONTROL (VALIDATED)
 ========================================================= */
 
 function setFreedom(userId, enabled) {
   updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
+    const u = db.users.find(x => x.id === userId);
     if (!u) return db;
+
     u.freedomEnabled = !!enabled;
     u.updatedAt = nowIso();
     return db;
@@ -177,8 +257,9 @@ function setFreedom(userId, enabled) {
 
 function setAutoProtect(userId, enabled) {
   updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
+    const u = db.users.find(x => x.id === userId);
     if (!u) return db;
+
     u.autoprotectEnabled = !!enabled;
     u.updatedAt = nowIso();
     return db;
@@ -186,8 +267,10 @@ function setAutoProtect(userId, enabled) {
 }
 
 function attachCompany(userId, companyId) {
+  validateCompany(companyId);
+
   updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
+    const u = db.users.find(x => x.id === userId);
     if (!u) return db;
 
     if (!Array.isArray(u.managedCompanies)) {
@@ -211,17 +294,18 @@ function ensureAdminFromEnv() {
   const email = normEmail(process.env.ADMIN_EMAIL || "");
   const password = String(process.env.ADMIN_PASSWORD || "");
 
-  if (!email || !password) {
-    return;
-  }
+  if (!email || !password) return;
 
   updateDb((db) => {
     db.users = Array.isArray(db.users) ? db.users : [];
 
-    const existing = db.users.find((u) => normEmail(u.email) === email);
+    const existing = db.users.find(
+      u => normEmail(u.email) === email
+    );
+
     if (existing) return db;
 
-    const passwordHash = bcrypt.hashSync(password, 10);
+    const passwordHash = bcrypt.hashSync(password, 12);
 
     db.users.push({
       id: makeId("admin"),
@@ -234,6 +318,7 @@ function ensureAdminFromEnv() {
       freedomEnabled: true,
       autoprotectEnabled: false,
       managedCompanies: [],
+      securityFlags: {},
 
       locked: false,
       subscriptionStatus: SUBSCRIPTION.ACTIVE,
@@ -245,6 +330,8 @@ function ensureAdminFromEnv() {
     return db;
   });
 }
+
+/* ========================================================= */
 
 module.exports = {
   ROLES,
