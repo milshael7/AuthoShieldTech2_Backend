@@ -1,6 +1,6 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Hardened v2
-// Anti-Brute Force • Audited • Token Versioned • Enumeration Resistant
+// Enterprise Auth Engine — Session Controlled v3
+// Anti-Brute Force • Audited • Token Versioned • JTI Revocation Enabled
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -10,6 +10,11 @@ const { sign } = require("../lib/jwt");
 const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+const {
+  revokeToken,
+  revokeAllUserSessions
+} = require("../lib/sessionStore");
+
 const users = require("../users/user.service");
 
 const MAX_LOGIN_ATTEMPTS = 5;
@@ -30,16 +35,14 @@ function safeDelay() {
 
 function ensureJwtSecret(res) {
   if (!process.env.JWT_SECRET) {
-    res.status(500).json({
-      error: "Server misconfigured"
-    });
+    res.status(500).json({ error: "Server misconfigured" });
     return false;
   }
   return true;
 }
 
 /* =========================================================
-   LOGIN ATTEMPT HANDLING
+   LOGIN ATTEMPTS
 ========================================================= */
 
 function recordFailedLogin(user) {
@@ -74,9 +77,11 @@ function recordSuccessfulLogin(user) {
     if (!u.securityFlags) u.securityFlags = {};
     u.securityFlags.failedLogins = 0;
     u.lastLoginAt = new Date().toISOString();
-    u.tokenVersion = (u.tokenVersion || 0) + 1;
-    u.updatedAt = new Date().toISOString();
 
+    // increment token version (kills previous sessions)
+    u.tokenVersion = (u.tokenVersion || 0) + 1;
+
+    u.updatedAt = new Date().toISOString();
     return db;
   });
 
@@ -87,9 +92,7 @@ function recordSuccessfulLogin(user) {
   });
 }
 
-/* =========================================================
-   SAFE USER RESPONSE
-========================================================= */
+/* ========================================================= */
 
 function safeUserResponse(u) {
   return {
@@ -115,9 +118,7 @@ router.post("/signup", async (req, res) => {
     const password = cleanStr(req.body?.password, 500);
 
     if (!email || !password) {
-      return res.status(400).json({
-        error: "Email and password required"
-      });
+      return res.status(400).json({ error: "Email and password required" });
     }
 
     const created = await users.createUser({
@@ -140,9 +141,7 @@ router.post("/signup", async (req, res) => {
     });
 
   } catch (e) {
-    return res.status(400).json({
-      error: e?.message || String(e)
-    });
+    return res.status(400).json({ error: e?.message || String(e) });
   }
 });
 
@@ -156,9 +155,7 @@ router.post("/login", async (req, res) => {
     const password = cleanStr(req.body?.password, 500);
 
     if (!email || !password) {
-      return res.status(400).json({
-        error: "Email and password required"
-      });
+      return res.status(400).json({ error: "Email and password required" });
     }
 
     const u = users.findByEmail(email);
@@ -182,9 +179,7 @@ router.post("/login", async (req, res) => {
     }
 
     if (u.mustResetPassword) {
-      return res.status(403).json({
-        error: "Password reset required"
-      });
+      return res.status(403).json({ error: "Password reset required" });
     }
 
     recordSuccessfulLogin(u);
@@ -208,9 +203,7 @@ router.post("/login", async (req, res) => {
     });
 
   } catch (e) {
-    return res.status(403).json({
-      error: e?.message || String(e)
-    });
+    return res.status(403).json({ error: e?.message || String(e) });
   }
 });
 
@@ -221,13 +214,10 @@ router.post("/login", async (req, res) => {
 router.post("/refresh", authRequired, (req, res) => {
   try {
     const dbUser = users.findById(req.user.id);
-    if (!dbUser) {
-      return res.status(401).json({ error: "User not found" });
-    }
+    if (!dbUser) return res.status(401).json({ error: "User not found" });
 
-    if (dbUser.locked) {
+    if (dbUser.locked)
       return res.status(403).json({ error: "Account suspended" });
-    }
 
     if (!ensureJwtSecret(res)) return;
 
@@ -254,10 +244,76 @@ router.post("/refresh", authRequired, (req, res) => {
     });
 
   } catch (e) {
-    return res.status(403).json({
-      error: e?.message || String(e)
-    });
+    return res.status(403).json({ error: e?.message || String(e) });
   }
+});
+
+/* =========================================================
+   LOGOUT (Revoke Current Session)
+========================================================= */
+
+router.post("/logout", authRequired, (req, res) => {
+  revokeToken(req.securityContext.jti);
+
+  audit({
+    actor: req.user.id,
+    role: req.user.role,
+    action: "SESSION_LOGOUT"
+  });
+
+  return res.json({ ok: true });
+});
+
+/* =========================================================
+   LOGOUT ALL SESSIONS (User-Wide Kill)
+========================================================= */
+
+router.post("/logout-all", authRequired, (req, res) => {
+  revokeAllUserSessions(req.user.id);
+
+  updateDb((db) => {
+    const u = db.users.find(x => x.id === req.user.id);
+    if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
+    return db;
+  });
+
+  audit({
+    actor: req.user.id,
+    role: req.user.role,
+    action: "ALL_SESSIONS_LOGOUT"
+  });
+
+  return res.json({ ok: true });
+});
+
+/* =========================================================
+   ADMIN FORCE LOGOUT
+========================================================= */
+
+router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
+
+  if (req.user.role !== users.ROLES.ADMIN) {
+    return res.status(403).json({ error: "Admin only" });
+  }
+
+  const { userId } = req.params;
+
+  revokeAllUserSessions(userId);
+
+  updateDb((db) => {
+    const u = db.users.find(x => x.id === userId);
+    if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
+    return db;
+  });
+
+  audit({
+    actor: req.user.id,
+    role: req.user.role,
+    action: "ADMIN_FORCE_LOGOUT",
+    target: userId
+  });
+
+  return res.json({ ok: true });
 });
 
 module.exports = router;
