@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// Enterprise Zero Trust Middleware — Adaptive Enforcement v1
-// Risk Engine • Threat Intel • Escalation • Optional Hard Block
+// Enterprise Zero Trust Middleware — Adaptive Enforcement v2
+// Risk + Threat Correlation • Smart Escalation • Strict Optional Block
 
 const { readDb, writeDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
@@ -14,17 +14,30 @@ const sessionAdapter = require("../lib/sessionAdapter");
 ========================================================= */
 
 const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
+const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
 
 /*
-  ZERO_TRUST_STRICT = false (default)
-    - Logs high risk
-    - Creates security event
-    - Does NOT block
+  ZERO_TRUST_ENABLED=false
+    → Middleware bypassed
 
-  ZERO_TRUST_STRICT = true
-    - Revokes sessions
-    - Blocks request
+  ZERO_TRUST_STRICT=true
+    → Critical risk revokes sessions + blocks
 */
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function clamp(num, min, max) {
+  return Math.max(min, Math.min(max, num));
+}
+
+function deriveLevel(score) {
+  if (score >= 75) return "Critical";
+  if (score >= 50) return "High";
+  if (score >= 25) return "Medium";
+  return "Low";
+}
 
 /* =========================================================
    MAIN MIDDLEWARE
@@ -32,19 +45,23 @@ const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 
 async function zeroTrust(req, res, next) {
   try {
-    if (!req.user) {
-      return next();
-    }
+    if (!ZERO_TRUST_ENABLED) return next();
+    if (!req.user) return next();
 
     const db = readDb();
     const user = (db.users || []).find(u => u.id === req.user.id);
-
-    if (!user) {
-      return next();
-    }
+    if (!user) return next();
 
     const ip = extractIp(req);
-    const geo = await geoLookup(ip);
+
+    /* ================= GEO (lazy) ================= */
+
+    let geo = null;
+    if (ip) {
+      geo = await geoLookup(ip);
+    }
+
+    /* ================= THREAT ================= */
 
     const threat = evaluateThreat({
       ip,
@@ -54,12 +71,13 @@ async function zeroTrust(req, res, next) {
       failedLogins: user.securityFlags?.failedLogins || 0
     });
 
+    /* ================= RISK ================= */
+
     const risk = calculateRisk({
       geo,
       device: {
         userAgent: req.headers["user-agent"],
-        language: req.headers["accept-language"],
-        timezone: geo?.region
+        language: req.headers["accept-language"]
       },
       session: {
         activeSessions: sessionAdapter.getActiveSessionCount(user.id)
@@ -69,51 +87,77 @@ async function zeroTrust(req, res, next) {
       }
     });
 
-    const combinedScore = Math.min(
-      100,
-      Math.round((threat.threatScore + risk.riskScore) / 2)
+    /* ================= CORRELATION ================= */
+
+    const combinedScore = clamp(
+      Math.round((threat.threatScore * 0.6) + (risk.riskScore * 0.4)),
+      0,
+      100
     );
 
-    let level = "Low";
-    if (combinedScore >= 70) level = "Critical";
-    else if (combinedScore >= 45) level = "High";
-    else if (combinedScore >= 25) level = "Medium";
+    const level = deriveLevel(combinedScore);
 
-    if (level === "High" || level === "Critical") {
+    /* ================= LOW RISK FAST EXIT ================= */
+
+    if (level === "Low") {
+      return next();
+    }
+
+    /* ================= AUDIT ================= */
+
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "ZERO_TRUST_EVALUATION",
+      detail: {
+        combinedScore,
+        level,
+        threatScore: threat.threatScore,
+        riskScore: risk.riskScore,
+        path: req.originalUrl,
+        method: req.method
+      }
+    });
+
+    /* ================= SECURITY EVENT ================= */
+
+    db.securityEvents = db.securityEvents || [];
+
+    const event = {
+      id: Date.now().toString(),
+      title: "Zero Trust Risk Evaluation",
+      description: `Level: ${level}`,
+      severity:
+        level === "Critical"
+          ? "critical"
+          : level === "High"
+          ? "high"
+          : "medium",
+      companyId: user.companyId || null,
+      userId: user.id,
+      createdAt: new Date().toISOString()
+    };
+
+    db.securityEvents.push(event);
+    writeDb(db);
+
+    /* ================= STRICT ENFORCEMENT ================= */
+
+    if (ZERO_TRUST_STRICT && level === "Critical") {
+
+      sessionAdapter.revokeAllUserSessions(user.id);
+
       writeAudit({
         actor: user.id,
         role: user.role,
-        action: "ZERO_TRUST_ELEVATED_RISK",
-        detail: {
-          combinedScore,
-          level,
-          ip,
-          geo
-        }
+        action: "ZERO_TRUST_SESSION_TERMINATED",
+        detail: { combinedScore }
       });
 
-      db.securityEvents = db.securityEvents || [];
-
-      const event = {
-        id: Date.now().toString(),
-        title: "Zero Trust Elevated Risk",
-        description: `Risk level: ${level}`,
-        severity: level === "Critical" ? "critical" : "high",
-        companyId: user.companyId || null,
-        createdAt: new Date().toISOString()
-      };
-
-      db.securityEvents.push(event);
-      writeDb(db);
-
-      if (ZERO_TRUST_STRICT && level === "Critical") {
-        sessionAdapter.revokeAllUserSessions(user.id);
-
-        return res.status(403).json({
-          ok: false,
-          error: "Security verification failed"
-        });
-      }
+      return res.status(403).json({
+        ok: false,
+        error: "Security verification failed"
+      });
     }
 
     return next();
