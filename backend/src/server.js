@@ -54,13 +54,18 @@ app.get("/health", (req, res) => {
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
+/* Tenant Isolation Layer */
 app.use(tenantMiddleware);
 
+/* Admin + Core */
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
 
-/* 🔥 Autodev 6.5 Route (NEW) */
+/* 🔥 TOOLS ENGINE ROUTE (NEW — Enterprise Layer) */
+app.use("/api/tools", require("./routes/tools.routes"));
+
+/* 🔥 Autodev 6.5 */
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 /* ================= SERVER ================= */
