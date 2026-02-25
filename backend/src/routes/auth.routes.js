@@ -1,5 +1,5 @@
 // backend/src/routes/auth.routes.js
-// Auth API — Enterprise Hardened • Tier Enforced • Multi-Tenant Safe
+// Auth API — Enterprise Hardened • Tier Enforced • Autodev 6.5 Integrated
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -9,6 +9,11 @@ const { sign } = require("../lib/jwt");
 const { authRequired } = require("../middleware/auth");
 const { readDb } = require("../lib/db");
 const users = require("../users/user.service");
+
+const {
+  canUseAutoProtect,
+  autoProtectLimit,
+} = require("../lib/autodev");
 
 /* =========================================================
    HELPERS
@@ -22,7 +27,18 @@ function cleanStr(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
 
+function resolveAccountType(user) {
+  if (user.role === users.ROLES.ADMIN) return "ADMIN";
+  if (user.role === users.ROLES.MANAGER) return "MANAGER";
+  if (user.role === users.ROLES.COMPANY) return "COMPANY";
+  if (user.role === users.ROLES.SMALL_COMPANY) return "COMPANY";
+  return "INDIVIDUAL";
+}
+
 function safeUserResponse(u) {
+  const allowed = canUseAutoProtect(u);
+  const limit = autoProtectLimit(u);
+
   return {
     id: u.id,
     role: u.role,
@@ -31,6 +47,16 @@ function safeUserResponse(u) {
     subscriptionStatus: u.subscriptionStatus,
     status: u.status,
     mustResetPassword: !!u.mustResetPassword,
+
+    accountType: resolveAccountType(u),
+
+    freedomEnabled: !!u.freedomEnabled,
+    autoprotectEnabled: !!u.autoprotectEnabled,
+
+    autodev: {
+      allowed,
+      limit: limit === Infinity ? "unlimited" : limit,
+    },
   };
 }
 
@@ -87,7 +113,7 @@ function ensureSubscription(user) {
    SIGNUP
 ========================================================= */
 
-router.post("/signup", (req, res) => {
+router.post("/signup", async (req, res) => {
   try {
     const email = cleanEmail(req.body?.email);
     const password = cleanStr(req.body?.password, 500);
@@ -99,7 +125,7 @@ router.post("/signup", (req, res) => {
       });
     }
 
-    const created = users.createUser({
+    const created = await users.createUser({
       email,
       password,
       role,
@@ -135,7 +161,6 @@ router.post("/login", async (req, res) => {
 
     const u = users.findByEmail(email);
 
-    // Anti-enumeration timing defense
     if (!u) {
       await bcrypt.compare(password, "$2a$10$invalidsaltinvalidsaltinv");
       return res.status(401).json({ error: "Invalid credentials" });
@@ -146,7 +171,6 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // Approval enforcement
     if (u.status !== users.APPROVAL_STATUS.APPROVED) {
       return res.status(403).json({
         error: "Account not approved",
@@ -158,10 +182,7 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ error: "Account suspended" });
     }
 
-    // 🔐 Company validation
     ensureCompanyValid(u);
-
-    // 💳 Subscription enforcement
     ensureSubscription(u);
 
     if (!ensureJwtSecret(res)) return;
@@ -234,47 +255,6 @@ router.post("/refresh", authRequired, (req, res) => {
 
   } catch (e) {
     return res.status(403).json({
-      error: e?.message || String(e),
-    });
-  }
-});
-
-/* =========================================================
-   RESET PASSWORD
-========================================================= */
-
-router.post("/reset-password", (req, res) => {
-  try {
-    const email = cleanEmail(req.body?.email);
-    const newPassword = cleanStr(req.body?.newPassword, 500);
-
-    if (!email || !newPassword) {
-      return res.status(400).json({
-        error: "Email and newPassword required",
-      });
-    }
-
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        error: "Password must be at least 8 characters",
-      });
-    }
-
-    const u = users.findByEmail(email);
-    if (!u) {
-      return res.status(404).json({
-        error: "User not found",
-      });
-    }
-
-    if (typeof users.setPassword === "function") {
-      users.setPassword(u.id, newPassword, u.id);
-    }
-
-    return res.json({ ok: true });
-
-  } catch (e) {
-    return res.status(500).json({
       error: e?.message || String(e),
     });
   }
