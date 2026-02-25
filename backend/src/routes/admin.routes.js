@@ -1,5 +1,5 @@
 // backend/src/routes/admin.routes.js
-// Phase 33 — Admin Platform Control + Protection Scope
+// Phase 34 — Admin Platform Control + Autodev Tier Governance
 
 const express = require("express");
 const router = express.Router();
@@ -38,7 +38,7 @@ function requireFinanceOrAdmin(req, res, next) {
 function ensureAdminState(db) {
   if (!db.adminState) {
     db.adminState = {
-      defenseMode: "auto", // auto | manual
+      defenseMode: "auto",
       protectedTenants: []
     };
   }
@@ -48,7 +48,7 @@ function ensureAdminState(db) {
 }
 
 /* =========================================================
-   METRICS (UNCHANGED)
+   METRICS
 ========================================================= */
 
 router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
@@ -109,37 +109,7 @@ router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   PREDICTIVE CHURN
-========================================================= */
-
-router.get("/predictive-churn", requireFinanceOrAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const usersList = db.users || [];
-
-    const locked = usersList.filter(u => u.subscriptionStatus === "Locked").length;
-    const total = usersList.length || 1;
-
-    const churnProbability = Number((locked / total).toFixed(4));
-
-    res.json({
-      ok: true,
-      predictiveChurn: {
-        probability: churnProbability,
-        riskLevel:
-          churnProbability > 0.3 ? "High" :
-          churnProbability > 0.15 ? "Moderate" :
-          "Low"
-      }
-    });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   PLATFORM TENANT LIST
+   TENANTS
 ========================================================= */
 
 router.get("/tenants", requireAdmin, (req, res) => {
@@ -162,18 +132,27 @@ router.get("/tenants", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   ADMIN PROTECTION SCOPE
+   AUTODEV — USER TIER GOVERNANCE
 ========================================================= */
 
-router.get("/protection-scope", requireAdmin, (req, res) => {
+/**
+ * List users with tier info
+ */
+router.get("/users/tier", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-    ensureAdminState(db);
+    const usersList = db.users || [];
 
     res.json({
       ok: true,
-      defenseMode: db.adminState.defenseMode,
-      protectedTenants: db.adminState.protectedTenants
+      users: usersList.map(u => ({
+        id: u.id,
+        email: u.email,
+        role: u.role,
+        freedomEnabled: !!u.freedomEnabled,
+        autoprotectEnabled: !!u.autoprotectEnabled,
+        managedCompanies: u.managedCompanies?.length || 0
+      }))
     });
 
   } catch (e) {
@@ -181,26 +160,28 @@ router.get("/protection-scope", requireAdmin, (req, res) => {
   }
 });
 
-/* =========================================================
-   TOGGLE DEFENSE MODE
-========================================================= */
-
-router.post("/defense-mode", requireAdmin, (req, res) => {
+/**
+ * Grant Freedom (Seat / Individual Upgrade)
+ */
+router.post("/users/:userId/grant-freedom", requireAdmin, (req, res) => {
   try {
-    const { mode } = req.body;
-    if (!["auto", "manual"].includes(mode)) {
-      return res.status(400).json({ ok: false, error: "Invalid mode" });
+    const { userId } = req.params;
+    const db = readDb();
+
+    const u = db.users.find(x => x.id === userId);
+    if (!u) {
+      return res.status(404).json({ ok: false, error: "User not found" });
     }
 
-    const db = readDb();
-    ensureAdminState(db);
+    u.freedomEnabled = true;
+    u.updatedAt = new Date().toISOString();
 
-    db.adminState.defenseMode = mode;
     writeDb(db);
 
     res.json({
       ok: true,
-      defenseMode: mode
+      message: "Freedom granted",
+      userId
     });
 
   } catch (e) {
@@ -208,26 +189,30 @@ router.post("/defense-mode", requireAdmin, (req, res) => {
   }
 });
 
-/* =========================================================
-   ADD TENANT TO PROTECTION
-========================================================= */
-
-router.post("/protect/:tenantId", requireAdmin, (req, res) => {
+/**
+ * Revoke Freedom
+ */
+router.post("/users/:userId/revoke-freedom", requireAdmin, (req, res) => {
   try {
-    const { tenantId } = req.params;
-
+    const { userId } = req.params;
     const db = readDb();
-    ensureAdminState(db);
 
-    if (!db.adminState.protectedTenants.includes(tenantId)) {
-      db.adminState.protectedTenants.push(tenantId);
+    const u = db.users.find(x => x.id === userId);
+    if (!u) {
+      return res.status(404).json({ ok: false, error: "User not found" });
     }
 
+    u.freedomEnabled = false;
+    u.autoprotectEnabled = false;
+    u.managedCompanies = [];
+    u.updatedAt = new Date().toISOString();
+
     writeDb(db);
 
     res.json({
       ok: true,
-      protectedTenants: db.adminState.protectedTenants
+      message: "Freedom revoked",
+      userId
     });
 
   } catch (e) {
@@ -236,33 +221,7 @@ router.post("/protect/:tenantId", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   REMOVE TENANT FROM PROTECTION
-========================================================= */
-
-router.delete("/protect/:tenantId", requireAdmin, (req, res) => {
-  try {
-    const { tenantId } = req.params;
-
-    const db = readDb();
-    ensureAdminState(db);
-
-    db.adminState.protectedTenants =
-      db.adminState.protectedTenants.filter(id => id !== tenantId);
-
-    writeDb(db);
-
-    res.json({
-      ok: true,
-      protectedTenants: db.adminState.protectedTenants
-    });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   PLATFORM INTEGRITY SNAPSHOT
+   PLATFORM HEALTH
 ========================================================= */
 
 router.get("/platform-health", requireAdmin, (req, res) => {
