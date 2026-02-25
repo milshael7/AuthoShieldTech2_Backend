@@ -1,7 +1,6 @@
 // backend/src/services/paperTrader.js
-// Phase 16 — Unified Autonomous Paper Engine
-// AI + Candles + Snapshot + Chart Ready
-// Fully Integrated • Multi-Tenant • Production Safe
+// Phase 17 — Unified Autonomous Paper Engine
+// Risk Integrated • AI Integrated • Chart Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -118,8 +117,7 @@ function updateCandle(state, price) {
     });
 
     if (state.candles.length > MAX_CANDLES) {
-      state.candles =
-        state.candles.slice(-MAX_CANDLES);
+      state.candles = state.candles.slice(-MAX_CANDLES);
     }
   }
 
@@ -161,6 +159,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     state.equity
   );
 
+  /* ================= RISK (Paper Mode) ================= */
+
+  const risk = riskManager.evaluate({
+    tenantId,
+    equity: state.equity,
+    volatility: state.volatility,
+    trades: state.trades,
+    ts,
+    mode: "paper"
+  });
+
+  /* ================= DECISION ================= */
+
   const plan = makeDecision({
     tenantId,
     symbol,
@@ -169,12 +180,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   });
 
   if (plan.action === "BUY" && !state.position) {
+
     const portfolioCheck =
       portfolioManager.evaluate({
         tenantId,
         symbol,
         equity: state.equity,
-        proposedRiskPct: plan.riskPct,
+        proposedRiskPct: plan.riskPct * risk.riskMultiplier,
         paperState: state,
       });
 
