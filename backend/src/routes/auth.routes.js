@@ -1,6 +1,6 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Session Controlled v3
-// Anti-Brute Force • Audited • Token Versioned • JTI Revocation Enabled
+// Enterprise Auth Engine — Device Bound v4
+// Session Controlled • Device Fingerprint Bound • Anti-Hijack Ready
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -14,6 +14,10 @@ const {
   revokeToken,
   revokeAllUserSessions
 } = require("../lib/sessionStore");
+
+const {
+  buildFingerprint
+} = require("../lib/deviceFingerprint");
 
 const users = require("../users/user.service");
 
@@ -69,7 +73,7 @@ function recordFailedLogin(user) {
   });
 }
 
-function recordSuccessfulLogin(user) {
+function recordSuccessfulLogin(user, fingerprint) {
   updateDb((db) => {
     const u = db.users.find(x => x.id === user.id);
     if (!u) return db;
@@ -78,8 +82,21 @@ function recordSuccessfulLogin(user) {
     u.securityFlags.failedLogins = 0;
     u.lastLoginAt = new Date().toISOString();
 
-    // increment token version (kills previous sessions)
+    // Kill previous sessions
     u.tokenVersion = (u.tokenVersion || 0) + 1;
+
+    // Store device fingerprint
+    const previous = u.activeDeviceFingerprint;
+
+    u.activeDeviceFingerprint = fingerprint;
+
+    if (previous && previous !== fingerprint) {
+      audit({
+        actor: u.id,
+        role: u.role,
+        action: "DEVICE_CHANGED",
+      });
+    }
 
     u.updatedAt = new Date().toISOString();
     return db;
@@ -146,7 +163,7 @@ router.post("/signup", async (req, res) => {
 });
 
 /* =========================================================
-   LOGIN
+   LOGIN (Device Bound)
 ========================================================= */
 
 router.post("/login", async (req, res) => {
@@ -174,7 +191,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    if (u.locked === true) {
+    if (u.locked) {
       return res.status(403).json({ error: "Account suspended" });
     }
 
@@ -182,7 +199,10 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ error: "Password reset required" });
     }
 
-    recordSuccessfulLogin(u);
+    // 🔐 Build fingerprint from request
+    const fingerprint = buildFingerprint(req);
+
+    recordSuccessfulLogin(u, fingerprint);
 
     if (!ensureJwtSecret(res)) return;
 
@@ -191,7 +211,7 @@ router.post("/login", async (req, res) => {
         id: u.id,
         role: u.role,
         companyId: u.companyId || null,
-        tokenVersion: u.tokenVersion || 0
+        tokenVersion: u.tokenVersion || 0,
       },
       null,
       "7d"
@@ -249,7 +269,7 @@ router.post("/refresh", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   LOGOUT (Revoke Current Session)
+   LOGOUT
 ========================================================= */
 
 router.post("/logout", authRequired, (req, res) => {
@@ -265,7 +285,7 @@ router.post("/logout", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   LOGOUT ALL SESSIONS (User-Wide Kill)
+   LOGOUT ALL
 ========================================================= */
 
 router.post("/logout-all", authRequired, (req, res) => {
