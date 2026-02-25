@@ -1,15 +1,17 @@
+// backend/src/routes/security.routes.js
+// Enterprise Security Firewall — Completed v5
+// Public Risk Engine • Session Monitor • Compliance Layer • Escalation Engine
+
 const express = require("express");
 const router = express.Router();
 
-const { authRequired, requireRole } = require("../middleware/auth");
+const { authRequired } = require("../middleware/auth");
 const users = require("../users/user.service");
-const securityTools = require("../services/securityTools");
 const { readDb, writeDb } = require("../lib/db");
-
-router.use(authRequired);
+const { getActiveSessionCount } = require("../lib/sessionStore");
 
 /* =========================================================
-   ROLE FALLBACKS
+   ROLE HELPERS
 ========================================================= */
 
 const ROLES = users?.ROLES || {};
@@ -24,6 +26,47 @@ function normalizeArray(v) {
 function isAdmin(role) {
   return String(role || "").toLowerCase() === ADMIN_ROLE;
 }
+
+/* =========================================================
+   PUBLIC DEVICE RISK (NO AUTH)
+========================================================= */
+
+router.post("/public-device-risk", (req, res) => {
+  try {
+    const { userAgent, language, timezone } = req.body || {};
+
+    let riskScore = 10;
+
+    if (!userAgent) riskScore += 20;
+    if (!language) riskScore += 10;
+    if (!timezone) riskScore += 10;
+
+    if (String(userAgent).toLowerCase().includes("headless")) {
+      riskScore += 40;
+    }
+
+    riskScore = Math.min(100, riskScore);
+
+    let level = "Low";
+    if (riskScore > 60) level = "High";
+    else if (riskScore > 30) level = "Medium";
+
+    return res.json({
+      ok: true,
+      riskScore,
+      level
+    });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================================================
+   AUTH REQUIRED BELOW THIS LINE
+========================================================= */
+
+router.use(authRequired);
 
 /* =========================================================
    AUTO ESCALATION ENGINE
@@ -120,46 +163,47 @@ router.get("/posture-summary", (req, res) => {
 });
 
 /* =========================================================
-   POSTURE CHECKS
+   COMPLIANCE SUMMARY
 ========================================================= */
 
-router.get("/posture-checks", (req, res) => {
-  res.json({ ok: true, checks: [] });
-});
-
-/* =========================================================
-   POSTURE RECENT
-========================================================= */
-
-router.get("/posture-recent", (req, res) => {
+router.get("/compliance", (req, res) => {
   try {
     const db = readDb();
-    const limit = Number(req.query.limit) || 20;
+    const vulns = db.vulnerabilities || [];
 
-    const recent = (db.securityEvents || [])
-      .slice(-limit)
-      .reverse();
+    const critical = vulns.filter(v => v.severity === "critical").length;
+    const high = vulns.filter(v => v.severity === "high").length;
 
-    res.json({ ok: true, recent });
+    let complianceScore = 100 - (critical * 10 + high * 5);
+    complianceScore = Math.max(10, Math.min(100, complianceScore));
+
+    res.json({
+      ok: true,
+      complianceScore,
+      critical,
+      high
+    });
 
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to load recent posture data" });
+    res.status(500).json({ ok: false, error: "Compliance failed" });
   }
 });
 
 /* =========================================================
-   VULNERABILITIES
+   ACTIVE SESSIONS
 ========================================================= */
 
-router.get("/vulnerabilities", (req, res) => {
+router.get("/sessions", (req, res) => {
   try {
-    const db = readDb();
+    const count = getActiveSessionCount(req.user.id);
+
     res.json({
       ok: true,
-      vulnerabilities: db.vulnerabilities || []
+      activeSessions: count
     });
+
   } catch {
-    res.status(500).json({ ok: false, error: "Failed to load vulnerabilities" });
+    res.status(500).json({ ok: false, error: "Failed to load sessions" });
   }
 });
 
@@ -229,6 +273,20 @@ router.post("/events", (req, res) => {
   }
 });
 
-/* ========================================================= */
+/* =========================================================
+   VULNERABILITIES
+========================================================= */
+
+router.get("/vulnerabilities", (req, res) => {
+  try {
+    const db = readDb();
+    res.json({
+      ok: true,
+      vulnerabilities: db.vulnerabilities || []
+    });
+  } catch {
+    res.status(500).json({ ok: false, error: "Failed to load vulnerabilities" });
+  }
+});
 
 module.exports = router;
