@@ -1,10 +1,10 @@
-// Phase 36 — Admin Platform Control + Full Audit Explorer + Autodev Telemetry
+// Phase 37 — Hardened Admin Control + Enterprise Audit Engine + Autodev Telemetry
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const { readDb, writeDb } = require("../lib/db");
+const { readDb } = require("../lib/db");
 const users = require("../users/user.service");
 
 const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
@@ -34,6 +34,28 @@ function requireFinanceOrAdmin(req, res, next) {
     });
   }
   next();
+}
+
+/* =========================================================
+   SAFE HELPERS
+========================================================= */
+
+function safeDate(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return 0;
+  return d.getTime();
+}
+
+function normalizeAuditRow(e) {
+  return {
+    id: e.id || `${safeDate(e.timestamp)}-${e.actorId || "system"}`,
+    timestamp: e.timestamp || e.createdAt || new Date().toISOString(),
+    actorId: e.actorId || "system",
+    action: e.action || "UNKNOWN",
+    targetType: e.targetType || null,
+    targetId: e.targetId || null,
+    metadata: e.metadata || {},
+  };
 }
 
 /* =========================================================
@@ -118,39 +140,15 @@ router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   AUDIT PREVIEW (Last 20)
-========================================================= */
-
-router.get("/audit-preview", requireAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const audit = db.audit || db.auditEvents || [];
-
-    const sorted = [...audit]
-      .sort(
-        (a, b) =>
-          new Date(b.timestamp).getTime() -
-          new Date(a.timestamp).getTime()
-      )
-      .slice(0, 20);
-
-    res.json({
-      ok: true,
-      events: sorted,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   FULL AUDIT EXPLORER (Pagination + Filters)
+   FULL AUDIT EXPLORER — HARDENED
 ========================================================= */
 
 router.get("/audit", requireAdmin, (req, res) => {
   try {
     const db = readDb();
+
     let audit = db.audit || db.auditEvents || [];
+    audit = audit.map(normalizeAuditRow);
 
     const {
       page = 1,
@@ -162,42 +160,35 @@ router.get("/audit", requireAdmin, (req, res) => {
       search,
     } = req.query;
 
-    audit = [...audit];
+    /* ---------- Filters ---------- */
 
-    // Filter by actor
     if (actorId) {
       audit = audit.filter(
         (e) => String(e.actorId) === String(actorId)
       );
     }
 
-    // Filter by action
     if (action) {
+      const a = String(action).toLowerCase();
       audit = audit.filter((e) =>
-        String(e.action || "")
-          .toLowerCase()
-          .includes(String(action).toLowerCase())
+        String(e.action).toLowerCase().includes(a)
       );
     }
 
-    // Date filtering
     if (startDate) {
-      const start = new Date(startDate).getTime();
+      const start = safeDate(startDate);
       audit = audit.filter(
-        (e) =>
-          new Date(e.timestamp).getTime() >= start
+        (e) => safeDate(e.timestamp) >= start
       );
     }
 
     if (endDate) {
-      const end = new Date(endDate).getTime();
+      const end = safeDate(endDate);
       audit = audit.filter(
-        (e) =>
-          new Date(e.timestamp).getTime() <= end
+        (e) => safeDate(e.timestamp) <= end
       );
     }
 
-    // Search filter
     if (search) {
       const s = String(search).toLowerCase();
       audit = audit.filter((e) =>
@@ -205,17 +196,19 @@ router.get("/audit", requireAdmin, (req, res) => {
       );
     }
 
-    // Sort newest first
+    /* ---------- Sort ---------- */
+
     audit.sort(
       (a, b) =>
-        new Date(b.timestamp).getTime() -
-        new Date(a.timestamp).getTime()
+        safeDate(b.timestamp) - safeDate(a.timestamp)
     );
+
+    /* ---------- Pagination ---------- */
 
     const pageNum = Math.max(1, Number(page));
     const perPage = Math.max(1, Math.min(100, Number(limit)));
-    const startIndex = (pageNum - 1) * perPage;
 
+    const startIndex = (pageNum - 1) * perPage;
     const paginated = audit.slice(
       startIndex,
       startIndex + perPage
@@ -228,6 +221,7 @@ router.get("/audit", requireAdmin, (req, res) => {
       pages: Math.ceil(audit.length / perPage),
       events: paginated,
     });
+
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -287,6 +281,7 @@ router.get("/autodev-stats", requireAdmin, (req, res) => {
       totalAttachedCompanies,
       automationLoadScore,
     });
+
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
