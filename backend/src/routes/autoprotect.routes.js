@@ -1,40 +1,33 @@
 // backend/src/routes/autoprotect.routes.js
-// AutoProtect Routes — Billing Enforced • Active Job Model • Enterprise Safe
+// Autodev 6.5 — Role-Based Auto Protection Control
+// Admin / Manager = Unlimited
+// Single / Upgraded Seat = 10 Max
+// Company = Not Allowed
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const users = require("../users/user.service");
-
+const { readDb, updateDb } = require("../lib/db");
 const {
-  activateAutoProtect,
-  deactivateAutoProtect,
-  canRunAutoProtect,
-  isAutoProtectActive,
-} = require("../users/user.service");
-
-const { runAutoProtectJob } = require("../autoprotect/autoprotect.service");
-const { readDb } = require("../lib/db");
+  canUseAutoProtect,
+  autoProtectLimit,
+  enforceLimit,
+} = require("../lib/autodev");
 
 router.use(authRequired);
 
-/* ========================================================= */
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function nowISO() {
   return new Date().toISOString();
 }
 
-function isAdmin(user) {
-  return user.role === users.ROLES.ADMIN;
-}
-
-function isManager(user) {
-  return user.role === users.ROLES.MANAGER;
-}
-
-function isIndividual(user) {
-  return user.role === users.ROLES.INDIVIDUAL;
+function getUserFromDb(userId) {
+  const db = readDb();
+  return db.users.find((u) => u.id === userId);
 }
 
 /* =========================================================
@@ -42,43 +35,26 @@ function isIndividual(user) {
 ========================================================= */
 
 router.get("/status", (req, res) => {
-  const user = req.user;
-  const db = readDb();
+  const user = getUserFromDb(req.user.id);
 
-  // Admin / Manager → read-only global mirror
-  if (isAdmin(user) || isManager(user)) {
-    const apUsers = Object.values(db.autoprotek?.users || {});
-
-    return res.json({
-      scope: "global",
-      totalSubscribers: apUsers.length,
-      activeSubscribers: apUsers.filter(u => u.status === "ACTIVE").length,
-      pastDueSubscribers: apUsers.filter(u => u.subscriptionStatus === "PAST_DUE").length,
-      time: nowISO(),
-      readOnly: true,
-    });
-  }
-
-  if (!isIndividual(user)) {
-    return res.status(403).json({
+  if (!user) {
+    return res.status(404).json({
       ok: false,
-      error: "AutoProtect available to Individuals only.",
+      error: "User not found",
     });
   }
 
-  const userAP = db.autoprotek?.users?.[user.id];
+  const allowed = canUseAutoProtect(user);
+  const limit = autoProtectLimit(user);
 
   return res.json({
-    scope: "user",
-    status: userAP?.status || "INACTIVE",
-    subscriptionStatus: userAP?.subscriptionStatus || "INACTIVE",
-    activeJobs: userAP?.activeJobsCount || 0,
-    activeLimit: userAP?.activeJobLimit || 10,
-    nextBillingDate: userAP?.nextBillingDate || null,
-    pricing: userAP?.pricing || {
-      automationService: 500,
-      platformFee: 50,
-      total: 550,
+    ok: true,
+    autodev: {
+      allowed,
+      enabled: !!user.autoprotectEnabled,
+      limit: limit === Infinity ? "unlimited" : limit,
+      activeCompanies: user.managedCompanies || [],
+      activeCount: user.managedCompanies?.length || 0,
     },
     time: nowISO(),
   });
@@ -89,26 +65,35 @@ router.get("/status", (req, res) => {
 ========================================================= */
 
 router.post("/enable", (req, res) => {
-  const user = req.user;
+  const user = getUserFromDb(req.user.id);
 
-  if (!isIndividual(user)) {
+  if (!canUseAutoProtect(user)) {
     return res.status(403).json({
       ok: false,
-      error: "AutoProtect available to Individuals only.",
+      error: "Autodev 6.5 not allowed for this account type.",
     });
   }
 
-  activateAutoProtect(user.id);
+  const check = enforceLimit(user);
+  if (!check.ok) {
+    return res.status(400).json({
+      ok: false,
+      error: check.error,
+    });
+  }
+
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === user.id);
+    if (u) {
+      u.autoprotectEnabled = true;
+      u.updatedAt = nowISO();
+    }
+    return db;
+  });
 
   return res.json({
     ok: true,
     status: "ACTIVE",
-    pricing: {
-      automationService: 500,
-      platformFee: 50,
-      total: 550,
-    },
-    limit: 10,
     time: nowISO(),
   });
 });
@@ -118,16 +103,14 @@ router.post("/enable", (req, res) => {
 ========================================================= */
 
 router.post("/disable", (req, res) => {
-  const user = req.user;
-
-  if (!isIndividual(user)) {
-    return res.status(403).json({
-      ok: false,
-      error: "AutoProtect available to Individuals only.",
-    });
-  }
-
-  deactivateAutoProtect(user.id);
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === req.user.id);
+    if (u) {
+      u.autoprotectEnabled = false;
+      u.updatedAt = nowISO();
+    }
+    return db;
+  });
 
   return res.json({
     ok: true,
@@ -137,47 +120,79 @@ router.post("/disable", (req, res) => {
 });
 
 /* =========================================================
-   RUN JOB
+   ATTACH COMPANY (Protect This Company)
 ========================================================= */
 
-router.post("/run", (req, res) => {
-  const user = req.user;
+router.post("/attach", (req, res) => {
+  const { companyId } = req.body || {};
 
-  if (!canRunAutoProtect(user)) {
+  if (!companyId) {
     return res.status(400).json({
       ok: false,
-      error: "AutoProtect inactive, expired, or active job limit reached (10).",
+      error: "companyId required",
     });
   }
 
-  const { companyId, title, issue } = req.body || {};
+  const user = getUserFromDb(req.user.id);
 
-  if (!companyId || !title || !issue) {
-    return res.status(400).json({
+  if (!canUseAutoProtect(user)) {
+    return res.status(403).json({
       ok: false,
-      error: "Missing companyId, title, or issue.",
+      error: "Autodev 6.5 not allowed.",
     });
   }
 
-  try {
-    const report = runAutoProtectJob({
-      actorId: user.id,
-      companyId,
-      title,
-      issue,
-    });
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === user.id);
+    if (!u.managedCompanies) u.managedCompanies = [];
 
-    return res.status(201).json({
-      ok: true,
-      report,
-      time: nowISO(),
-    });
-  } catch (e) {
+    if (!u.managedCompanies.includes(companyId)) {
+      u.managedCompanies.push(companyId);
+    }
+
+    u.updatedAt = nowISO();
+    return db;
+  });
+
+  const updated = getUserFromDb(user.id);
+  const check = enforceLimit(updated);
+
+  if (!check.ok) {
     return res.status(400).json({
       ok: false,
-      error: e.message,
+      error: check.error,
     });
   }
+
+  return res.json({
+    ok: true,
+    managedCompanies: updated.managedCompanies,
+    time: nowISO(),
+  });
+});
+
+/* =========================================================
+   DETACH COMPANY
+========================================================= */
+
+router.post("/detach", (req, res) => {
+  const { companyId } = req.body || {};
+
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === req.user.id);
+    if (u && Array.isArray(u.managedCompanies)) {
+      u.managedCompanies = u.managedCompanies.filter(
+        (c) => c !== companyId
+      );
+      u.updatedAt = nowISO();
+    }
+    return db;
+  });
+
+  return res.json({
+    ok: true,
+    time: nowISO(),
+  });
 });
 
 module.exports = router;
