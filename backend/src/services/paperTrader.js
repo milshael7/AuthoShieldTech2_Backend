@@ -1,10 +1,7 @@
 // backend/src/services/paperTrader.js
-// Phase 14 — Fully Reinforced Autonomous Paper Engine
-// Unlimited Learning Mode
-// AI Reinforcement Integrated
-// Expectancy + Adaptive Aggression
-// Friday Shutdown
-// Production Safe • Institutional Grade
+// Phase 16 — Unified Autonomous Paper Engine
+// AI + Candles + Snapshot + Chart Ready
+// Fully Integrated • Multi-Tenant • Production Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -14,16 +11,15 @@ const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
 const executionEngine = require("./executionEngine");
 const aiBrain = require("./aiBrain");
-const { addMemory } = require("../lib/brain");
 
 /* ================= CONFIG ================= */
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
-const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200);
 const BASE_PATH =
   process.env.PAPER_STATE_DIR || path.join("/tmp", "paper_trader");
 
-const PERFORMANCE_WINDOW = 50;
+const CANDLE_MS = 60 * 1000;
+const MAX_CANDLES = 2000;
 
 /* ================= HELPERS ================= */
 
@@ -40,62 +36,29 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function isFridayShutdown(ts) {
-  const d = new Date(ts);
-  return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
-}
-
 /* ================= STATE ================= */
 
 function defaultState() {
   return {
     running: true,
-
     cashBalance: START_BAL,
     equity: START_BAL,
     peakEquity: START_BAL,
 
-    realized: {
-      wins: 0,
-      losses: 0,
-      net: 0,
-      grossProfit: 0,
-      grossLoss: 0,
-    },
-
-    performance: {
-      window: [],
-      winRate: 0,
-      expectancy: 0,
-      avgWin: 0,
-      avgLoss: 0,
-    },
-
     position: null,
     trades: [],
-
-    lastPrice: null,
     volatility: 0.002,
+    lastPrice: 65000,
 
-    learnStats: {
-      ticksSeen: 0,
-      confidence: 0,
-      decision: "WAIT",
-      trendEdge: 0,
-      lastReason: "boot",
-    },
-
-    adaptive: {
-      winStreak: 0,
-      lossStreak: 0,
-      riskBoost: 1,
-    },
+    candles: [],
+    performance: {},
+    adaptive: { riskBoost: 1 },
   };
 }
 
 const STATES = new Map();
 
-/* ================= PERSIST ================= */
+/* ================= LOAD / SAVE ================= */
 
 function load(tenantId) {
   if (STATES.has(tenantId)) return STATES.get(tenantId);
@@ -115,63 +78,55 @@ function load(tenantId) {
 }
 
 function save(tenantId) {
-  const state = STATES.get(tenantId);
-  if (!state) return;
-
   try {
     fs.writeFileSync(
       statePath(tenantId),
-      JSON.stringify(state, null, 2)
+      JSON.stringify(STATES.get(tenantId), null, 2)
     );
   } catch {}
 }
 
-/* ================= PERFORMANCE ================= */
+/* ================= CANDLES ================= */
 
-function updatePerformance(state, trade) {
-  state.performance.window.push(trade.profit);
-
-  if (state.performance.window.length > PERFORMANCE_WINDOW)
-    state.performance.window =
-      state.performance.window.slice(-PERFORMANCE_WINDOW);
-
-  const wins = state.performance.window.filter(p => p > 0);
-  const losses = state.performance.window.filter(p => p <= 0);
-
-  state.performance.winRate =
-    wins.length / state.performance.window.length;
-
-  state.performance.avgWin =
-    wins.length > 0
-      ? wins.reduce((a, b) => a + b, 0) / wins.length
-      : 0;
-
-  state.performance.avgLoss =
-    losses.length > 0
-      ? losses.reduce((a, b) => a + b, 0) / losses.length
-      : 0;
-
-  state.performance.expectancy =
-    state.performance.winRate *
-      state.performance.avgWin +
-    (1 - state.performance.winRate) *
-      state.performance.avgLoss;
+function currentCandle(state) {
+  return state.candles[state.candles.length - 1];
 }
 
-/* ================= ADAPTIVE ================= */
+function updateCandle(state, price) {
+  const now = Date.now();
 
-function updateAdaptive(state, trade) {
-  if (trade.profit > 0) {
-    state.adaptive.winStreak++;
-    state.adaptive.lossStreak = 0;
-    state.adaptive.riskBoost =
-      clamp(state.adaptive.riskBoost * 1.1, 1, 2);
-  } else {
-    state.adaptive.lossStreak++;
-    state.adaptive.winStreak = 0;
-    state.adaptive.riskBoost =
-      clamp(state.adaptive.riskBoost * 0.7, 0.4, 1);
+  if (!state.candles.length) {
+    state.candles.push({
+      t: now,
+      o: price,
+      h: price,
+      l: price,
+      c: price,
+    });
+    return;
   }
+
+  const last = currentCandle(state);
+
+  if (now - last.t >= CANDLE_MS) {
+    state.candles.push({
+      t: now,
+      o: last.c,
+      h: last.c,
+      l: last.c,
+      c: last.c,
+    });
+
+    if (state.candles.length > MAX_CANDLES) {
+      state.candles =
+        state.candles.slice(-MAX_CANDLES);
+    }
+  }
+
+  const cur = currentCandle(state);
+  cur.h = Math.max(cur.h, price);
+  cur.l = Math.min(cur.l, price);
+  cur.c = price;
 }
 
 /* ================= TICK ================= */
@@ -180,21 +135,18 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
 
-  if (isFridayShutdown(ts)) return;
-
-  /* --- Update price first --- */
-  const prevPrice = state.lastPrice;
+  const prev = state.lastPrice;
   state.lastPrice = price;
-  state.learnStats.ticksSeen++;
 
-  /* --- Volatility --- */
-  if (prevPrice) {
-    const change = Math.abs(price - prevPrice) / prevPrice;
+  if (prev) {
+    const change = Math.abs(price - prev) / prev;
     state.volatility =
       state.volatility * 0.9 + change * 0.1;
   }
 
-  /* --- Equity --- */
+  updateCandle(state, price);
+
+  /* === Equity === */
   if (state.position) {
     state.equity =
       state.cashBalance +
@@ -209,18 +161,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     state.equity
   );
 
-  /* --- Risk Layer (Paper Mode Still Evaluated) --- */
-  const risk = riskManager.evaluate({
-    tenantId,
-    equity: state.equity,
-    volatility: state.volatility,
-    trades: state.trades,
-    ts,
-  });
-
-  if (state.learnStats.ticksSeen < WARMUP_TICKS)
-    return;
-
   const plan = makeDecision({
     tenantId,
     symbol,
@@ -228,76 +168,50 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     paper: state,
   });
 
-  state.learnStats.decision = plan.action;
-  state.learnStats.confidence = plan.confidence;
-  state.learnStats.trendEdge = plan.edge;
+  if (plan.action === "BUY" && !state.position) {
+    const portfolioCheck =
+      portfolioManager.evaluate({
+        tenantId,
+        symbol,
+        equity: state.equity,
+        proposedRiskPct: plan.riskPct,
+        paperState: state,
+      });
 
-  /* ================= EXIT ================= */
+    if (!portfolioCheck.allow) return;
+
+    executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action: "BUY",
+      price,
+      riskPct: portfolioCheck.adjustedRiskPct,
+      state,
+      ts,
+    });
+
+    save(tenantId);
+    return;
+  }
 
   if (
     (plan.action === "SELL" ||
       plan.action === "CLOSE") &&
     state.position
   ) {
-    const result =
-      executionEngine.executePaperOrder({
-        tenantId,
-        symbol,
-        action: plan.action,
-        price,
-        riskPct: 0,
-        state,
-        ts,
-      });
-
-    if (result?.result?.type === "EXIT") {
-      const trade = result.result;
-
-      updatePerformance(state, trade);
-      updateAdaptive(state, trade);
-
-      // 🔥 Reinforcement loop into AI
-      aiBrain.recordTradeOutcome({
-        pnl: trade.pnl,
-      });
-    }
+    executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action: "SELL",
+      price,
+      riskPct: 0,
+      state,
+      ts,
+    });
 
     save(tenantId);
     return;
   }
-
-  /* ================= ENTRY ================= */
-
-  if (plan.action !== "BUY" || state.position)
-    return;
-
-  const portfolioCheck =
-    portfolioManager.evaluate({
-      tenantId,
-      symbol,
-      equity: state.equity,
-      proposedRiskPct: plan.riskPct,
-      paperState: state,
-    });
-
-  if (!portfolioCheck.allow) return;
-
-  let adjustedRisk =
-    portfolioCheck.adjustedRiskPct *
-    (risk.riskMultiplier || 1);
-
-  adjustedRisk *= state.adaptive.riskBoost;
-  adjustedRisk = clamp(adjustedRisk, 0.001, 0.08);
-
-  executionEngine.executePaperOrder({
-    tenantId,
-    symbol,
-    action: "BUY",
-    price,
-    riskPct: adjustedRisk,
-    state,
-    ts,
-  });
 
   save(tenantId);
 }
@@ -317,16 +231,33 @@ function snapshot(tenantId) {
   };
 }
 
+function getCandles(tenantId, limit = 200) {
+  const state = load(tenantId);
+  return state.candles.slice(-limit).map(c => ({
+    time: c.t,
+    open: c.o,
+    high: c.h,
+    low: c.l,
+    close: c.c,
+  }));
+}
+
+function getMarketPrice(tenantId) {
+  return load(tenantId).lastPrice;
+}
+
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
   save(tenantId);
-  riskManager.resetTenant(tenantId);
-  portfolioManager.resetTenant(tenantId);
-  aiBrain.resetBrain();
+  riskManager.resetTenant?.(tenantId);
+  portfolioManager.resetTenant?.(tenantId);
+  aiBrain.resetBrain?.();
 }
 
 module.exports = {
   tick,
   snapshot,
+  getCandles,
+  getMarketPrice,
   hardReset,
 };
