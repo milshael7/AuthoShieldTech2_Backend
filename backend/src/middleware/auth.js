@@ -1,40 +1,13 @@
 // backend/src/middleware/auth.js
-// Phase 26 — Enterprise Access Governance Layer
-// JWT Auth • Subscription Enforcement • Exposure Tier Tagging • Privilege Auditing
+// Enterprise Access Governance Layer — Hardened v3
+// Token Versioned • Role Locked • Subscription Enforced • Replay Resistant
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 const users = require("../users/user.service");
 
-/* ======================================================
-   ROLE CLASSIFICATION
-====================================================== */
-
-const ACCESS_TIERS = {
-  ADMIN: "ADMIN",
-  FINANCE: "FINANCE",
-  MANAGER: "MANAGER",
-  STANDARD: "STANDARD",
-};
-
-function classifyAccessTier(role) {
-  const r = String(role || "").toLowerCase();
-
-  if (r === "admin") return ACCESS_TIERS.ADMIN;
-  if (r === "finance") return ACCESS_TIERS.FINANCE;
-  if (r === "manager") return ACCESS_TIERS.MANAGER;
-
-  return ACCESS_TIERS.STANDARD;
-}
-
-/* ======================================================
-   HELPERS
-====================================================== */
-
-function normRole(r) {
-  return String(r || "").trim().toLowerCase();
-}
+/* ====================================================== */
 
 function extractToken(req) {
   const header = String(req.headers.authorization || "");
@@ -45,14 +18,15 @@ function extractToken(req) {
 }
 
 function error(res, code, message) {
-  return res.status(code).json({
-    ok: false,
-    error: message,
-  });
+  return res.status(code).json({ ok: false, error: message });
 }
 
 function isBillingRoute(req) {
   return req.originalUrl.startsWith("/api/billing");
+}
+
+function norm(v) {
+  return String(v || "").trim().toLowerCase();
 }
 
 /* ======================================================
@@ -61,39 +35,66 @@ function isBillingRoute(req) {
 
 function authRequired(req, res, next) {
   const token = extractToken(req);
-
-  if (!token) {
-    return error(res, 401, "Missing token");
-  }
+  if (!token) return error(res, 401, "Missing token");
 
   let payload;
-
   try {
     payload = verify(token);
   } catch {
     return error(res, 401, "Token expired or invalid");
   }
 
-  if (!payload?.id || !payload?.role) {
+  if (!payload?.id) {
     return error(res, 401, "Invalid token payload");
   }
 
   const db = readDb();
-  const user = (db.users || []).find((u) => u.id === payload.id);
+  const user = (db.users || []).find(u => u.id === payload.id);
 
   if (!user) {
     return error(res, 401, "User no longer exists");
   }
 
-  /* --------------------------------------------------
-     USER STATUS ENFORCEMENT
-  -------------------------------------------------- */
+  /* ======================================================
+     TOKEN VERSION ENFORCEMENT
+  ====================================================== */
+
+  const tokenVersion = Number(payload.tokenVersion || 0);
+  const currentVersion = Number(user.tokenVersion || 0);
+
+  if (tokenVersion !== currentVersion) {
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "ACCESS_DENIED_TOKEN_VERSION_MISMATCH"
+    });
+
+    return error(res, 401, "Session expired");
+  }
+
+  /* ======================================================
+     ROLE MISMATCH PROTECTION
+  ====================================================== */
+
+  if (norm(payload.role) !== norm(user.role)) {
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "ACCESS_DENIED_ROLE_TAMPER_DETECTED"
+    });
+
+    return error(res, 403, "Privilege mismatch");
+  }
+
+  /* ======================================================
+     ACCOUNT LOCK
+  ====================================================== */
 
   if (user.locked === true) {
     writeAudit({
       actor: user.id,
       role: user.role,
-      action: "ACCESS_DENIED_ACCOUNT_LOCKED",
+      action: "ACCESS_DENIED_ACCOUNT_LOCKED"
     });
 
     return error(res, 403, "Account locked");
@@ -103,32 +104,30 @@ function authRequired(req, res, next) {
     return error(res, 403, "Account not approved");
   }
 
-  /* --------------------------------------------------
+  /* ======================================================
      SUBSCRIPTION ENFORCEMENT
-  -------------------------------------------------- */
+  ====================================================== */
 
-  const subscriptionInactive =
+  const inactive =
     user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
     user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
 
-  if (subscriptionInactive && !isBillingRoute(req)) {
+  if (inactive && !isBillingRoute(req)) {
     writeAudit({
       actor: user.id,
       role: user.role,
-      action: "ACCESS_DENIED_SUBSCRIPTION_INACTIVE",
+      action: "ACCESS_DENIED_SUBSCRIPTION_INACTIVE"
     });
 
     return error(res, 403, "Subscription inactive");
   }
 
-  /* --------------------------------------------------
-     COMPANY STATUS ENFORCEMENT
-  -------------------------------------------------- */
+  /* ======================================================
+     COMPANY STATUS
+  ====================================================== */
 
   if (user.companyId && Array.isArray(db.companies)) {
-    const company = db.companies.find(
-      (c) => c.id === user.companyId
-    );
+    const company = db.companies.find(c => c.id === user.companyId);
 
     if (!company) {
       return error(res, 403, "Company not found");
@@ -138,48 +137,45 @@ function authRequired(req, res, next) {
       writeAudit({
         actor: user.id,
         role: user.role,
-        action: "ACCESS_DENIED_COMPANY_SUSPENDED",
+        action: "ACCESS_DENIED_COMPANY_SUSPENDED"
       });
 
       return error(res, 403, "Company suspended");
     }
   }
 
-  /* --------------------------------------------------
-     ACCESS CONTEXT INJECTION
-  -------------------------------------------------- */
-
-  const accessTier = classifyAccessTier(user.role);
+  /* ======================================================
+     ACCESS CONTEXT
+  ====================================================== */
 
   req.user = {
     id: user.id,
     role: user.role,
     companyId: user.companyId || null,
-    subscriptionStatus: user.subscriptionStatus,
-    status: user.status,
+    subscriptionStatus: user.subscriptionStatus
   };
 
-  req.accessContext = {
-    tier: accessTier,
-    isHighPrivilege:
-      accessTier === ACCESS_TIERS.ADMIN ||
-      accessTier === ACCESS_TIERS.FINANCE,
-    requestedAt: Date.now(),
+  req.securityContext = {
+    tokenVersion,
+    verifiedAt: Date.now(),
+    highPrivilege:
+      norm(user.role) === "admin" ||
+      norm(user.role) === "finance"
   };
 
-  /* --------------------------------------------------
-     HIGH PRIVILEGE ACCESS TELEMETRY
-  -------------------------------------------------- */
+  /* ======================================================
+     HIGH PRIVILEGE TELEMETRY
+  ====================================================== */
 
-  if (req.accessContext.isHighPrivilege) {
+  if (req.securityContext.highPrivilege) {
     writeAudit({
       actor: user.id,
       role: user.role,
       action: "HIGH_PRIVILEGE_ACCESS",
       detail: {
         path: req.originalUrl,
-        method: req.method,
-      },
+        method: req.method
+      }
     });
   }
 
@@ -190,43 +186,20 @@ function authRequired(req, res, next) {
    ROLE GUARD
 ====================================================== */
 
-function requireRole(...args) {
-  let opts = {};
-
-  if (
-    args.length &&
-    typeof args[args.length - 1] === "object" &&
-    !Array.isArray(args[args.length - 1])
-  ) {
-    opts = args.pop() || {};
-  }
-
-  const rawRoles = args.flat().filter(Boolean);
-  const allow = new Set(rawRoles.map(normRole));
-
-  const adminRole = normRole(opts.adminRole || "Admin");
-  const adminAlso = !!opts.adminAlso;
+function requireRole(...roles) {
+  const allow = new Set(roles.map(r => norm(r)));
 
   return (req, res, next) => {
     if (!req.user) {
       return error(res, 401, "Missing auth context");
     }
 
-    const userRole = normRole(req.user.role);
-
-    if (userRole === adminRole && adminAlso) {
-      return next();
-    }
-
-    if (!allow.has(userRole)) {
+    if (!allow.has(norm(req.user.role))) {
       writeAudit({
         actor: req.user.id,
         role: req.user.role,
         action: "ACCESS_DENIED_ROLE_MISMATCH",
-        detail: {
-          requiredRoles: rawRoles,
-          attemptedPath: req.originalUrl,
-        },
+        detail: { path: req.originalUrl }
       });
 
       return error(res, 403, "Forbidden");
@@ -238,6 +211,5 @@ function requireRole(...args) {
 
 module.exports = {
   authRequired,
-  requireRole,
-  ACCESS_TIERS,
+  requireRole
 };
