@@ -1,4 +1,4 @@
-// Phase 35 — Admin Platform Control + Executive Intelligence Layer
+// Phase 36 — Admin Platform Control + Full Audit Explorer + Autodev Telemetry
 
 const express = require("express");
 const router = express.Router();
@@ -85,44 +85,40 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
    EXECUTIVE RISK
 ========================================================= */
 
-router.get(
-  "/executive-risk",
-  requireFinanceOrAdmin,
-  (req, res) => {
-    try {
-      const db = readDb();
-      const incidents = db.securityEvents || [];
+router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const incidents = db.securityEvents || [];
 
-      const critical = incidents.filter(
-        (e) => e.severity === "critical"
-      ).length;
+    const critical = incidents.filter(
+      (e) => e.severity === "critical"
+    ).length;
 
-      const high = incidents.filter(
-        (e) => e.severity === "high"
-      ).length;
+    const high = incidents.filter(
+      (e) => e.severity === "high"
+    ).length;
 
-      const score = Math.min(100, critical * 20 + high * 10);
+    const score = Math.min(100, critical * 20 + high * 10);
 
-      res.json({
-        ok: true,
-        executiveRisk: {
-          score,
-          level:
-            score > 75
-              ? "Critical"
-              : score > 40
-              ? "Elevated"
-              : "Stable",
-        },
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
+    res.json({
+      ok: true,
+      executiveRisk: {
+        score,
+        level:
+          score > 75
+            ? "Critical"
+            : score > 40
+            ? "Elevated"
+            : "Stable",
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-);
+});
 
 /* =========================================================
-   AUDIT PREVIEW (NEW)
+   AUDIT PREVIEW (Last 20)
 ========================================================= */
 
 router.get("/audit-preview", requireAdmin, (req, res) => {
@@ -148,7 +144,97 @@ router.get("/audit-preview", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   AUTODEV GLOBAL STATS (NEW)
+   FULL AUDIT EXPLORER (Pagination + Filters)
+========================================================= */
+
+router.get("/audit", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    let audit = db.audit || db.auditEvents || [];
+
+    const {
+      page = 1,
+      limit = 25,
+      actorId,
+      action,
+      startDate,
+      endDate,
+      search,
+    } = req.query;
+
+    audit = [...audit];
+
+    // Filter by actor
+    if (actorId) {
+      audit = audit.filter(
+        (e) => String(e.actorId) === String(actorId)
+      );
+    }
+
+    // Filter by action
+    if (action) {
+      audit = audit.filter((e) =>
+        String(e.action || "")
+          .toLowerCase()
+          .includes(String(action).toLowerCase())
+      );
+    }
+
+    // Date filtering
+    if (startDate) {
+      const start = new Date(startDate).getTime();
+      audit = audit.filter(
+        (e) =>
+          new Date(e.timestamp).getTime() >= start
+      );
+    }
+
+    if (endDate) {
+      const end = new Date(endDate).getTime();
+      audit = audit.filter(
+        (e) =>
+          new Date(e.timestamp).getTime() <= end
+      );
+    }
+
+    // Search filter
+    if (search) {
+      const s = String(search).toLowerCase();
+      audit = audit.filter((e) =>
+        JSON.stringify(e).toLowerCase().includes(s)
+      );
+    }
+
+    // Sort newest first
+    audit.sort(
+      (a, b) =>
+        new Date(b.timestamp).getTime() -
+        new Date(a.timestamp).getTime()
+    );
+
+    const pageNum = Math.max(1, Number(page));
+    const perPage = Math.max(1, Math.min(100, Number(limit)));
+    const startIndex = (pageNum - 1) * perPage;
+
+    const paginated = audit.slice(
+      startIndex,
+      startIndex + perPage
+    );
+
+    res.json({
+      ok: true,
+      page: pageNum,
+      total: audit.length,
+      pages: Math.ceil(audit.length / perPage),
+      events: paginated,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   AUTODEV GLOBAL STATS
 ========================================================= */
 
 router.get("/autodev-stats", requireAdmin, (req, res) => {
@@ -174,7 +260,8 @@ router.get("/autodev-stats", requireAdmin, (req, res) => {
 
     const totalAttachedCompanies = usersList.reduce(
       (sum, u) =>
-        sum + (Array.isArray(u.managedCompanies)
+        sum +
+        (Array.isArray(u.managedCompanies)
           ? u.managedCompanies.length
           : 0),
       0
@@ -206,35 +293,12 @@ router.get("/autodev-stats", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   TENANTS
-========================================================= */
-
-router.get("/tenants", requireAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const companies = db.companies || [];
-
-    res.json({
-      ok: true,
-      tenants: companies.map((c) => ({
-        id: c.id,
-        name: c.name,
-        status: c.status || "Active",
-      })),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
    PLATFORM HEALTH
 ========================================================= */
 
 router.get("/platform-health", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-
     const usersList = db.users || [];
     const events = db.securityEvents || [];
 
