@@ -1,6 +1,6 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Distributed Session Hardened
-// Token Versioned • JTI Revocation • Replay Guard • Subscription Enforced
+// Enterprise Access Governance Layer — Device Bound Zero Trust
+// Token Versioned • JTI Revocation • Replay Guard • Device Binding Enforced
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -10,6 +10,11 @@ const {
   revokeToken,
   isRevoked
 } = require("../lib/sessionStore");
+
+const {
+  buildFingerprint,
+  classifyDeviceRisk
+} = require("../lib/deviceFingerprint");
 
 const users = require("../users/user.service");
 
@@ -40,6 +45,7 @@ function norm(v) {
 ====================================================== */
 
 function authRequired(req, res, next) {
+
   const token = extractToken(req);
   if (!token) return error(res, 401, "Missing token");
 
@@ -55,9 +61,7 @@ function authRequired(req, res, next) {
     return error(res, 401, "Invalid token payload");
   }
 
-  /* ======================================================
-     JTI REPLAY / REVOCATION CHECK
-  ====================================================== */
+  /* ================= JTI REVOCATION ================= */
 
   if (isRevoked(payload.jti)) {
     writeAudit({
@@ -77,9 +81,7 @@ function authRequired(req, res, next) {
     return error(res, 401, "User no longer exists");
   }
 
-  /* ======================================================
-     TOKEN VERSION ENFORCEMENT
-  ====================================================== */
+  /* ================= TOKEN VERSION ================= */
 
   const tokenVersion = Number(payload.tokenVersion || 0);
   const currentVersion = Number(user.tokenVersion || 0);
@@ -97,9 +99,7 @@ function authRequired(req, res, next) {
     return error(res, 401, "Session expired");
   }
 
-  /* ======================================================
-     ROLE MISMATCH PROTECTION
-  ====================================================== */
+  /* ================= ROLE TAMPER ================= */
 
   if (norm(payload.role) !== norm(user.role)) {
 
@@ -114,9 +114,28 @@ function authRequired(req, res, next) {
     return error(res, 403, "Privilege mismatch");
   }
 
-  /* ======================================================
-     ACCOUNT LOCK
-  ====================================================== */
+  /* ================= DEVICE BINDING ================= */
+
+  const deviceCheck = classifyDeviceRisk(
+    user.activeDeviceFingerprint,
+    req
+  );
+
+  if (!deviceCheck.match) {
+
+    revokeToken(payload.jti);
+
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "DEVICE_MISMATCH_DETECTED",
+      detail: { risk: deviceCheck.risk }
+    });
+
+    return error(res, 401, "Device verification failed");
+  }
+
+  /* ================= ACCOUNT STATUS ================= */
 
   if (user.locked === true) {
     revokeToken(payload.jti);
@@ -134,9 +153,7 @@ function authRequired(req, res, next) {
     return error(res, 403, "Account not approved");
   }
 
-  /* ======================================================
-     SUBSCRIPTION ENFORCEMENT
-  ====================================================== */
+  /* ================= SUBSCRIPTION ================= */
 
   const inactive =
     user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
@@ -154,14 +171,13 @@ function authRequired(req, res, next) {
     return error(res, 403, "Subscription inactive");
   }
 
-  /* ======================================================
-     COMPANY STATUS
-  ====================================================== */
+  /* ================= COMPANY ================= */
 
   if (user.companyId && Array.isArray(db.companies)) {
     const company = db.companies.find(c => c.id === user.companyId);
 
     if (!company || company.status === "Suspended") {
+
       revokeToken(payload.jti);
 
       writeAudit({
@@ -174,15 +190,11 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ======================================================
-     REGISTER ACTIVE SESSION
-  ====================================================== */
+  /* ================= REGISTER SESSION ================= */
 
   registerSession(user.id, payload.jti);
 
-  /* ======================================================
-     ACCESS CONTEXT
-  ====================================================== */
+  /* ================= CONTEXT ================= */
 
   req.user = {
     id: user.id,
@@ -200,9 +212,7 @@ function authRequired(req, res, next) {
       norm(user.role) === "finance"
   };
 
-  /* ======================================================
-     HIGH PRIVILEGE TELEMETRY
-  ====================================================== */
+  /* ================= HIGH PRIVILEGE LOG ================= */
 
   if (req.securityContext.highPrivilege) {
     writeAudit({
