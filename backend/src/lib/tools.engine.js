@@ -1,22 +1,14 @@
 // backend/src/lib/tools.engine.js
 // Enterprise Tools Engine Core
-// Centralized access control + catalog logic
-// Used by routes layer (tools.routes.js)
+// Entitlement-based access control (billing-ready)
 
-/*
-   ROLE MODEL (from user.service):
-   ADMIN
-   MANAGER
-   COMPANY
-   SMALL_COMPANY
-   INDIVIDUAL
+const {
+  userHasTool
+} = require("./entitlement.engine");
 
-   SUBSCRIPTION:
-   TRIAL
-   ACTIVE
-   PAST_DUE
-   LOCKED
-*/
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function normalizeArray(v) {
   if (!v) return [];
@@ -43,24 +35,20 @@ function isIndividual(user, ROLES) {
   return user?.role === ROLES.INDIVIDUAL;
 }
 
-function isSubscriptionActive(user, SUBSCRIPTION) {
-  return user?.subscriptionStatus === SUBSCRIPTION.ACTIVE;
-}
-
 /* =========================================================
-   TOOL ACCESS CORE LOGIC
+   TOOL ACCESS CORE LOGIC (ENTITLEMENT DRIVEN)
 ========================================================= */
 
-function canAccessTool(user, tool, ROLES, SUBSCRIPTION) {
+function canAccessTool(user, tool, ROLES) {
   if (!user || !tool) return false;
   if (tool.enabled === false) return false;
 
-  // ADMIN — unlimited
+  // ADMIN — full override
   if (isAdmin(user, ROLES)) {
     return tool.adminAllowed !== false;
   }
 
-  // MANAGER — high-level access
+  // MANAGER — full operational access
   if (isManager(user, ROLES)) {
     if (tool.enterpriseOnly) {
       return tool.managerAllowed === true;
@@ -68,20 +56,20 @@ function canAccessTool(user, tool, ROLES, SUBSCRIPTION) {
     return tool.managerAllowed !== false;
   }
 
-  // COMPANY — business/security only if allowed
+  // COMPANY — only explicitly allowed tools
   if (isCompany(user, ROLES)) {
     return tool.companyAllowed === true;
   }
 
-  // INDIVIDUAL
+  // INDIVIDUAL — entitlement required for paid/enterprise tools
   if (isIndividual(user, ROLES)) {
+
+    // Free tools always allowed
     if (tool.tier === "free") return true;
 
-    if (
-      tool.tier === "paid" &&
-      isSubscriptionActive(user, SUBSCRIPTION)
-    ) {
-      return true;
+    // Paid or enterprise require entitlement
+    if (tool.tier === "paid" || tool.tier === "enterprise") {
+      return userHasTool(user, tool.id);
     }
 
     return false;
@@ -134,7 +122,7 @@ function seedToolsIfEmpty(db) {
       enterpriseOnly: false,
       adminAllowed: true,
       managerAllowed: true,
-      companyAllowed: false, // per your rule
+      companyAllowed: false,
     },
     {
       id: "enterprise-radar",
