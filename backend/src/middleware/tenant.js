@@ -1,8 +1,9 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v5)
-// Strict Isolation • Suspension Aware • Restricted Aware
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v6)
+// Strict Isolation • Cross-Tenant Detection • Audit Integrated
 
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
 
 function clean(v, max = 100) {
   return String(v ?? "").trim().slice(0, max);
@@ -31,20 +32,42 @@ function resolveFromSubdomain(req) {
   return clean(parts[0], 50);
 }
 
-function tenantMiddleware(req, res, next) {
+function recordViolation(dbUser, reason, meta = {}) {
+  audit({
+    actor: dbUser.id,
+    role: dbUser.role,
+    action: "TENANT_BOUNDARY_VIOLATION",
+    metadata: { reason, ...meta },
+  });
 
-  // Only enforce tenant for authenticated users
-  if (!req.user) {
-    return next();
-  }
+  updateDb((db) => {
+    const u = db.users.find(x => x.id === dbUser.id);
+    if (!u) return db;
+
+    if (!u.securityFlags) u.securityFlags = {};
+    u.securityFlags.tenantViolations =
+      (u.securityFlags.tenantViolations || 0) + 1;
+
+    // Auto-lock after 5 violations
+    if (u.securityFlags.tenantViolations >= 5) {
+      u.locked = true;
+      audit({
+        actor: u.id,
+        role: u.role,
+        action: "ACCOUNT_AUTO_LOCKED_TENANT_ABUSE",
+      });
+    }
+
+    return db;
+  });
+}
+
+function tenantMiddleware(req, res, next) {
+  if (!req.user) return next();
 
   const db = readDb();
   const role = normRole(req.user.role);
   const isAdmin = role === "admin";
-
-  /* =====================================================
-     GLOBAL USER LOCK CHECK
-  ===================================================== */
 
   const dbUser = (db.users || []).find(u => u.id === req.user.id);
 
@@ -59,9 +82,9 @@ function tenantMiddleware(req, res, next) {
   let companyId = null;
   let resolvedFrom = null;
 
-  /* =====================================================
+  /* =============================
      RESOLUTION ORDER
-  ===================================================== */
+  ============================== */
 
   if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
@@ -84,9 +107,9 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  /* =====================================================
+  /* =============================
      ADMIN GLOBAL MODE
-  ===================================================== */
+  ============================== */
 
   if (isAdmin && !companyId) {
     req.tenant = {
@@ -101,18 +124,14 @@ function tenantMiddleware(req, res, next) {
       restricted: false,
       scope: {
         isAdmin: true,
-        isManager: false,
-        isCompany: false,
-        isIndividual: false,
       },
     };
-
     return next();
   }
 
-  /* =====================================================
+  /* =============================
      TENANT ENFORCEMENT
-  ===================================================== */
+  ============================== */
 
   if (companyId) {
 
@@ -120,12 +139,10 @@ function tenantMiddleware(req, res, next) {
       (db.companies || []).find(c => c.id === companyId);
 
     if (!company) {
-      return res.status(404).json({
-        error: "Company not found",
-      });
+      recordViolation(dbUser, "COMPANY_NOT_FOUND", { companyId });
+      return res.status(404).json({ error: "Company not found" });
     }
 
-    // Hard suspension
     if (company.status === "Suspended") {
       return res.status(403).json({
         error: "Company suspended",
@@ -133,6 +150,26 @@ function tenantMiddleware(req, res, next) {
     }
 
     const isRestricted = company.status === "Restricted";
+
+    /* =============================
+       OWNERSHIP VALIDATION
+    ============================== */
+
+    const userBelongs =
+      isAdmin ||
+      dbUser.companyId === companyId ||
+      (Array.isArray(dbUser.managedCompanies) &&
+        dbUser.managedCompanies.includes(companyId));
+
+    if (!userBelongs) {
+      recordViolation(dbUser, "CROSS_TENANT_ACCESS_ATTEMPT", {
+        attemptedCompany: companyId,
+      });
+
+      return res.status(403).json({
+        error: "Tenant boundary violation",
+      });
+    }
 
     req.tenant = {
       id: companyId,
