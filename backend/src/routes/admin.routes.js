@@ -1,5 +1,4 @@
-// backend/src/routes/admin.routes.js
-// Phase 34 — Admin Platform Control + Autodev Tier Governance
+// Phase 35 — Admin Platform Control + Executive Intelligence Layer
 
 const express = require("express");
 const router = express.Router();
@@ -25,26 +24,16 @@ function requireAdmin(req, res, next) {
 }
 
 function requireFinanceOrAdmin(req, res, next) {
-  if (req.user.role !== ADMIN_ROLE && req.user.role !== FINANCE_ROLE) {
-    return res.status(403).json({ ok: false, error: "Finance or Admin only" });
+  if (
+    req.user.role !== ADMIN_ROLE &&
+    req.user.role !== FINANCE_ROLE
+  ) {
+    return res.status(403).json({
+      ok: false,
+      error: "Finance or Admin only",
+    });
   }
   next();
-}
-
-/* =========================================================
-   INTERNAL HELPER — ENSURE ADMIN STATE
-========================================================= */
-
-function ensureAdminState(db) {
-  if (!db.adminState) {
-    db.adminState = {
-      defenseMode: "auto",
-      protectedTenants: []
-    };
-  }
-  if (!Array.isArray(db.adminState.protectedTenants)) {
-    db.adminState.protectedTenants = [];
-  }
 }
 
 /* =========================================================
@@ -56,11 +45,24 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
     const db = readDb();
     const usersList = db.users || [];
 
-    const activeSubscribers = usersList.filter(u => u.subscriptionStatus === "Active").length;
-    const trialUsers = usersList.filter(u => u.subscriptionStatus === "Trial").length;
-    const lockedUsers = usersList.filter(u => u.subscriptionStatus === "Locked").length;
+    const activeSubscribers = usersList.filter(
+      (u) => String(u.subscriptionStatus).toLowerCase() === "active"
+    ).length;
 
-    const totalRevenue = Number(db.revenueSummary?.totalRevenue || 0);
+    const trialUsers = usersList.filter(
+      (u) => String(u.subscriptionStatus).toLowerCase() === "trial"
+    ).length;
+
+    const lockedUsers = usersList.filter(
+      (u) => String(u.subscriptionStatus).toLowerCase() === "locked"
+    ).length;
+
+    const totalRevenue = Number(
+      db.revenueSummary?.totalRevenue || 0
+    );
+
+    const MRR = Number(db.revenueSummary?.MRR || 0);
+    const churnRate = Number(db.revenueSummary?.churnRate || 0);
 
     res.json({
       ok: true,
@@ -69,10 +71,11 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
         activeSubscribers,
         trialUsers,
         lockedUsers,
-        totalRevenue
-      }
+        totalRevenue,
+        MRR,
+        churnRate,
+      },
     });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -82,27 +85,121 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
    EXECUTIVE RISK
 ========================================================= */
 
-router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
+router.get(
+  "/executive-risk",
+  requireFinanceOrAdmin,
+  (req, res) => {
+    try {
+      const db = readDb();
+      const incidents = db.securityEvents || [];
+
+      const critical = incidents.filter(
+        (e) => e.severity === "critical"
+      ).length;
+
+      const high = incidents.filter(
+        (e) => e.severity === "high"
+      ).length;
+
+      const score = Math.min(100, critical * 20 + high * 10);
+
+      res.json({
+        ok: true,
+        executiveRisk: {
+          score,
+          level:
+            score > 75
+              ? "Critical"
+              : score > 40
+              ? "Elevated"
+              : "Stable",
+        },
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  }
+);
+
+/* =========================================================
+   AUDIT PREVIEW (NEW)
+========================================================= */
+
+router.get("/audit-preview", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-    const incidents = db.securityEvents || [];
+    const audit = db.audit || db.auditEvents || [];
 
-    const critical = incidents.filter(e => e.severity === "critical").length;
-    const high = incidents.filter(e => e.severity === "high").length;
-
-    const score = Math.min(100, critical * 20 + high * 10);
+    const sorted = [...audit]
+      .sort(
+        (a, b) =>
+          new Date(b.timestamp).getTime() -
+          new Date(a.timestamp).getTime()
+      )
+      .slice(0, 20);
 
     res.json({
       ok: true,
-      executiveRisk: {
-        score,
-        level:
-          score > 75 ? "Critical" :
-          score > 40 ? "Elevated" :
-          "Stable"
-      }
+      events: sorted,
     });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
+/* =========================================================
+   AUTODEV GLOBAL STATS (NEW)
+========================================================= */
+
+router.get("/autodev-stats", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const usersList = db.users || [];
+
+    const totalSubscribers = usersList.filter(
+      (u) => u.autoprotectEnabled === true
+    ).length;
+
+    const activeSubscribers = usersList.filter(
+      (u) =>
+        u.autoprotectEnabled === true &&
+        String(u.subscriptionStatus).toLowerCase() === "active"
+    ).length;
+
+    const pastDueSubscribers = usersList.filter(
+      (u) =>
+        u.autoprotectEnabled === true &&
+        String(u.subscriptionStatus).toLowerCase() === "pastdue"
+    ).length;
+
+    const totalAttachedCompanies = usersList.reduce(
+      (sum, u) =>
+        sum + (Array.isArray(u.managedCompanies)
+          ? u.managedCompanies.length
+          : 0),
+      0
+    );
+
+    const automationLoadScore =
+      totalAttachedCompanies > 0
+        ? Math.min(
+            100,
+            Math.round(
+              (totalAttachedCompanies /
+                (totalSubscribers || 1)) *
+                10
+            )
+          )
+        : 0;
+
+    res.json({
+      ok: true,
+      totalSubscribers,
+      activeSubscribers,
+      pastDueSubscribers,
+      totalAttachedCompanies,
+      automationLoadScore,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -119,102 +216,12 @@ router.get("/tenants", requireAdmin, (req, res) => {
 
     res.json({
       ok: true,
-      tenants: companies.map(c => ({
+      tenants: companies.map((c) => ({
         id: c.id,
         name: c.name,
-        status: c.status || "Active"
-      }))
+        status: c.status || "Active",
+      })),
     });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   AUTODEV — USER TIER GOVERNANCE
-========================================================= */
-
-/**
- * List users with tier info
- */
-router.get("/users/tier", requireAdmin, (req, res) => {
-  try {
-    const db = readDb();
-    const usersList = db.users || [];
-
-    res.json({
-      ok: true,
-      users: usersList.map(u => ({
-        id: u.id,
-        email: u.email,
-        role: u.role,
-        freedomEnabled: !!u.freedomEnabled,
-        autoprotectEnabled: !!u.autoprotectEnabled,
-        managedCompanies: u.managedCompanies?.length || 0
-      }))
-    });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/**
- * Grant Freedom (Seat / Individual Upgrade)
- */
-router.post("/users/:userId/grant-freedom", requireAdmin, (req, res) => {
-  try {
-    const { userId } = req.params;
-    const db = readDb();
-
-    const u = db.users.find(x => x.id === userId);
-    if (!u) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
-
-    u.freedomEnabled = true;
-    u.updatedAt = new Date().toISOString();
-
-    writeDb(db);
-
-    res.json({
-      ok: true,
-      message: "Freedom granted",
-      userId
-    });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/**
- * Revoke Freedom
- */
-router.post("/users/:userId/revoke-freedom", requireAdmin, (req, res) => {
-  try {
-    const { userId } = req.params;
-    const db = readDb();
-
-    const u = db.users.find(x => x.id === userId);
-    if (!u) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
-
-    u.freedomEnabled = false;
-    u.autoprotectEnabled = false;
-    u.managedCompanies = [];
-    u.updatedAt = new Date().toISOString();
-
-    writeDb(db);
-
-    res.json({
-      ok: true,
-      message: "Freedom revoked",
-      userId
-    });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -231,8 +238,14 @@ router.get("/platform-health", requireAdmin, (req, res) => {
     const usersList = db.users || [];
     const events = db.securityEvents || [];
 
-    const activeUsers = usersList.filter(u => u.subscriptionStatus === "Active").length;
-    const criticalEvents = events.filter(e => e.severity === "critical").length;
+    const activeUsers = usersList.filter(
+      (u) =>
+        String(u.subscriptionStatus).toLowerCase() === "active"
+    ).length;
+
+    const criticalEvents = events.filter(
+      (e) => e.severity === "critical"
+    ).length;
 
     res.json({
       ok: true,
@@ -240,10 +253,9 @@ router.get("/platform-health", requireAdmin, (req, res) => {
         systemStatus: "Operational",
         activeUsers,
         criticalEvents,
-        totalEvents: events.length
-      }
+        totalEvents: events.length,
+      },
     });
-
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
