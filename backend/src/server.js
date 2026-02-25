@@ -7,7 +7,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 
-const { ensureDb, readDb, writeDb } = require("./lib/db");
+const { ensureDb, readDb } = require("./lib/db");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
@@ -36,7 +36,7 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-/* ================= HEALTH ROUTE (FIXED PROPERLY) ================= */
+/* ================= HEALTH ROUTE ================= */
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -53,10 +53,15 @@ app.get("/health", (req, res) => {
 /* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
+
 app.use(tenantMiddleware);
+
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
+
+/* 🔥 Autodev 6.5 Route (NEW) */
+app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 /* ================= SERVER ================= */
 
@@ -104,9 +109,6 @@ const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
 
 const baselineMemory = new Map();
-const forecastMemory = new Map();
-const behaviorMemory = new Map();
-const lockdownMemory = new Map();
 
 function detectIntelligence() {
   const db = readDb();
