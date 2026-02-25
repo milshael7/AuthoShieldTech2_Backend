@@ -1,4 +1,5 @@
-// Phase 37 — Hardened Admin Control + Enterprise Audit Engine + Autodev Telemetry
+// backend/src/routes/admin.routes.js
+// Phase 38 — Hardened Admin Control + Enterprise Audit Engine + Autodev Telemetry (Frontend Aligned)
 
 const express = require("express");
 const router = express.Router();
@@ -79,10 +80,7 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       (u) => String(u.subscriptionStatus).toLowerCase() === "locked"
     ).length;
 
-    const totalRevenue = Number(
-      db.revenueSummary?.totalRevenue || 0
-    );
-
+    const totalRevenue = Number(db.revenueSummary?.totalRevenue || 0);
     const MRR = Number(db.revenueSummary?.MRR || 0);
     const churnRate = Number(db.revenueSummary?.churnRate || 0);
 
@@ -140,13 +138,72 @@ router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   FULL AUDIT EXPLORER — HARDENED
+   COMPLIANCE REPORT (NEW — FRONTEND REQUIRED)
+========================================================= */
+
+router.get("/compliance", requireFinanceOrAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const vulns = db.vulnerabilities || [];
+
+    const critical = vulns.filter(v => v.severity === "critical").length;
+    const high = vulns.filter(v => v.severity === "high").length;
+    const medium = vulns.filter(v => v.severity === "medium").length;
+
+    let complianceScore =
+      100 - (critical * 10 + high * 6 + medium * 3);
+
+    complianceScore = Math.max(10, Math.min(100, complianceScore));
+
+    res.json({
+      ok: true,
+      complianceReport: {
+        complianceScore,
+        critical,
+        high,
+        medium,
+      },
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   AUDIT PREVIEW (NEW — DASHBOARD REQUIRED)
+========================================================= */
+
+router.get("/audit-preview", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    let audit = db.audit || db.auditEvents || [];
+
+    audit = audit
+      .map(normalizeAuditRow)
+      .sort(
+        (a, b) =>
+          safeDate(b.timestamp) - safeDate(a.timestamp)
+      )
+      .slice(0, 20);
+
+    res.json({
+      ok: true,
+      events: audit,
+    });
+
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   FULL AUDIT EXPLORER
 ========================================================= */
 
 router.get("/audit", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-
     let audit = db.audit || db.auditEvents || [];
     audit = audit.map(normalizeAuditRow);
 
@@ -159,8 +216,6 @@ router.get("/audit", requireAdmin, (req, res) => {
       endDate,
       search,
     } = req.query;
-
-    /* ---------- Filters ---------- */
 
     if (actorId) {
       audit = audit.filter(
@@ -196,14 +251,10 @@ router.get("/audit", requireAdmin, (req, res) => {
       );
     }
 
-    /* ---------- Sort ---------- */
-
     audit.sort(
       (a, b) =>
         safeDate(b.timestamp) - safeDate(a.timestamp)
     );
-
-    /* ---------- Pagination ---------- */
 
     const pageNum = Math.max(1, Number(page));
     const perPage = Math.max(1, Math.min(100, Number(limit)));
@@ -252,34 +303,11 @@ router.get("/autodev-stats", requireAdmin, (req, res) => {
         String(u.subscriptionStatus).toLowerCase() === "pastdue"
     ).length;
 
-    const totalAttachedCompanies = usersList.reduce(
-      (sum, u) =>
-        sum +
-        (Array.isArray(u.managedCompanies)
-          ? u.managedCompanies.length
-          : 0),
-      0
-    );
-
-    const automationLoadScore =
-      totalAttachedCompanies > 0
-        ? Math.min(
-            100,
-            Math.round(
-              (totalAttachedCompanies /
-                (totalSubscribers || 1)) *
-                10
-            )
-          )
-        : 0;
-
     res.json({
       ok: true,
       totalSubscribers,
       activeSubscribers,
       pastDueSubscribers,
-      totalAttachedCompanies,
-      automationLoadScore,
     });
 
   } catch (e) {
@@ -315,6 +343,7 @@ router.get("/platform-health", requireAdmin, (req, res) => {
         totalEvents: events.length,
       },
     });
+
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
