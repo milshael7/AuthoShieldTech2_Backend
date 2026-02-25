@@ -1,5 +1,5 @@
 // backend/src/services/strategyEngine.js
-// Phase 9.5 — Institutional Regime-Aware Strategy Core
+// Phase 10 — Institutional Regime-Aware Strategy Core (Corrected)
 // Persistent Learning + Regime Detection + Adaptive Weighting
 // Tenant Safe • Deterministic • Disk Persisted
 
@@ -29,7 +29,7 @@ const BASE_CONFIG = Object.freeze({
    LEARNING CONFIG
 ========================================================= */
 
-const LEARNING_VERSION = 2;
+const LEARNING_VERSION = 3;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
@@ -56,7 +56,6 @@ function defaultLearning() {
     confidenceMultiplier: 1,
     lastWinRate: 0.5,
     lastEvaluatedTradeCount: 0,
-    regimeMemory: "neutral",
     lastUpdated: Date.now(),
   };
 }
@@ -116,17 +115,9 @@ function detectRegime({ price, lastPrice, volatility }) {
 
   const move = Math.abs((price - lastPrice) / lastPrice);
 
-  if (volatility > 0.02 && move > 0.01) {
-    return "expansion";
-  }
-
-  if (move > volatility * 1.5) {
-    return "trend";
-  }
-
-  if (move < volatility * 0.5) {
-    return "range";
-  }
+  if (volatility > 0.02 && move > 0.01) return "expansion";
+  if (move > volatility * 1.5) return "trend";
+  if (move < volatility * 0.5) return "range";
 
   return "neutral";
 }
@@ -142,6 +133,7 @@ function computeEdge({ price, lastPrice, volatility, regime }) {
 
   const vol = volatility || 0.002;
   const momentum = (price - lastPrice) / lastPrice;
+
   let normalized = momentum / (vol || 0.001);
 
   if (regime === "trend") {
@@ -164,13 +156,8 @@ function computeConfidence({ edge, ticksSeen, regime }) {
 
   let base = Math.abs(edge) * 6;
 
-  if (regime === "expansion") {
-    base *= 1.1;
-  }
-
-  if (regime === "range") {
-    base *= 0.85;
-  }
+  if (regime === "expansion") base *= 1.1;
+  if (regime === "range") base *= 0.85;
 
   return clamp(base, 0, 1);
 }
@@ -201,7 +188,6 @@ function adaptFromPerformance(tenantId, paperState) {
   if (winRate < 0.45) {
     learning.edgeMultiplier =
       clamp(learning.edgeMultiplier * 1.06, 1, 2);
-
     learning.confidenceMultiplier =
       clamp(learning.confidenceMultiplier * 1.04, 1, 1.5);
   }
@@ -209,7 +195,6 @@ function adaptFromPerformance(tenantId, paperState) {
   if (winRate > 0.65) {
     learning.edgeMultiplier =
       clamp(learning.edgeMultiplier * 0.97, 0.7, 1.5);
-
     learning.confidenceMultiplier =
       clamp(learning.confidenceMultiplier * 0.97, 0.7, 1.3);
   }
@@ -218,77 +203,6 @@ function adaptFromPerformance(tenantId, paperState) {
   learning.lastUpdated = Date.now();
 
   saveLearning(tenantId);
-}
-
-/* =========================================================
-   RULE EVALUATION
-========================================================= */
-
-function evaluateRules({
-  tenantId,
-  price,
-  edge,
-  confidence,
-  limits,
-  paperState,
-  regime,
-}) {
-  const learning = loadLearning(tenantId);
-
-  adaptFromPerformance(tenantId, paperState);
-
-  const adaptiveMinEdge =
-    BASE_CONFIG.minEdge * learning.edgeMultiplier;
-
-  const adaptiveMinConfidence =
-    BASE_CONFIG.minConfidence * learning.confidenceMultiplier;
-
-  if (!Number.isFinite(price)) {
-    return { action: "WAIT", reason: "Invalid price." };
-  }
-
-  if (limits?.halted) {
-    return { action: "WAIT", reason: "Trading halted." };
-  }
-
-  if (limits?.tradesToday >= BASE_CONFIG.maxDailyTrades) {
-    return { action: "WAIT", reason: "Daily trade cap reached." };
-  }
-
-  if (confidence < adaptiveMinConfidence) {
-    return { action: "WAIT", reason: "Adaptive confidence filter." };
-  }
-
-  if (Math.abs(edge) < adaptiveMinEdge) {
-    return { action: "WAIT", reason: "Adaptive edge filter." };
-  }
-
-  if (edge > 0) return { action: "BUY", reason: `Regime: ${regime}` };
-  if (edge < 0) return { action: "SELL", reason: `Regime: ${regime}` };
-
-  return { action: "WAIT", reason: "No signal." };
-}
-
-/* =========================================================
-   RISK MODEL
-========================================================= */
-
-function adjustRisk({ limits, regime }) {
-  let risk = BASE_CONFIG.baseRiskPct * 2;
-
-  if (regime === "range") {
-    risk *= 0.7;
-  }
-
-  if (limits?.lossesToday >= 2) {
-    risk = BASE_CONFIG.baseRiskPct;
-  }
-
-  return clamp(
-    risk,
-    BASE_CONFIG.baseRiskPct,
-    BASE_CONFIG.maxRiskPct
-  );
 }
 
 /* =========================================================
@@ -307,46 +221,62 @@ function buildDecision(context = {}) {
     paperState = null,
   } = context;
 
+  const learning = loadLearning(tenantId);
+  adaptFromPerformance(tenantId, paperState);
+
   const regime = detectRegime({
     price,
     lastPrice,
     volatility,
   });
 
-  const edgeRaw = computeEdge({
+  let edge = computeEdge({
     price,
     lastPrice,
     volatility,
     regime,
   });
 
-  const confidenceRaw = computeConfidence({
-    edge: edgeRaw,
+  let confidence = computeConfidence({
+    edge,
     ticksSeen,
     regime,
   });
 
-  const ruleResult = evaluateRules({
-    tenantId,
-    price,
-    edge: edgeRaw,
-    confidence: confidenceRaw,
-    limits,
-    paperState,
-    regime,
-  });
+  /* 🔥 APPLY LEARNING MULTIPLIERS */
 
-  const riskPct = adjustRisk({ limits, regime });
+  edge *= learning.edgeMultiplier;
+  confidence *= learning.confidenceMultiplier;
+
+  edge = clamp(edge, -0.05, 0.05);
+  confidence = clamp(confidence, 0, 1);
+
+  if (!Number.isFinite(price)) {
+    return { action: "WAIT", confidence: 0, edge: 0 };
+  }
+
+  if (confidence < BASE_CONFIG.minConfidence) {
+    return { action: "WAIT", confidence, edge };
+  }
+
+  if (Math.abs(edge) < BASE_CONFIG.minEdge) {
+    return { action: "WAIT", confidence, edge };
+  }
+
+  const riskPct = clamp(
+    BASE_CONFIG.baseRiskPct,
+    BASE_CONFIG.baseRiskPct,
+    BASE_CONFIG.maxRiskPct
+  );
 
   return {
     symbol,
-    action: ruleResult.action,
-    reason: ruleResult.reason,
-    confidence: confidenceRaw,
-    edge: edgeRaw,
+    action: edge > 0 ? "BUY" : "SELL",
+    confidence,
+    edge,
     riskPct,
     regime,
-    learning: loadLearning(tenantId),
+    learning,
     ts: Date.now(),
   };
 }
