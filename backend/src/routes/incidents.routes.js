@@ -1,16 +1,52 @@
+// backend/src/routes/incidents.routes.js
+// Enterprise Incident Engine — Hardened v2
+// Auth Protected • Company Scoped • Role Aware
+
 const express = require("express");
 const router = express.Router();
-const { readDb, ensureDb } = require("../lib/db");
+
+const { readDb, writeDb } = require("../lib/db");
+const { authRequired } = require("../middleware/auth");
+const users = require("../users/user.service");
+
+const ADMIN_ROLE = users?.ROLES?.ADMIN || "Admin";
 
 /* =========================================================
-   GET ALL INCIDENTS
+   AUTH REQUIRED
+========================================================= */
+
+router.use(authRequired);
+
+/* =========================================================
+   ROLE HELPERS
+========================================================= */
+
+function isAdmin(role) {
+  return String(role) === ADMIN_ROLE;
+}
+
+/* =========================================================
+   GET INCIDENTS (SCOPED)
 ========================================================= */
 
 router.get("/", (req, res) => {
   try {
     const db = readDb();
+    let incidents = db.incidents || [];
 
-    const incidents = db.incidents || [];
+    // Admin sees all
+    if (!isAdmin(req.user.role)) {
+      incidents = incidents.filter(
+        (i) => i.companyId === req.user.companyId
+      );
+    }
+
+    // Sort newest first
+    incidents.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() -
+        new Date(a.createdAt).getTime()
+    );
 
     res.json({
       ok: true,
@@ -26,13 +62,12 @@ router.get("/", (req, res) => {
 });
 
 /* =========================================================
-   CREATE INCIDENT
+   CREATE INCIDENT (SCOPED)
 ========================================================= */
 
 router.post("/", (req, res) => {
   try {
     const db = readDb();
-
     if (!db.incidents) db.incidents = [];
 
     const { title, description, severity = "medium" } = req.body;
@@ -50,12 +85,12 @@ router.post("/", (req, res) => {
       description: description || "",
       severity,
       status: "open",
+      companyId: req.user.companyId || null,
       createdAt: new Date().toISOString(),
     };
 
     db.incidents.push(newIncident);
-
-    require("../lib/db").writeDb(db);
+    writeDb(db);
 
     res.status(201).json({
       ok: true,
@@ -71,7 +106,7 @@ router.post("/", (req, res) => {
 });
 
 /* =========================================================
-   UPDATE INCIDENT STATUS
+   UPDATE INCIDENT STATUS (ROLE SAFE)
 ========================================================= */
 
 router.patch("/:id/status", (req, res) => {
@@ -80,7 +115,7 @@ router.patch("/:id/status", (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    const incident = db.incidents?.find(i => i.id === id);
+    let incident = db.incidents?.find(i => i.id === id);
 
     if (!incident) {
       return res.status(404).json({
@@ -89,9 +124,22 @@ router.patch("/:id/status", (req, res) => {
       });
     }
 
-    incident.status = status || incident.status;
+    // Company scoping
+    if (
+      !isAdmin(req.user.role) &&
+      incident.companyId !== req.user.companyId
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "Forbidden",
+      });
+    }
 
-    require("../lib/db").writeDb(db);
+    if (status) {
+      incident.status = status;
+    }
+
+    writeDb(db);
 
     res.json({
       ok: true,
