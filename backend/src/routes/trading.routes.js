@@ -1,6 +1,6 @@
 // backend/src/routes/trading.routes.js
-// Phase 15 — Institutional Trading Control API
-// Unified Dashboard Layer • Router Health • Behavioral Telemetry
+// Phase 16 — Institutional Trading Control API
+// Unified Dashboard • Market Feed Integrated
 // Paper + Live + Risk + Portfolio + AI
 // Tenant Safe • Role Protected • Snapshot Accurate
 
@@ -16,6 +16,7 @@ const riskManager = require("../services/riskManager");
 const portfolioManager = require("../services/portfolioManager");
 const aiBrain = require("../services/aiBrain");
 const exchangeRouter = require("../services/exchangeRouter");
+const marketEngine = require("../services/marketEngine");
 
 // ---------------- ROLES ----------------
 const ADMIN = "Admin";
@@ -39,6 +40,53 @@ router.get("/symbols", (req, res) => {
 router.use(authRequired);
 
 /* =========================================================
+   MARKET (NEW)
+========================================================= */
+
+router.get("/market/price/:symbol", requireRole(ADMIN, MANAGER), (req, res) => {
+  const tenantId = req.tenant?.id;
+  const { symbol } = req.params;
+
+  if (!tenantId)
+    return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  marketEngine.registerTenant(tenantId);
+
+  const price = marketEngine.getPrice(tenantId, symbol.toUpperCase());
+
+  return res.json({
+    ok: true,
+    tenantId,
+    symbol: symbol.toUpperCase(),
+    price,
+  });
+});
+
+router.get("/market/candles/:symbol", requireRole(ADMIN, MANAGER), (req, res) => {
+  const tenantId = req.tenant?.id;
+  const { symbol } = req.params;
+  const limit = Number(req.query.limit) || 200;
+
+  if (!tenantId)
+    return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  marketEngine.registerTenant(tenantId);
+
+  const candles = marketEngine.getCandles(
+    tenantId,
+    symbol.toUpperCase(),
+    limit
+  );
+
+  return res.json({
+    ok: true,
+    tenantId,
+    symbol: symbol.toUpperCase(),
+    candles,
+  });
+});
+
+/* =========================================================
    PAPER
 ========================================================= */
 
@@ -46,6 +94,8 @@ router.get("/paper/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
   const tenantId = req.tenant?.id;
   if (!tenantId)
     return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  marketEngine.registerTenant(tenantId);
 
   const snapshot = paperTrader.snapshot(tenantId);
 
@@ -178,6 +228,8 @@ router.get("/dashboard/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
   if (!tenantId)
     return res.status(400).json({ ok: false, error: "Missing tenant" });
 
+  marketEngine.registerTenant(tenantId);
+
   const paper = paperTrader.snapshot(tenantId);
   const live = liveTrader.snapshot(tenantId);
 
@@ -189,9 +241,15 @@ router.get("/dashboard/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
     ts: Date.now(),
   });
 
+  const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+
   return res.json({
     ok: true,
     tenantId,
+
+    market: {
+      BTCUSDT: price,
+    },
 
     paper: {
       equity: paper.equity,
