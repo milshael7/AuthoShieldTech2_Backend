@@ -1,5 +1,6 @@
 // backend/src/routes/auth.routes.js
-// Auth API — Enterprise Hardened • Tools Engine Integrated
+// Enterprise Auth Engine — Hardened v2
+// Anti-Brute Force • Audited • Token Versioned • Enumeration Resistant
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -7,17 +8,13 @@ const router = express.Router();
 
 const { sign } = require("../lib/jwt");
 const { authRequired } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
+const { audit } = require("../lib/audit");
 const users = require("../users/user.service");
 
-const {
-  canAccessTool,
-  seedToolsIfEmpty
-} = require("../lib/tools.engine");
+const MAX_LOGIN_ATTEMPTS = 5;
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ========================================================= */
 
 function cleanEmail(v) {
   return String(v || "").trim().toLowerCase();
@@ -27,50 +24,74 @@ function cleanStr(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
 
-function resolveAccountType(user) {
-  if (user.role === users.ROLES.ADMIN) return "ADMIN";
-  if (user.role === users.ROLES.MANAGER) return "MANAGER";
-  if (
-    user.role === users.ROLES.COMPANY ||
-    user.role === users.ROLES.SMALL_COMPANY
-  ) return "COMPANY";
-  return "INDIVIDUAL";
+function safeDelay() {
+  return new Promise(resolve => setTimeout(resolve, 400));
 }
 
-function resolveAutodev(user) {
-  const db = readDb();
-  seedToolsIfEmpty(db);
-
-  const tool = (db.tools || []).find(t => t.id === "autodev-65");
-
-  const allowed = canAccessTool(
-    user,
-    tool,
-    users.ROLES,
-    users.SUBSCRIPTION
-  );
-
-  let limit = 0;
-
-  if (user.role === users.ROLES.ADMIN ||
-      user.role === users.ROLES.MANAGER) {
-    limit = "unlimited";
-  } else if (
-    user.role === users.ROLES.INDIVIDUAL &&
-    user.subscriptionStatus === users.SUBSCRIPTION.ACTIVE
-  ) {
-    limit = 10;
+function ensureJwtSecret(res) {
+  if (!process.env.JWT_SECRET) {
+    res.status(500).json({
+      error: "Server misconfigured"
+    });
+    return false;
   }
-
-  return {
-    allowed,
-    limit
-  };
+  return true;
 }
+
+/* =========================================================
+   LOGIN ATTEMPT HANDLING
+========================================================= */
+
+function recordFailedLogin(user) {
+  updateDb((db) => {
+    const u = db.users.find(x => x.id === user.id);
+    if (!u) return db;
+
+    if (!u.securityFlags) u.securityFlags = {};
+    u.securityFlags.failedLogins =
+      (u.securityFlags.failedLogins || 0) + 1;
+
+    if (u.securityFlags.failedLogins >= MAX_LOGIN_ATTEMPTS) {
+      u.locked = true;
+
+      audit({
+        actor: u.id,
+        role: u.role,
+        action: "ACCOUNT_AUTO_LOCKED_LOGIN_ABUSE"
+      });
+    }
+
+    u.updatedAt = new Date().toISOString();
+    return db;
+  });
+}
+
+function recordSuccessfulLogin(user) {
+  updateDb((db) => {
+    const u = db.users.find(x => x.id === user.id);
+    if (!u) return db;
+
+    if (!u.securityFlags) u.securityFlags = {};
+    u.securityFlags.failedLogins = 0;
+    u.lastLoginAt = new Date().toISOString();
+    u.tokenVersion = (u.tokenVersion || 0) + 1;
+    u.updatedAt = new Date().toISOString();
+
+    return db;
+  });
+
+  audit({
+    actor: user.id,
+    role: user.role,
+    action: "LOGIN_SUCCESS"
+  });
+}
+
+/* =========================================================
+   SAFE USER RESPONSE
+========================================================= */
 
 function safeUserResponse(u) {
-  const autodev = resolveAutodev(u);
-
   return {
     id: u.id,
     role: u.role,
@@ -79,52 +100,9 @@ function safeUserResponse(u) {
     subscriptionStatus: u.subscriptionStatus,
     status: u.status,
     mustResetPassword: !!u.mustResetPassword,
-
-    accountType: resolveAccountType(u),
-
     freedomEnabled: !!u.freedomEnabled,
     autoprotectEnabled: !!u.autoprotectEnabled,
-
-    autodev
   };
-}
-
-function ensureJwtSecret(res) {
-  if (!process.env.JWT_SECRET) {
-    res.status(500).json({
-      error: "Server misconfigured (JWT_SECRET missing)"
-    });
-    return false;
-  }
-  return true;
-}
-
-function ensureCompanyValid(user) {
-  if (!user.companyId) return;
-
-  const db = readDb();
-  const company = (db.companies || []).find(
-    c => c.id === user.companyId
-  );
-
-  if (!company) throw new Error("Company not found");
-  if (company.status !== "Active") throw new Error("Company not active");
-
-  const member = (company.members || []).find(
-    m => String(m.userId || m) === String(user.id)
-  );
-
-  if (!member) throw new Error("User not assigned to company");
-}
-
-function ensureSubscription(user) {
-  const status = String(user.subscriptionStatus || "");
-
-  if (status === users.SUBSCRIPTION.LOCKED)
-    throw new Error("Subscription locked");
-
-  if (status === users.SUBSCRIPTION.PAST_DUE)
-    throw new Error("Subscription past due");
 }
 
 /* =========================================================
@@ -135,7 +113,6 @@ router.post("/signup", async (req, res) => {
   try {
     const email = cleanEmail(req.body?.email);
     const password = cleanStr(req.body?.password, 500);
-    const role = cleanStr(req.body?.role || users.ROLES.INDIVIDUAL);
 
     if (!email || !password) {
       return res.status(400).json({
@@ -146,7 +123,14 @@ router.post("/signup", async (req, res) => {
     const created = await users.createUser({
       email,
       password,
-      role
+      role: users.ROLES.INDIVIDUAL
+    });
+
+    audit({
+      actor: "system",
+      role: "system",
+      action: "SIGNUP_CREATED",
+      target: created.id
     });
 
     return res.status(201).json({
@@ -180,30 +164,30 @@ router.post("/login", async (req, res) => {
     const u = users.findByEmail(email);
 
     if (!u) {
-      await bcrypt.compare(password, "$2a$10$invalidsaltinvalidsaltinv");
+      await safeDelay();
+      await bcrypt.compare(password, "$2a$12$invalidinvalidinvalidinvalid");
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
     const valid = await bcrypt.compare(password, u.passwordHash);
+
     if (!valid) {
+      recordFailedLogin(u);
+      await safeDelay();
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    if (u.status !== users.APPROVAL_STATUS.APPROVED) {
-      return res.status(403).json({
-        error: "Account not approved",
-        status: u.status
-      });
-    }
-
     if (u.locked === true) {
+      return res.status(403).json({ error: "Account suspended" });
+    }
+
+    if (u.mustResetPassword) {
       return res.status(403).json({
-        error: "Account suspended"
+        error: "Password reset required"
       });
     }
 
-    ensureCompanyValid(u);
-    ensureSubscription(u);
+    recordSuccessfulLogin(u);
 
     if (!ensureJwtSecret(res)) return;
 
@@ -211,7 +195,8 @@ router.post("/login", async (req, res) => {
       {
         id: u.id,
         role: u.role,
-        companyId: u.companyId || null
+        companyId: u.companyId || null,
+        tokenVersion: u.tokenVersion || 0
       },
       null,
       "7d"
@@ -240,16 +225,9 @@ router.post("/refresh", authRequired, (req, res) => {
       return res.status(401).json({ error: "User not found" });
     }
 
-    if (dbUser.status !== users.APPROVAL_STATUS.APPROVED) {
-      return res.status(403).json({ error: "Account not approved" });
-    }
-
-    if (dbUser.locked === true) {
+    if (dbUser.locked) {
       return res.status(403).json({ error: "Account suspended" });
     }
-
-    ensureCompanyValid(dbUser);
-    ensureSubscription(dbUser);
 
     if (!ensureJwtSecret(res)) return;
 
@@ -257,11 +235,18 @@ router.post("/refresh", authRequired, (req, res) => {
       {
         id: dbUser.id,
         role: dbUser.role,
-        companyId: dbUser.companyId || null
+        companyId: dbUser.companyId || null,
+        tokenVersion: dbUser.tokenVersion || 0
       },
       null,
       "7d"
     );
+
+    audit({
+      actor: dbUser.id,
+      role: dbUser.role,
+      action: "TOKEN_REFRESHED"
+    });
 
     return res.json({
       token,
