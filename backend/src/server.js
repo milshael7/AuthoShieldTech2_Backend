@@ -7,7 +7,8 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 
-const { ensureDb, readDb } = require("./lib/db");
+const { ensureDb, readDb, updateDb } = require("./lib/db");
+const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
 
@@ -38,12 +39,14 @@ app.use(morgan("dev"));
 
 /* ================= HEALTH ROUTE ================= */
 
+let globalSecurityStatus = "secure";
+
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
     systemState: {
       status: "operational",
-      securityStatus: "secure",
+      securityStatus: globalSecurityStatus,
       uptime: process.uptime(),
       timestamp: Date.now()
     }
@@ -53,28 +56,15 @@ app.get("/health", (req, res) => {
 /* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
-
-/* Tenant Isolation Layer */
 app.use(tenantMiddleware);
-
-/* ================= CORE ADMIN + SECURITY ================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
 
-/* ================= MONETIZATION LAYER ================= */
-
-/* Tools Catalog + Access */
 app.use("/api/tools", require("./routes/tools.routes"));
-
-/* Entitlement Engine (Admin grant/revoke + self view) */
 app.use("/api/entitlements", require("./routes/entitlements.routes"));
-
-/* Billing + Stripe */
 app.use("/api/billing", require("./routes/billing.routes"));
-
-/* ================= AUTODEV 6.5 ================= */
 
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
@@ -204,6 +194,55 @@ function detectIntelligence() {
 }
 
 setInterval(detectIntelligence, CHECK_INTERVAL);
+
+/* =========================================================
+   🔐 AUDIT INTEGRITY WATCHDOG
+========================================================= */
+
+const INTEGRITY_CHECK_INTERVAL = 60000; // 60 seconds
+let integrityCompromised = false;
+
+function monitorAuditIntegrity() {
+  const result = verifyAuditIntegrity();
+
+  if (!result.ok && !integrityCompromised) {
+
+    integrityCompromised = true;
+    globalSecurityStatus = "compromised";
+
+    writeAudit({
+      actor: "integrity_watchdog",
+      role: "system",
+      action: "AUDIT_INTEGRITY_FAILURE",
+      detail: result,
+    });
+
+    updateDb((db) => {
+      if (!Array.isArray(db.securityEvents))
+        db.securityEvents = [];
+
+      db.securityEvents.push({
+        id: crypto.randomUUID?.() || Date.now().toString(),
+        severity: "critical",
+        timestamp: Date.now(),
+        message: "Audit ledger integrity failure detected",
+        type: "ledger_integrity",
+      });
+
+      return db;
+    });
+
+    broadcast({
+      type: "integrity_alert",
+      severity: "critical",
+      detail: result,
+    });
+
+    console.error("🚨 AUDIT INTEGRITY FAILURE DETECTED", result);
+  }
+}
+
+setInterval(monitorAuditIntegrity, INTEGRITY_CHECK_INTERVAL);
 
 /* ================= START ================= */
 
