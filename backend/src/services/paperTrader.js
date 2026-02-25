@@ -1,6 +1,6 @@
 // backend/src/services/paperTrader.js
-// Phase 17 — Unified Autonomous Paper Engine
-// Risk Integrated • AI Integrated • Chart Ready
+// Phase 18 — Unified Autonomous Paper Engine
+// Explicit Mode • Risk Integrated • AI Integrated • Chart Ready
 
 const fs = require("fs");
 const path = require("path");
@@ -29,10 +29,6 @@ function ensureDir(p) {
 function statePath(tenantId) {
   ensureDir(BASE_PATH);
   return path.join(BASE_PATH, `paper_${tenantId}.json`);
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
 }
 
 /* ================= STATE ================= */
@@ -159,7 +155,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     state.equity
   );
 
-  /* ================= RISK (Paper Mode) ================= */
+  /* ================= RISK (Explicit Paper Mode) ================= */
 
   const risk = riskManager.evaluate({
     tenantId,
@@ -177,7 +173,10 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     symbol,
     last: price,
     paper: state,
+    mode: "paper" // 🔥 EXPLICIT
   });
+
+  /* ================= ENTRY ================= */
 
   if (plan.action === "BUY" && !state.position) {
 
@@ -205,6 +204,8 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     save(tenantId);
     return;
   }
+
+  /* ================= EXIT ================= */
 
   if (
     (plan.action === "SELL" ||
