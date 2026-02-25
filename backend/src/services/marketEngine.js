@@ -2,10 +2,11 @@
 // --------------------------------------------------
 // AutoShield — Market Engine (Authoritative Price Feed)
 // Multi-Tenant • Deterministic • Candle Generator
-// Safe for Paper + Future Live Integration
+// Feeds Paper + Live Engines
 // --------------------------------------------------
 
 const paperTrader = require("./paperTrader");
+const liveTrader = require("./liveTrader");
 
 /* ================= CONFIG ================= */
 
@@ -18,7 +19,6 @@ const CONFIG = {
 
 /* ================= STATE ================= */
 
-// tenantId -> market state
 const TENANTS = new Map();
 
 /* ================= HELPERS ================= */
@@ -93,7 +93,7 @@ function updateCandle(arr, price) {
   c.c = price;
 }
 
-function maybeRollCandle(arr, price) {
+function maybeRollCandle(arr) {
   const now = Date.now();
   const last = arr[arr.length - 1];
 
@@ -133,11 +133,18 @@ function marketTick(tenantId) {
     node.price = Number(next.toFixed(8));
 
     const candles = market.candles[sym];
-    maybeRollCandle(candles, node.price);
+    maybeRollCandle(candles);
     updateCandle(candles, node.price);
 
-    // 🔥 feed paper engine
-    paperTrader.tick(tenantId, sym, node.price);
+    /* ================= FEED ENGINES ================= */
+
+    try {
+      paperTrader.tick(tenantId, sym, node.price);
+    } catch {}
+
+    try {
+      liveTrader.tick(tenantId, sym, node.price);
+    } catch {}
   }
 }
 
@@ -165,6 +172,7 @@ function getPrice(tenantId, symbol) {
 function getCandles(tenantId, symbol, limit = 200) {
   const market = getTenant(tenantId);
   const arr = market.candles[symbol] || [];
+
   return arr.slice(-limit).map(c => ({
     time: c.t,
     open: c.o,
