@@ -57,15 +57,25 @@ app.use("/api/auth", require("./routes/auth.routes"));
 /* Tenant Isolation Layer */
 app.use(tenantMiddleware);
 
-/* Admin + Core */
+/* ================= CORE ADMIN + SECURITY ================= */
+
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
 
-/* 🔥 TOOLS ENGINE ROUTE (NEW — Enterprise Layer) */
+/* ================= MONETIZATION LAYER ================= */
+
+/* Tools Catalog + Access */
 app.use("/api/tools", require("./routes/tools.routes"));
 
-/* 🔥 Autodev 6.5 */
+/* Entitlement Engine (Admin grant/revoke + self view) */
+app.use("/api/entitlements", require("./routes/entitlements.routes"));
+
+/* Billing + Stripe */
+app.use("/api/billing", require("./routes/billing.routes"));
+
+/* ================= AUTODEV 6.5 ================= */
+
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 /* ================= SERVER ================= */
