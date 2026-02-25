@@ -1,7 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 17 — Institutional Live Engine (Risk Explicit)
-// MarketEngine Integrated • Multi-Tenant Safe
-// AI Reinforcement • Margin Discipline
+// Phase 18 — Institutional Live Engine (Fully Explicit)
+// Risk Explicit • Brain Explicit • MarketEngine Integrated
+// AI Reinforcement • Margin Discipline • Tenant Safe
 
 const fs = require("fs");
 const path = require("path");
@@ -53,17 +53,13 @@ function isFridayShutdown(ts) {
   return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
 /* =========================================================
    DEFAULT STATE
 ========================================================= */
 
 function defaultState() {
   return {
-    version: 17,
+    version: 18,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -249,11 +245,14 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     return;
   }
 
+  /* ================= DECISION (Explicit Live Mode) ================= */
+
   const plan = makeDecision({
     tenantId,
     symbol,
     last: price,
     paper: state,
+    mode: "live" // 🔥 EXPLICIT
   });
 
   if (
