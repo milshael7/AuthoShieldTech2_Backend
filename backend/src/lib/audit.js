@@ -1,6 +1,5 @@
-// backend/src/lib/audit.js
-// Enterprise Immutable Audit Ledger — Phase 23
-// Cryptographic Hash Chain • Sequence Locked • Tamper Evident • SOC2 Ready
+// Phase 39 — Enterprise Immutable Audit Ledger
+// Hash Chain • Snapshot Anchors • Versioned Integrity • Truncation Detection • Tamper Resistant
 
 const crypto = require("crypto");
 const { updateDb, readDb } = require("./db");
@@ -10,6 +9,8 @@ const { updateDb, readDb } = require("./db");
 ========================================================= */
 
 const GENESIS_HASH = "GENESIS";
+const INTEGRITY_VERSION = 2;
+const SNAPSHOT_INTERVAL = 1000; // Every 1000 records we anchor snapshot
 
 /* =========================================================
    HASH UTIL
@@ -21,6 +22,7 @@ function sha256(data) {
 
 function computeRecordHash(record) {
   const base = JSON.stringify({
+    v: INTEGRITY_VERSION,
     seq: record.seq,
     ts: record.ts,
     actor: record.actor,
@@ -36,7 +38,7 @@ function computeRecordHash(record) {
 }
 
 /* =========================================================
-   WRITE AUDIT (IMMUTABLE + SEQUENCE LOCKED)
+   WRITE AUDIT — HARDENED
 ========================================================= */
 
 function writeAudit(input = {}) {
@@ -44,17 +46,17 @@ function writeAudit(input = {}) {
     const db = readDb();
 
     if (!Array.isArray(db.audit)) db.audit = [];
+
     if (!db.auditMeta) {
       db.auditMeta = {
         lastHash: null,
         lastSequence: 0,
-        integrityVersion: 1,
+        integrityVersion: INTEGRITY_VERSION,
+        snapshots: [],
       };
     }
 
-    const prevHash =
-      db.auditMeta.lastHash || GENESIS_HASH;
-
+    const prevHash = db.auditMeta.lastHash || GENESIS_HASH;
     const seq = db.auditMeta.lastSequence + 1;
 
     const record = {
@@ -86,7 +88,8 @@ function writeAudit(input = {}) {
         db2.auditMeta = {
           lastHash: null,
           lastSequence: 0,
-          integrityVersion: 1,
+          integrityVersion: INTEGRITY_VERSION,
+          snapshots: [],
         };
       }
 
@@ -94,11 +97,22 @@ function writeAudit(input = {}) {
 
       db2.auditMeta.lastHash = record.hash;
       db2.auditMeta.lastSequence = seq;
+      db2.auditMeta.integrityVersion = INTEGRITY_VERSION;
+
+      /* Snapshot Anchoring */
+      if (seq % SNAPSHOT_INTERVAL === 0) {
+        db2.auditMeta.snapshots.push({
+          seq,
+          hash: record.hash,
+          ts: Date.now(),
+        });
+      }
 
       return db2;
     });
 
     return record;
+
   } catch (err) {
     console.error("⚠️ Audit write failed:", err);
     return null;
@@ -106,7 +120,7 @@ function writeAudit(input = {}) {
 }
 
 /* =========================================================
-   VERIFY AUDIT INTEGRITY
+   VERIFY AUDIT INTEGRITY — HARDENED
 ========================================================= */
 
 function verifyAuditIntegrity() {
@@ -134,8 +148,6 @@ function verifyAuditIntegrity() {
           ok: false,
           error: "Sequence mismatch",
           index: i,
-          expectedSeq,
-          foundSeq: current.seq,
         };
       }
 
@@ -167,7 +179,7 @@ function verifyAuditIntegrity() {
     if (meta.lastHash !== expectedPrevHash) {
       return {
         ok: false,
-        error: "Meta hash mismatch",
+        error: "Meta hash mismatch (possible truncation)",
       };
     }
 
@@ -182,7 +194,9 @@ function verifyAuditIntegrity() {
       ok: true,
       totalRecords: logs.length,
       lastHash: meta.lastHash,
+      integrityVersion: meta.integrityVersion,
     };
+
   } catch (err) {
     return {
       ok: false,
@@ -192,7 +206,7 @@ function verifyAuditIntegrity() {
 }
 
 /* =========================================================
-   BACKWARD COMPATIBILITY LAYER
+   BACKWARD COMPATIBILITY WRAPPER
 ========================================================= */
 
 function audit(input = {}) {
