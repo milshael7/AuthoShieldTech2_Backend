@@ -1,6 +1,6 @@
 // backend/src/routes/billing.routes.js
 // Billing & Subscription Control — Enterprise Hardened
-// Stripe Safe • Portal Enabled • Revenue Protected
+// Stripe Safe • Entitlement Synced • Revenue Protected
 
 const express = require("express");
 const router = express.Router();
@@ -10,6 +10,12 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+
+const {
+  grantTool,
+  revokeTool,
+  revokeAllTools
+} = require("../lib/entitlement.engine");
 
 const {
   createCheckoutSession,
@@ -30,8 +36,11 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
    PLAN CONTROL
 ========================================================= */
 
-const INDIVIDUAL_PLANS = ["individual_autodev"];
-const COMPANY_PLANS = ["micro", "small", "mid", "enterprise"];
+const PLAN_TOOL_MAP = {
+  individual_autodev: ["autodev-65"],
+  individual_security: ["threat-feed"],
+  enterprise: ["enterprise-monitor", "autodev-65", "threat-feed"]
+};
 
 function clean(v, max = 200) {
   return String(v || "").trim().slice(0, max);
@@ -54,10 +63,15 @@ function saveUser(updatedUser) {
   }
 }
 
-function validatePlanForUser(dbUser, type) {
-  if (INDIVIDUAL_PLANS.includes(type)) return true;
-  if (COMPANY_PLANS.includes(type) && dbUser.companyId) return true;
-  throw new Error("Plan not allowed for this user type");
+function grantPlanTools(userId, planType) {
+  const tools = PLAN_TOOL_MAP[planType] || [];
+  tools.forEach(toolId => {
+    grantTool(userId, toolId);
+  });
+}
+
+function revokePlanTools(userId) {
+  revokeAllTools(userId);
 }
 
 /* =========================================================
@@ -94,6 +108,7 @@ router.get("/me", authRequired, (req, res) => {
         stripeCustomerId: dbUser.stripeCustomerId || null,
         stripeSubscriptionId: dbUser.stripeSubscriptionId || null,
         companyPlan,
+        entitlements: dbUser.entitlements || { tools: [] }
       },
     });
 
@@ -115,15 +130,6 @@ router.post("/checkout", authRequired, async (req, res) => {
     const dbUser = users.findById(user.id);
     if (!dbUser) {
       return res.status(404).json({ ok: false, error: "User not found" });
-    }
-
-    validatePlanForUser(dbUser, type);
-
-    if (dbUser.subscriptionStatus === users.SUBSCRIPTION.ACTIVE) {
-      return res.status(400).json({
-        ok: false,
-        error: "Already subscribed",
-      });
     }
 
     const successUrl =
@@ -161,51 +167,43 @@ router.post("/checkout", authRequired, async (req, res) => {
 });
 
 /* =========================================================
-   STRIPE CUSTOMER PORTAL
+   ACTIVATE PLAN (Webhook or Admin Hook)
 ========================================================= */
 
-router.post("/portal", authRequired, async (req, res) => {
-  try {
-    const user = requireUser(req, res);
-    if (!user) return;
+router.post(
+  "/admin/activate",
+  authRequired,
+  requireRole(users.ROLES.ADMIN),
+  (req, res) => {
+    try {
+      const userId = clean(req.body?.userId);
+      const planType = clean(req.body?.planType);
 
-    const dbUser = users.findById(user.id);
-    if (!dbUser?.stripeCustomerId) {
-      return res.status(400).json({
-        ok: false,
-        error: "No Stripe customer found",
+      const dbUser = users.findById(userId);
+      if (!dbUser) {
+        return res.status(404).json({ ok: false, error: "User not found" });
+      }
+
+      dbUser.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
+      saveUser(dbUser);
+
+      grantPlanTools(userId, planType);
+
+      audit({
+        actorId: req.user.id,
+        action: "PLAN_ACTIVATED",
+        targetType: "User",
+        targetId: userId,
+        metadata: { planType },
       });
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      res.status(400).json({ ok: false, error: e.message });
     }
-
-    const returnUrl =
-      clean(req.body?.returnUrl) ||
-      process.env.STRIPE_PORTAL_RETURN_URL;
-
-    if (!returnUrl) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing return URL",
-      });
-    }
-
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: dbUser.stripeCustomerId,
-      return_url: returnUrl,
-    });
-
-    audit({
-      actorId: user.id,
-      action: "STRIPE_PORTAL_OPENED",
-      targetType: "Billing",
-      targetId: dbUser.stripeCustomerId,
-    });
-
-    res.json({ ok: true, portalUrl: portalSession.url });
-
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
   }
-});
+);
 
 /* =========================================================
    CANCEL SUBSCRIPTION
@@ -224,72 +222,28 @@ router.post("/cancel", authRequired, async (req, res) => {
       });
     }
 
-    const subId = dbUser.stripeSubscriptionId;
-
     await cancelSubscription(user.id);
+
+    dbUser.subscriptionStatus = users.SUBSCRIPTION.LOCKED;
+    saveUser(dbUser);
+
+    revokePlanTools(user.id);
 
     audit({
       actorId: user.id,
-      action: "SUBSCRIPTION_CANCEL_REQUESTED",
-      targetType: "StripeSubscription",
-      targetId: subId,
+      action: "SUBSCRIPTION_CANCELLED",
+      targetType: "User",
+      targetId: user.id,
     });
 
     res.json({
       ok: true,
-      message: "Subscription cancelled",
+      message: "Subscription cancelled and entitlements revoked",
     });
 
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
-/* =========================================================
-   ADMIN MANUAL STATUS OVERRIDE
-========================================================= */
-
-router.post(
-  "/admin/set-status",
-  authRequired,
-  requireRole(users.ROLES.ADMIN),
-  (req, res) => {
-    try {
-      const userId = clean(req.body?.userId, 100);
-      const status = clean(req.body?.status, 50);
-
-      if (!Object.values(users.SUBSCRIPTION).includes(status)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Invalid subscription status",
-        });
-      }
-
-      const dbUser = users.findById(userId);
-      if (!dbUser) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found",
-        });
-      }
-
-      dbUser.subscriptionStatus = status;
-      saveUser(dbUser);
-
-      audit({
-        actorId: req.user.id,
-        action: "SUBSCRIPTION_STATUS_CHANGED",
-        targetType: "User",
-        targetId: userId,
-        metadata: { status },
-      });
-
-      res.json({ ok: true, userId, status });
-
-    } catch (e) {
-      res.status(400).json({ ok: false, error: e.message });
-    }
-  }
-);
 
 module.exports = router;
