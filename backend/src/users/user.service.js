@@ -1,6 +1,6 @@
 // backend/src/users/user.service.js
 // Enterprise User Service — Roles + Subscription + Admin Bootstrap
-// Single source of truth for ROLES / SUBSCRIPTION / APPROVAL_STATUS
+// + Autodev 6.5 Capability Extension (Safe Upgrade)
 
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
@@ -40,6 +40,26 @@ function makeId(prefix = "usr") {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 }
 
+/* =========================================================
+   ACCOUNT TYPE RESOLUTION (Autodev Logic)
+========================================================= */
+
+function resolveAccountType(role) {
+  switch (role) {
+    case ROLES.ADMIN:
+      return "admin";
+    case ROLES.MANAGER:
+      return "manager";
+    case ROLES.COMPANY:
+    case ROLES.SMALL_COMPANY:
+      return "company";
+    case ROLES.INDIVIDUAL:
+      return "single";
+    default:
+      return "seat";
+  }
+}
+
 function safeUser(u) {
   if (!u) return null;
   const { passwordHash, ...rest } = u;
@@ -76,18 +96,28 @@ async function createUser({
 }) {
   const e = normEmail(email);
   if (!e) throw new Error("Email required");
-  if (!password || String(password).length < 6) throw new Error("Password too short");
+  if (!password || String(password).length < 6)
+    throw new Error("Password too short");
 
   const exists = findByEmail(e);
   if (exists) throw new Error("Email already exists");
 
   const passwordHash = await bcrypt.hash(String(password), 10);
 
+  const accountType = resolveAccountType(role);
+
   const user = {
     id: makeId(),
     email: e,
     role,
+    accountType,
     companyId,
+
+    // 🔥 Autodev 6.5 Capability Fields
+    freedomEnabled: false,        // seat upgrade flag
+    autoprotectEnabled: false,    // Autodev 6.5 toggle
+    managedCompanies: [],         // companies under protection scope
+
     locked: false,
     subscriptionStatus,
     status,
@@ -132,6 +162,48 @@ function setApprovalStatus(userId, status) {
 }
 
 /* =========================================================
+   AUTODEV 6.5 CONTROL METHODS
+========================================================= */
+
+function setFreedom(userId, enabled) {
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === userId);
+    if (!u) return db;
+    u.freedomEnabled = !!enabled;
+    u.updatedAt = nowIso();
+    return db;
+  });
+}
+
+function setAutoProtect(userId, enabled) {
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === userId);
+    if (!u) return db;
+    u.autoprotectEnabled = !!enabled;
+    u.updatedAt = nowIso();
+    return db;
+  });
+}
+
+function attachCompany(userId, companyId) {
+  updateDb((db) => {
+    const u = db.users.find((x) => x.id === userId);
+    if (!u) return db;
+
+    if (!Array.isArray(u.managedCompanies)) {
+      u.managedCompanies = [];
+    }
+
+    if (!u.managedCompanies.includes(companyId)) {
+      u.managedCompanies.push(companyId);
+    }
+
+    u.updatedAt = nowIso();
+    return db;
+  });
+}
+
+/* =========================================================
    ADMIN BOOTSTRAP
 ========================================================= */
 
@@ -140,7 +212,6 @@ function ensureAdminFromEnv() {
   const password = String(process.env.ADMIN_PASSWORD || "");
 
   if (!email || !password) {
-    // Not configured — do nothing
     return;
   }
 
@@ -157,7 +228,13 @@ function ensureAdminFromEnv() {
       email,
       passwordHash,
       role: ROLES.ADMIN,
+      accountType: "admin",
       companyId: null,
+
+      freedomEnabled: true,
+      autoprotectEnabled: false,
+      managedCompanies: [],
+
       locked: false,
       subscriptionStatus: SUBSCRIPTION.ACTIVE,
       status: APPROVAL_STATUS.APPROVED,
@@ -182,6 +259,10 @@ module.exports = {
 
   setSubscriptionStatus,
   setApprovalStatus,
+
+  setFreedom,
+  setAutoProtect,
+  attachCompany,
 
   ensureAdminFromEnv,
 };
