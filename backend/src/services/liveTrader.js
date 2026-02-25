@@ -1,8 +1,7 @@
 // backend/src/services/liveTrader.js
-// Phase 15 — Institutional Live Engine (Reinforced)
-// Paper Profit Gate • Capital Detection • AI Reinforcement
-// Cross Margin • Multi-Timeframe Fusion
-// Friday Shutdown • Production Safe
+// Phase 16 — Institutional Live Engine (Stabilized)
+// MarketEngine Integrated • Multi-Tenant Safe
+// AI Reinforcement • Margin Discipline
 
 const fs = require("fs");
 const path = require("path");
@@ -64,7 +63,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 15,
+    version: 16,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -87,17 +86,6 @@ function defaultState() {
 
     lastPrices: {},
     positions: {},
-
-    timeframes: {
-      micro: [],
-      short: [],
-      medium: [],
-    },
-
-    fusedSignal: {
-      direction: "NEUTRAL",
-      score: 0,
-    },
 
     trades: [],
     orders: [],
@@ -175,7 +163,7 @@ function maintenanceRequired(state) {
 }
 
 /* =========================================================
-   POSITION ENGINE
+   POSITION ENGINE (FIXED)
 ========================================================= */
 
 function applyFill(state, { symbol, side, price, qty }) {
@@ -187,19 +175,18 @@ function applyFill(state, { symbol, side, price, qty }) {
 
   const pos = state.positions[symbol];
   const signedQty = side === "BUY" ? qty : -qty;
-  const newQty = pos.qty + signedQty;
 
-  if (
-    pos.qty === 0 ||
-    Math.sign(pos.qty) === Math.sign(newQty)
-  ) {
+  // Same direction
+  if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(signedQty)) {
     const totalCost =
       pos.avgEntry * pos.qty + price * signedQty;
 
-    pos.qty = newQty;
+    pos.qty += signedQty;
     pos.avgEntry =
       pos.qty !== 0 ? totalCost / pos.qty : 0;
+
   } else {
+    // Opposite direction = partial or full close
     const closingQty = Math.min(
       Math.abs(pos.qty),
       Math.abs(signedQty)
@@ -210,8 +197,9 @@ function applyFill(state, { symbol, side, price, qty }) {
       closingQty *
       Math.sign(pos.qty);
 
-    pos.realizedPnL += pnl;
+    pos.qty += signedQty; // correct adjustment
     state.cashBalance += pnl;
+    pos.realizedPnL += pnl;
 
     state.trades.push({
       ts: Date.now(),
@@ -225,7 +213,6 @@ function applyFill(state, { symbol, side, price, qty }) {
     if (state.trades.length > MAX_TRADES)
       state.trades = state.trades.slice(-MAX_TRADES);
 
-    // 🔥 Reinforcement to AI
     aiBrain.recordTradeOutcome({ pnl });
   }
 
@@ -239,7 +226,6 @@ function applyFill(state, { symbol, side, price, qty }) {
 async function tick(tenantId, symbol, price, ts = Date.now()) {
   const state = load(tenantId);
   if (!state.running) return;
-
   if (isFridayShutdown(ts)) return;
 
   refreshFlags(state);
@@ -247,7 +233,6 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
   state.lastPrices[symbol] = price;
   recalcEquity(state);
 
-  // 🔥 Risk evaluation for live capital discipline
   const risk = riskManager.evaluate({
     tenantId,
     equity: state.equity,
@@ -283,7 +268,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
       tenantId,
       symbol,
       side: plan.action,
-      riskPct: plan.riskPct * risk.riskMultiplier,
+      riskPct: plan.riskPct * (risk.riskMultiplier || 1),
       price,
       ts,
     });
@@ -340,7 +325,6 @@ function snapshot(tenantId) {
   refreshFlags(state);
 
   return {
-    ok: true,
     mode: state.mode,
     cash: state.cashBalance,
     equity: state.equity,
