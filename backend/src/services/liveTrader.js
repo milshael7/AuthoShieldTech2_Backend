@@ -1,5 +1,5 @@
 // backend/src/services/liveTrader.js
-// Phase 16 — Institutional Live Engine (Stabilized)
+// Phase 17 — Institutional Live Engine (Risk Explicit)
 // MarketEngine Integrated • Multi-Tenant Safe
 // AI Reinforcement • Margin Discipline
 
@@ -63,7 +63,7 @@ function clamp(n, min, max) {
 
 function defaultState() {
   return {
-    version: 16,
+    version: 17,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -119,6 +119,7 @@ function load(tenantId) {
 function save(tenantId) {
   const state = STATES.get(tenantId);
   if (!state) return;
+
   state.updatedAt = nowIso();
 
   try {
@@ -163,7 +164,7 @@ function maintenanceRequired(state) {
 }
 
 /* =========================================================
-   POSITION ENGINE (FIXED)
+   POSITION ENGINE
 ========================================================= */
 
 function applyFill(state, { symbol, side, price, qty }) {
@@ -176,7 +177,6 @@ function applyFill(state, { symbol, side, price, qty }) {
   const pos = state.positions[symbol];
   const signedQty = side === "BUY" ? qty : -qty;
 
-  // Same direction
   if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(signedQty)) {
     const totalCost =
       pos.avgEntry * pos.qty + price * signedQty;
@@ -186,7 +186,6 @@ function applyFill(state, { symbol, side, price, qty }) {
       pos.qty !== 0 ? totalCost / pos.qty : 0;
 
   } else {
-    // Opposite direction = partial or full close
     const closingQty = Math.min(
       Math.abs(pos.qty),
       Math.abs(signedQty)
@@ -197,7 +196,7 @@ function applyFill(state, { symbol, side, price, qty }) {
       closingQty *
       Math.sign(pos.qty);
 
-    pos.qty += signedQty; // correct adjustment
+    pos.qty += signedQty;
     state.cashBalance += pnl;
     pos.realizedPnL += pnl;
 
@@ -233,6 +232,8 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
   state.lastPrices[symbol] = price;
   recalcEquity(state);
 
+  /* ================= RISK (Explicit Live Mode) ================= */
+
   const risk = riskManager.evaluate({
     tenantId,
     equity: state.equity,
@@ -240,6 +241,7 @@ async function tick(tenantId, symbol, price, ts = Date.now()) {
     marginUsed: state.marginUsed,
     maintenanceRequired: maintenanceRequired(state),
     ts,
+    mode: "live"
   });
 
   if (risk.halted) {
