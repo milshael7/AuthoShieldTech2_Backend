@@ -1,7 +1,7 @@
 // backend/src/services/executionEngine.js
-// Phase 11 — Adaptive Institutional Execution Engine
+// Phase 12 — Hardened Institutional Execution Engine
 // Paper + Live Unified Layer
-// Now returns structured outcome for AI learning
+// Safe Against Missing State Fields
 
 const exchangeRouter = require("./exchangeRouter");
 
@@ -13,23 +13,35 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 const CONFIG = Object.freeze({
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
-
   baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005),
   maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.002),
-
   minOrderUsd: 50,
   maxCapitalFraction: 0.5,
-
   partialFillProbability: 0.35,
   minPartialFillPct: 0.4,
-
   simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 15),
-
   liveDryRun:
     String(process.env.LIVE_DRY_RUN || "true")
       .toLowerCase()
       .trim() !== "false",
 });
+
+/* =========================================================
+   SAFE STATE INIT
+========================================================= */
+
+function ensureStateSafety(state) {
+  state.costs = state.costs || { feePaid: 0 };
+  state.limits = state.limits || { tradesToday: 0, lossesToday: 0 };
+  state.realized = state.realized || {
+    wins: 0,
+    losses: 0,
+    net: 0,
+    grossProfit: 0,
+    grossLoss: 0,
+  };
+  state.trades = state.trades || [];
+}
 
 /* =========================================================
    HELPERS
@@ -86,17 +98,6 @@ function buildExecutionId() {
     .slice(2)}`;
 }
 
-function pushAudit(state, record) {
-  state.executionAudit = state.executionAudit || [];
-  state.executionAudit.push({
-    ts: Date.now(),
-    ...record,
-  });
-
-  state.executionAudit =
-    state.executionAudit.slice(-500);
-}
-
 /* =========================================================
    PAPER EXECUTION
 ========================================================= */
@@ -113,11 +114,11 @@ function executePaperOrder({
   if (!state) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
 
+  ensureStateSafety(state);
+
   const executionId = buildExecutionId();
 
-  /* =======================================================
-     ENTRY
-  ======================================================= */
+  /* ================= ENTRY ================= */
 
   if (action === "BUY" && !state.position) {
     const safeRisk = clamp(
@@ -155,39 +156,22 @@ function executePaperOrder({
       feesPaid: fee,
     };
 
-    state.limits.tradesToday =
-      (state.limits.tradesToday || 0) + 1;
+    state.limits.tradesToday++;
 
     recalcEquity(state);
 
-    pushAudit(state, {
-      type: "PAPER_ENTRY",
-      symbol,
-      qty,
-      price: slippedPrice,
-      fee,
-      executionId,
-    });
-
     return {
-      narration: {
-        text: `Entered ${symbol} at ${slippedPrice.toFixed(2)}`,
-        meta: { action: "BUY", qty, executionId },
-      },
       result: {
         type: "ENTRY",
         symbol,
         price: slippedPrice,
         qty,
-        riskPct: safeRisk,
         executionId,
       },
     };
   }
 
-  /* =======================================================
-     EXIT
-  ======================================================= */
+  /* ================= EXIT ================= */
 
   if (
     (action === "SELL" || action === "CLOSE") &&
@@ -216,8 +200,7 @@ function executePaperOrder({
     } else {
       state.realized.losses++;
       state.realized.grossLoss += Math.abs(pnl);
-      state.limits.lossesToday =
-        (state.limits.lossesToday || 0) + 1;
+      state.limits.lossesToday++;
     }
 
     state.trades.push({
@@ -228,35 +211,16 @@ function executePaperOrder({
       qty,
       profit: pnl,
       executionId,
-      latencyMs: CONFIG.simulatedLatencyMs,
     });
 
     state.position = null;
 
     recalcEquity(state);
 
-    pushAudit(state, {
-      type: "PAPER_EXIT",
-      symbol,
-      qty,
-      price: slippedPrice,
-      pnl,
-      executionId,
-    });
-
     return {
-      narration: {
-        text: `Closed ${symbol}. ${
-          isWin ? "Profit" : "Loss"
-        } ${pnl.toFixed(2)}`,
-        meta: { action: "CLOSE", pnl, executionId },
-      },
       result: {
         type: "EXIT",
         symbol,
-        entry: pos.entry,
-        exit: slippedPrice,
-        qty,
         pnl,
         isWin,
         executionId,
@@ -279,8 +243,6 @@ async function executeLiveOrder(params = {}) {
       ok: true,
       dryRun: true,
       executionId,
-      note:
-        "LIVE_DRY_RUN enabled — no exchange call made.",
     };
   }
 
@@ -291,20 +253,9 @@ async function executeLiveOrder(params = {}) {
         executionId,
       });
 
-    if (!routed.ok) {
-      return {
-        ok: false,
-        executionId,
-        error: routed.error,
-      };
-    }
-
-    return {
-      ok: true,
-      executionId,
-      exchange: routed.exchange,
-      result: routed.result,
-    };
+    return routed.ok
+      ? { ok: true, executionId, result: routed.result }
+      : { ok: false, executionId, error: routed.error };
   } catch (err) {
     return {
       ok: false,
