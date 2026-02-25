@@ -4,13 +4,15 @@ const cors = require("cors");
 const morgan = require("morgan");
 const helmet = require("helmet");
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
-const jwt = require("jsonwebtoken");
 
 const { ensureDb, readDb, updateDb } = require("./lib/db");
 const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
+const { verify } = require("./lib/jwt");
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
+const rateLimiter = require("./middleware/rateLimiter");
 
 /* ================= SAFE BOOT ================= */
 
@@ -27,6 +29,13 @@ requireEnv("STRIPE_SECRET_KEY");
 ensureDb();
 users.ensureAdminFromEnv();
 
+/* ================= STARTUP INTEGRITY CHECK ================= */
+
+const integrityCheck = verifyAuditIntegrity();
+if (!integrityCheck.ok) {
+  console.error("🚨 AUDIT INTEGRITY FAILURE ON BOOT", integrityCheck);
+}
+
 /* ================= EXPRESS ================= */
 
 const app = express();
@@ -36,10 +45,11 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
+app.use(rateLimiter); // 🔐 Global traffic shield
 
-/* ================= HEALTH ROUTE ================= */
+/* ================= HEALTH ================= */
 
-let globalSecurityStatus = "secure";
+let globalSecurityStatus = integrityCheck.ok ? "secure" : "compromised";
 
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -53,6 +63,16 @@ app.get("/health", (req, res) => {
   });
 });
 
+/* Liveness (for load balancers) */
+app.get("/live", (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+/* Readiness (future DB/redis checks go here) */
+app.get("/ready", (req, res) => {
+  res.status(200).json({ ready: true });
+});
+
 /* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
@@ -61,18 +81,16 @@ app.use(tenantMiddleware);
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
-
 app.use("/api/tools", require("./routes/tools.routes"));
 app.use("/api/entitlements", require("./routes/entitlements.routes"));
 app.use("/api/billing", require("./routes/billing.routes"));
-
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
 
-/* ================= WEBSOCKET ================= */
+/* ================= WEBSOCKET (HARDENED) ================= */
 
 const wss = new WebSocketServer({
   server,
@@ -85,13 +103,56 @@ wss.on("connection", (ws, req) => {
     const token = url.searchParams.get("token");
     if (!token) return ws.close(1008);
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const payload = verify(token, "access");
+
+    const db = readDb();
+    const user = (db.users || []).find(u => u.id === payload.id);
+    if (!user) return ws.close(1008);
+
+    /* ===== TOKEN VERSION ENFORCEMENT ===== */
+    if ((payload.tokenVersion || 0) !== (user.tokenVersion || 0)) {
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "WS_TOKEN_VERSION_MISMATCH"
+      });
+      return ws.close(1008);
+    }
+
+    /* ===== ACCOUNT LOCK ===== */
+    if (user.locked) return ws.close(1008);
+
+    /* ===== SUBSCRIPTION CHECK ===== */
+    const inactive =
+      user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
+      user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
+
+    if (inactive) return ws.close(1008);
+
+    /* ===== COMPANY CHECK ===== */
+    if (user.companyId) {
+      const company = (db.companies || []).find(
+        c => c.id === user.companyId
+      );
+      if (!company || company.status === "Suspended") {
+        return ws.close(1008);
+      }
+    }
 
     ws.user = {
-      id: decoded.id,
-      role: decoded.role,
-      companyId: decoded.companyId || null,
+      id: user.id,
+      role: user.role,
+      companyId: user.companyId || null,
     };
+
+    if (["Admin", "Finance"].includes(user.role)) {
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "WS_HIGH_PRIVILEGE_CONNECTION"
+      });
+    }
+
   } catch {
     ws.close(1008);
   }
@@ -112,7 +173,6 @@ function broadcast(payload) {
 
 const WINDOW_MS = 5 * 60 * 1000;
 const CHECK_INTERVAL = 15000;
-
 const baselineMemory = new Map();
 
 function detectIntelligence() {
@@ -138,7 +198,6 @@ function detectIntelligence() {
 
     list.forEach(e => {
       const asset = e.targetAsset || "unknown";
-
       const weight =
         e.severity === "critical" ? 25 :
         e.severity === "high" ? 15 :
@@ -195,11 +254,9 @@ function detectIntelligence() {
 
 setInterval(detectIntelligence, CHECK_INTERVAL);
 
-/* =========================================================
-   🔐 AUDIT INTEGRITY WATCHDOG
-========================================================= */
+/* ================= AUDIT INTEGRITY WATCHDOG ================= */
 
-const INTEGRITY_CHECK_INTERVAL = 60000; // 60 seconds
+const INTEGRITY_CHECK_INTERVAL = 60000;
 let integrityCompromised = false;
 
 function monitorAuditIntegrity() {
@@ -222,7 +279,7 @@ function monitorAuditIntegrity() {
         db.securityEvents = [];
 
       db.securityEvents.push({
-        id: crypto.randomUUID?.() || Date.now().toString(),
+        id: crypto.randomUUID(),
         severity: "critical",
         timestamp: Date.now(),
         message: "Audit ledger integrity failure detected",
@@ -243,6 +300,44 @@ function monitorAuditIntegrity() {
 }
 
 setInterval(monitorAuditIntegrity, INTEGRITY_CHECK_INTERVAL);
+
+/* ================= GRACEFUL SHUTDOWN ================= */
+
+function shutdown(signal) {
+  console.log(`\n[SHUTDOWN] Received ${signal}`);
+  server.close(() => {
+    console.log("[SHUTDOWN] HTTP server closed");
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("[SHUTDOWN] Forced exit");
+    process.exit(1);
+  }, 10000);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled Rejection:", err);
+  writeAudit({
+    actor: "system",
+    role: "system",
+    action: "UNHANDLED_REJECTION",
+    detail: { message: err?.message }
+  });
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+  writeAudit({
+    actor: "system",
+    role: "system",
+    action: "UNCAUGHT_EXCEPTION",
+    detail: { message: err?.message }
+  });
+});
 
 /* ================= START ================= */
 
