@@ -1,6 +1,6 @@
 // backend/src/lib/jwt.js
-// Unified JWT Core — Institutional Hardened (Phase 4 Lock)
-// Access/Refresh separated • Type enforced • Strict verify • No algorithm drift
+// Enterprise JWT Core — Rotation Ready v2
+// Key Rotation • Strict Claims • Multi-Key Verify • Replay Foundation
 
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -9,17 +9,21 @@ const crypto = require("crypto");
    CONFIG
 ========================================================= */
 
-const JWT_SECRET = process.env.JWT_SECRET;
+const ACTIVE_SECRET = process.env.JWT_SECRET;
+const PREVIOUS_SECRET = process.env.JWT_SECRET_PREVIOUS || null;
+
 const JWT_ISSUER = process.env.JWT_ISSUER || "autoshield-tech";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "autoshield-clients";
-const JWT_ALGORITHM = "HS256";
 
-if (!JWT_SECRET || typeof JWT_SECRET !== "string" || JWT_SECRET.length < 32) {
-  throw new Error("JWT_SECRET must be defined and at least 32 characters");
+const JWT_ALGORITHM = "HS256";
+const MAX_ACCESS_LIFETIME = 60 * 60 * 24; // 24 hours max
+
+if (!ACTIVE_SECRET || ACTIVE_SECRET.length < 32) {
+  throw new Error("JWT_SECRET must be at least 32 chars");
 }
 
 /* =========================================================
-   BASE SIGNER
+   SIGN BASE
 ========================================================= */
 
 function baseSign(payload, { expiresIn, type }) {
@@ -33,20 +37,25 @@ function baseSign(payload, { expiresIn, type }) {
 
   const jti = crypto.randomUUID();
 
-  return jwt.sign(
+  const token = jwt.sign(
     {
       ...payload,
       type,
       jti,
     },
-    JWT_SECRET,
+    ACTIVE_SECRET,
     {
       expiresIn,
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
       algorithm: JWT_ALGORITHM,
+      header: {
+        kid: "active",
+      },
     }
   );
+
+  return token;
 }
 
 /* =========================================================
@@ -72,7 +81,7 @@ function signRefresh(payload, expiresIn = "7d") {
 }
 
 /* =========================================================
-   BACKWARD COMPATIBLE SIGN (ACCESS ONLY)
+   BACKWARD COMPAT SIGN
 ========================================================= */
 
 function sign(payload, _ignoredSecret, expiresIn = "15m") {
@@ -80,20 +89,36 @@ function sign(payload, _ignoredSecret, expiresIn = "15m") {
 }
 
 /* =========================================================
-   STRICT VERIFY
+   VERIFY
 ========================================================= */
+
+function tryVerify(token, secret) {
+  return jwt.verify(token, secret, {
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    algorithms: [JWT_ALGORITHM],
+    clockTolerance: 5,
+  });
+}
 
 function verify(token, expectedType = "access") {
   if (!token || typeof token !== "string") {
     throw new Error("Invalid token");
   }
 
-  const decoded = jwt.verify(token, JWT_SECRET, {
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
-    algorithms: [JWT_ALGORITHM],
-    clockTolerance: 5,
-  });
+  let decoded;
+
+  try {
+    decoded = tryVerify(token, ACTIVE_SECRET);
+  } catch (err) {
+    if (!PREVIOUS_SECRET) throw err;
+
+    try {
+      decoded = tryVerify(token, PREVIOUS_SECRET);
+    } catch {
+      throw err;
+    }
+  }
 
   if (!decoded || typeof decoded !== "object") {
     throw new Error("Invalid token payload");
@@ -105,6 +130,17 @@ function verify(token, expectedType = "access") {
 
   if (!decoded.id || !decoded.role) {
     throw new Error("Malformed token payload");
+  }
+
+  /* =========================================================
+     ABSOLUTE LIFETIME ENFORCEMENT
+  ========================================================= */
+
+  if (decoded.iat && decoded.exp) {
+    const lifetime = decoded.exp - decoded.iat;
+    if (lifetime > MAX_ACCESS_LIFETIME && expectedType === "access") {
+      throw new Error("Token lifetime exceeds policy");
+    }
   }
 
   return decoded;
