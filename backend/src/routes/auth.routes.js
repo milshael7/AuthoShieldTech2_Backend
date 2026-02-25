@@ -1,5 +1,5 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Device Bound v4
+// Enterprise Auth Engine — Device Bound v4 (Policy Fixed)
 // Session Controlled • Device Fingerprint Bound • Anti-Hijack Ready
 
 const express = require("express");
@@ -87,7 +87,6 @@ function recordSuccessfulLogin(user, fingerprint) {
 
     // Store device fingerprint
     const previous = u.activeDeviceFingerprint;
-
     u.activeDeviceFingerprint = fingerprint;
 
     if (previous && previous !== fingerprint) {
@@ -199,13 +198,12 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ error: "Password reset required" });
     }
 
-    // 🔐 Build fingerprint from request
     const fingerprint = buildFingerprint(req);
-
     recordSuccessfulLogin(u, fingerprint);
 
     if (!ensureJwtSecret(res)) return;
 
+    // ✅ FIXED: 15m access token (policy compliant)
     const token = sign(
       {
         id: u.id,
@@ -214,7 +212,7 @@ router.post("/login", async (req, res) => {
         tokenVersion: u.tokenVersion || 0,
       },
       null,
-      "7d"
+      "15m"
     );
 
     return res.json({
@@ -241,6 +239,7 @@ router.post("/refresh", authRequired, (req, res) => {
 
     if (!ensureJwtSecret(res)) return;
 
+    // ✅ FIXED: 15m access token
     const token = sign(
       {
         id: dbUser.id,
@@ -249,7 +248,7 @@ router.post("/refresh", authRequired, (req, res) => {
         tokenVersion: dbUser.tokenVersion || 0
       },
       null,
-      "7d"
+      "15m"
     );
 
     audit({
@@ -269,55 +268,32 @@ router.post("/refresh", authRequired, (req, res) => {
 });
 
 /* =========================================================
-   LOGOUT
+   LOGOUT / ADMIN ROUTES UNCHANGED
 ========================================================= */
 
 router.post("/logout", authRequired, (req, res) => {
   revokeToken(req.securityContext.jti);
-
-  audit({
-    actor: req.user.id,
-    role: req.user.role,
-    action: "SESSION_LOGOUT"
-  });
-
+  audit({ actor: req.user.id, role: req.user.role, action: "SESSION_LOGOUT" });
   return res.json({ ok: true });
 });
 
-/* =========================================================
-   LOGOUT ALL
-========================================================= */
-
 router.post("/logout-all", authRequired, (req, res) => {
   revokeAllUserSessions(req.user.id);
-
   updateDb((db) => {
     const u = db.users.find(x => x.id === req.user.id);
     if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
     return db;
   });
-
-  audit({
-    actor: req.user.id,
-    role: req.user.role,
-    action: "ALL_SESSIONS_LOGOUT"
-  });
-
+  audit({ actor: req.user.id, role: req.user.role, action: "ALL_SESSIONS_LOGOUT" });
   return res.json({ ok: true });
 });
 
-/* =========================================================
-   ADMIN FORCE LOGOUT
-========================================================= */
-
 router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
-
   if (req.user.role !== users.ROLES.ADMIN) {
     return res.status(403).json({ error: "Admin only" });
   }
 
   const { userId } = req.params;
-
   revokeAllUserSessions(userId);
 
   updateDb((db) => {
