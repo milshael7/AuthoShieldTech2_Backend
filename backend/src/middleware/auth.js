@@ -1,10 +1,16 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Hardened v3
-// Token Versioned • Role Locked • Subscription Enforced • Replay Resistant
+// Enterprise Access Governance Layer — Distributed Session Hardened
+// Token Versioned • JTI Revocation • Replay Guard • Subscription Enforced
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
+const {
+  registerSession,
+  revokeToken,
+  isRevoked
+} = require("../lib/sessionStore");
+
 const users = require("../users/user.service");
 
 /* ====================================================== */
@@ -38,14 +44,30 @@ function authRequired(req, res, next) {
   if (!token) return error(res, 401, "Missing token");
 
   let payload;
+
   try {
     payload = verify(token);
   } catch {
     return error(res, 401, "Token expired or invalid");
   }
 
-  if (!payload?.id) {
+  if (!payload?.id || !payload?.jti) {
     return error(res, 401, "Invalid token payload");
+  }
+
+  /* ======================================================
+     JTI REPLAY / REVOCATION CHECK
+  ====================================================== */
+
+  if (isRevoked(payload.jti)) {
+    writeAudit({
+      actor: payload.id,
+      role: payload.role,
+      action: "ACCESS_DENIED_REVOKED_TOKEN",
+      detail: { jti: payload.jti }
+    });
+
+    return error(res, 401, "Session revoked");
   }
 
   const db = readDb();
@@ -63,6 +85,9 @@ function authRequired(req, res, next) {
   const currentVersion = Number(user.tokenVersion || 0);
 
   if (tokenVersion !== currentVersion) {
+
+    revokeToken(payload.jti);
+
     writeAudit({
       actor: user.id,
       role: user.role,
@@ -77,6 +102,9 @@ function authRequired(req, res, next) {
   ====================================================== */
 
   if (norm(payload.role) !== norm(user.role)) {
+
+    revokeToken(payload.jti);
+
     writeAudit({
       actor: user.id,
       role: user.role,
@@ -91,6 +119,8 @@ function authRequired(req, res, next) {
   ====================================================== */
 
   if (user.locked === true) {
+    revokeToken(payload.jti);
+
     writeAudit({
       actor: user.id,
       role: user.role,
@@ -113,6 +143,8 @@ function authRequired(req, res, next) {
     user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
 
   if (inactive && !isBillingRoute(req)) {
+    revokeToken(payload.jti);
+
     writeAudit({
       actor: user.id,
       role: user.role,
@@ -129,11 +161,9 @@ function authRequired(req, res, next) {
   if (user.companyId && Array.isArray(db.companies)) {
     const company = db.companies.find(c => c.id === user.companyId);
 
-    if (!company) {
-      return error(res, 403, "Company not found");
-    }
+    if (!company || company.status === "Suspended") {
+      revokeToken(payload.jti);
 
-    if (company.status === "Suspended") {
       writeAudit({
         actor: user.id,
         role: user.role,
@@ -143,6 +173,12 @@ function authRequired(req, res, next) {
       return error(res, 403, "Company suspended");
     }
   }
+
+  /* ======================================================
+     REGISTER ACTIVE SESSION
+  ====================================================== */
+
+  registerSession(user.id, payload.jti);
 
   /* ======================================================
      ACCESS CONTEXT
@@ -157,6 +193,7 @@ function authRequired(req, res, next) {
 
   req.securityContext = {
     tokenVersion,
+    jti: payload.jti,
     verifiedAt: Date.now(),
     highPrivilege:
       norm(user.role) === "admin" ||
