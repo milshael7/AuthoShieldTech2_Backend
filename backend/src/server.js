@@ -12,8 +12,14 @@ const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const {
   registerSession,
-  isRevoked
+  isRevoked,
+  revokeToken
 } = require("./lib/sessionStore");
+
+const {
+  buildFingerprint,
+  classifyDeviceRisk
+} = require("./lib/deviceFingerprint");
 
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
@@ -66,8 +72,8 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/live", (req, res) => res.status(200).json({ ok: true }));
-app.get("/ready", (req, res) => res.status(200).json({ ready: true }));
+app.get("/live", (_, res) => res.status(200).json({ ok: true }));
+app.get("/ready", (_, res) => res.status(200).json({ ready: true }));
 
 /* ================= ROUTES ================= */
 
@@ -86,7 +92,7 @@ app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 
 const server = http.createServer(app);
 
-/* ================= WEBSOCKET (SESSION ENFORCED) ================= */
+/* ================= WEBSOCKET — ZERO TRUST ================= */
 
 const wss = new WebSocketServer({
   server,
@@ -94,20 +100,18 @@ const wss = new WebSocketServer({
 });
 
 wss.on("connection", (ws, req) => {
+
   try {
+
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
+
     if (!token) return ws.close(1008);
 
     const payload = verify(token, "access");
 
-    /* ===== JTI REVOCATION CHECK ===== */
+    /* === JTI CHECK === */
     if (!payload?.jti || isRevoked(payload.jti)) {
-      writeAudit({
-        actor: payload?.id || "unknown",
-        role: payload?.role || "unknown",
-        action: "WS_REJECTED_REVOKED_TOKEN"
-      });
       return ws.close(1008);
     }
 
@@ -115,37 +119,65 @@ wss.on("connection", (ws, req) => {
     const user = (db.users || []).find(u => u.id === payload.id);
     if (!user) return ws.close(1008);
 
-    /* ===== TOKEN VERSION CHECK ===== */
+    /* === TOKEN VERSION === */
     if ((payload.tokenVersion || 0) !== (user.tokenVersion || 0)) {
-      writeAudit({
-        actor: user.id,
-        role: user.role,
-        action: "WS_TOKEN_VERSION_MISMATCH"
-      });
+      revokeToken(payload.jti);
       return ws.close(1008);
     }
 
-    /* ===== ROLE TAMPER CHECK ===== */
+    /* === ROLE TAMPER === */
     if (String(payload.role) !== String(user.role)) {
-      writeAudit({
-        actor: user.id,
-        role: user.role,
-        action: "WS_ROLE_TAMPER_DETECTED"
-      });
+      revokeToken(payload.jti);
       return ws.close(1008);
     }
 
-    /* ===== ACCOUNT LOCK ===== */
+    /* === DEVICE BINDING === */
+    const deviceRisk = classifyDeviceRisk(
+      user.activeDeviceFingerprint,
+      req
+    );
+
+    if (!deviceRisk.match) {
+
+      revokeToken(payload.jti);
+
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "WS_DEVICE_MISMATCH",
+        detail: { risk: deviceRisk.risk }
+      });
+
+      updateDb((db) => {
+        if (!Array.isArray(db.securityEvents))
+          db.securityEvents = [];
+
+        db.securityEvents.push({
+          id: crypto.randomUUID(),
+          severity: "high",
+          timestamp: Date.now(),
+          companyId: user.companyId || null,
+          type: "device_anomaly",
+          message: "WebSocket device mismatch detected"
+        });
+
+        return db;
+      });
+
+      return ws.close(1008);
+    }
+
+    /* === ACCOUNT LOCK === */
     if (user.locked) return ws.close(1008);
 
-    /* ===== SUBSCRIPTION CHECK ===== */
+    /* === SUBSCRIPTION === */
     const inactive =
       user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
       user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
 
     if (inactive) return ws.close(1008);
 
-    /* ===== COMPANY CHECK ===== */
+    /* === COMPANY === */
     if (user.companyId) {
       const company = (db.companies || []).find(
         c => c.id === user.companyId
@@ -155,7 +187,7 @@ wss.on("connection", (ws, req) => {
       }
     }
 
-    /* ===== REGISTER SESSION ===== */
+    /* === REGISTER SESSION === */
     registerSession(user.id, payload.jti);
 
     ws.user = {
@@ -178,21 +210,7 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-/* ================= BROADCAST CORE ================= */
-
-function broadcast(payload) {
-  const msg = JSON.stringify(payload);
-
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) {
-      try {
-        client.send(msg);
-      } catch {}
-    }
-  });
-}
-
-/* ================= AUTO DISCONNECT REVOKED SESSIONS ================= */
+/* ================= AUTO TERMINATE REVOKED ================= */
 
 setInterval(() => {
   wss.clients.forEach(client => {
@@ -200,16 +218,22 @@ setInterval(() => {
     if (!client.user?.jti) return;
 
     if (isRevoked(client.user.jti)) {
-      writeAudit({
-        actor: client.user.id,
-        role: client.user.role,
-        action: "WS_SESSION_TERMINATED_REVOKED"
-      });
-
       try { client.close(1008); } catch {}
     }
   });
 }, 10000);
+
+/* ================= BROADCAST ================= */
+
+function broadcast(payload) {
+  const msg = JSON.stringify(payload);
+
+  wss.clients.forEach(client => {
+    if (client.readyState === 1) {
+      try { client.send(msg); } catch {}
+    }
+  });
+}
 
 /* ================= INTELLIGENCE ENGINE ================= */
 
@@ -218,6 +242,7 @@ const CHECK_INTERVAL = 15000;
 const baselineMemory = new Map();
 
 function detectIntelligence() {
+
   const db = readDb();
   const events = db.securityEvents || [];
   const now = Date.now();
@@ -235,20 +260,6 @@ function detectIntelligence() {
   }
 
   for (const [companyId, list] of Object.entries(grouped)) {
-    const assetExposure = {};
-
-    list.forEach(e => {
-      const asset = e.targetAsset || "unknown";
-      const weight =
-        e.severity === "critical" ? 25 :
-        e.severity === "high" ? 15 :
-        e.severity === "medium" ? 8 : 2;
-
-      assetExposure[asset] =
-        (assetExposure[asset] || 0) + weight;
-    });
-
-    broadcast({ type: "asset_exposure_update", companyId, exposure: assetExposure });
 
     const total = list.length;
     const critical = list.filter(e => e.severity === "critical").length;
@@ -295,7 +306,7 @@ function detectIntelligence() {
 
 setInterval(detectIntelligence, CHECK_INTERVAL);
 
-/* ================= AUDIT INTEGRITY WATCHDOG ================= */
+/* ================= INTEGRITY WATCHDOG ================= */
 
 const INTEGRITY_CHECK_INTERVAL = 60000;
 let integrityCompromised = false;
@@ -313,51 +324,10 @@ function monitorAuditIntegrity() {
       action: "AUDIT_INTEGRITY_FAILURE",
       detail: result,
     });
-
-    updateDb((db) => {
-      if (!Array.isArray(db.securityEvents))
-        db.securityEvents = [];
-
-      db.securityEvents.push({
-        id: crypto.randomUUID(),
-        severity: "critical",
-        timestamp: Date.now(),
-        message: "Audit ledger integrity failure detected",
-        type: "ledger_integrity",
-      });
-
-      return db;
-    });
-
-    broadcast({
-      type: "integrity_alert",
-      severity: "critical",
-      detail: result,
-    });
-
-    console.error("🚨 AUDIT INTEGRITY FAILURE DETECTED", result);
   }
 }
 
 setInterval(monitorAuditIntegrity, INTEGRITY_CHECK_INTERVAL);
-
-/* ================= GRACEFUL SHUTDOWN ================= */
-
-function shutdown(signal) {
-  console.log(`\n[SHUTDOWN] Received ${signal}`);
-  server.close(() => {
-    console.log("[SHUTDOWN] HTTP server closed");
-    process.exit(0);
-  });
-
-  setTimeout(() => {
-    console.error("[SHUTDOWN] Forced exit");
-    process.exit(1);
-  }, 10000);
-}
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
 
 /* ================= START ================= */
 
