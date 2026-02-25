@@ -1,6 +1,5 @@
-// backend/src/routes/stripe.webhook.routes.js
-// Phase 25 — Enterprise Stripe Webhook Security Layer
-// Signature Verified • Replay Protected • Idempotent • Audited
+// Phase 38 — Immutable Stripe Revenue Core
+// Signature Verified • Replay Protected • Idempotent • Memory Bounded • Livemode Enforced • Audited
 
 const express = require("express");
 const router = express.Router();
@@ -10,13 +9,11 @@ const { handleStripeWebhook } = require("../services/stripe.service");
 const { readDb, updateDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 
-if (!process.env.STRIPE_SECRET_KEY) {
+if (!process.env.STRIPE_SECRET_KEY)
   throw new Error("STRIPE_SECRET_KEY missing");
-}
 
-if (!process.env.STRIPE_WEBHOOK_SECRET) {
+if (!process.env.STRIPE_WEBHOOK_SECRET)
   throw new Error("STRIPE_WEBHOOK_SECRET missing");
-}
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
@@ -26,9 +23,9 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
    CONFIG
 ========================================================= */
 
-const MAX_TIMESTAMP_TOLERANCE_SECONDS = 300; // 5 minutes
+const MAX_TIMESTAMP_TOLERANCE_SECONDS = 300;
+const MAX_STORED_EVENT_IDS = 5000;
 
-// Only allow specific Stripe events
 const ALLOWED_EVENT_TYPES = new Set([
   "invoice.payment_succeeded",
   "charge.refunded",
@@ -37,39 +34,21 @@ const ALLOWED_EVENT_TYPES = new Set([
   "customer.subscription.deleted",
 ]);
 
-/*
-IMPORTANT:
-Raw body must be provided from server.js
-Do NOT use express.json() here
-*/
-
 /* =========================================================
-   WEBHOOK ENDPOINT
+   WEBHOOK
 ========================================================= */
 
 router.post("/", async (req, res) => {
+
   const signature = req.headers["stripe-signature"];
 
   if (!signature) {
     writeAudit({
       actor: "stripe_webhook",
       role: "system",
-      action: "WEBHOOK_REJECTED_MISSING_SIGNATURE",
+      action: "WEBHOOK_REJECTED_NO_SIGNATURE",
     });
-
     return res.status(400).send("Missing stripe-signature header");
-  }
-
-  // Content-Type validation
-  if (req.headers["content-type"] !== "application/json") {
-    writeAudit({
-      actor: "stripe_webhook",
-      role: "system",
-      action: "WEBHOOK_REJECTED_INVALID_CONTENT_TYPE",
-      detail: { contentType: req.headers["content-type"] },
-    });
-
-    return res.status(400).send("Invalid content-type");
   }
 
   let event;
@@ -87,12 +66,27 @@ router.post("/", async (req, res) => {
       action: "WEBHOOK_INVALID_SIGNATURE",
       detail: { message: err.message },
     });
-
-    return res.status(400).send("Webhook signature verification failed");
+    return res.status(400).send("Invalid signature");
   }
 
   /* =========================================================
-     REPLAY ATTACK PROTECTION
+     LIVE MODE ENFORCEMENT
+  ========================================================== */
+
+  const isProduction = process.env.NODE_ENV === "production";
+
+  if (isProduction && event.livemode !== true) {
+    writeAudit({
+      actor: "stripe_webhook",
+      role: "system",
+      action: "WEBHOOK_TEST_EVENT_BLOCKED",
+      detail: { eventId: event.id },
+    });
+    return res.status(400).send("Test event blocked in production");
+  }
+
+  /* =========================================================
+     TIMESTAMP REPLAY PROTECTION
   ========================================================== */
 
   const timestamp = event.created;
@@ -105,49 +99,61 @@ router.post("/", async (req, res) => {
       action: "WEBHOOK_REPLAY_BLOCKED",
       detail: { eventId: event.id },
     });
-
-    return res.status(400).send("Event outside allowed time window");
+    return res.status(400).send("Replay window exceeded");
   }
 
   /* =========================================================
-     EVENT TYPE ALLOW LIST
+     ALLOW LIST
   ========================================================== */
 
   if (!ALLOWED_EVENT_TYPES.has(event.type)) {
     writeAudit({
       actor: "stripe_webhook",
       role: "system",
-      action: "WEBHOOK_EVENT_IGNORED",
-      detail: { eventType: event.type },
+      action: "WEBHOOK_IGNORED_EVENT",
+      detail: { type: event.type },
     });
-
     return res.json({ ignored: true });
   }
 
   /* =========================================================
-     IDEMPOTENCY PRE-CHECK
+     IDEMPOTENCY
   ========================================================== */
 
   const db = readDb();
-  if (db.processedStripeEvents?.includes(event.id)) {
+  if (!Array.isArray(db.processedStripeEvents))
+    db.processedStripeEvents = [];
+
+  if (db.processedStripeEvents.includes(event.id)) {
     writeAudit({
       actor: "stripe_webhook",
       role: "system",
       action: "WEBHOOK_DUPLICATE_IGNORED",
       detail: { eventId: event.id },
     });
-
     return res.json({ duplicate: true });
   }
+
+  /* =========================================================
+     PROCESS EVENT
+  ========================================================== */
 
   try {
     await handleStripeWebhook(event);
 
     updateDb((db2) => {
+
       if (!Array.isArray(db2.processedStripeEvents))
         db2.processedStripeEvents = [];
 
       db2.processedStripeEvents.push(event.id);
+
+      // Memory Bound Protection
+      if (db2.processedStripeEvents.length > MAX_STORED_EVENT_IDS) {
+        db2.processedStripeEvents =
+          db2.processedStripeEvents.slice(-MAX_STORED_EVENT_IDS);
+      }
+
       return db2;
     });
 
@@ -155,7 +161,10 @@ router.post("/", async (req, res) => {
       actor: "stripe_webhook",
       role: "system",
       action: "WEBHOOK_PROCESSED",
-      detail: { eventId: event.id, type: event.type },
+      detail: {
+        eventId: event.id,
+        type: event.type,
+      },
     });
 
   } catch (err) {
@@ -163,7 +172,10 @@ router.post("/", async (req, res) => {
       actor: "stripe_webhook",
       role: "system",
       action: "WEBHOOK_PROCESSING_FAILED",
-      detail: { eventId: event.id, error: err.message },
+      detail: {
+        eventId: event.id,
+        error: err.message,
+      },
     });
 
     return res.status(500).json({
