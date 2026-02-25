@@ -1,24 +1,20 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Device Bound Zero Trust
-// Token Versioned • JTI Revocation • Replay Guard • Device Binding Enforced
+// Enterprise Access Governance Layer — Zero Trust Core v4
+// Token Versioned • JTI Revocation • Device Binding • Subscription Guard • Company Guard
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
+const sessionAdapter = require("../lib/sessionAdapter");
 const {
-  registerSession,
-  revokeToken,
-  isRevoked
-} = require("../lib/sessionStore");
-
-const {
-  buildFingerprint,
   classifyDeviceRisk
 } = require("../lib/deviceFingerprint");
 
 const users = require("../users/user.service");
 
 /* ====================================================== */
+
+const DEVICE_STRICT = process.env.DEVICE_BINDING_STRICT === "true";
 
 function extractToken(req) {
   const header = String(req.headers.authorization || "");
@@ -52,7 +48,7 @@ function authRequired(req, res, next) {
   let payload;
 
   try {
-    payload = verify(token);
+    payload = verify(token, "access");
   } catch {
     return error(res, 401, "Token expired or invalid");
   }
@@ -63,12 +59,11 @@ function authRequired(req, res, next) {
 
   /* ================= JTI REVOCATION ================= */
 
-  if (isRevoked(payload.jti)) {
+  if (sessionAdapter.isRevoked(payload.jti)) {
     writeAudit({
       actor: payload.id,
       role: payload.role,
-      action: "ACCESS_DENIED_REVOKED_TOKEN",
-      detail: { jti: payload.jti }
+      action: "ACCESS_DENIED_REVOKED_TOKEN"
     });
 
     return error(res, 401, "Session revoked");
@@ -88,7 +83,7 @@ function authRequired(req, res, next) {
 
   if (tokenVersion !== currentVersion) {
 
-    revokeToken(payload.jti);
+    sessionAdapter.revokeToken(payload.jti);
 
     writeAudit({
       actor: user.id,
@@ -103,7 +98,7 @@ function authRequired(req, res, next) {
 
   if (norm(payload.role) !== norm(user.role)) {
 
-    revokeToken(payload.jti);
+    sessionAdapter.revokeToken(payload.jti);
 
     writeAudit({
       actor: user.id,
@@ -114,31 +109,11 @@ function authRequired(req, res, next) {
     return error(res, 403, "Privilege mismatch");
   }
 
-  /* ================= DEVICE BINDING ================= */
-
-  const deviceCheck = classifyDeviceRisk(
-    user.activeDeviceFingerprint,
-    req
-  );
-
-  if (!deviceCheck.match) {
-
-    revokeToken(payload.jti);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "DEVICE_MISMATCH_DETECTED",
-      detail: { risk: deviceCheck.risk }
-    });
-
-    return error(res, 401, "Device verification failed");
-  }
-
-  /* ================= ACCOUNT STATUS ================= */
+  /* ================= ACCOUNT LOCK ================= */
 
   if (user.locked === true) {
-    revokeToken(payload.jti);
+
+    sessionAdapter.revokeToken(payload.jti);
 
     writeAudit({
       actor: user.id,
@@ -153,6 +128,28 @@ function authRequired(req, res, next) {
     return error(res, 403, "Account not approved");
   }
 
+  /* ================= DEVICE BINDING ================= */
+
+  const deviceCheck = classifyDeviceRisk(
+    user.activeDeviceFingerprint,
+    req
+  );
+
+  if (!deviceCheck.match) {
+
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "DEVICE_MISMATCH_DETECTED",
+      detail: { risk: deviceCheck.risk }
+    });
+
+    if (DEVICE_STRICT) {
+      sessionAdapter.revokeAllUserSessions(user.id);
+      return error(res, 401, "Device verification failed");
+    }
+  }
+
   /* ================= SUBSCRIPTION ================= */
 
   const inactive =
@@ -160,7 +157,8 @@ function authRequired(req, res, next) {
     user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
 
   if (inactive && !isBillingRoute(req)) {
-    revokeToken(payload.jti);
+
+    sessionAdapter.revokeToken(payload.jti);
 
     writeAudit({
       actor: user.id,
@@ -171,14 +169,14 @@ function authRequired(req, res, next) {
     return error(res, 403, "Subscription inactive");
   }
 
-  /* ================= COMPANY ================= */
+  /* ================= COMPANY STATUS ================= */
 
   if (user.companyId && Array.isArray(db.companies)) {
     const company = db.companies.find(c => c.id === user.companyId);
 
     if (!company || company.status === "Suspended") {
 
-      revokeToken(payload.jti);
+      sessionAdapter.revokeToken(payload.jti);
 
       writeAudit({
         actor: user.id,
@@ -192,7 +190,7 @@ function authRequired(req, res, next) {
 
   /* ================= REGISTER SESSION ================= */
 
-  registerSession(user.id, payload.jti);
+  sessionAdapter.registerSession(user.id, payload.jti);
 
   /* ================= CONTEXT ================= */
 
@@ -212,7 +210,7 @@ function authRequired(req, res, next) {
       norm(user.role) === "finance"
   };
 
-  /* ================= HIGH PRIVILEGE LOG ================= */
+  /* ================= HIGH PRIVILEGE AUDIT ================= */
 
   if (req.securityContext.highPrivilege) {
     writeAudit({
@@ -242,6 +240,7 @@ function requireRole(...roles) {
     }
 
     if (!allow.has(norm(req.user.role))) {
+
       writeAudit({
         actor: req.user.id,
         role: req.user.role,
