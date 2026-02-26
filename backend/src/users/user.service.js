@@ -1,6 +1,7 @@
 // backend/src/users/user.service.js
-// Enterprise User Authority Service — Hardened v2
+// Enterprise User Authority Service — Hardened v2.1
 // Anti-Escalation • Audited • Subscription Safe • Tenant Validated
+// Adds: seat/freedom helpers for tool-request routing
 
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
@@ -33,6 +34,7 @@ const APPROVAL_STATUS = Object.freeze({
 
 const ROLE_VALUES = Object.values(ROLES);
 const SUB_VALUES = Object.values(SUBSCRIPTION);
+const APPROVAL_VALUES = Object.values(APPROVAL_STATUS);
 
 /* ========================================================= */
 
@@ -71,6 +73,41 @@ function safeUser(u) {
 }
 
 /* =========================================================
+   ROLE / SEAT / FREEDOM HELPERS (USED BY ROUTES)
+========================================================= */
+
+/**
+ * Seat = user is tied to a company AND does not have freedom.
+ * This matches your rule: seat requests go to company first.
+ */
+function isSeatUser(u) {
+  return Boolean(u?.companyId) && !Boolean(u?.freedomEnabled);
+}
+
+/**
+ * Freedom = user can act independently (direct tool request allowed).
+ */
+function hasFreedom(u) {
+  return Boolean(u?.freedomEnabled);
+}
+
+function isAdmin(u) {
+  return String(u?.role) === ROLES.ADMIN;
+}
+
+function isManager(u) {
+  return String(u?.role) === ROLES.MANAGER;
+}
+
+function isCompany(u) {
+  return String(u?.role) === ROLES.COMPANY || String(u?.role) === ROLES.SMALL_COMPANY;
+}
+
+function isIndividual(u) {
+  return String(u?.role) === ROLES.INDIVIDUAL;
+}
+
+/* =========================================================
    VALIDATION HELPERS
 ========================================================= */
 
@@ -86,12 +123,18 @@ function validateSubscription(status) {
   }
 }
 
+function validateApprovalStatus(status) {
+  if (!APPROVAL_VALUES.includes(status)) {
+    throw new Error("Invalid approval status");
+  }
+}
+
 function validateCompany(companyId) {
   if (!companyId) return;
 
   const db = readDb();
   const exists = (db.companies || []).some(
-    c => String(c.id) === String(companyId)
+    (c) => String(c.id) === String(companyId)
   );
 
   if (!exists) {
@@ -110,13 +153,13 @@ function listUsers() {
 
 function findById(id) {
   const db = readDb();
-  return (db.users || []).find(u => String(u.id) === String(id)) || null;
+  return (db.users || []).find((u) => String(u.id) === String(id)) || null;
 }
 
 function findByEmail(email) {
   const db = readDb();
   const e = normEmail(email);
-  return (db.users || []).find(u => normEmail(u.email) === e) || null;
+  return (db.users || []).find((u) => normEmail(u.email) === e) || null;
 }
 
 /* =========================================================
@@ -138,6 +181,7 @@ async function createUser({
 
   validateRole(role);
   validateSubscription(subscriptionStatus);
+  validateApprovalStatus(status);
   validateCompany(companyId);
 
   if (role === ROLES.ADMIN) {
@@ -179,7 +223,7 @@ async function createUser({
     actor: "system",
     role: "system",
     action: "USER_CREATED",
-    target: user.id
+    target: user.id,
   });
 
   return safeUser(user);
@@ -202,7 +246,7 @@ function setSubscriptionStatus(userId, subscriptionStatus) {
   validateSubscription(subscriptionStatus);
 
   updateDb((db) => {
-    const u = db.users.find(x => String(x.id) === String(userId));
+    const u = db.users.find((x) => String(x.id) === String(userId));
     if (!u) return db;
 
     u.subscriptionStatus = subscriptionStatus;
@@ -217,13 +261,15 @@ function setSubscriptionStatus(userId, subscriptionStatus) {
     role: "system",
     action: "SUBSCRIPTION_STATUS_CHANGED",
     target: userId,
-    metadata: { subscriptionStatus }
+    metadata: { subscriptionStatus },
   });
 }
 
 function setApprovalStatus(userId, status) {
+  validateApprovalStatus(status);
+
   updateDb((db) => {
-    const u = db.users.find(x => String(x.id) === String(userId));
+    const u = db.users.find((x) => String(x.id) === String(userId));
     if (!u) return db;
 
     u.status = status;
@@ -236,7 +282,7 @@ function setApprovalStatus(userId, status) {
     role: "system",
     action: "APPROVAL_STATUS_CHANGED",
     target: userId,
-    metadata: { status }
+    metadata: { status },
   });
 }
 
@@ -246,7 +292,7 @@ function setApprovalStatus(userId, status) {
 
 function setFreedom(userId, enabled) {
   updateDb((db) => {
-    const u = db.users.find(x => x.id === userId);
+    const u = db.users.find((x) => x.id === userId);
     if (!u) return db;
 
     u.freedomEnabled = !!enabled;
@@ -257,7 +303,7 @@ function setFreedom(userId, enabled) {
 
 function setAutoProtect(userId, enabled) {
   updateDb((db) => {
-    const u = db.users.find(x => x.id === userId);
+    const u = db.users.find((x) => x.id === userId);
     if (!u) return db;
 
     u.autoprotectEnabled = !!enabled;
@@ -270,7 +316,7 @@ function attachCompany(userId, companyId) {
   validateCompany(companyId);
 
   updateDb((db) => {
-    const u = db.users.find(x => x.id === userId);
+    const u = db.users.find((x) => x.id === userId);
     if (!u) return db;
 
     if (!Array.isArray(u.managedCompanies)) {
@@ -299,10 +345,7 @@ function ensureAdminFromEnv() {
   updateDb((db) => {
     db.users = Array.isArray(db.users) ? db.users : [];
 
-    const existing = db.users.find(
-      u => normEmail(u.email) === email
-    );
-
+    const existing = db.users.find((u) => normEmail(u.email) === email);
     if (existing) return db;
 
     const passwordHash = bcrypt.hashSync(password, 12);
@@ -337,6 +380,14 @@ module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
+
+  // helpers (important for tool request logic)
+  isSeatUser,
+  hasFreedom,
+  isAdmin,
+  isManager,
+  isCompany,
+  isIndividual,
 
   listUsers,
   findById,
