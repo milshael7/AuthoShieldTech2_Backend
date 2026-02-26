@@ -1,24 +1,17 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Device Bound v4 (Policy Fixed)
+// Enterprise Auth Engine — Device Bound v4 (Refresh hardened)
 // Session Controlled • Device Fingerprint Bound • Anti-Hijack Ready
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const router = express.Router();
 
-const { sign } = require("../lib/jwt");
+const { sign, verify } = require("../lib/jwt"); // ✅ import verify
 const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const {
-  revokeToken,
-  revokeAllUserSessions
-} = require("../lib/sessionStore");
-
-const {
-  buildFingerprint
-} = require("../lib/deviceFingerprint");
-
+const { revokeToken, revokeAllUserSessions } = require("../lib/sessionStore");
+const { buildFingerprint } = require("../lib/deviceFingerprint");
 const users = require("../users/user.service");
 
 const MAX_LOGIN_ATTEMPTS = 5;
@@ -34,7 +27,7 @@ function cleanStr(v, max = 200) {
 }
 
 function safeDelay() {
-  return new Promise(resolve => setTimeout(resolve, 400));
+  return new Promise((resolve) => setTimeout(resolve, 400));
 }
 
 function ensureJwtSecret(res) {
@@ -45,18 +38,47 @@ function ensureJwtSecret(res) {
   return true;
 }
 
+/* ================= BEARER TOKEN HELPERS ================= */
+
+function getBearerToken(req) {
+  const h = req.headers?.authorization || req.headers?.Authorization;
+  if (!h) return null;
+  const m = String(h).match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+
+function requireAccessPayload(req, res) {
+  const token = getBearerToken(req);
+  if (!token) {
+    res.status(401).json({ error: "Missing token" });
+    return null;
+  }
+
+  try {
+    // Your server code uses: verify(token, "access")
+    const payload = verify(token, "access");
+    if (!payload?.id) {
+      res.status(401).json({ error: "Invalid token" });
+      return null;
+    }
+    return payload;
+  } catch (e) {
+    res.status(401).json({ error: "Invalid token" });
+    return null;
+  }
+}
+
 /* =========================================================
    LOGIN ATTEMPTS
 ========================================================= */
 
 function recordFailedLogin(user) {
   updateDb((db) => {
-    const u = db.users.find(x => x.id === user.id);
+    const u = db.users.find((x) => x.id === user.id);
     if (!u) return db;
 
     if (!u.securityFlags) u.securityFlags = {};
-    u.securityFlags.failedLogins =
-      (u.securityFlags.failedLogins || 0) + 1;
+    u.securityFlags.failedLogins = (u.securityFlags.failedLogins || 0) + 1;
 
     if (u.securityFlags.failedLogins >= MAX_LOGIN_ATTEMPTS) {
       u.locked = true;
@@ -64,7 +86,7 @@ function recordFailedLogin(user) {
       audit({
         actor: u.id,
         role: u.role,
-        action: "ACCOUNT_AUTO_LOCKED_LOGIN_ABUSE"
+        action: "ACCOUNT_AUTO_LOCKED_LOGIN_ABUSE",
       });
     }
 
@@ -75,7 +97,7 @@ function recordFailedLogin(user) {
 
 function recordSuccessfulLogin(user, fingerprint) {
   updateDb((db) => {
-    const u = db.users.find(x => x.id === user.id);
+    const u = db.users.find((x) => x.id === user.id);
     if (!u) return db;
 
     if (!u.securityFlags) u.securityFlags = {};
@@ -104,7 +126,7 @@ function recordSuccessfulLogin(user, fingerprint) {
   audit({
     actor: user.id,
     role: user.role,
-    action: "LOGIN_SUCCESS"
+    action: "LOGIN_SUCCESS",
   });
 }
 
@@ -140,22 +162,21 @@ router.post("/signup", async (req, res) => {
     const created = await users.createUser({
       email,
       password,
-      role: users.ROLES.INDIVIDUAL
+      role: users.ROLES.INDIVIDUAL,
     });
 
     audit({
       actor: "system",
       role: "system",
       action: "SIGNUP_CREATED",
-      target: created.id
+      target: created.id,
     });
 
     return res.status(201).json({
       ok: true,
       message: "Account created. Pending approval.",
-      user: safeUserResponse(created)
+      user: safeUserResponse(created),
     });
-
   } catch (e) {
     return res.status(400).json({ error: e?.message || String(e) });
   }
@@ -190,20 +211,15 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    if (u.locked) {
-      return res.status(403).json({ error: "Account suspended" });
-    }
-
-    if (u.mustResetPassword) {
+    if (u.locked) return res.status(403).json({ error: "Account suspended" });
+    if (u.mustResetPassword)
       return res.status(403).json({ error: "Password reset required" });
-    }
 
     const fingerprint = buildFingerprint(req);
     recordSuccessfulLogin(u, fingerprint);
 
     if (!ensureJwtSecret(res)) return;
 
-    // ✅ FIXED: 15m access token (policy compliant)
     const token = sign(
       {
         id: u.id,
@@ -216,36 +232,41 @@ router.post("/login", async (req, res) => {
     );
 
     return res.json({
+      ok: true,
       token,
-      user: safeUserResponse(u)
+      user: safeUserResponse(u),
     });
-
   } catch (e) {
     return res.status(403).json({ error: e?.message || String(e) });
   }
 });
 
 /* =========================================================
-   REFRESH
+   REFRESH (✅ FIX: verify Bearer token here, don’t depend on authRequired)
 ========================================================= */
 
-router.post("/refresh", authRequired, (req, res) => {
+router.post("/refresh", (req, res) => {
   try {
-    const dbUser = users.findById(req.user.id);
-    if (!dbUser) return res.status(401).json({ error: "User not found" });
+    const payload = requireAccessPayload(req, res);
+    if (!payload) return;
 
-    if (dbUser.locked)
-      return res.status(403).json({ error: "Account suspended" });
+    const dbUser = users.findById(payload.id);
+    if (!dbUser) return res.status(401).json({ error: "User not found" });
+    if (dbUser.locked) return res.status(403).json({ error: "Account suspended" });
+
+    // ✅ tokenVersion sync check so old tokens can’t refresh
+    if ((payload.tokenVersion || 0) !== (dbUser.tokenVersion || 0)) {
+      return res.status(401).json({ error: "Session expired" });
+    }
 
     if (!ensureJwtSecret(res)) return;
 
-    // ✅ FIXED: 15m access token
     const token = sign(
       {
         id: dbUser.id,
         role: dbUser.role,
         companyId: dbUser.companyId || null,
-        tokenVersion: dbUser.tokenVersion || 0
+        tokenVersion: dbUser.tokenVersion || 0,
       },
       null,
       "15m"
@@ -254,14 +275,14 @@ router.post("/refresh", authRequired, (req, res) => {
     audit({
       actor: dbUser.id,
       role: dbUser.role,
-      action: "TOKEN_REFRESHED"
+      action: "TOKEN_REFRESHED",
     });
 
     return res.json({
+      ok: true,
       token,
-      user: safeUserResponse(dbUser)
+      user: safeUserResponse(dbUser),
     });
-
   } catch (e) {
     return res.status(403).json({ error: e?.message || String(e) });
   }
@@ -280,7 +301,7 @@ router.post("/logout", authRequired, (req, res) => {
 router.post("/logout-all", authRequired, (req, res) => {
   revokeAllUserSessions(req.user.id);
   updateDb((db) => {
-    const u = db.users.find(x => x.id === req.user.id);
+    const u = db.users.find((x) => x.id === req.user.id);
     if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
     return db;
   });
@@ -297,7 +318,7 @@ router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
   revokeAllUserSessions(userId);
 
   updateDb((db) => {
-    const u = db.users.find(x => x.id === userId);
+    const u = db.users.find((x) => x.id === userId);
     if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
     return db;
   });
@@ -306,7 +327,7 @@ router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
     actor: req.user.id,
     role: req.user.role,
     action: "ADMIN_FORCE_LOGOUT",
-    target: userId
+    target: userId,
   });
 
   return res.json({ ok: true });
