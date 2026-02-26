@@ -1,8 +1,8 @@
 // backend/src/lib/tools.engine.js
 // Enterprise Tools Engine Core
-// Entitlement-based access control (billing-ready)
-// v2: Adds support fields for approval-based tools (requiresApproval/dangerous/maxDurationMinutes)
-// NOTE: Approval timing/grants are enforced in routes/tools.routes.js (not here).
+// v3 — Hardened Governance Alignment
+// Entitlement + Role + Seat Governance Logic
+// Approval timing/grants enforced in routes/tools.routes.js
 
 const { userHasTool } = require("./entitlement.engine");
 
@@ -25,29 +25,44 @@ function isManager(user, ROLES) {
 }
 
 function isCompany(user, ROLES) {
-  return user?.role === ROLES.COMPANY || user?.role === ROLES.SMALL_COMPANY;
+  return (
+    user?.role === ROLES.COMPANY ||
+    user?.role === ROLES.SMALL_COMPANY
+  );
 }
 
 function isIndividual(user, ROLES) {
   return user?.role === ROLES.INDIVIDUAL;
 }
 
+/**
+ * Seat user = tied to company AND no freedom
+ */
+function isSeatUser(user) {
+  return Boolean(user?.companyId) && !Boolean(user?.freedomEnabled);
+}
+
 /* =========================================================
-   TOOL ACCESS CORE LOGIC (ENTITLEMENT DRIVEN)
-   - This answers: "Are you allowed to ever use/request this tool?"
-   - Time-limited "approval/grant" enforcement happens in tools.routes.js
+   CORE ACCESS DECISION
+   This answers:
+   "Is this user ever allowed to use or request this tool?"
+   (NOT time-limited approval logic — that's in routes)
 ========================================================= */
 
 function canAccessTool(user, tool, ROLES) {
   if (!user || !tool) return false;
   if (tool.enabled === false) return false;
 
-  // ADMIN — full override
+  /* ===============================
+     ADMIN — FULL OVERRIDE
+  =============================== */
   if (isAdmin(user, ROLES)) {
     return tool.adminAllowed !== false;
   }
 
-  // MANAGER — operational access
+  /* ===============================
+     MANAGER
+  =============================== */
   if (isManager(user, ROLES)) {
     if (tool.enterpriseOnly) {
       return tool.managerAllowed === true;
@@ -55,17 +70,38 @@ function canAccessTool(user, tool, ROLES) {
     return tool.managerAllowed !== false;
   }
 
-  // COMPANY (and SMALL COMPANY) — only explicitly allowed tools
+  /* ===============================
+     COMPANY
+  =============================== */
   if (isCompany(user, ROLES)) {
     return tool.companyAllowed === true;
   }
 
-  // INDIVIDUAL — entitlement required for paid/enterprise tools
-  if (isIndividual(user, ROLES)) {
-    // Free tools always allowed
+  /* ===============================
+     INDIVIDUAL (Standalone)
+  =============================== */
+  if (isIndividual(user, ROLES) && !isSeatUser(user)) {
     if (tool.tier === "free") return true;
 
-    // Paid or enterprise require entitlement
+    if (tool.tier === "paid" || tool.tier === "enterprise") {
+      return userHasTool(user, tool.id);
+    }
+
+    return false;
+  }
+
+  /* ===============================
+     SEAT USER (Under Company)
+     🔒 Cannot escalate beyond company policy
+  =============================== */
+  if (isSeatUser(user)) {
+    // If company does not allow this tool at all → deny
+    if (tool.companyAllowed !== true) return false;
+
+    // Free tools allowed
+    if (tool.tier === "free") return true;
+
+    // Paid/enterprise tools require entitlement
     if (tool.tier === "paid" || tool.tier === "enterprise") {
       return userHasTool(user, tool.id);
     }
@@ -78,8 +114,7 @@ function canAccessTool(user, tool, ROLES) {
 
 /* =========================================================
    DEFAULT TOOL SEED
-   - We seed some tools as "requiresApproval"/"dangerous"
-   - "dangerous" implies admin-only approval in tools.routes.js
+   Includes approval/dangerous metadata
 ========================================================= */
 
 function seedToolsIfEmpty(db) {
@@ -101,7 +136,6 @@ function seedToolsIfEmpty(db) {
       managerAllowed: true,
       companyAllowed: true,
 
-      // approval model
       requiresApproval: false,
       dangerous: false,
     },
@@ -124,7 +158,7 @@ function seedToolsIfEmpty(db) {
     {
       id: "autodev-65",
       name: "Autodev 6.5",
-      description: "Automated defense system engine (internal-grade).",
+      description: "Automated defense system engine.",
       tier: "paid",
       category: "automation",
       enabled: true,
@@ -134,15 +168,14 @@ function seedToolsIfEmpty(db) {
       managerAllowed: true,
       companyAllowed: false,
 
-      // Autodev can be powerful; keep it approval-based if you want:
       requiresApproval: true,
       dangerous: false,
-      maxDurationMinutes: 1440, // cap at 1 day even if admin tries > 1 day
+      maxDurationMinutes: 1440, // 1 day cap
     },
     {
       id: "enterprise-radar",
       name: "Enterprise Global Radar",
-      description: "Global monitoring + response control (high impact).",
+      description: "Global monitoring + response control.",
       tier: "enterprise",
       category: "enterprise",
       enabled: true,
@@ -152,13 +185,10 @@ function seedToolsIfEmpty(db) {
       managerAllowed: true,
       companyAllowed: false,
 
-      // admin-only approval
       requiresApproval: true,
       dangerous: true,
-      maxDurationMinutes: 2880, // cap at 2 days
+      maxDurationMinutes: 2880, // 2 day cap
     },
-
-    // Example of a tool that exists in catalog but is disabled by default
     {
       id: "forensics-shell",
       name: "Forensics Shell (Restricted)",
@@ -174,7 +204,7 @@ function seedToolsIfEmpty(db) {
 
       requiresApproval: true,
       dangerous: true,
-      maxDurationMinutes: 120, // even if enabled later, cap it hard
+      maxDurationMinutes: 120,
     },
   ];
 
