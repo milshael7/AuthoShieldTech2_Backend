@@ -1,5 +1,5 @@
 // backend/src/routes/tools.routes.js
-// Enterprise Tools Engine — Hardened Access Enforcement v3
+// Enterprise Tools Engine — Hardened Access Enforcement v3.1
 // Catalog + Strict Access + Time-Limited Tool Grants
 // Seat → Company Request → Admin/Manager Approval (timed) → Auto Expire
 // Audited • Abuse Aware • Backward Compatible
@@ -16,7 +16,7 @@ const users = require("../users/user.service");
 const {
   canAccessTool,
   seedToolsIfEmpty,
-  normalizeArray
+  normalizeArray,
 } = require("../lib/tools.engine");
 
 /* ========================================================= */
@@ -30,7 +30,7 @@ function uid(prefix = "req") {
 }
 
 function findUser(db, userId) {
-  return (db.users || []).find(u => String(u.id) === String(userId));
+  return (db.users || []).find((u) => String(u.id) === String(userId));
 }
 
 function subscriptionActive(user) {
@@ -39,10 +39,27 @@ function subscriptionActive(user) {
 }
 
 function ensureToolsState(db) {
-  if (!Array.isArray(db.tools)) db.tools = [];
+  // IMPORTANT: don't wipe if tools is an object (normalize instead)
+  db.tools = normalizeArray(db.tools);
+
   if (!Array.isArray(db.toolRequests)) db.toolRequests = [];
   if (!Array.isArray(db.toolGrants)) db.toolGrants = [];
   return db;
+}
+
+function persistSeedIfNeeded(db) {
+  // Seed tools if empty AND persist to db.json
+  const seeded = seedToolsIfEmpty(db);
+  if (!seeded) return;
+
+  updateDb((db2) => {
+    db2 = ensureToolsState(db2);
+    // if db2.tools already exists, keep it; otherwise persist db.tools
+    if (!Array.isArray(db2.tools) || db2.tools.length === 0) {
+      db2.tools = db.tools;
+    }
+    return db2;
+  });
 }
 
 function isAdmin(user) {
@@ -54,7 +71,8 @@ function isManager(user) {
 }
 
 function isCompany(user) {
-  return String(user?.role) === users.ROLES.COMPANY;
+  const r = String(user?.role);
+  return r === users.ROLES.COMPANY || r === users.ROLES.SMALL_COMPANY;
 }
 
 function isIndividual(user) {
@@ -75,24 +93,23 @@ function recordToolViolation(user, toolId, reason) {
     role: user.role,
     action: "TOOL_ACCESS_DENIED",
     target: toolId,
-    metadata: { reason }
+    metadata: { reason },
   });
 
   updateDb((db) => {
     db = ensureToolsState(db);
-    const u = db.users.find(x => x.id === user.id);
+    const u = db.users.find((x) => x.id === user.id);
     if (!u) return db;
 
     if (!u.securityFlags) u.securityFlags = {};
-    u.securityFlags.toolViolations =
-      (u.securityFlags.toolViolations || 0) + 1;
+    u.securityFlags.toolViolations = (u.securityFlags.toolViolations || 0) + 1;
 
     if (u.securityFlags.toolViolations >= 5) {
       u.locked = true;
       audit({
         actor: u.id,
         role: u.role,
-        action: "ACCOUNT_AUTO_LOCKED_TOOL_ABUSE"
+        action: "ACCOUNT_AUTO_LOCKED_TOOL_ABUSE",
       });
     }
 
@@ -107,17 +124,12 @@ function recordToolViolation(user, toolId, reason) {
 function cleanupExpiredGrants(db) {
   db = ensureToolsState(db);
   const now = Date.now();
-  const before = db.toolGrants.length;
 
-  db.toolGrants = db.toolGrants.filter(g => {
+  db.toolGrants = (db.toolGrants || []).filter((g) => {
     if (!g?.expiresAt) return true;
     return Date.parse(g.expiresAt) > now;
   });
 
-  const after = db.toolGrants.length;
-  if (after !== before) {
-    // no audit spam; only silent cleanup
-  }
   return db;
 }
 
@@ -126,22 +138,17 @@ function hasActiveGrant(db, { toolId, user }) {
   db = cleanupExpiredGrants(db);
 
   const now = Date.now();
-  const grants = db.toolGrants || [];
 
-  // A grant can be:
-  // - for a company (companyId)
-  // - for a specific seat user (userId)
-  // - both (companyId + userId)
-  return grants.some(g => {
+  return (db.toolGrants || []).some((g) => {
     if (String(g.toolId) !== String(toolId)) return false;
     if (!g.expiresAt) return false;
     if (Date.parse(g.expiresAt) <= now) return false;
 
-    // user-specific grant
+    // user-scoped grant
     if (g.userId && String(g.userId) === String(user.id)) return true;
 
-    // company-wide grant (covers seats and company role)
-    if (g.companyId && String(g.companyId) === String(user.companyId)) return true;
+    // company-scoped grant
+    if (g.companyId && user.companyId && String(g.companyId) === String(user.companyId)) return true;
 
     return false;
   });
@@ -152,8 +159,7 @@ function hasActiveGrant(db, { toolId, user }) {
 ========================================================= */
 
 /**
- * If tool is "dangerous", manager requests must be approved by admin (your rule).
- * You can mark tools with:
+ * Mark tools with:
  *  - tool.requiresApproval = true
  *  - tool.dangerous = true
  *  - tool.maxDurationMinutes = number (cap)
@@ -175,7 +181,7 @@ function resolveRequestStage(user, tool) {
     return "pending_review";
   }
 
-  // Admin can self-approve effectively, but we still model it as review
+  // Admin can self-approve, but we still model as review
   if (isAdmin(user)) return "pending_review";
 
   return "pending_review";
@@ -185,7 +191,7 @@ function canApproveRequest(approver, request, tool) {
   if (!approver) return false;
   if (approver.locked) return false;
 
-  // Company can only forward seat requests, not approve grants
+  // Company cannot approve tool grants (only forward/deny seat requests)
   if (isCompany(approver)) return false;
 
   if (isAdmin(approver)) return true;
@@ -193,7 +199,6 @@ function canApproveRequest(approver, request, tool) {
   if (isManager(approver)) {
     // manager cannot approve dangerous tools
     if (Boolean(tool?.dangerous)) return false;
-    // manager can approve normal approvals
     return true;
   }
 
@@ -206,7 +211,7 @@ function clampDurationMinutes(approver, tool, requestedMinutes) {
   // admin: 1440 mins (1 day)
   const mgrMax = 120;
   const adminDefault = 1440;
-  const adminMax = 2880; // 2 days (your “maybe a day or two”)
+  const adminMax = 2880; // 2 days
 
   let mins = Number(requestedMinutes);
   if (!Number.isFinite(mins) || mins <= 0) {
@@ -232,6 +237,27 @@ function clampDurationMinutes(approver, tool, requestedMinutes) {
   return mins;
 }
 
+/**
+ * Grant scope rules (matches what you described):
+ * - Seat request: grant is USER-scoped (only that seat user can use it)
+ * - Company request: grant is COMPANY-scoped (company + its seats can use it)
+ * - Individual request: USER-scoped
+ */
+function buildGrantScopeFromRequest(request) {
+  const requestedRole = String(request?.requestedRole || "");
+
+  if (request?.seatUser) {
+    return { companyId: null, userId: request.requestedBy };
+  }
+
+  if (requestedRole === users.ROLES.COMPANY || requestedRole === users.ROLES.SMALL_COMPANY) {
+    return { companyId: request.companyId || null, userId: null };
+  }
+
+  // default (individual/manager/admin)
+  return { companyId: null, userId: request.requestedBy };
+}
+
 /* ========================================================= */
 
 router.use(authRequired);
@@ -243,12 +269,10 @@ router.use(authRequired);
 router.get("/catalog", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const user = findUser(db, req.user.id);
-    if (!user) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
+    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
     const toolsArr = normalizeArray(db.tools);
 
@@ -258,7 +282,6 @@ router.get("/catalog", (req, res) => {
         subscriptionActive(user) &&
         canAccessTool(user, tool, users.ROLES);
 
-      // If a tool requires approval, "accessible" only if user has a grant
       const needsApproval = toolRequiresApproval(tool);
       const grantOk = !needsApproval ? true : hasActiveGrant(db, { toolId: tool.id, user });
 
@@ -273,16 +296,11 @@ router.get("/catalog", (req, res) => {
         requiresApproval: needsApproval,
         hasActiveGrant: needsApproval ? grantOk : true,
 
-        accessible: baseEntitled && grantOk
+        accessible: baseEntitled && grantOk,
       };
     });
 
-    return res.json({
-      ok: true,
-      tools,
-      time: nowIso()
-    });
-
+    return res.json({ ok: true, tools, time: nowIso() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
@@ -290,29 +308,21 @@ router.get("/catalog", (req, res) => {
 
 /* =========================================================
    STRICT TOOL ACCESS
-   - Keeps your old entitlement checks
-   - Adds approval/grant enforcement for tools marked requiresApproval/dangerous
 ========================================================= */
 
 router.get("/access/:toolId", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const { toolId } = req.params;
     const toolsArr = normalizeArray(db.tools);
 
-    const tool = toolsArr.find(t => String(t.id) === String(toolId));
-    if (!tool) {
-      return res.status(404).json({ ok: false, error: "Tool not found" });
-    }
+    const tool = toolsArr.find((t) => String(t.id) === String(toolId));
+    if (!tool) return res.status(404).json({ ok: false, error: "Tool not found" });
 
     const user = findUser(db, req.user.id);
-    if (!user) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
-
-    /* ================= ENFORCEMENT ================= */
+    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
     if (tool.enabled === false) {
       recordToolViolation(user, toolId, "TOOL_DISABLED");
@@ -330,7 +340,6 @@ router.get("/access/:toolId", (req, res) => {
       return res.status(403).json({ ok: false, error: "Access denied" });
     }
 
-    // NEW: approval enforcement
     if (toolRequiresApproval(tool)) {
       const grantOk = hasActiveGrant(db, { toolId: tool.id, user });
       if (!grantOk) {
@@ -338,23 +347,21 @@ router.get("/access/:toolId", (req, res) => {
           actor: user.id,
           role: user.role,
           action: "TOOL_ACCESS_BLOCKED_APPROVAL_REQUIRED",
-          target: toolId
+          target: toolId,
         });
         return res.status(403).json({
           ok: false,
           error: "Tool requires approval",
-          requiresApproval: true
+          requiresApproval: true,
         });
       }
     }
-
-    /* ================= SUCCESS — AUDIT GRANT ================= */
 
     audit({
       actor: user.id,
       role: user.role,
       action: "TOOL_ACCESS_GRANTED",
-      target: toolId
+      target: toolId,
     });
 
     return res.json({
@@ -364,18 +371,17 @@ router.get("/access/:toolId", (req, res) => {
         name: tool.name,
         tier: tool.tier,
         category: tool.category,
-        requiresApproval: toolRequiresApproval(tool)
+        requiresApproval: toolRequiresApproval(tool),
       },
-      time: nowIso()
+      time: nowIso(),
     });
-
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   REQUEST TOOL ACCESS (SEAT → COMPANY, OTHERS → REVIEW)
+   REQUEST TOOL ACCESS
    POST /api/tools/request/:toolId
    body: { note?: string }
 ========================================================= */
@@ -383,21 +389,20 @@ router.get("/access/:toolId", (req, res) => {
 router.post("/request/:toolId", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const user = findUser(db, req.user.id);
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
     const { toolId } = req.params;
     const toolsArr = normalizeArray(db.tools);
-    const tool = toolsArr.find(t => String(t.id) === String(toolId));
+    const tool = toolsArr.find((t) => String(t.id) === String(toolId));
     if (!tool) return res.status(404).json({ ok: false, error: "Tool not found" });
 
     if (tool.enabled === false) {
       return res.status(403).json({ ok: false, error: "Tool disabled" });
     }
 
-    // Must be subscribed + entitled just to request
     if (!subscriptionActive(user)) {
       return res.status(403).json({ ok: false, error: "Subscription inactive" });
     }
@@ -408,9 +413,13 @@ router.post("/request/:toolId", (req, res) => {
       return res.status(403).json({ ok: false, error: "Not entitled to request this tool" });
     }
 
+    // Seat must have companyId; if missing, treat as invalid seat state
+    if (isSeatUser(user) && !user.companyId) {
+      return res.status(400).json({ ok: false, error: "Seat user missing company binding" });
+    }
+
     const stage = resolveRequestStage(user, tool);
     const requestId = uid("toolreq");
-
     const note = String(req.body?.note || "").trim().slice(0, 600);
 
     const request = {
@@ -424,7 +433,6 @@ router.post("/request/:toolId", (req, res) => {
       requestedRole: String(user.role),
       companyId: user.companyId || null,
 
-      // seat requests go here
       status: stage, // pending_company | pending_review | pending_admin
 
       seatUser: isSeatUser(user),
@@ -433,16 +441,15 @@ router.post("/request/:toolId", (req, res) => {
       createdAt: nowIso(),
       updatedAt: nowIso(),
 
-      // filled during flow:
       forwardedByCompanyUserId: null,
       forwardedAt: null,
 
       decidedBy: null,
       decidedByRole: null,
-      decision: null,      // approved | denied
+      decision: null, // approved | denied
       decisionNote: null,
       durationMinutes: null,
-      expiresAt: null
+      expiresAt: null,
     };
 
     updateDb((db2) => {
@@ -456,7 +463,7 @@ router.post("/request/:toolId", (req, res) => {
       role: user.role,
       action: "TOOL_REQUEST_CREATED",
       target: toolId,
-      metadata: { requestId, status: stage, seatUser: request.seatUser }
+      metadata: { requestId, status: stage, seatUser: request.seatUser },
     });
 
     return res.json({
@@ -467,20 +474,16 @@ router.post("/request/:toolId", (req, res) => {
         stage === "pending_company"
           ? "Request sent to your company for approval forwarding"
           : "Request sent for review",
-      time: nowIso()
+      time: nowIso(),
     });
-
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   INBOX (what YOU need to handle)
+   INBOX
    GET /api/tools/requests/inbox
-   - Company sees pending_company for their companyId
-   - Admin sees pending_review + pending_admin
-   - Manager sees pending_review only (NOT pending_admin)
 ========================================================= */
 
 router.get("/requests/inbox", (req, res) => {
@@ -490,48 +493,43 @@ router.get("/requests/inbox", (req, res) => {
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
     const requests = normalizeArray(db.toolRequests);
-
     let inbox = [];
 
     if (isCompany(user)) {
-      inbox = requests.filter(r =>
-        r.status === "pending_company" &&
-        String(r.companyId || "") === String(user.companyId || user.id || "")
+      // Company sees seat requests for their companyId ONLY
+      if (!user.companyId) return res.json({ ok: true, inbox: [], time: nowIso() });
+
+      inbox = requests.filter(
+        (r) =>
+          r.status === "pending_company" &&
+          String(r.companyId || "") === String(user.companyId)
       );
     } else if (isAdmin(user)) {
-      inbox = requests.filter(r => r.status === "pending_review" || r.status === "pending_admin");
+      inbox = requests.filter((r) => r.status === "pending_review" || r.status === "pending_admin");
     } else if (isManager(user)) {
-      inbox = requests.filter(r => r.status === "pending_review");
-    } else {
-      inbox = [];
+      inbox = requests.filter((r) => r.status === "pending_review");
     }
 
-    return res.json({
-      ok: true,
-      inbox,
-      time: nowIso()
-    });
+    return res.json({ ok: true, inbox, time: nowIso() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   COMPANY FORWARD (seat request → admin/manager review)
+   COMPANY FORWARD
    POST /api/tools/requests/:requestId/forward
-   body: { note?: string }
-   - Only COMPANY role
-   - Only when status is pending_company
 ========================================================= */
 
 router.post("/requests/:requestId/forward", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const actor = findUser(db, req.user.id);
     if (!actor) return res.status(404).json({ ok: false, error: "User not found" });
     if (!isCompany(actor)) return res.status(403).json({ ok: false, error: "Company only" });
+    if (!actor.companyId) return res.status(400).json({ ok: false, error: "Company missing companyId binding" });
 
     const requestId = String(req.params.requestId);
     const note = String(req.body?.note || "").trim().slice(0, 600);
@@ -540,12 +538,11 @@ router.post("/requests/:requestId/forward", (req, res) => {
 
     updateDb((db2) => {
       db2 = ensureToolsState(db2);
-      const r = (db2.toolRequests || []).find(x => String(x.id) === requestId);
+
+      const r = (db2.toolRequests || []).find((x) => String(x.id) === requestId);
       if (!r) return db2;
 
-      // must match company
-      if (String(r.companyId || "") !== String(actor.companyId || actor.id || "")) return db2;
-
+      if (String(r.companyId || "") !== String(actor.companyId)) return db2;
       if (r.status !== "pending_company") return db2;
 
       r.status = r.toolDangerous ? "pending_admin" : "pending_review";
@@ -554,7 +551,6 @@ router.post("/requests/:requestId/forward", (req, res) => {
       r.updatedAt = nowIso();
 
       if (note) {
-        // keep original seat note + company note
         r.note = [r.note, `Company note: ${note}`].filter(Boolean).join("\n\n");
       }
 
@@ -571,11 +567,10 @@ router.post("/requests/:requestId/forward", (req, res) => {
       role: actor.role,
       action: "TOOL_REQUEST_FORWARDED",
       target: updated.toolId,
-      metadata: { requestId: updated.id, status: updated.status }
+      metadata: { requestId: updated.id, status: updated.status },
     });
 
     return res.json({ ok: true, request: updated, time: nowIso() });
-
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
@@ -584,16 +579,12 @@ router.post("/requests/:requestId/forward", (req, res) => {
 /* =========================================================
    APPROVE
    POST /api/tools/requests/:requestId/approve
-   body: { durationMinutes?: number, note?: string }
-   - Admin approves anything
-   - Manager cannot approve dangerous tools
-   - Creates timed toolGrant
 ========================================================= */
 
 router.post("/requests/:requestId/approve", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const approver = findUser(db, req.user.id);
     if (!approver) return res.status(404).json({ ok: false, error: "User not found" });
@@ -610,24 +601,20 @@ router.post("/requests/:requestId/approve", (req, res) => {
       db2 = ensureToolsState(db2);
       db2 = cleanupExpiredGrants(db2);
 
-      const r = (db2.toolRequests || []).find(x => String(x.id) === requestId);
+      const r = (db2.toolRequests || []).find((x) => String(x.id) === requestId);
       if (!r) return db2;
 
-      const tool = toolsArr.find(t => String(t.id) === String(r.toolId));
+      const tool = toolsArr.find((t) => String(t.id) === String(r.toolId));
       if (!tool) return db2;
 
-      // only pending states can be approved
       if (!["pending_review", "pending_admin"].includes(String(r.status))) return db2;
-
-      // permission check
       if (!canApproveRequest(approver, r, tool)) return db2;
 
       const durationMinutes = clampDurationMinutes(approver, tool, req.body?.durationMinutes);
       const expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
 
-      // Create a timed grant:
-      // - for company if request came from company or seat under company
-      // - for user if individual OR seat user id exists
+      const scope = buildGrantScopeFromRequest(r);
+
       const grantId = uid("grant");
       grant = {
         id: grantId,
@@ -638,14 +625,12 @@ router.post("/requests/:requestId/approve", (req, res) => {
         approvedByRole: String(approver.role),
         durationMinutes,
 
-        // who can use it:
-        companyId: r.companyId || null,
-        userId: r.requestedBy || null,
+        companyId: scope.companyId,
+        userId: scope.userId,
       };
 
       db2.toolGrants.unshift(grant);
 
-      // mark request decided
       r.status = "approved";
       r.decision = "approved";
       r.decidedBy = String(approver.id);
@@ -662,7 +647,7 @@ router.post("/requests/:requestId/approve", (req, res) => {
     if (!responseRequest) {
       return res.status(403).json({
         ok: false,
-        error: "Not approved (not found, not pending, or insufficient authority)"
+        error: "Not approved (not found, not pending, or insufficient authority)",
       });
     }
 
@@ -674,17 +659,12 @@ router.post("/requests/:requestId/approve", (req, res) => {
       metadata: {
         requestId: responseRequest.id,
         expiresAt: responseRequest.expiresAt,
-        durationMinutes: responseRequest.durationMinutes
-      }
+        durationMinutes: responseRequest.durationMinutes,
+        scope: { companyId: grant?.companyId || null, userId: grant?.userId || null },
+      },
     });
 
-    return res.json({
-      ok: true,
-      request: responseRequest,
-      grant,
-      time: nowIso()
-    });
-
+    return res.json({ ok: true, request: responseRequest, grant, time: nowIso() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
@@ -693,13 +673,12 @@ router.post("/requests/:requestId/approve", (req, res) => {
 /* =========================================================
    DENY
    POST /api/tools/requests/:requestId/deny
-   body: { note?: string }
 ========================================================= */
 
 router.post("/requests/:requestId/deny", (req, res) => {
   try {
     const db = ensureToolsState(readDb());
-    seedToolsIfEmpty(db);
+    persistSeedIfNeeded(db);
 
     const decider = findUser(db, req.user.id);
     if (!decider) return res.status(404).json({ ok: false, error: "User not found" });
@@ -708,25 +687,25 @@ router.post("/requests/:requestId/deny", (req, res) => {
     const note = String(req.body?.note || "").trim().slice(0, 600);
 
     const toolsArr = normalizeArray(db.tools);
-
     let responseRequest = null;
 
     updateDb((db2) => {
       db2 = ensureToolsState(db2);
 
-      const r = (db2.toolRequests || []).find(x => String(x.id) === requestId);
+      const r = (db2.toolRequests || []).find((x) => String(x.id) === requestId);
       if (!r) return db2;
 
-      const tool = toolsArr.find(t => String(t.id) === String(r.toolId));
+      const tool = toolsArr.find((t) => String(t.id) === String(r.toolId));
       if (!tool) return db2;
 
       if (!["pending_review", "pending_admin", "pending_company"].includes(String(r.status))) return db2;
 
-      // Company can deny only pending_company requests for their company
+      // Company can deny ONLY pending_company requests for their company
       if (isCompany(decider)) {
+        if (!decider.companyId) return db2;
         const okCompany =
           r.status === "pending_company" &&
-          String(r.companyId || "") === String(decider.companyId || decider.id || "");
+          String(r.companyId || "") === String(decider.companyId);
         if (!okCompany) return db2;
       } else {
         // Admin can deny anything; Manager cannot deny dangerous pending_admin
@@ -746,7 +725,10 @@ router.post("/requests/:requestId/deny", (req, res) => {
     });
 
     if (!responseRequest) {
-      return res.status(403).json({ ok: false, error: "Not denied (not found or insufficient authority)" });
+      return res.status(403).json({
+        ok: false,
+        error: "Not denied (not found or insufficient authority)",
+      });
     }
 
     audit({
@@ -754,18 +736,17 @@ router.post("/requests/:requestId/deny", (req, res) => {
       role: decider.role,
       action: "TOOL_REQUEST_DENIED",
       target: responseRequest.toolId,
-      metadata: { requestId: responseRequest.id }
+      metadata: { requestId: responseRequest.id },
     });
 
     return res.json({ ok: true, request: responseRequest, time: nowIso() });
-
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 /* =========================================================
-   MY REQUESTS (helpful for user UI)
+   MY REQUESTS
    GET /api/tools/requests/mine
 ========================================================= */
 
@@ -775,7 +756,9 @@ router.get("/requests/mine", (req, res) => {
     const user = findUser(db, req.user.id);
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
-    const requests = normalizeArray(db.toolRequests).filter(r => String(r.requestedBy) === String(user.id));
+    const requests = normalizeArray(db.toolRequests).filter(
+      (r) => String(r.requestedBy) === String(user.id)
+    );
 
     return res.json({ ok: true, requests, time: nowIso() });
   } catch (e) {
