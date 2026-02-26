@@ -1,5 +1,5 @@
 // backend/src/lib/db.js
-// Enterprise DB — Phase 24 Asset Intelligence Layer
+// Enterprise DB — Phase 25 Tool Governance Layer
 
 const fs = require("fs");
 const path = require("path");
@@ -7,7 +7,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12; // 🔥 bumped
 
 function ensureDir(p) {
   const dir = path.dirname(p);
@@ -23,7 +23,12 @@ function defaultDb() {
     companies: [],
     notifications: [],
 
-    /* 🔥 NEW ASSET LAYER */
+    /* 🔥 TOOL GOVERNANCE LAYER */
+    tools: [],                // master tool registry
+    toolRequests: [],         // approval workflow
+    entitlements: [],         // temporary access grants
+
+    /* ASSETS */
     assets: [],
 
     /* SECURITY */
@@ -106,7 +111,13 @@ function migrate(db) {
     "users",
     "companies",
     "notifications",
-    "assets",            // 🔥 NEW
+
+    /* 🔥 TOOL LAYER */
+    "tools",
+    "toolRequests",
+    "entitlements",
+
+    "assets",
     "scans",
     "scanCredits",
     "processedStripeEvents",
