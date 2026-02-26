@@ -1,6 +1,7 @@
 // backend/src/lib/entitlement.engine.js
-// Enterprise Entitlement Engine
-// Handles tool-based billing access (not role-based overrides)
+// Enterprise Entitlement Engine — Hardened v2
+// Per-tool expiration model
+// Safe against cross-tool expiration wipe
 
 const { readDb, updateDb } = require("./db");
 
@@ -14,14 +15,14 @@ function now() {
 
 function toTimestamp(date) {
   if (!date) return null;
-  return new Date(date).getTime();
+  const t = new Date(date).getTime();
+  return Number.isFinite(t) ? t : null;
 }
 
 function ensureUserEntitlements(user) {
   if (!user.entitlements) {
     user.entitlements = {
-      tools: [],
-      expiresAt: null
+      tools: []
     };
   }
 
@@ -39,34 +40,50 @@ function userHasTool(user, toolId) {
 
   ensureUserEntitlements(user);
 
-  // If expired → deny
-  if (user.entitlements.expiresAt) {
-    const expiry = toTimestamp(user.entitlements.expiresAt);
-    if (expiry && expiry < now()) {
+  const nowTs = now();
+
+  const entry = user.entitlements.tools.find(
+    (t) => String(t.toolId) === String(toolId)
+  );
+
+  if (!entry) return false;
+
+  if (entry.expiresAt) {
+    const expiry = toTimestamp(entry.expiresAt);
+    if (expiry && expiry < nowTs) {
       return false;
     }
   }
 
-  return user.entitlements.tools.includes(toolId);
+  return true;
 }
 
 /* =========================================================
    GRANT TOOL
+   - expiresAt optional
 ========================================================= */
 
 function grantTool(userId, toolId, expiresAt = null) {
   updateDb((db) => {
-    const user = (db.users || []).find(u => u.id === userId);
+    const user = (db.users || []).find((u) => u.id === userId);
     if (!user) return db;
 
     ensureUserEntitlements(user);
 
-    if (!user.entitlements.tools.includes(toolId)) {
-      user.entitlements.tools.push(toolId);
-    }
+    const existing = user.entitlements.tools.find(
+      (t) => String(t.toolId) === String(toolId)
+    );
 
-    if (expiresAt) {
-      user.entitlements.expiresAt = expiresAt;
+    if (existing) {
+      // update expiration if provided
+      if (expiresAt) {
+        existing.expiresAt = expiresAt;
+      }
+    } else {
+      user.entitlements.tools.push({
+        toolId: String(toolId),
+        expiresAt: expiresAt || null,
+      });
     }
 
     user.updatedAt = new Date().toISOString();
@@ -80,11 +97,12 @@ function grantTool(userId, toolId, expiresAt = null) {
 
 function revokeTool(userId, toolId) {
   updateDb((db) => {
-    const user = (db.users || []).find(u => u.id === userId);
+    const user = (db.users || []).find((u) => u.id === userId);
     if (!user || !user.entitlements) return db;
 
-    user.entitlements.tools =
-      user.entitlements.tools.filter(t => t !== toolId);
+    user.entitlements.tools = user.entitlements.tools.filter(
+      (t) => String(t.toolId) !== String(toolId)
+    );
 
     user.updatedAt = new Date().toISOString();
     return db;
@@ -97,14 +115,10 @@ function revokeTool(userId, toolId) {
 
 function revokeAllTools(userId) {
   updateDb((db) => {
-    const user = (db.users || []).find(u => u.id === userId);
+    const user = (db.users || []).find((u) => u.id === userId);
     if (!user) return db;
 
-    user.entitlements = {
-      tools: [],
-      expiresAt: null
-    };
-
+    user.entitlements = { tools: [] };
     user.updatedAt = new Date().toISOString();
     return db;
   });
@@ -112,23 +126,27 @@ function revokeAllTools(userId) {
 
 /* =========================================================
    CLEANUP EXPIRED ENTITLEMENTS
+   - Removes ONLY expired tools
 ========================================================= */
 
 function expireExpiredEntitlements() {
   updateDb((db) => {
     const users = db.users || [];
+    const nowTs = now();
 
-    users.forEach(user => {
-      if (!user.entitlements) return;
+    users.forEach((user) => {
+      if (!user.entitlements || !Array.isArray(user.entitlements.tools)) return;
 
-      const expiry = toTimestamp(user.entitlements.expiresAt);
-      if (expiry && expiry < now()) {
-        user.entitlements = {
-          tools: [],
-          expiresAt: null
-        };
-        user.updatedAt = new Date().toISOString();
-      }
+      user.entitlements.tools = user.entitlements.tools.filter((t) => {
+        if (!t.expiresAt) return true;
+
+        const expiry = toTimestamp(t.expiresAt);
+        if (!expiry) return true;
+
+        return expiry >= nowTs;
+      });
+
+      user.updatedAt = new Date().toISOString();
     });
 
     return db;
@@ -140,5 +158,5 @@ module.exports = {
   grantTool,
   revokeTool,
   revokeAllTools,
-  expireExpiredEntitlements
+  expireExpiredEntitlements,
 };
