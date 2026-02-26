@@ -1,5 +1,5 @@
 // backend/src/lib/db.js
-// Enterprise DB — Phase 25 Tool Governance Layer
+// Enterprise DB — Phase 25.1 Tool Governance Layer (Hardened)
 
 const fs = require("fs");
 const path = require("path");
@@ -7,7 +7,7 @@ const path = require("path");
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
 
-const SCHEMA_VERSION = 12; // 🔥 bumped
+const SCHEMA_VERSION = 13; // 🔥 bumped again for grant alignment
 
 function ensureDir(p) {
   const dir = path.dirname(p);
@@ -24,9 +24,9 @@ function defaultDb() {
     notifications: [],
 
     /* 🔥 TOOL GOVERNANCE LAYER */
-    tools: [],                // master tool registry
+    tools: [],                // master registry
     toolRequests: [],         // approval workflow
-    entitlements: [],         // temporary access grants
+    toolGrants: [],           // 🔥 timed access grants (replaces entitlements)
 
     /* ASSETS */
     assets: [],
@@ -107,15 +107,21 @@ function migrate(db) {
   if (!db || typeof db !== "object") return defaultDb();
   if (!db.schemaVersion) db.schemaVersion = 1;
 
+  /* 🔥 Backward Compatibility Migration */
+  // If old schema used "entitlements", migrate them to toolGrants
+  if (Array.isArray(db.entitlements) && !Array.isArray(db.toolGrants)) {
+    db.toolGrants = db.entitlements;
+  }
+
   const arrayFields = [
     "users",
     "companies",
     "notifications",
 
-    /* 🔥 TOOL LAYER */
+    /* TOOL LAYER */
     "tools",
     "toolRequests",
-    "entitlements",
+    "toolGrants",
 
     "assets",
     "scans",
