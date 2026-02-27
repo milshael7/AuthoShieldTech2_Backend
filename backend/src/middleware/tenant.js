@@ -1,6 +1,6 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v6)
-// Strict Isolation • Cross-Tenant Detection • Audit Integrated
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v7)
+// Strict Isolation • Cross-Tenant Detection • Type-Safe Matching • Audit Integrated
 
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
@@ -11,6 +11,10 @@ function clean(v, max = 100) {
 
 function normRole(r) {
   return String(r || "").trim().toLowerCase();
+}
+
+function idEq(a, b) {
+  return String(a) === String(b);
 }
 
 function resolveFromSubdomain(req) {
@@ -41,14 +45,13 @@ function recordViolation(dbUser, reason, meta = {}) {
   });
 
   updateDb((db) => {
-    const u = db.users.find(x => x.id === dbUser.id);
+    const u = db.users.find(x => idEq(x.id, dbUser.id));
     if (!u) return db;
 
     if (!u.securityFlags) u.securityFlags = {};
     u.securityFlags.tenantViolations =
       (u.securityFlags.tenantViolations || 0) + 1;
 
-    // Auto-lock after 5 violations
     if (u.securityFlags.tenantViolations >= 5) {
       u.locked = true;
       audit({
@@ -69,7 +72,7 @@ function tenantMiddleware(req, res, next) {
   const role = normRole(req.user.role);
   const isAdmin = role === "admin";
 
-  const dbUser = (db.users || []).find(u => u.id === req.user.id);
+  const dbUser = (db.users || []).find(u => idEq(u.id, req.user.id));
 
   if (!dbUser) {
     return res.status(401).json({ error: "User not found" });
@@ -136,20 +139,21 @@ function tenantMiddleware(req, res, next) {
   if (companyId) {
 
     const company =
-      (db.companies || []).find(c => c.id === companyId);
+      (db.companies || []).find(c => idEq(c.id, companyId));
 
     if (!company) {
       recordViolation(dbUser, "COMPANY_NOT_FOUND", { companyId });
       return res.status(404).json({ error: "Company not found" });
     }
 
-    if (company.status === "Suspended") {
+    const isSuspended = company.status === "Suspended";
+    const isRestricted = company.status === "Restricted";
+
+    if (isSuspended) {
       return res.status(403).json({
         error: "Company suspended",
       });
     }
-
-    const isRestricted = company.status === "Restricted";
 
     /* =============================
        OWNERSHIP VALIDATION
@@ -157,9 +161,9 @@ function tenantMiddleware(req, res, next) {
 
     const userBelongs =
       isAdmin ||
-      dbUser.companyId === companyId ||
+      idEq(dbUser.companyId, companyId) ||
       (Array.isArray(dbUser.managedCompanies) &&
-        dbUser.managedCompanies.includes(companyId));
+        dbUser.managedCompanies.some(id => idEq(id, companyId)));
 
     if (!userBelongs) {
       recordViolation(dbUser, "CROSS_TENANT_ACCESS_ATTEMPT", {
@@ -172,14 +176,14 @@ function tenantMiddleware(req, res, next) {
     }
 
     req.tenant = {
-      id: companyId,
+      id: String(companyId),
       type: "tenant",
       brainKey: `tenant:${companyId}`,
       resolvedFrom,
       userId: req.user.id,
       role: req.user.role,
       plan: company.tier || "micro",
-      suspended: false,
+      suspended: isSuspended,
       restricted: isRestricted,
       scope: {
         isAdmin,
