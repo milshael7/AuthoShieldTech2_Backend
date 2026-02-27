@@ -1,6 +1,6 @@
 // backend/src/lib/sessionStore.js
-// Enterprise Session Control Layer
-// JTI Tracking • Revocation • Replay Guard • Redis-Ready Abstraction
+// Enterprise Session Control Layer — Hardened v2
+// JTI Tracking • TTL Accurate • Memory Safe • Revocation Clean
 
 const { writeAudit } = require("./audit");
 
@@ -13,11 +13,13 @@ const DEFAULT_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /* =========================================================
    IN-MEMORY STORE
-   (Swap to Redis later without changing interface)
 ========================================================= */
 
-const revokedTokens = new Map(); // jti -> expiresAt
-const activeSessions = new Map(); // userId -> Set<jti>
+// jti -> expiresAt
+const revokedTokens = new Map();
+
+// userId -> Map<jti, expiresAt>
+const activeSessions = new Map();
 
 /* =========================================================
    UTIL
@@ -27,61 +29,73 @@ function now() {
   return Date.now();
 }
 
-function scheduleCleanup() {
+function cleanup() {
   const current = now();
 
+  // Clean revoked tokens
   for (const [jti, expiresAt] of revokedTokens.entries()) {
     if (expiresAt <= current) {
       revokedTokens.delete(jti);
     }
   }
+
+  // Clean expired active sessions
+  for (const [userId, sessions] of activeSessions.entries()) {
+    for (const [jti, expiresAt] of sessions.entries()) {
+      if (expiresAt <= current) {
+        sessions.delete(jti);
+      }
+    }
+
+    if (sessions.size === 0) {
+      activeSessions.delete(userId);
+    }
+  }
 }
 
-setInterval(scheduleCleanup, CLEANUP_INTERVAL);
+setInterval(cleanup, CLEANUP_INTERVAL);
 
 /* =========================================================
    API
 ========================================================= */
 
-/**
- * Register active session
- */
 function registerSession(userId, jti, ttlMs = DEFAULT_TTL) {
   if (!userId || !jti) return;
 
+  const expiresAt = now() + ttlMs;
+
   if (!activeSessions.has(userId)) {
-    activeSessions.set(userId, new Set());
+    activeSessions.set(userId, new Map());
   }
 
-  activeSessions.get(userId).add(jti);
+  activeSessions.get(userId).set(jti, expiresAt);
 }
 
-/**
- * Revoke specific token
- */
 function revokeToken(jti, ttlMs = DEFAULT_TTL) {
   if (!jti) return;
 
   const expiresAt = now() + ttlMs;
   revokedTokens.set(jti, expiresAt);
 
+  // Remove from activeSessions
+  for (const sessions of activeSessions.values()) {
+    sessions.delete(jti);
+  }
+
   writeAudit({
     actor: "session_store",
     role: "system",
     action: "TOKEN_REVOKED",
-    detail: { jti }
+    detail: { jti },
   });
 }
 
-/**
- * Revoke all sessions for a user
- */
 function revokeAllUserSessions(userId) {
   if (!activeSessions.has(userId)) return;
 
   const sessions = activeSessions.get(userId);
 
-  for (const jti of sessions) {
+  for (const jti of sessions.keys()) {
     revokeToken(jti);
   }
 
@@ -90,13 +104,10 @@ function revokeAllUserSessions(userId) {
   writeAudit({
     actor: userId,
     role: "system",
-    action: "ALL_SESSIONS_REVOKED"
+    action: "ALL_SESSIONS_REVOKED",
   });
 }
 
-/**
- * Check if token is revoked
- */
 function isRevoked(jti) {
   if (!jti) return true;
 
@@ -111,16 +122,10 @@ function isRevoked(jti) {
   return true;
 }
 
-/**
- * Optional: get active session count
- */
 function getActiveSessionCount(userId) {
   return activeSessions.get(userId)?.size || 0;
 }
 
-/**
- * Hard kill all sessions (emergency mode)
- */
 function revokeAllSessions() {
   revokedTokens.clear();
   activeSessions.clear();
@@ -128,7 +133,7 @@ function revokeAllSessions() {
   writeAudit({
     actor: "system",
     role: "system",
-    action: "GLOBAL_SESSION_RESET"
+    action: "GLOBAL_SESSION_RESET",
   });
 }
 
