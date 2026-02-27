@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
-// Enterprise Admin Control — Hardened v9
-// Deterministic Role Enforcement • Audit Safe • Blueprint Aligned
+// AutoShield Tech — Enterprise Admin Control v10
+// Deterministic • Audit-Safe • Performance-Bounded • Blueprint Aligned
 
 const express = require("express");
 const router = express.Router();
@@ -9,9 +9,7 @@ const { authRequired } = require("../middleware/auth");
 const { readDb, writeDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ========================================================= */
 
 function normalize(role) {
   return String(role || "").trim().toLowerCase();
@@ -21,14 +19,6 @@ function requireAdmin(req, res, next) {
   if (normalize(req.user.role) !== "admin") {
     return res.status(403).json({ ok: false, error: "Admin only" });
   }
-
-  writeAudit({
-    actor: req.user.id,
-    role: req.user.role,
-    action: "ADMIN_ROUTE_ACCESS",
-    detail: { path: req.originalUrl }
-  });
-
   next();
 }
 
@@ -42,31 +32,12 @@ function requireFinanceOrAdmin(req, res, next) {
     });
   }
 
-  writeAudit({
-    actor: req.user.id,
-    role: req.user.role,
-    action: "ADMIN_ROUTE_ACCESS",
-    detail: { path: req.originalUrl }
-  });
-
   next();
 }
 
 function safeDate(ts) {
   const d = new Date(ts);
   return isNaN(d.getTime()) ? 0 : d.getTime();
-}
-
-function normalizeAuditRow(e) {
-  return {
-    id: e.id || `${safeDate(e.timestamp)}-${e.actorId || "system"}`,
-    timestamp: e.timestamp || e.createdAt || new Date().toISOString(),
-    actorId: e.actorId || "system",
-    action: e.action || "UNKNOWN",
-    targetType: e.targetType || null,
-    targetId: e.targetId || null,
-    metadata: e.metadata || {},
-  };
 }
 
 /* =========================================================
@@ -96,9 +67,17 @@ router.get("/metrics", requireFinanceOrAdmin, (req, res) => {
       u => normalize(u.subscriptionStatus) === "locked"
     ).length;
 
-    const totalRevenue = Number(db.revenueSummary?.totalRevenue || 0);
-    const MRR = Number(db.revenueSummary?.MRR || 0);
-    const churnRate = Number(db.revenueSummary?.churnRate || 0);
+    const revenue = db.revenueSummary || {};
+
+    const totalRevenue = Number(revenue.totalRevenue || 0);
+    const MRR = Number(revenue.subscriptionRevenue || 0);
+    const churnRate = Number(revenue.churnRate || 0);
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_METRICS"
+    });
 
     return res.json({
       ok: true,
@@ -129,17 +108,27 @@ router.get("/executive-risk", requireFinanceOrAdmin, (req, res) => {
 
     const critical = events.filter(e => e.severity === "critical").length;
     const high = events.filter(e => e.severity === "high").length;
+    const medium = events.filter(e => e.severity === "medium").length;
 
-    const score = Math.min(100, critical * 20 + high * 10);
+    const score = Math.min(
+      100,
+      critical * 25 + high * 12 + medium * 5
+    );
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_EXEC_RISK"
+    });
 
     return res.json({
       ok: true,
       executiveRisk: {
         score,
         level:
-          score > 75
+          score >= 80
             ? "Critical"
-            : score > 40
+            : score >= 50
             ? "Elevated"
             : "Stable",
       },
@@ -164,9 +153,15 @@ router.get("/compliance", requireFinanceOrAdmin, (req, res) => {
     const medium = vulns.filter(v => v.severity === "medium").length;
 
     let complianceScore =
-      100 - (critical * 10 + high * 6 + medium * 3);
+      100 - (critical * 12 + high * 7 + medium * 4);
 
     complianceScore = Math.max(10, Math.min(100, complianceScore));
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_COMPLIANCE"
+    });
 
     return res.json({
       ok: true,
@@ -184,7 +179,7 @@ router.get("/compliance", requireFinanceOrAdmin, (req, res) => {
 });
 
 /* =========================================================
-   ACTIVATE PLAN (Blueprint Required)
+   ACTIVATE PLAN
 ========================================================= */
 
 router.post("/activate", requireAdmin, (req, res) => {
@@ -199,7 +194,9 @@ router.post("/activate", requireAdmin, (req, res) => {
     }
 
     const db = readDb();
-    const user = (db.users || []).find(u => String(u.id) === String(userId));
+    const user = (db.users || []).find(
+      u => String(u.id) === String(userId)
+    );
 
     if (!user) {
       return res.status(404).json({
@@ -208,8 +205,8 @@ router.post("/activate", requireAdmin, (req, res) => {
       });
     }
 
-    user.subscriptionStatus = "Active";
-    user.plan = plan;
+    user.subscriptionStatus = "active";
+    user.subscriptionTier = String(plan).toLowerCase();
 
     writeDb(db);
 
@@ -228,18 +225,19 @@ router.post("/activate", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   AUDIT PREVIEW
+   AUDIT PREVIEW (BOUNDED)
 ========================================================= */
 
 router.get("/audit-preview", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-    let audit = db.audit || db.auditEvents || [];
+    const audit = (db.audit || []).slice(-20).reverse();
 
-    audit = audit
-      .map(normalizeAuditRow)
-      .sort((a, b) => safeDate(b.timestamp) - safeDate(a.timestamp))
-      .slice(0, 20);
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_AUDIT_PREVIEW"
+    });
 
     return res.json({ ok: true, events: audit });
 
@@ -249,27 +247,25 @@ router.get("/audit-preview", requireAdmin, (req, res) => {
 });
 
 /* =========================================================
-   FULL AUDIT EXPLORER
+   FULL AUDIT EXPLORER (PERF SAFE)
 ========================================================= */
 
 router.get("/audit", requireAdmin, (req, res) => {
   try {
     const db = readDb();
-    let audit = db.audit || db.auditEvents || [];
-    audit = audit.map(normalizeAuditRow);
+    let audit = db.audit || [];
 
     const {
       page = 1,
       limit = 25,
       actorId,
-      action,
-      startDate,
-      endDate,
-      search,
+      action
     } = req.query;
 
     if (actorId) {
-      audit = audit.filter(e => String(e.actorId) === String(actorId));
+      audit = audit.filter(e =>
+        String(e.actor) === String(actorId)
+      );
     }
 
     if (action) {
@@ -279,32 +275,19 @@ router.get("/audit", requireAdmin, (req, res) => {
       );
     }
 
-    if (startDate) {
-      const start = safeDate(startDate);
-      audit = audit.filter(e => safeDate(e.timestamp) >= start);
-    }
-
-    if (endDate) {
-      const end = safeDate(endDate);
-      audit = audit.filter(e => safeDate(e.timestamp) <= end);
-    }
-
-    if (search) {
-      const s = normalize(search);
-      audit = audit.filter(e =>
-        JSON.stringify(e).toLowerCase().includes(s)
-      );
-    }
-
-    audit.sort((a, b) =>
-      safeDate(b.timestamp) - safeDate(a.timestamp)
-    );
+    audit.sort((a, b) => b.seq - a.seq);
 
     const pageNum = Math.max(1, Number(page));
     const perPage = Math.max(1, Math.min(100, Number(limit)));
     const startIndex = (pageNum - 1) * perPage;
 
     const paginated = audit.slice(startIndex, startIndex + perPage);
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_AUDIT_FULL"
+    });
 
     return res.json({
       ok: true,
@@ -336,6 +319,12 @@ router.get("/platform-health", requireAdmin, (req, res) => {
     const criticalEvents = events.filter(
       e => e.severity === "critical"
     ).length;
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_VIEW_PLATFORM_HEALTH"
+    });
 
     return res.json({
       ok: true,
