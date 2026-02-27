@@ -1,6 +1,6 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Device Bound v6 (SessionAdapter Unified)
-// Session Controlled • Device Fingerprint Bound • TokenVersioned • Company/Sub Guard • Anti-Hijack Ready
+// Enterprise Auth Engine — Device Bound v7 (SessionAdapter Unified)
+// Session Controlled • Device Fingerprint Bound • TokenVersioned • Rotation Safe • Anti-Hijack Ready
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
@@ -11,10 +11,7 @@ const { sign, verify } = require("../lib/jwt");
 const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-
-// ✅ UNIFIED SESSION LAYER
 const sessionAdapter = require("../lib/sessionAdapter");
-
 const { buildFingerprint, classifyDeviceRisk } = require("../lib/deviceFingerprint");
 const users = require("../users/user.service");
 
@@ -43,23 +40,9 @@ function safeDelay() {
   return new Promise((resolve) => setTimeout(resolve, 400));
 }
 
-function ensureJwtSecret(res) {
-  if (!process.env.JWT_SECRET) {
-    res.status(500).json({ ok: false, error: "Server misconfigured" });
-    return false;
-  }
-  return true;
-}
-
 function norm(v) {
   return String(v || "").trim().toLowerCase();
 }
-
-function isBillingRoute(req) {
-  return req.originalUrl.startsWith("/api/billing");
-}
-
-/* ========================================================= */
 
 function getBearerToken(req) {
   const h = req.headers?.authorization || req.headers?.Authorization;
@@ -134,11 +117,21 @@ router.post("/login", async (req, res) => {
 
     const fingerprint = buildFingerprint(req);
 
+    let newTokenVersion;
+
     updateDb((db) => {
       const user = db.users.find(x => x.id === u.id);
+
       user.tokenVersion = (user.tokenVersion || 0) + 1;
+      newTokenVersion = user.tokenVersion;
+
       user.activeDeviceFingerprint = fingerprint;
       user.lastLoginAt = nowIso();
+
+      if (user.securityFlags) {
+        user.securityFlags.failedLogins = 0; // ✅ RESET ON SUCCESS
+      }
+
       return db;
     });
 
@@ -150,7 +143,7 @@ router.post("/login", async (req, res) => {
         jti,
         role: u.role,
         companyId: u.companyId || null,
-        tokenVersion: u.tokenVersion || 0,
+        tokenVersion: newTokenVersion, // ✅ FIXED
       },
       null,
       "15m"
@@ -180,7 +173,7 @@ router.post("/login", async (req, res) => {
 });
 
 /* =========================================================
-   REFRESH
+   REFRESH (ROTATION SAFE)
 ========================================================= */
 
 router.post("/refresh", (req, res) => {
@@ -204,6 +197,9 @@ router.post("/refresh", (req, res) => {
       sessionAdapter.revokeAllUserSessions(dbUser.id);
       return res.status(401).json({ ok: false, error: "Device verification failed" });
     }
+
+    // ✅ ROTATE TOKEN
+    sessionAdapter.revokeToken(payload.jti);
 
     const newJti = uid("jti");
 
