@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// AutoShield Tech — Enterprise Zero Trust Engine v7
-// Adaptive • Explainable • Acceleration-Aware • Privilege-Sensitive • Stable
+// AutoShield Tech — Enterprise Zero Trust Engine v8
+// Adaptive • Explainable • Acceleration-Aware • Self-Healing • Stable
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -14,10 +14,14 @@ const sessionAdapter = require("../lib/sessionAdapter");
 
 const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
+
 const MAX_SECURITY_EVENTS = 2000;
 const MAX_AI_DECISIONS = 3000;
 
-const ACCELERATION_THRESHOLD = 15; // spike detection sensitivity
+const ACCELERATION_THRESHOLD = 15;
+const STABILIZATION_WINDOW = 15;
+const STABLE_AVG_THRESHOLD = 35;
+
 const evaluationCache = new Map();
 const EVAL_COOLDOWN_MS = 5000;
 
@@ -38,6 +42,11 @@ function uid() {
   return crypto.randomBytes(8).toString("hex");
 }
 
+function average(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
 function shouldBypass(req) {
   const path = req.originalUrl || "";
   return (
@@ -47,11 +56,6 @@ function shouldBypass(req) {
     path.startsWith("/api/auth") ||
     path.startsWith("/api/stripe/webhook")
   );
-}
-
-function average(arr) {
-  if (!arr.length) return 0;
-  return arr.reduce((s, v) => s + v, 0) / arr.length;
 }
 
 /* ========================================================= */
@@ -74,13 +78,13 @@ async function zeroTrust(req, res, next) {
     }
     evaluationCache.set(user.id, now);
 
-    /* ===== GEO ===== */
+    /* ================= GEO ================= */
 
     const ip = extractIp(req);
     let geo = null;
     if (ip) geo = await geoLookup(ip);
 
-    /* ===== THREAT ===== */
+    /* ================= THREAT ================= */
 
     const threat = evaluateThreat({
       ip,
@@ -90,7 +94,7 @@ async function zeroTrust(req, res, next) {
       failedLogins: user.securityFlags?.failedLogins || 0
     });
 
-    /* ===== RISK ===== */
+    /* ================= RISK ================= */
 
     const risk = calculateRisk({
       geo,
@@ -105,8 +109,6 @@ async function zeroTrust(req, res, next) {
         failedLogins: user.securityFlags?.failedLogins || 0
       }
     });
-
-    /* ===== PRIVILEGE WEIGHT ===== */
 
     const isHighPrivilege =
       req.user.role === "admin" ||
@@ -135,8 +137,10 @@ async function zeroTrust(req, res, next) {
       .slice(-20);
 
     let accelerationDetected = false;
+    let stabilizationDetected = false;
 
     if (userHistory.length >= 20) {
+
       const last10 = userHistory.slice(-10).map(d => d.combinedScore);
       const prev10 = userHistory.slice(0, 10).map(d => d.combinedScore);
 
@@ -149,16 +153,47 @@ async function zeroTrust(req, res, next) {
       }
     }
 
+    /* =========================================================
+       STABILIZATION DETECTION (SELF-HEALING)
+    ========================================================== */
+
+    const recent = decisions
+      .filter(d => d.userId === user.id)
+      .slice(-STABILIZATION_WINDOW);
+
+    if (recent.length === STABILIZATION_WINDOW) {
+
+      const avgRecent = average(recent.map(d => d.combinedScore));
+      const hasCritical = recent.some(d => d.level === "Critical");
+      const hasAcceleration = recent.some(d => d.accelerationDetected);
+
+      if (
+        avgRecent <= STABLE_AVG_THRESHOLD &&
+        !hasCritical &&
+        !hasAcceleration
+      ) {
+        stabilizationDetected = true;
+
+        writeAudit({
+          actor: user.id,
+          role: user.role,
+          action: "ZERO_TRUST_STABILIZED",
+          detail: { avgRecent }
+        });
+      }
+    }
+
     req.zeroTrust = {
       combinedScore,
       level,
       threatScore: threat.threatScore,
       riskScore: risk.riskScore,
-      accelerationDetected
+      accelerationDetected,
+      stabilizationDetected
     };
 
     /* =========================================================
-       AI DECISION MEMORY
+       AI MEMORY
     ========================================================== */
 
     updateDb(dbState => {
@@ -179,6 +214,7 @@ async function zeroTrust(req, res, next) {
         combinedScore,
         level,
         accelerationDetected,
+        stabilizationDetected,
         privilegeMultiplier,
         breakdown: {
           threat: threat.breakdown,
@@ -198,13 +234,7 @@ async function zeroTrust(req, res, next) {
       return dbState;
     });
 
-    /* =========================================================
-       LOW RISK EXIT
-    ========================================================== */
-
-    if (level === "Low") {
-      return next();
-    }
+    if (level === "Low") return next();
 
     /* =========================================================
        SECURITY EVENT
@@ -246,10 +276,6 @@ async function zeroTrust(req, res, next) {
         : "ZERO_TRUST_EVALUATION",
       detail: { combinedScore, level }
     });
-
-    /* =========================================================
-       STRICT MODE
-    ========================================================== */
 
     if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
 
