@@ -11,7 +11,7 @@ const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
 const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
-const { verifyRevenueLedger } = require("./lib/revenueIntegrity"); // 🔥 NEW
+const { verifyRevenueLedger } = require("./lib/revenueIntegrity");
 
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
@@ -39,96 +39,16 @@ users.ensureAdminFromEnv();
 const auditIntegrity = verifyAuditIntegrity();
 let globalSecurityStatus = auditIntegrity.ok ? "secure" : "compromised";
 
-if (!auditIntegrity.ok) {
-  console.error("🚨 AUDIT INTEGRITY FAILURE ON BOOT", auditIntegrity);
-}
-
-/* ================= REVENUE INTEGRITY ================= */
-
-const revenueIntegrity = verifyRevenueLedger(); // 🔥 NEW
+const revenueIntegrity = verifyRevenueLedger();
 let financialStatus = revenueIntegrity.ok ? "secure" : "compromised";
 
+if (!auditIntegrity.ok) {
+  console.error("🚨 AUDIT INTEGRITY FAILURE", auditIntegrity);
+}
+
 if (!revenueIntegrity.ok) {
-  console.error("🚨 REVENUE LEDGER CORRUPTION DETECTED", revenueIntegrity);
-
-  writeAudit({
-    actor: "system",
-    role: "system",
-    action: "REVENUE_LEDGER_CORRUPTION_DETECTED",
-    detail: revenueIntegrity,
-  });
+  console.error("🚨 REVENUE LEDGER CORRUPTION", revenueIntegrity);
 }
-
-/* =========================================================
-   AUTONOMOUS ZEROTRUST ENGINE
-========================================================= */
-
-const ENFORCEMENT_THRESHOLD = 75;
-const ZEROTRUST_INTERVAL_MS = 15000;
-
-function calculateCompanyRisk(db, companyId) {
-  const events = (db.securityEvents || []).filter(
-    e => String(e.companyId) === String(companyId)
-  );
-
-  let score = 0;
-
-  for (const e of events) {
-    if (e.severity === "critical") score += 25;
-    if (e.severity === "high") score += 15;
-    if (e.severity === "medium") score += 8;
-    if (e.severity === "low") score += 2;
-    if (!e.acknowledged) score += 5;
-  }
-
-  return Math.min(100, score);
-}
-
-function autonomousZeroTrust() {
-  try {
-    const db = readDb();
-    db.companies = db.companies || [];
-
-    let anyCritical = false;
-
-    for (const company of db.companies) {
-      const riskScore = calculateCompanyRisk(db, company.id);
-
-      if (riskScore >= ENFORCEMENT_THRESHOLD) {
-        if (company.status !== "Locked") {
-          company.status = "Locked";
-          company.lockReason = "Autonomous ZeroTrust enforcement";
-          company.lockedAt = new Date().toISOString();
-
-          writeAudit({
-            actor: "system",
-            role: "system",
-            action: "AUTO_ZEROTRUST_LOCK",
-            detail: {
-              companyId: company.id,
-              riskScore,
-              threshold: ENFORCEMENT_THRESHOLD
-            }
-          });
-
-          console.log(
-            `[ZEROTRUST] Company ${company.id} locked (risk=${riskScore})`
-          );
-        }
-
-        anyCritical = true;
-      }
-    }
-
-    globalSecurityStatus = anyCritical ? "compromised" : "secure";
-    writeDb(db);
-
-  } catch (err) {
-    console.error("[ZEROTRUST ENGINE ERROR]", err);
-  }
-}
-
-setInterval(autonomousZeroTrust, ZEROTRUST_INTERVAL_MS);
 
 /* ================= EXPRESS ================= */
 
@@ -160,20 +80,16 @@ app.get("/health", (_, res) => {
     systemState: {
       status: "operational",
       securityStatus: globalSecurityStatus,
-      financialStatus, // 🔥 NEW
+      financialStatus,
       uptime: process.uptime(),
       timestamp: Date.now(),
     },
   });
 });
 
-app.get("/live", (_, res) => res.json({ ok: true }));
-app.get("/ready", (_, res) => res.json({ ready: true }));
-
 /* ================= ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
-
 app.use(tenantMiddleware);
 
 app.use("/api", (req, res, next) => {
@@ -191,25 +107,6 @@ app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 
-/* ================= 404 ================= */
-
-app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "Route not found"
-  });
-});
-
-/* ================= ERROR HANDLER ================= */
-
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({
-    ok: false,
-    error: "Internal server error"
-  });
-});
-
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
@@ -223,6 +120,15 @@ const wss = new WebSocketServer({
 
 function wsClose(ws, code = 1008) {
   try { ws.close(code); } catch {}
+}
+
+function norm(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function isInactiveStatus(v) {
+  const s = norm(v);
+  return s === "locked" || s === "past_due" || s === "past due";
 }
 
 wss.on("connection", (ws, req) => {
@@ -242,8 +148,71 @@ wss.on("connection", (ws, req) => {
     );
     if (!user) return wsClose(ws);
 
+    /* ===== TOKEN VERSION ===== */
+
+    const tokenVersion = Number(payload.tokenVersion || 0);
+    const currentVersion = Number(user.tokenVersion || 0);
+
+    if (tokenVersion !== currentVersion) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws);
+    }
+
+    /* ===== ACCOUNT LOCK ===== */
+
+    if (user.locked === true) {
+      return wsClose(ws);
+    }
+
+    if (user.status !== users.APPROVAL_STATUS.APPROVED) {
+      return wsClose(ws);
+    }
+
+    /* ===== SUBSCRIPTION ===== */
+
+    if (isInactiveStatus(user.subscriptionStatus)) {
+      return wsClose(ws);
+    }
+
+    /* ===== COMPANY STATUS ===== */
+
+    if (user.companyId) {
+      const company = (db.companies || []).find(
+        c => String(c.id) === String(user.companyId)
+      );
+
+      if (!company || company.status === "Locked") {
+        sessionAdapter.revokeAllUserSessions(user.id);
+        return wsClose(ws);
+      }
+    }
+
+    /* ===== DEVICE BINDING ===== */
+
+    const deviceCheck = classifyDeviceRisk(
+      user.activeDeviceFingerprint,
+      req
+    );
+
+    if (!deviceCheck.match) {
+      sessionAdapter.revokeAllUserSessions(user.id);
+      return wsClose(ws);
+    }
+
+    /* ===== REGISTER SESSION ===== */
+
     const ttlMs = 15 * 60 * 1000;
     sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
+
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: "WEBSOCKET_CONNECTED",
+      detail: {
+        path: req.url,
+        companyId: user.companyId || null
+      }
+    });
 
     ws.user = {
       id: user.id,
@@ -252,7 +221,7 @@ wss.on("connection", (ws, req) => {
       jti: payload.jti,
     };
 
-  } catch {
+  } catch (err) {
     wsClose(ws);
   }
 });
