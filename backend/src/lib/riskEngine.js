@@ -1,6 +1,6 @@
 // backend/src/lib/riskEngine.js
-// AutoShield Tech — Enterprise Risk Engine v3
-// Deterministic • Weighted • Correlation Aware • Privilege Sensitive • Auditable
+// AutoShield Tech — Enterprise Risk Engine v4
+// Deterministic • Weighted • Cross-User Correlation • Privilege Sensitive • Auditable
 
 /* =========================================================
    CONFIG
@@ -17,7 +17,6 @@ const DEVICE_WEIGHT = 0.25;
 const SESSION_WEIGHT = 0.25;
 const BEHAVIOR_WEIGHT = 0.30;
 
-/* Weight drift protection */
 const TOTAL_WEIGHT =
   GEO_WEIGHT + DEVICE_WEIGHT + SESSION_WEIGHT + BEHAVIOR_WEIGHT;
 
@@ -85,11 +84,6 @@ function deviceRisk(device = {}) {
     signals.push("headless_browser");
   }
 
-  if (ua.includes("phantom")) {
-    score += 40;
-    signals.push("phantom_driver");
-  }
-
   if (ua.includes("selenium")) {
     score += 45;
     signals.push("selenium_driver");
@@ -98,11 +92,6 @@ function deviceRisk(device = {}) {
   if (!device.language) {
     score += 10;
     signals.push("language_missing");
-  }
-
-  if (!device.timezone) {
-    score += 10;
-    signals.push("timezone_missing");
   }
 
   return { score, signals };
@@ -128,11 +117,6 @@ function sessionRisk(session = {}) {
     signals.push("excessive_sessions");
   }
 
-  if (session.tokenVersionMismatch === true) {
-    score += 50;
-    signals.push("token_version_mismatch");
-  }
-
   return { score, signals };
 }
 
@@ -156,14 +140,41 @@ function behaviorRisk(behavior = {}) {
     signals.push("excessive_failed_logins");
   }
 
-  if (behavior.rapidRequests === true) {
-    score += 30;
-    signals.push("rapid_requests");
-  }
-
   if (behavior.privilegeEscalationAttempt === true) {
     score += 60;
     signals.push("privilege_escalation_attempt");
+  }
+
+  return { score, signals };
+}
+
+/* =========================================================
+   CROSS-USER CORRELATION
+========================================================= */
+
+function crossUserCorrelation(context = {}) {
+  let score = 0;
+  const signals = [];
+
+  const {
+    sameIpUserCount = 0,
+    sameFingerprintUserCount = 0,
+    elevatedUsersLast5Min = 0
+  } = context;
+
+  if (sameIpUserCount >= 3) {
+    score += 20;
+    signals.push("ip_cluster_activity");
+  }
+
+  if (sameFingerprintUserCount >= 2) {
+    score += 25;
+    signals.push("shared_device_across_users");
+  }
+
+  if (elevatedUsersLast5Min >= 3) {
+    score += 30;
+    signals.push("coordinated_risk_spike");
   }
 
   return { score, signals };
@@ -178,14 +189,13 @@ function correlationBoost(geoRes, deviceRes) {
     geoRes.signals.includes("high_risk_country") &&
     deviceRes.signals.includes("headless_browser")
   ) {
-    return 15; // automation from hostile region
+    return 15;
   }
-
   return 0;
 }
 
 /* =========================================================
-   LEVEL DERIVATION
+   LEVEL
 ========================================================= */
 
 function deriveLevel(score) {
@@ -205,9 +215,11 @@ function calculateRisk({
   session = {},
   behavior = {},
   baselineScore = null,
-  role = null
+  role = null,
+  correlationContext = null
 }) {
   try {
+
     const geoRes = geoRisk(geo);
     const deviceRes = deviceRisk(device);
     const sessionRes = sessionRisk(session);
@@ -221,8 +233,17 @@ function calculateRisk({
 
     let finalScore = weighted;
 
-    /* Correlation spike */
     finalScore += correlationBoost(geoRes, deviceRes);
+
+    /* Cross-user anomaly intelligence */
+    if (correlationContext) {
+      const correlationRes =
+        crossUserCorrelation(correlationContext);
+
+      finalScore += correlationRes.score;
+
+      correlationContext._signals = correlationRes.signals;
+    }
 
     /* Privilege sensitivity */
     if (role === "admin" || role === "finance") {
@@ -231,10 +252,7 @@ function calculateRisk({
 
     finalScore = clamp(Math.round(finalScore), 0, 100);
 
-    /* Prevent zero bypass */
-    if (finalScore === 0) {
-      finalScore = 5;
-    }
+    if (finalScore === 0) finalScore = 5;
 
     const level = deriveLevel(finalScore);
 
@@ -248,7 +266,8 @@ function calculateRisk({
         ...geoRes.signals,
         ...deviceRes.signals,
         ...sessionRes.signals,
-        ...behaviorRes.signals
+        ...behaviorRes.signals,
+        ...(correlationContext?._signals || [])
       ])
     );
 
