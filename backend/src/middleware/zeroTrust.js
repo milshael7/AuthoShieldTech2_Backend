@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// AutoShield Tech — Enterprise Zero Trust Engine v6
-// Adaptive • Explainable • Privilege-Sensitive • AI Decision Logged • Stable
+// AutoShield Tech — Enterprise Zero Trust Engine v7
+// Adaptive • Explainable • Acceleration-Aware • Privilege-Sensitive • Stable
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -17,6 +17,7 @@ const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
 const MAX_SECURITY_EVENTS = 2000;
 const MAX_AI_DECISIONS = 3000;
 
+const ACCELERATION_THRESHOLD = 15; // spike detection sensitivity
 const evaluationCache = new Map();
 const EVAL_COOLDOWN_MS = 5000;
 
@@ -48,6 +49,11 @@ function shouldBypass(req) {
   );
 }
 
+function average(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
 /* ========================================================= */
 
 async function zeroTrust(req, res, next) {
@@ -61,8 +67,6 @@ async function zeroTrust(req, res, next) {
     if (!user) return next();
 
     const now = Date.now();
-
-    /* ===== RATE DAMPENING ===== */
 
     const lastEval = evaluationCache.get(user.id);
     if (lastEval && now - lastEval < EVAL_COOLDOWN_MS) {
@@ -110,7 +114,7 @@ async function zeroTrust(req, res, next) {
 
     const privilegeMultiplier = isHighPrivilege ? 1.15 : 1;
 
-    const combinedScore = clamp(
+    let combinedScore = clamp(
       Math.round(
         ((threat.threatScore * 0.6) +
           (risk.riskScore * 0.4)) * privilegeMultiplier
@@ -119,16 +123,43 @@ async function zeroTrust(req, res, next) {
       100
     );
 
-    const level = deriveLevel(combinedScore);
+    let level = deriveLevel(combinedScore);
+
+    /* =========================================================
+       ACCELERATION DETECTION
+    ========================================================== */
+
+    const decisions = db.brain?.decisions || [];
+    const userHistory = decisions
+      .filter(d => d.userId === user.id)
+      .slice(-20);
+
+    let accelerationDetected = false;
+
+    if (userHistory.length >= 20) {
+      const last10 = userHistory.slice(-10).map(d => d.combinedScore);
+      const prev10 = userHistory.slice(0, 10).map(d => d.combinedScore);
+
+      const drift = average(last10) - average(prev10);
+
+      if (drift >= ACCELERATION_THRESHOLD) {
+        accelerationDetected = true;
+        combinedScore = clamp(combinedScore + 15, 0, 100);
+        level = deriveLevel(combinedScore);
+      }
+    }
 
     req.zeroTrust = {
       combinedScore,
       level,
       threatScore: threat.threatScore,
-      riskScore: risk.riskScore
+      riskScore: risk.riskScore,
+      accelerationDetected
     };
 
-    /* ===== AI DECISION MEMORY ===== */
+    /* =========================================================
+       AI DECISION MEMORY
+    ========================================================== */
 
     updateDb(dbState => {
 
@@ -147,6 +178,7 @@ async function zeroTrust(req, res, next) {
         geo,
         combinedScore,
         level,
+        accelerationDetected,
         privilegeMultiplier,
         breakdown: {
           threat: threat.breakdown,
@@ -166,34 +198,26 @@ async function zeroTrust(req, res, next) {
       return dbState;
     });
 
-    /* ===== LOW RISK FAST EXIT ===== */
+    /* =========================================================
+       LOW RISK EXIT
+    ========================================================== */
 
     if (level === "Low") {
       return next();
     }
 
-    /* ===== AUDIT ===== */
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "ZERO_TRUST_EVALUATION",
-      detail: {
-        combinedScore,
-        level,
-        path: req.originalUrl,
-        method: req.method
-      }
-    });
-
-    /* ===== SECURITY EVENT ===== */
+    /* =========================================================
+       SECURITY EVENT
+    ========================================================== */
 
     updateDb(dbState => {
       dbState.securityEvents = dbState.securityEvents || [];
 
       dbState.securityEvents.push({
         id: `zt_${uid()}`,
-        title: "Zero Trust Risk Evaluation",
+        title: accelerationDetected
+          ? "Risk Acceleration Detected"
+          : "Zero Trust Risk Evaluation",
         description: `Level: ${level}`,
         severity:
           level === "Critical"
@@ -214,7 +238,18 @@ async function zeroTrust(req, res, next) {
       return dbState;
     });
 
-    /* ===== STRICT MODE ===== */
+    writeAudit({
+      actor: user.id,
+      role: user.role,
+      action: accelerationDetected
+        ? "ZERO_TRUST_ACCELERATION_DETECTED"
+        : "ZERO_TRUST_EVALUATION",
+      detail: { combinedScore, level }
+    });
+
+    /* =========================================================
+       STRICT MODE
+    ========================================================== */
 
     if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
 
@@ -240,7 +275,7 @@ async function zeroTrust(req, res, next) {
     writeAudit({
       actor: req.user?.id || "unknown",
       role: req.user?.role || "unknown",
-      action: "ZERO_TRUST_ERROR",
+      action: "ZERO_TRUST_ERROR"
     });
 
     return next();
