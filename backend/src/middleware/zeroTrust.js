@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// AutoShield Tech — Enterprise Zero Trust Engine v5
-// Adaptive • Rate-Aware • Privilege-Sensitive • Memory-Bounded • Stable
+// AutoShield Tech — Enterprise Zero Trust Engine v6
+// Adaptive • Explainable • Privilege-Sensitive • AI Decision Logged • Stable
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -10,21 +10,17 @@ const { evaluateThreat } = require("../lib/threatIntel");
 const { geoLookup, extractIp } = require("../lib/geoLookup");
 const sessionAdapter = require("../lib/sessionAdapter");
 
-/* =========================================================
-   CONFIG
-========================================================= */
+/* ========================================================= */
 
 const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
 const MAX_SECURITY_EVENTS = 2000;
+const MAX_AI_DECISIONS = 3000;
 
-/* Risk cache per user to prevent flooding */
 const evaluationCache = new Map();
-const EVAL_COOLDOWN_MS = 5000; // 5 sec minimum gap per user
+const EVAL_COOLDOWN_MS = 5000;
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ========================================================= */
 
 function clamp(num, min, max) {
   return Math.max(min, Math.min(max, num));
@@ -43,23 +39,16 @@ function uid() {
 
 function shouldBypass(req) {
   const path = req.originalUrl || "";
-
-  if (
+  return (
     path.startsWith("/health") ||
     path.startsWith("/live") ||
     path.startsWith("/ready") ||
     path.startsWith("/api/auth") ||
     path.startsWith("/api/stripe/webhook")
-  ) {
-    return true;
-  }
-
-  return false;
+  );
 }
 
-/* =========================================================
-   MAIN
-========================================================= */
+/* ========================================================= */
 
 async function zeroTrust(req, res, next) {
   try {
@@ -71,36 +60,33 @@ async function zeroTrust(req, res, next) {
     const user = (db.users || []).find(u => u.id === req.user.id);
     if (!user) return next();
 
-    /* ================= RATE DAMPENING ================= */
-
-    const lastEval = evaluationCache.get(user.id);
     const now = Date.now();
 
+    /* ===== RATE DAMPENING ===== */
+
+    const lastEval = evaluationCache.get(user.id);
     if (lastEval && now - lastEval < EVAL_COOLDOWN_MS) {
       return next();
     }
-
     evaluationCache.set(user.id, now);
 
-    /* ================= GEO ================= */
+    /* ===== GEO ===== */
 
     const ip = extractIp(req);
     let geo = null;
+    if (ip) geo = await geoLookup(ip);
 
-    if (ip) {
-      geo = await geoLookup(ip);
-    }
-
-    /* ================= THREAT ================= */
+    /* ===== THREAT ===== */
 
     const threat = evaluateThreat({
       ip,
       userAgent: req.headers["user-agent"],
+      fingerprint: user.activeDeviceFingerprint,
       previousFingerprint: user.activeDeviceFingerprint,
       failedLogins: user.securityFlags?.failedLogins || 0
     });
 
-    /* ================= RISK ================= */
+    /* ===== RISK ===== */
 
     const risk = calculateRisk({
       geo,
@@ -116,7 +102,7 @@ async function zeroTrust(req, res, next) {
       }
     });
 
-    /* ================= PRIVILEGE WEIGHTING ================= */
+    /* ===== PRIVILEGE WEIGHT ===== */
 
     const isHighPrivilege =
       req.user.role === "admin" ||
@@ -142,13 +128,51 @@ async function zeroTrust(req, res, next) {
       riskScore: risk.riskScore
     };
 
-    /* ================= LOW RISK FAST EXIT ================= */
+    /* ===== AI DECISION MEMORY ===== */
+
+    updateDb(dbState => {
+
+      dbState.brain = dbState.brain || {};
+      dbState.brain.decisions = dbState.brain.decisions || [];
+
+      dbState.brain.decisions.push({
+        id: `ai_${uid()}`,
+        timestamp: new Date().toISOString(),
+        userId: user.id,
+        role: user.role,
+        companyId: req.companyId || user.companyId || null,
+        path: req.originalUrl,
+        method: req.method,
+        ip,
+        geo,
+        combinedScore,
+        level,
+        privilegeMultiplier,
+        breakdown: {
+          threat: threat.breakdown,
+          risk: risk.breakdown
+        },
+        signals: [
+          ...(threat.signals || []),
+          ...(risk.signals || [])
+        ]
+      });
+
+      if (dbState.brain.decisions.length > MAX_AI_DECISIONS) {
+        dbState.brain.decisions =
+          dbState.brain.decisions.slice(-MAX_AI_DECISIONS);
+      }
+
+      return dbState;
+    });
+
+    /* ===== LOW RISK FAST EXIT ===== */
 
     if (level === "Low") {
       return next();
     }
 
-    /* ================= AUDIT ================= */
+    /* ===== AUDIT ===== */
 
     writeAudit({
       actor: user.id,
@@ -158,12 +182,11 @@ async function zeroTrust(req, res, next) {
         combinedScore,
         level,
         path: req.originalUrl,
-        method: req.method,
-        companyId: req.companyId || user.companyId || null
+        method: req.method
       }
     });
 
-    /* ================= SECURITY EVENT ================= */
+    /* ===== SECURITY EVENT ===== */
 
     updateDb(dbState => {
       dbState.securityEvents = dbState.securityEvents || [];
@@ -191,7 +214,7 @@ async function zeroTrust(req, res, next) {
       return dbState;
     });
 
-    /* ================= STRICT MODE ================= */
+    /* ===== STRICT MODE ===== */
 
     if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
 
@@ -218,10 +241,9 @@ async function zeroTrust(req, res, next) {
       actor: req.user?.id || "unknown",
       role: req.user?.role || "unknown",
       action: "ZERO_TRUST_ERROR",
-      detail: { message: "ZeroTrust internal error" }
     });
 
-    return next(); // fail-open, audited
+    return next();
   }
 }
 
