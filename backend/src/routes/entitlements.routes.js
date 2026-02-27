@@ -1,20 +1,14 @@
 // backend/src/routes/entitlements.routes.js
-// Enterprise Entitlement Management — Hardened v2
-// Admin + Manager Scoped • Company Bound • Audit Safe
+// Enterprise Entitlement Management — Unified Enforcement v3
+// Subscription Aware • Tier Guarded • Governance Compatible • Audit Hardened
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired } = require("../middleware/auth");
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 const users = require("../users/user.service");
-
-const {
-  grantTool,
-  revokeTool,
-  revokeAllTools
-} = require("../lib/entitlement.engine");
 
 router.use(authRequired);
 
@@ -34,11 +28,6 @@ function isManager(user) {
   return normalize(user.role) === normalize(users.ROLES.MANAGER);
 }
 
-function findUser(userId) {
-  const db = readDb();
-  return (db.users || []).find(u => u.id === userId);
-}
-
 function sameCompany(actor, target) {
   return actor.companyId && actor.companyId === target.companyId;
 }
@@ -47,77 +36,92 @@ function nowISO() {
   return new Date().toISOString();
 }
 
+function findUser(userId) {
+  const db = readDb();
+  return (db.users || []).find((u) => u.id === userId);
+}
+
+function ensureEntitlements(user) {
+  if (!user.entitlements) {
+    user.entitlements = { tools: [] };
+  }
+  if (!Array.isArray(user.entitlements.tools)) {
+    user.entitlements.tools = [];
+  }
+}
+
 /* =========================================================
    VIEW MY ENTITLEMENTS
 ========================================================= */
 
 router.get("/me", (req, res) => {
   const user = findUser(req.user.id);
+  if (!user) return res.status(404).json({ ok: false });
 
-  if (!user) {
-    return res.status(404).json({
-      ok: false,
-      error: "User not found"
-    });
-  }
+  ensureEntitlements(user);
 
   return res.json({
     ok: true,
-    entitlements: user.entitlements || { tools: [] },
-    time: nowISO()
+    entitlements: user.entitlements,
+    subscriptionStatus: user.subscriptionStatus,
+    subscriptionTier: user.subscriptionTier || "free",
+    time: nowISO(),
   });
 });
 
 /* =========================================================
-   GRANT TOOL (ADMIN OR MANAGER SCOPED)
+   GRANT TOOL (MANUAL)
 ========================================================= */
 
 router.post("/grant", (req, res) => {
   const actor = req.user;
-  const { userId, toolId, expiresAt } = req.body || {};
+  const { userId, toolId } = req.body || {};
 
-  if (!userId || !toolId) {
-    return res.status(400).json({
-      ok: false,
-      error: "userId and toolId required"
-    });
-  }
+  if (!userId || !toolId)
+    return res.status(400).json({ ok: false, error: "Missing fields" });
 
   const target = findUser(userId);
-  if (!target) {
-    return res.status(404).json({
+  if (!target) return res.status(404).json({ ok: false });
+
+  // Subscription lock guard
+  if (String(target.subscriptionStatus).toLowerCase() === "locked") {
+    return res.status(403).json({
       ok: false,
-      error: "Target user not found"
+      error: "Cannot grant tool to locked subscription",
     });
   }
 
-  // Admin can grant globally
+  // Admin global / Manager same company only
   if (!isAdmin(actor)) {
-    // Managers can only grant within same company
     if (!isManager(actor) || !sameCompany(actor, target)) {
-      return res.status(403).json({
-        ok: false,
-        error: "Forbidden"
-      });
+      return res.status(403).json({ ok: false });
     }
   }
 
-  grantTool(userId, toolId, expiresAt || null);
+  updateDb((db) => {
+    const user = db.users.find((u) => u.id === userId);
+    if (!user) return db;
+
+    ensureEntitlements(user);
+
+    if (!user.entitlements.tools.includes(toolId)) {
+      user.entitlements.tools.push(toolId);
+    }
+
+    return db;
+  });
 
   writeAudit({
     actor: actor.id,
     role: actor.role,
-    action: "ENTITLEMENT_GRANTED",
-    detail: { targetUser: userId, toolId }
+    action: "MANUAL_ENTITLEMENT_GRANTED",
+    detail: { targetUser: userId, toolId },
   });
 
   return res.json({
     ok: true,
     message: "Tool granted",
-    toolId,
-    userId,
-    expiresAt: expiresAt || null,
-    time: nowISO()
+    time: nowISO(),
   });
 });
 
@@ -129,94 +133,81 @@ router.post("/revoke", (req, res) => {
   const actor = req.user;
   const { userId, toolId } = req.body || {};
 
-  if (!userId || !toolId) {
-    return res.status(400).json({
-      ok: false,
-      error: "userId and toolId required"
-    });
-  }
+  if (!userId || !toolId)
+    return res.status(400).json({ ok: false });
 
   const target = findUser(userId);
-  if (!target) {
-    return res.status(404).json({
-      ok: false,
-      error: "Target user not found"
-    });
-  }
+  if (!target) return res.status(404).json({ ok: false });
 
   if (!isAdmin(actor)) {
     if (!isManager(actor) || !sameCompany(actor, target)) {
-      return res.status(403).json({
-        ok: false,
-        error: "Forbidden"
-      });
+      return res.status(403).json({ ok: false });
     }
   }
 
-  revokeTool(userId, toolId);
+  updateDb((db) => {
+    const user = db.users.find((u) => u.id === userId);
+    if (!user?.entitlements?.tools) return db;
+
+    user.entitlements.tools =
+      user.entitlements.tools.filter((t) => t !== toolId);
+
+    return db;
+  });
 
   writeAudit({
     actor: actor.id,
     role: actor.role,
-    action: "ENTITLEMENT_REVOKED",
-    detail: { targetUser: userId, toolId }
+    action: "MANUAL_ENTITLEMENT_REVOKED",
+    detail: { targetUser: userId, toolId },
   });
 
   return res.json({
     ok: true,
     message: "Tool revoked",
-    toolId,
-    userId,
-    time: nowISO()
+    time: nowISO(),
   });
 });
 
 /* =========================================================
-   REVOKE ALL TOOLS
+   REVOKE ALL
 ========================================================= */
 
 router.post("/revoke-all", (req, res) => {
   const actor = req.user;
   const { userId } = req.body || {};
 
-  if (!userId) {
-    return res.status(400).json({
-      ok: false,
-      error: "userId required"
-    });
-  }
+  if (!userId)
+    return res.status(400).json({ ok: false });
 
   const target = findUser(userId);
-  if (!target) {
-    return res.status(404).json({
-      ok: false,
-      error: "Target user not found"
-    });
-  }
+  if (!target) return res.status(404).json({ ok: false });
 
   if (!isAdmin(actor)) {
     if (!isManager(actor) || !sameCompany(actor, target)) {
-      return res.status(403).json({
-        ok: false,
-        error: "Forbidden"
-      });
+      return res.status(403).json({ ok: false });
     }
   }
 
-  revokeAllTools(userId);
+  updateDb((db) => {
+    const user = db.users.find((u) => u.id === userId);
+    if (!user) return db;
+
+    user.entitlements = { tools: [] };
+    return db;
+  });
 
   writeAudit({
     actor: actor.id,
     role: actor.role,
-    action: "ALL_ENTITLEMENTS_REVOKED",
-    detail: { targetUser: userId }
+    action: "ALL_MANUAL_ENTITLEMENTS_REVOKED",
+    detail: { targetUser: userId },
   });
 
   return res.json({
     ok: true,
     message: "All tools revoked",
-    userId,
-    time: nowISO()
+    time: nowISO(),
   });
 });
 
