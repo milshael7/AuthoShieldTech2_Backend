@@ -1,30 +1,72 @@
 // backend/src/middleware/rateLimiter.js
-// Enterprise Traffic Shield — Burst + Sliding Window
-// IP + Token Hybrid • Auto Block • Abuse Telemetry
+// Enterprise Traffic Shield — Burst + Sliding Window (Hardened v2)
+// IP + Token Hybrid • Auto Block • Memory Bounded • Abuse Telemetry Safe
 
+const crypto = require("crypto");
 const { writeAudit } = require("../lib/audit");
 
-const WINDOW_MS = 60 * 1000;      // 1 minute window
-const MAX_REQUESTS = 120;         // per window
-const BURST_LIMIT = 40;           // 10-second burst
+const WINDOW_MS = 60 * 1000;      // 1 minute
+const MAX_REQUESTS = 120;
+const BURST_LIMIT = 40;
 const BURST_WINDOW = 10 * 1000;
-const BLOCK_TIME = 5 * 60 * 1000; // 5 minutes
+const BLOCK_TIME = 5 * 60 * 1000;
+
+const CLEANUP_INTERVAL = 60 * 1000;
+const MAX_STORE_SIZE = 5000;
 
 const ipStore = new Map();
+
+/* ========================================================= */
 
 function now() {
   return Date.now();
 }
 
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
+
 function getKey(req) {
-  const ip =
-    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
 
   const token = req.headers.authorization || "";
-  return token ? `${ip}|${token.slice(-12)}` : ip;
+  if (!token) return ip;
+
+  return `${ip}|${hashToken(token)}`;
 }
+
+/* =========================================================
+   CLEANUP
+========================================================= */
+
+function cleanupStore() {
+  const current = now();
+
+  for (const [key, entry] of ipStore.entries()) {
+    const expiredBlock =
+      !entry.blockedUntil || entry.blockedUntil <= current;
+
+    const empty =
+      entry.timestamps.length === 0 &&
+      entry.burst.length === 0;
+
+    if (expiredBlock && empty) {
+      ipStore.delete(key);
+    }
+  }
+
+  // Hard cap protection
+  if (ipStore.size > MAX_STORE_SIZE) {
+    const keys = Array.from(ipStore.keys());
+    for (let i = 0; i < keys.length - MAX_STORE_SIZE; i++) {
+      ipStore.delete(keys[i]);
+    }
+  }
+}
+
+setInterval(cleanupStore, CLEANUP_INTERVAL);
+
+/* ========================================================= */
 
 function rateLimiter(req, res, next) {
   const key = getKey(req);
