@@ -1,6 +1,7 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v7)
-// Strict Isolation • Cross-Tenant Detection • Type-Safe Matching • Audit Integrated
+// AutoShield — Enterprise Tenant Isolation Core (Hardened v8)
+// Deterministic Resolution • Token-Authoritative • Cross-Tenant Enforcement
+// Aligns with Master Plan + companyGuard
 
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
@@ -86,15 +87,20 @@ function tenantMiddleware(req, res, next) {
   let resolvedFrom = null;
 
   /* =============================
-     RESOLUTION ORDER
+     STRICT RESOLUTION ORDER
+     1. Token companyId (authoritative for non-admin)
+     2. Admin header override
+     3. Subdomain resolution (admin only fallback)
   ============================== */
 
+  // 1️⃣ TOKEN AUTHORITY (non-admin)
   if (req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
-    resolvedFrom = "auth";
+    resolvedFrom = "auth-token";
   }
 
-  if (!companyId && isAdmin) {
+  // 2️⃣ ADMIN HEADER OVERRIDE
+  if (isAdmin) {
     const headerCompany = req.headers["x-company-id"];
     if (headerCompany) {
       companyId = clean(headerCompany, 50);
@@ -102,7 +108,8 @@ function tenantMiddleware(req, res, next) {
     }
   }
 
-  if (!companyId) {
+  // 3️⃣ SUBDOMAIN (admin fallback only)
+  if (!companyId && isAdmin) {
     const sub = resolveFromSubdomain(req);
     if (sub) {
       companyId = sub;
@@ -115,10 +122,10 @@ function tenantMiddleware(req, res, next) {
   ============================== */
 
   if (isAdmin && !companyId) {
+    req.companyId = null;
     req.tenant = {
       id: null,
       type: "global",
-      brainKey: "global",
       resolvedFrom: "admin-global",
       userId: req.user.id,
       role: req.user.role,
@@ -136,63 +143,70 @@ function tenantMiddleware(req, res, next) {
      TENANT ENFORCEMENT
   ============================== */
 
-  if (companyId) {
-
-    const company =
-      (db.companies || []).find(c => idEq(c.id, companyId));
-
-    if (!company) {
-      recordViolation(dbUser, "COMPANY_NOT_FOUND", { companyId });
-      return res.status(404).json({ error: "Company not found" });
-    }
-
-    const isSuspended = company.status === "Suspended";
-    const isRestricted = company.status === "Restricted";
-
-    if (isSuspended) {
-      return res.status(403).json({
-        error: "Company suspended",
-      });
-    }
-
-    /* =============================
-       OWNERSHIP VALIDATION
-    ============================== */
-
-    const userBelongs =
-      isAdmin ||
-      idEq(dbUser.companyId, companyId) ||
-      (Array.isArray(dbUser.managedCompanies) &&
-        dbUser.managedCompanies.some(id => idEq(id, companyId)));
-
-    if (!userBelongs) {
-      recordViolation(dbUser, "CROSS_TENANT_ACCESS_ATTEMPT", {
-        attemptedCompany: companyId,
-      });
-
-      return res.status(403).json({
-        error: "Tenant boundary violation",
-      });
-    }
-
-    req.tenant = {
-      id: String(companyId),
-      type: "tenant",
-      brainKey: `tenant:${companyId}`,
-      resolvedFrom,
-      userId: req.user.id,
-      role: req.user.role,
-      plan: company.tier || "micro",
-      suspended: isSuspended,
-      restricted: isRestricted,
-      scope: {
-        isAdmin,
-        isManager: role === "manager",
-        isCompany: role === "company",
-        isIndividual: role === "individual",
-      },
-    };
+  if (!companyId) {
+    // Non-admin without company = invalid state
+    return res.status(403).json({
+      error: "Tenant context required",
+    });
   }
+
+  const company =
+    (db.companies || []).find(c => idEq(c.id, companyId));
+
+  if (!company) {
+    recordViolation(dbUser, "COMPANY_NOT_FOUND", { companyId });
+    return res.status(404).json({ error: "Company not found" });
+  }
+
+  const isSuspended = company.status === "Suspended";
+  const isRestricted = company.status === "Restricted";
+
+  if (isSuspended) {
+    return res.status(403).json({
+      error: "Company suspended",
+    });
+  }
+
+  /* =============================
+     OWNERSHIP VALIDATION
+  ============================== */
+
+  const userBelongs =
+    isAdmin ||
+    idEq(dbUser.companyId, companyId) ||
+    (Array.isArray(dbUser.managedCompanies) &&
+      dbUser.managedCompanies.some(id => idEq(id, companyId)));
+
+  if (!userBelongs) {
+    recordViolation(dbUser, "CROSS_TENANT_ACCESS_ATTEMPT", {
+      attemptedCompany: companyId,
+    });
+
+    return res.status(403).json({
+      error: "Tenant boundary violation",
+    });
+  }
+
+  // Canonical company context for downstream middleware
+  req.companyId = String(companyId);
+
+  req.tenant = {
+    id: String(companyId),
+    type: "tenant",
+    resolvedFrom,
+    userId: req.user.id,
+    role: req.user.role,
+    plan: company.tier || "micro",
+    suspended: isSuspended,
+    restricted: isRestricted,
+    scope: {
+      isAdmin,
+      isManager: role === "manager",
+      isCompany: role === "company",
+      isIndividual: role === "individual",
+      isSmallCompany: role === "small_company",
+    },
+  };
 
   return next();
 }
