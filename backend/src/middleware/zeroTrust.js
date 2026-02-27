@@ -1,8 +1,9 @@
 // backend/src/middleware/zeroTrust.js
-// Enterprise Zero Trust Middleware — Adaptive Enforcement v2
+// Enterprise Zero Trust Middleware — Adaptive Enforcement v3
 // Risk + Threat Correlation • Smart Escalation • Strict Optional Block
 
-const { readDb, writeDb } = require("../lib/db");
+const crypto = require("crypto");
+const { readDb, updateDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 const { calculateRisk } = require("../lib/riskEngine");
 const { evaluateThreat } = require("../lib/threatIntel");
@@ -15,14 +16,6 @@ const sessionAdapter = require("../lib/sessionAdapter");
 
 const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
-
-/*
-  ZERO_TRUST_ENABLED=false
-    → Middleware bypassed
-
-  ZERO_TRUST_STRICT=true
-    → Critical risk revokes sessions + blocks
-*/
 
 /* =========================================================
    HELPERS
@@ -37,6 +30,10 @@ function deriveLevel(score) {
   if (score >= 50) return "High";
   if (score >= 25) return "Medium";
   return "Low";
+}
+
+function uid() {
+  return crypto.randomBytes(8).toString("hex");
 }
 
 /* =========================================================
@@ -66,7 +63,6 @@ async function zeroTrust(req, res, next) {
     const threat = evaluateThreat({
       ip,
       userAgent: req.headers["user-agent"],
-      fingerprint: req.securityContext?.fingerprint,
       previousFingerprint: user.activeDeviceFingerprint,
       failedLogins: user.securityFlags?.failedLogins || 0
     });
@@ -121,25 +117,26 @@ async function zeroTrust(req, res, next) {
 
     /* ================= SECURITY EVENT ================= */
 
-    db.securityEvents = db.securityEvents || [];
+    updateDb(dbState => {
+      dbState.securityEvents = dbState.securityEvents || [];
 
-    const event = {
-      id: Date.now().toString(),
-      title: "Zero Trust Risk Evaluation",
-      description: `Level: ${level}`,
-      severity:
-        level === "Critical"
-          ? "critical"
-          : level === "High"
-          ? "high"
-          : "medium",
-      companyId: user.companyId || null,
-      userId: user.id,
-      createdAt: new Date().toISOString()
-    };
+      dbState.securityEvents.push({
+        id: `zt_${uid()}`,
+        title: "Zero Trust Risk Evaluation",
+        description: `Level: ${level}`,
+        severity:
+          level === "Critical"
+            ? "critical"
+            : level === "High"
+            ? "high"
+            : "medium",
+        companyId: user.companyId || null,
+        userId: user.id,
+        createdAt: new Date().toISOString()
+      });
 
-    db.securityEvents.push(event);
-    writeDb(db);
+      return dbState;
+    });
 
     /* ================= STRICT ENFORCEMENT ================= */
 
