@@ -1,7 +1,6 @@
 // backend/src/middleware/tenant.js
-// AutoShield — Enterprise Tenant Isolation Core (Hardened v8)
-// Deterministic Resolution • Token-Authoritative • Cross-Tenant Enforcement
-// Aligns with Master Plan + companyGuard
+// AutoShield Tech — Enterprise Tenant Isolation Core v9
+// Token Authoritative • Admin Scoped • Slug Safe • Cross-Tenant Guard • Audit Escalated
 
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
@@ -42,7 +41,7 @@ function recordViolation(dbUser, reason, meta = {}) {
     actor: dbUser.id,
     role: dbUser.role,
     action: "TENANT_BOUNDARY_VIOLATION",
-    metadata: { reason, ...meta },
+    detail: { reason, ...meta },
   });
 
   updateDb((db) => {
@@ -55,6 +54,7 @@ function recordViolation(dbUser, reason, meta = {}) {
 
     if (u.securityFlags.tenantViolations >= 5) {
       u.locked = true;
+
       audit({
         actor: u.id,
         role: u.role,
@@ -86,40 +86,54 @@ function tenantMiddleware(req, res, next) {
   let companyId = null;
   let resolvedFrom = null;
 
-  /* =============================
+  /* =====================================================
      STRICT RESOLUTION ORDER
-     1. Token companyId (authoritative for non-admin)
-     2. Admin header override
-     3. Subdomain resolution (admin only fallback)
-  ============================== */
+     1. Token companyId (authoritative, immutable)
+     2. Admin header override (validated)
+     3. Subdomain resolution (validated, admin only)
+  ===================================================== */
 
-  // 1️⃣ TOKEN AUTHORITY (non-admin)
-  if (req.user.companyId) {
+  // 1️⃣ TOKEN AUTHORITY (non-admin immutable)
+  if (!isAdmin && req.user.companyId) {
     companyId = clean(req.user.companyId, 50);
     resolvedFrom = "auth-token";
   }
 
-  // 2️⃣ ADMIN HEADER OVERRIDE
-  if (isAdmin) {
-    const headerCompany = req.headers["x-company-id"];
-    if (headerCompany) {
-      companyId = clean(headerCompany, 50);
-      resolvedFrom = "admin-header";
+  // 2️⃣ ADMIN HEADER OVERRIDE (validated existence)
+  if (isAdmin && req.headers["x-company-id"]) {
+    const headerCompany = clean(req.headers["x-company-id"], 50);
+
+    const exists = (db.companies || []).some(c =>
+      idEq(c.id, headerCompany)
+    );
+
+    if (!exists) {
+      return res.status(404).json({ error: "Company not found" });
     }
+
+    companyId = headerCompany;
+    resolvedFrom = "admin-header";
   }
 
-  // 3️⃣ SUBDOMAIN (admin fallback only)
-  if (!companyId && isAdmin) {
+  // 3️⃣ SUBDOMAIN (admin fallback only, validated)
+  if (isAdmin && !companyId) {
     const sub = resolveFromSubdomain(req);
+
     if (sub) {
-      companyId = sub;
-      resolvedFrom = "subdomain";
+      const company = (db.companies || []).find(
+        c => idEq(c.slug, sub) || idEq(c.id, sub)
+      );
+
+      if (company) {
+        companyId = company.id;
+        resolvedFrom = "subdomain";
+      }
     }
   }
 
-  /* =============================
+  /* =====================================================
      ADMIN GLOBAL MODE
-  ============================== */
+  ===================================================== */
 
   if (isAdmin && !companyId) {
     req.companyId = null;
@@ -132,19 +146,16 @@ function tenantMiddleware(req, res, next) {
       plan: "global",
       suspended: false,
       restricted: false,
-      scope: {
-        isAdmin: true,
-      },
+      scope: { isAdmin: true },
     };
     return next();
   }
 
-  /* =============================
-     TENANT ENFORCEMENT
-  ============================== */
+  /* =====================================================
+     TENANT REQUIRED
+  ===================================================== */
 
   if (!companyId) {
-    // Non-admin without company = invalid state
     return res.status(403).json({
       error: "Tenant context required",
     });
@@ -162,14 +173,21 @@ function tenantMiddleware(req, res, next) {
   const isRestricted = company.status === "Restricted";
 
   if (isSuspended) {
+    audit({
+      actor: dbUser.id,
+      role: dbUser.role,
+      action: "SUSPENDED_COMPANY_ACCESS_ATTEMPT",
+      detail: { companyId }
+    });
+
     return res.status(403).json({
       error: "Company suspended",
     });
   }
 
-  /* =============================
+  /* =====================================================
      OWNERSHIP VALIDATION
-  ============================== */
+  ===================================================== */
 
   const userBelongs =
     isAdmin ||
@@ -187,7 +205,10 @@ function tenantMiddleware(req, res, next) {
     });
   }
 
-  // Canonical company context for downstream middleware
+  /* =====================================================
+     CONTEXT FREEZE
+  ===================================================== */
+
   req.companyId = String(companyId);
 
   req.tenant = {
