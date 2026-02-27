@@ -1,8 +1,8 @@
 // backend/src/lib/tools.engine.js
 // Enterprise Tools Engine Core
-// v3 — Hardened Governance Alignment
+// v4 — Subscription Tier Alignment + Seat Governance Hardening
 // Entitlement + Role + Seat Governance Logic
-// Approval timing/grants enforced in routes/tools.routes.js
+// NOTE: approval timing/grants are enforced in routes/tools.routes.js
 
 const { userHasTool } = require("./entitlement.engine");
 
@@ -16,6 +16,10 @@ function normalizeArray(v) {
   return Object.values(v);
 }
 
+function norm(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
 function isAdmin(user, ROLES) {
   return user?.role === ROLES.ADMIN;
 }
@@ -25,10 +29,7 @@ function isManager(user, ROLES) {
 }
 
 function isCompany(user, ROLES) {
-  return (
-    user?.role === ROLES.COMPANY ||
-    user?.role === ROLES.SMALL_COMPANY
-  );
+  return user?.role === ROLES.COMPANY || user?.role === ROLES.SMALL_COMPANY;
 }
 
 function isIndividual(user, ROLES) {
@@ -37,21 +38,63 @@ function isIndividual(user, ROLES) {
 
 /**
  * Seat user = tied to company AND no freedom
+ * (Seat is still a user account, but governed by company)
  */
 function isSeatUser(user) {
   return Boolean(user?.companyId) && !Boolean(user?.freedomEnabled);
 }
 
+function isSubscriptionLocked(user) {
+  const s = norm(user?.subscriptionStatus);
+  return s === "locked";
+}
+
+function safeToolTier(tool) {
+  const t = norm(tool?.tier);
+  if (t === "free" || t === "paid" || t === "enterprise") return t;
+  return "free";
+}
+
+/**
+ * Subscription tier check (billing-ready):
+ * - free: can use free tools only
+ * - paid: can use free + paid tools
+ * - enterprise: can use free + paid + enterprise tools
+ *
+ * Admin/Manager bypass this gating (they already have role overrides).
+ */
+function tierAllowsTool(user, tool) {
+  const toolTier = safeToolTier(tool);
+  if (toolTier === "free") return true;
+
+  const userTier = norm(user?.subscriptionTier || "free"); // if missing, treat as free
+
+  if (toolTier === "paid") {
+    return userTier === "paid" || userTier === "enterprise";
+  }
+
+  if (toolTier === "enterprise") {
+    return userTier === "enterprise";
+  }
+
+  return false;
+}
+
 /* =========================================================
    CORE ACCESS DECISION
+
    This answers:
-   "Is this user ever allowed to use or request this tool?"
-   (NOT time-limited approval logic — that's in routes)
+   "Is this user ever allowed to use/request this tool?"
+   (NOT time-limited approval logic — that's enforced in routes)
 ========================================================= */
 
 function canAccessTool(user, tool, ROLES) {
   if (!user || !tool) return false;
   if (tool.enabled === false) return false;
+
+  // Hard stop: locked subscriptions are never allowed to use/request tools
+  // (Routes also gate this, but we enforce here to keep policy consistent.)
+  if (isSubscriptionLocked(user)) return false;
 
   /* ===============================
      ADMIN — FULL OVERRIDE
@@ -61,7 +104,7 @@ function canAccessTool(user, tool, ROLES) {
   }
 
   /* ===============================
-     MANAGER
+     MANAGER — OPERATIONAL ACCESS
   =============================== */
   if (isManager(user, ROLES)) {
     if (tool.enterpriseOnly) {
@@ -71,42 +114,44 @@ function canAccessTool(user, tool, ROLES) {
   }
 
   /* ===============================
-     COMPANY
+     COMPANY (and SMALL COMPANY)
+     - Only explicitly allowed tools
+     - Must also pass subscription tier gating
   =============================== */
   if (isCompany(user, ROLES)) {
-    return tool.companyAllowed === true;
+    if (tool.companyAllowed !== true) return false;
+    return tierAllowsTool(user, tool);
   }
 
   /* ===============================
      INDIVIDUAL (Standalone)
+     - Free allowed
+     - Paid/Enterprise: must pass tier gating AND have entitlement
   =============================== */
   if (isIndividual(user, ROLES) && !isSeatUser(user)) {
-    if (tool.tier === "free") return true;
+    if (!tierAllowsTool(user, tool)) return false;
 
-    if (tool.tier === "paid" || tool.tier === "enterprise") {
-      return userHasTool(user, tool.id);
-    }
+    if (safeToolTier(tool) === "free") return true;
 
-    return false;
+    // paid/enterprise require entitlement
+    return userHasTool(user, tool.id);
   }
 
   /* ===============================
      SEAT USER (Under Company)
-     🔒 Cannot escalate beyond company policy
+     🔒 Cannot escalate beyond company tool policy
+     - Must be companyAllowed
+     - Must pass tier gating (seat uses their own subscriptionTier unless you later switch this
+       to a company-tier lookup in routes)
+     - Paid/Enterprise require entitlement (billing-ready)
   =============================== */
   if (isSeatUser(user)) {
-    // If company does not allow this tool at all → deny
     if (tool.companyAllowed !== true) return false;
+    if (!tierAllowsTool(user, tool)) return false;
 
-    // Free tools allowed
-    if (tool.tier === "free") return true;
+    if (safeToolTier(tool) === "free") return true;
 
-    // Paid/enterprise tools require entitlement
-    if (tool.tier === "paid" || tool.tier === "enterprise") {
-      return userHasTool(user, tool.id);
-    }
-
-    return false;
+    return userHasTool(user, tool.id);
   }
 
   return false;
@@ -119,7 +164,6 @@ function canAccessTool(user, tool, ROLES) {
 
 function seedToolsIfEmpty(db) {
   db.tools = normalizeArray(db.tools);
-
   if (db.tools.length > 0) return false;
 
   db.tools = [
