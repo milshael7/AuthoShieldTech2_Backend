@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// Enterprise Zero Trust Middleware — Adaptive Enforcement v4
-// Deterministic • Tenant-Aware • WebSocket-Compatible • Memory-Bounded
+// AutoShield Tech — Enterprise Zero Trust Engine v5
+// Adaptive • Rate-Aware • Privilege-Sensitive • Memory-Bounded • Stable
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -18,6 +18,10 @@ const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
 const MAX_SECURITY_EVENTS = 2000;
 
+/* Risk cache per user to prevent flooding */
+const evaluationCache = new Map();
+const EVAL_COOLDOWN_MS = 5000; // 5 sec minimum gap per user
+
 /* =========================================================
    HELPERS
 ========================================================= */
@@ -27,9 +31,9 @@ function clamp(num, min, max) {
 }
 
 function deriveLevel(score) {
-  if (score >= 75) return "Critical";
-  if (score >= 50) return "High";
-  if (score >= 25) return "Medium";
+  if (score >= 80) return "Critical";
+  if (score >= 60) return "High";
+  if (score >= 35) return "Medium";
   return "Low";
 }
 
@@ -37,18 +41,48 @@ function uid() {
   return crypto.randomBytes(8).toString("hex");
 }
 
+function shouldBypass(req) {
+  const path = req.originalUrl || "";
+
+  if (
+    path.startsWith("/health") ||
+    path.startsWith("/live") ||
+    path.startsWith("/ready") ||
+    path.startsWith("/api/auth") ||
+    path.startsWith("/api/stripe/webhook")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 /* =========================================================
-   MAIN MIDDLEWARE
+   MAIN
 ========================================================= */
 
 async function zeroTrust(req, res, next) {
   try {
     if (!ZERO_TRUST_ENABLED) return next();
     if (!req.user) return next();
+    if (shouldBypass(req)) return next();
 
     const db = readDb();
     const user = (db.users || []).find(u => u.id === req.user.id);
     if (!user) return next();
+
+    /* ================= RATE DAMPENING ================= */
+
+    const lastEval = evaluationCache.get(user.id);
+    const now = Date.now();
+
+    if (lastEval && now - lastEval < EVAL_COOLDOWN_MS) {
+      return next();
+    }
+
+    evaluationCache.set(user.id, now);
+
+    /* ================= GEO ================= */
 
     const ip = extractIp(req);
     let geo = null;
@@ -82,17 +116,25 @@ async function zeroTrust(req, res, next) {
       }
     });
 
-    /* ================= CORRELATION ================= */
+    /* ================= PRIVILEGE WEIGHTING ================= */
+
+    const isHighPrivilege =
+      req.user.role === "admin" ||
+      req.user.role === "finance";
+
+    const privilegeMultiplier = isHighPrivilege ? 1.15 : 1;
 
     const combinedScore = clamp(
-      Math.round((threat.threatScore * 0.6) + (risk.riskScore * 0.4)),
+      Math.round(
+        ((threat.threatScore * 0.6) +
+          (risk.riskScore * 0.4)) * privilegeMultiplier
+      ),
       0,
       100
     );
 
     const level = deriveLevel(combinedScore);
 
-    // Attach to request for downstream usage (UI parity, logging, WS layer)
     req.zeroTrust = {
       combinedScore,
       level,
@@ -115,8 +157,6 @@ async function zeroTrust(req, res, next) {
       detail: {
         combinedScore,
         level,
-        threatScore: threat.threatScore,
-        riskScore: risk.riskScore,
         path: req.originalUrl,
         method: req.method,
         companyId: req.companyId || user.companyId || null
@@ -143,15 +183,15 @@ async function zeroTrust(req, res, next) {
         createdAt: new Date().toISOString()
       });
 
-      // Memory bound
       if (dbState.securityEvents.length > MAX_SECURITY_EVENTS) {
-        dbState.securityEvents = dbState.securityEvents.slice(-MAX_SECURITY_EVENTS);
+        dbState.securityEvents =
+          dbState.securityEvents.slice(-MAX_SECURITY_EVENTS);
       }
 
       return dbState;
     });
 
-    /* ================= STRICT ENFORCEMENT ================= */
+    /* ================= STRICT MODE ================= */
 
     if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
 
@@ -161,10 +201,7 @@ async function zeroTrust(req, res, next) {
         actor: user.id,
         role: user.role,
         action: "ZERO_TRUST_SESSION_TERMINATED",
-        detail: {
-          combinedScore,
-          level
-        }
+        detail: { combinedScore, level }
       });
 
       return res.status(403).json({
@@ -175,18 +212,16 @@ async function zeroTrust(req, res, next) {
 
     return next();
 
-  } catch (err) {
+  } catch {
 
     writeAudit({
       actor: req.user?.id || "unknown",
       role: req.user?.role || "unknown",
       action: "ZERO_TRUST_ERROR",
-      detail: {
-        message: "ZeroTrust internal error"
-      }
+      detail: { message: "ZeroTrust internal error" }
     });
 
-    return next(); // fail-open but audited
+    return next(); // fail-open, audited
   }
 }
 
