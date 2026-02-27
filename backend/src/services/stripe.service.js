@@ -1,14 +1,17 @@
 // backend/src/services/stripe.service.js
-// Revenue → Entitlement Enforcement Engine v2
-// Webhook Verified • Ledger Safe • Session Safe • Tier Synced
+// Revenue → Entitlement Enforcement Engine v3
+// Immutable Revenue Ledger Integrated • Stripe Safe • Session Safe
 
 const Stripe = require("stripe");
-const crypto = require("crypto");
 const sessionAdapter = require("../lib/sessionAdapter");
 const users = require("../users/user.service");
 const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 const { nanoid } = require("nanoid");
+
+const {
+  appendRevenueEntry
+} = require("../lib/revenueLedger");
 
 if (!process.env.STRIPE_SECRET_KEY)
   throw new Error("STRIPE_SECRET_KEY missing");
@@ -21,14 +24,6 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* ========================================================= */
-
-function sha256(data) {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-function computeLedgerHash(entry) {
-  return sha256(JSON.stringify(entry));
-}
 
 function clampRevenue(n) {
   return Math.max(0, Number(n) || 0);
@@ -76,11 +71,11 @@ function lockUser(user) {
 
   purgeToolGrantsForUser(user.id);
 
-  // 🔥 Immediately kill sessions
   sessionAdapter.revokeAllUserSessions(user.id);
 
   audit({
-    actorId: user.id,
+    actor: user.id,
+    role: user.role,
     action: "SUBSCRIPTION_LOCKED",
   });
 }
@@ -100,22 +95,11 @@ function activateUser(user, nextBillingDate, planType = "paid") {
   });
 
   audit({
-    actorId: user.id,
+    actor: user.id,
+    role: user.role,
     action: "SUBSCRIPTION_ACTIVATED",
-    metadata: { planType },
+    detail: { planType },
   });
-}
-
-/* =========================================================
-   WEBHOOK VERIFICATION
-========================================================= */
-
-function verifyStripeWebhook(rawBody, signature) {
-  return stripe.webhooks.constructEvent(
-    rawBody,
-    signature,
-    process.env.STRIPE_WEBHOOK_SECRET
-  );
 }
 
 /* =========================================================
@@ -158,8 +142,6 @@ async function handleStripeWebhook(event) {
       createdAt: new Date().toISOString(),
     };
 
-    paymentEntry.hash = computeLedgerHash(paymentEntry);
-
     updateDb((ledgerDb) => {
       ensureFinancialArrays(ledgerDb);
 
@@ -172,6 +154,14 @@ async function handleStripeWebhook(event) {
         clampRevenue(ledgerDb.revenueSummary.subscriptionRevenue + amount);
 
       return ledgerDb;
+    });
+
+    // 🔥 IMMUTABLE REVENUE LEDGER APPEND
+    appendRevenueEntry({
+      type: "subscription_payment",
+      amount,
+      userId: user.id,
+      invoiceId: invoiceObj.id
     });
 
     activateUser(
@@ -195,12 +185,12 @@ async function handleStripeWebhook(event) {
     const user = db.users.find((u) => u.id === payment.userId);
     if (!user) return;
 
+    const refundAmount = charge.amount_refunded / 100;
+
     lockUser(user);
 
     updateDb((ledgerDb) => {
       ensureFinancialArrays(ledgerDb);
-
-      const refundAmount = charge.amount_refunded / 100;
 
       ledgerDb.revenueSummary.totalRevenue =
         clampRevenue(ledgerDb.revenueSummary.totalRevenue - refundAmount);
@@ -211,6 +201,14 @@ async function handleStripeWebhook(event) {
       ledgerDb.revenueSummary.refundedAmount += refundAmount;
 
       return ledgerDb;
+    });
+
+    // 🔥 LEDGER ENTRY
+    appendRevenueEntry({
+      type: "refund",
+      amount: -refundAmount,
+      userId: user.id,
+      invoiceId: charge.invoice
     });
   }
 
@@ -228,6 +226,13 @@ async function handleStripeWebhook(event) {
     if (!user) return;
 
     lockUser(user);
+
+    appendRevenueEntry({
+      type: "dispute",
+      amount: -payment.amount,
+      userId: user.id,
+      invoiceId: dispute.invoice
+    });
   }
 
   if (event.type === "customer.subscription.deleted") {
@@ -244,7 +249,5 @@ async function handleStripeWebhook(event) {
 }
 
 module.exports = {
-  cancelSubscription,
-  handleStripeWebhook,
-  verifyStripeWebhook,
+  handleStripeWebhook
 };
