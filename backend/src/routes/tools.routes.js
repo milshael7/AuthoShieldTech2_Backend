@@ -1,6 +1,6 @@
 // backend/src/routes/tools.routes.js
-// Enterprise Tools Engine — Hardened Access Enforcement v5
-// Full Governance Layer • Admin/Manager Boundaries • Expiry Safety • Audit Complete
+// Enterprise Tools Engine — Hardened v6
+// Deterministic Tenant Scope • Role Normalized • Subscription Enforced • Memory Bounded
 
 const express = require("express");
 const crypto = require("crypto");
@@ -9,15 +9,19 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
-const users = require("../users/user.service");
-
 const {
   canAccessTool,
   seedToolsIfEmpty,
   normalizeArray,
 } = require("../lib/tools.engine");
 
+const MAX_TOOL_REQUESTS = 2000;
+
 /* ========================================================= */
+
+function normalize(role) {
+  return String(role || "").trim().toLowerCase();
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -32,7 +36,7 @@ function findUser(db, userId) {
 }
 
 function subscriptionActive(user) {
-  const s = String(user.subscriptionStatus || "").toLowerCase();
+  const s = normalize(user.subscriptionStatus);
   return s === "active" || s === "trial";
 }
 
@@ -44,21 +48,17 @@ function ensureToolsState(db) {
 }
 
 function isAdmin(user) {
-  return String(user?.role) === users.ROLES.ADMIN;
+  return normalize(user?.role) === "admin";
 }
 
 function isManager(user) {
-  return String(user?.role) === users.ROLES.MANAGER;
-}
-
-function isSeatUser(user) {
-  return Boolean(user?.companyId) && !Boolean(user?.freedomEnabled);
+  return normalize(user?.role) === "manager";
 }
 
 function cleanupExpiredGrants(db) {
   const now = Date.now();
-  db.toolGrants = (db.toolGrants || []).filter(g =>
-    g?.expiresAt && Date.parse(g.expiresAt) > now
+  db.toolGrants = (db.toolGrants || []).filter(
+    g => g?.expiresAt && Date.parse(g.expiresAt) > now
   );
   return db;
 }
@@ -78,15 +78,12 @@ function hasActiveGrant(db, { toolId, user }) {
   });
 }
 
-function clampDurationMinutes(user, tool, minutes) {
+function clampDurationMinutes(user, minutes) {
   const requested = Number(minutes);
   const safe = Number.isFinite(requested) && requested > 0 ? requested : 1440;
 
-  const maxAdmin = 2880;
-  const maxManager = 120;
-
-  if (isAdmin(user)) return Math.min(safe, maxAdmin);
-  if (isManager(user)) return Math.min(safe, maxManager);
+  if (isAdmin(user)) return Math.min(safe, 2880);
+  if (isManager(user)) return Math.min(safe, 120);
 
   return 1440;
 }
@@ -111,7 +108,7 @@ router.get("/catalog", (req, res) => {
       const entitled =
         tool.enabled !== false &&
         subscriptionActive(user) &&
-        canAccessTool(user, tool, users.ROLES);
+        canAccessTool(user, tool);
 
       const requiresApproval = Boolean(tool.requiresApproval || tool.dangerous);
       const grantOk = requiresApproval
@@ -128,8 +125,8 @@ router.get("/catalog", (req, res) => {
 
     return res.json({ ok: true, tools, time: nowIso() });
 
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+  } catch {
+    return res.status(500).json({ ok: false });
   }
 });
 
@@ -143,31 +140,37 @@ router.post("/request/:toolId", (req, res) => {
     const user = findUser(db, req.user.id);
     if (!user) return res.status(404).json({ ok: false });
 
-    const tool = db.tools.find(t => String(t.id) === String(req.params.toolId));
-    if (!tool) return res.status(404).json({ ok: false });
+    if (!subscriptionActive(user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Subscription inactive"
+      });
+    }
 
-    const stage = isSeatUser(user)
-      ? "pending_company"
-      : tool.dangerous
-      ? "pending_admin"
-      : "pending_review";
+    const tool = db.tools.find(
+      t => String(t.id) === String(req.params.toolId)
+    );
+    if (!tool) return res.status(404).json({ ok: false });
 
     const request = {
       id: uid("req"),
       toolId: tool.id,
       toolName: tool.name,
-      toolDangerous: Boolean(tool.dangerous),
       requestedBy: user.id,
       requestedRole: user.role,
-      companyId: user.companyId || null,
-      seatUser: isSeatUser(user),
-      status: stage,
+      companyId: req.companyId || null,
+      status: tool.dangerous ? "pending_admin" : "pending_review",
       createdAt: nowIso(),
     };
 
     updateDb(db2 => {
       db2 = ensureToolsState(db2);
       db2.toolRequests.unshift(request);
+
+      if (db2.toolRequests.length > MAX_TOOL_REQUESTS) {
+        db2.toolRequests = db2.toolRequests.slice(-MAX_TOOL_REQUESTS);
+      }
+
       return db2;
     });
 
@@ -175,7 +178,7 @@ router.post("/request/:toolId", (req, res) => {
       actor: user.id,
       role: user.role,
       action: "TOOL_REQUEST_CREATED",
-      target: tool.id
+      metadata: { toolId: tool.id }
     });
 
     return res.json({ ok: true, request });
@@ -205,28 +208,23 @@ router.post("/requests/:id/approve", (req, res) => {
       const r = db2.toolRequests.find(x => x.id === req.params.id);
       if (!r) return db2;
 
-      if (r.status !== "pending_review" && r.status !== "pending_admin")
+      if (isManager(approver) && r.companyId !== req.companyId)
         return db2;
-
-      if (isManager(approver) && r.toolDangerous)
-        return db2;
-
-      const tool = db2.tools.find(t => t.id === r.toolId);
-      if (!tool) return db2;
 
       const duration = clampDurationMinutes(
         approver,
-        tool,
         req.body?.durationMinutes
       );
 
-      const expiresAt = new Date(Date.now() + duration * 60000).toISOString();
+      const expiresAt = new Date(
+        Date.now() + duration * 60000
+      ).toISOString();
 
       grant = {
         id: uid("grant"),
         toolId: r.toolId,
-        userId: r.seatUser ? r.requestedBy : null,
-        companyId: r.seatUser ? null : r.companyId,
+        userId: r.requestedBy,
+        companyId: r.companyId,
         durationMinutes: duration,
         expiresAt,
         approvedBy: approver.id,
@@ -236,8 +234,6 @@ router.post("/requests/:id/approve", (req, res) => {
 
       db2.toolGrants.unshift(grant);
       r.status = "approved";
-      r.decidedBy = approver.id;
-      r.decidedByRole = approver.role;
       r.expiresAt = expiresAt;
 
       return db2;
@@ -249,7 +245,7 @@ router.post("/requests/:id/approve", (req, res) => {
       actor: approver.id,
       role: approver.role,
       action: "TOOL_REQUEST_APPROVED",
-      target: grant.toolId
+      metadata: { toolId: grant.toolId }
     });
 
     return res.json({ ok: true, grant });
@@ -260,44 +256,7 @@ router.post("/requests/:id/approve", (req, res) => {
 });
 
 /* =========================================================
-   DENY REQUEST
-========================================================= */
-
-router.post("/requests/:id/deny", (req, res) => {
-  try {
-    const db = ensureToolsState(readDb());
-    const decider = findUser(db, req.user.id);
-
-    if (!isAdmin(decider) && !isManager(decider))
-      return res.status(403).json({ ok: false });
-
-    updateDb(db2 => {
-      const r = db2.toolRequests.find(x => x.id === req.params.id);
-      if (!r) return db2;
-
-      r.status = "denied";
-      r.decidedBy = decider.id;
-      r.decidedByRole = decider.role;
-      r.updatedAt = nowIso();
-
-      return db2;
-    });
-
-    audit({
-      actor: decider.id,
-      role: decider.role,
-      action: "TOOL_REQUEST_DENIED"
-    });
-
-    return res.json({ ok: true });
-
-  } catch {
-    return res.status(500).json({ ok: false });
-  }
-});
-
-/* =========================================================
-   LIST ACTIVE GRANTS
+   GRANTS LIST (Scoped)
 ========================================================= */
 
 router.get("/grants", (req, res) => {
@@ -308,7 +267,15 @@ router.get("/grants", (req, res) => {
     if (!isAdmin(user) && !isManager(user))
       return res.status(403).json({ ok: false });
 
-    return res.json({ ok: true, grants: db.toolGrants });
+    let grants = db.toolGrants || [];
+
+    if (!isAdmin(user)) {
+      grants = grants.filter(
+        g => String(g.companyId) === String(req.companyId)
+      );
+    }
+
+    return res.json({ ok: true, grants });
 
   } catch {
     return res.status(500).json({ ok: false });
@@ -337,48 +304,8 @@ router.post("/grants/:grantId/revoke", (req, res) => {
     audit({
       actor: user.id,
       role: user.role,
-      action: "TOOL_GRANT_REVOKED"
-    });
-
-    return res.json({ ok: true });
-
-  } catch {
-    return res.status(500).json({ ok: false });
-  }
-});
-
-/* =========================================================
-   EXTEND GRANT
-========================================================= */
-
-router.post("/grants/:grantId/extend", (req, res) => {
-  try {
-    const db = ensureToolsState(readDb());
-    const user = findUser(db, req.user.id);
-
-    if (!isAdmin(user))
-      return res.status(403).json({ ok: false });
-
-    const additional = Number(req.body?.durationMinutes);
-    if (!additional || additional <= 0)
-      return res.status(400).json({ ok: false });
-
-    updateDb(db2 => {
-      const g = db2.toolGrants.find(x => x.id === req.params.grantId);
-      if (!g) return db2;
-
-      const current = new Date(g.expiresAt).getTime();
-      g.expiresAt = new Date(current + additional * 60000).toISOString();
-      g.durationMinutes += additional;
-      g.updatedAt = nowIso();
-
-      return db2;
-    });
-
-    audit({
-      actor: user.id,
-      role: user.role,
-      action: "TOOL_GRANT_EXTENDED"
+      action: "TOOL_GRANT_REVOKED",
+      metadata: { grantId: req.params.grantId }
     });
 
     return res.json({ ok: true });
