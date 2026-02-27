@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// Enterprise Zero Trust Middleware — Adaptive Enforcement v3
-// Risk + Threat Correlation • Smart Escalation • Strict Optional Block
+// Enterprise Zero Trust Middleware — Adaptive Enforcement v4
+// Deterministic • Tenant-Aware • WebSocket-Compatible • Memory-Bounded
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -16,6 +16,7 @@ const sessionAdapter = require("../lib/sessionAdapter");
 
 const ZERO_TRUST_STRICT = process.env.ZERO_TRUST_STRICT === "true";
 const ZERO_TRUST_ENABLED = process.env.ZERO_TRUST_ENABLED !== "false";
+const MAX_SECURITY_EVENTS = 2000;
 
 /* =========================================================
    HELPERS
@@ -50,10 +51,8 @@ async function zeroTrust(req, res, next) {
     if (!user) return next();
 
     const ip = extractIp(req);
-
-    /* ================= GEO (lazy) ================= */
-
     let geo = null;
+
     if (ip) {
       geo = await geoLookup(ip);
     }
@@ -93,6 +92,14 @@ async function zeroTrust(req, res, next) {
 
     const level = deriveLevel(combinedScore);
 
+    // Attach to request for downstream usage (UI parity, logging, WS layer)
+    req.zeroTrust = {
+      combinedScore,
+      level,
+      threatScore: threat.threatScore,
+      riskScore: risk.riskScore
+    };
+
     /* ================= LOW RISK FAST EXIT ================= */
 
     if (level === "Low") {
@@ -111,7 +118,8 @@ async function zeroTrust(req, res, next) {
         threatScore: threat.threatScore,
         riskScore: risk.riskScore,
         path: req.originalUrl,
-        method: req.method
+        method: req.method,
+        companyId: req.companyId || user.companyId || null
       }
     });
 
@@ -130,17 +138,22 @@ async function zeroTrust(req, res, next) {
             : level === "High"
             ? "high"
             : "medium",
-        companyId: user.companyId || null,
+        companyId: req.companyId || user.companyId || null,
         userId: user.id,
         createdAt: new Date().toISOString()
       });
+
+      // Memory bound
+      if (dbState.securityEvents.length > MAX_SECURITY_EVENTS) {
+        dbState.securityEvents = dbState.securityEvents.slice(-MAX_SECURITY_EVENTS);
+      }
 
       return dbState;
     });
 
     /* ================= STRICT ENFORCEMENT ================= */
 
-    if (ZERO_TRUST_STRICT && level === "Critical") {
+    if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
 
       sessionAdapter.revokeAllUserSessions(user.id);
 
@@ -148,7 +161,10 @@ async function zeroTrust(req, res, next) {
         actor: user.id,
         role: user.role,
         action: "ZERO_TRUST_SESSION_TERMINATED",
-        detail: { combinedScore }
+        detail: {
+          combinedScore,
+          level
+        }
       });
 
       return res.status(403).json({
@@ -159,8 +175,18 @@ async function zeroTrust(req, res, next) {
 
     return next();
 
-  } catch {
-    return next();
+  } catch (err) {
+
+    writeAudit({
+      actor: req.user?.id || "unknown",
+      role: req.user?.role || "unknown",
+      action: "ZERO_TRUST_ERROR",
+      detail: {
+        message: "ZeroTrust internal error"
+      }
+    });
+
+    return next(); // fail-open but audited
   }
 }
 
