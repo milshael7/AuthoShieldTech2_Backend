@@ -1,6 +1,6 @@
 // backend/src/lib/sessionStore.js
-// Enterprise Session Control Layer — Hardened v2
-// JTI Tracking • TTL Accurate • Memory Safe • Revocation Clean
+// AutoShield Tech — Enterprise Session Control v3
+// Replay Guard • Session Cap • Memory Bounded • TTL Safe • Crash Hardened
 
 const { writeAudit } = require("./audit");
 
@@ -8,11 +8,15 @@ const { writeAudit } = require("./audit");
    CONFIG
 ========================================================= */
 
-const CLEANUP_INTERVAL = 60 * 1000; // 1 minute
-const DEFAULT_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+const CLEANUP_INTERVAL = 60 * 1000;           // 1 minute
+const DEFAULT_TTL = 7 * 24 * 60 * 60 * 1000;  // 7 days
+
+const MAX_SESSIONS_PER_USER = 25;             // 🔒 per-user cap
+const MAX_TOTAL_SESSIONS = 50000;             // 🔒 global cap
+const MAX_REVOKED_TOKENS = 100000;            // 🔒 memory bound
 
 /* =========================================================
-   IN-MEMORY STORE
+   STORE
 ========================================================= */
 
 // jti -> expiresAt
@@ -28,6 +32,25 @@ const activeSessions = new Map();
 function now() {
   return Date.now();
 }
+
+function normalizeTTL(ttlMs) {
+  if (!ttlMs || typeof ttlMs !== "number") {
+    return DEFAULT_TTL;
+  }
+  return Math.max(1000, ttlMs);
+}
+
+function totalSessionCount() {
+  let count = 0;
+  for (const sessions of activeSessions.values()) {
+    count += sessions.size;
+  }
+  return count;
+}
+
+/* =========================================================
+   CLEANUP LOOP
+========================================================= */
 
 function cleanup() {
   const current = now();
@@ -51,9 +74,17 @@ function cleanup() {
       activeSessions.delete(userId);
     }
   }
+
+  // Enforce revoked token bound
+  if (revokedTokens.size > MAX_REVOKED_TOKENS) {
+    const excess = revokedTokens.size - MAX_REVOKED_TOKENS;
+    const keys = Array.from(revokedTokens.keys()).slice(0, excess);
+    for (const key of keys) revokedTokens.delete(key);
+  }
 }
 
-setInterval(cleanup, CLEANUP_INTERVAL);
+const interval = setInterval(cleanup, CLEANUP_INTERVAL);
+interval.unref(); // 🔒 does not block process shutdown
 
 /* =========================================================
    API
@@ -62,22 +93,44 @@ setInterval(cleanup, CLEANUP_INTERVAL);
 function registerSession(userId, jti, ttlMs = DEFAULT_TTL) {
   if (!userId || !jti) return;
 
+  ttlMs = normalizeTTL(ttlMs);
+
   const expiresAt = now() + ttlMs;
+
+  // Replay guard — if already revoked, block
+  if (revokedTokens.has(jti)) {
+    return;
+  }
 
   if (!activeSessions.has(userId)) {
     activeSessions.set(userId, new Map());
   }
 
-  activeSessions.get(userId).set(jti, expiresAt);
+  const sessions = activeSessions.get(userId);
+
+  // Enforce per-user cap
+  if (sessions.size >= MAX_SESSIONS_PER_USER) {
+    const oldestJti = sessions.keys().next().value;
+    revokeToken(oldestJti);
+  }
+
+  sessions.set(jti, expiresAt);
+
+  // Enforce global cap
+  if (totalSessionCount() > MAX_TOTAL_SESSIONS) {
+    revokeAllSessions();
+  }
 }
 
 function revokeToken(jti, ttlMs = DEFAULT_TTL) {
   if (!jti) return;
 
+  ttlMs = normalizeTTL(ttlMs);
+
   const expiresAt = now() + ttlMs;
   revokedTokens.set(jti, expiresAt);
 
-  // Remove from activeSessions
+  // Remove from active sessions
   for (const sessions of activeSessions.values()) {
     sessions.delete(jti);
   }
@@ -96,7 +149,7 @@ function revokeAllUserSessions(userId) {
   const sessions = activeSessions.get(userId);
 
   for (const jti of sessions.keys()) {
-    revokeToken(jti);
+    revokedTokens.set(jti, now() + DEFAULT_TTL);
   }
 
   activeSessions.delete(userId);
@@ -105,6 +158,17 @@ function revokeAllUserSessions(userId) {
     actor: userId,
     role: "system",
     action: "ALL_SESSIONS_REVOKED",
+  });
+}
+
+function revokeAllSessions() {
+  revokedTokens.clear();
+  activeSessions.clear();
+
+  writeAudit({
+    actor: "system",
+    role: "system",
+    action: "GLOBAL_SESSION_RESET",
   });
 }
 
@@ -124,17 +188,6 @@ function isRevoked(jti) {
 
 function getActiveSessionCount(userId) {
   return activeSessions.get(userId)?.size || 0;
-}
-
-function revokeAllSessions() {
-  revokedTokens.clear();
-  activeSessions.clear();
-
-  writeAudit({
-    actor: "system",
-    role: "system",
-    action: "GLOBAL_SESSION_RESET",
-  });
 }
 
 module.exports = {
