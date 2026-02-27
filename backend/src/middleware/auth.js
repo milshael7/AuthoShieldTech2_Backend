@@ -1,8 +1,9 @@
 // backend/src/middleware/auth.js
-// AutoShield Tech — Zero Trust Identity Firewall v7
-// Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard • Company Guard • Audit Logged
+// AutoShield Tech — Zero Trust Identity Firewall v8
+// Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard
+// Company Guard • Privilege Auto-Downgrade • Audit Logged
 
-const { verify, JWTError } = require("../lib/jwt");
+const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const sessionAdapter = require("../lib/sessionAdapter");
 const { classifyDeviceRisk } = require("../lib/deviceFingerprint");
@@ -15,6 +16,10 @@ const users = require("../users/user.service");
 const DEVICE_STRICT = process.env.DEVICE_BINDING_STRICT === "true";
 const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 const DEVICE_RISK_BLOCK_THRESHOLD = 70;
+
+const PRIVILEGE_ACCELERATION_WINDOW = 15;
+const PRIVILEGE_CRITICAL_THRESHOLD = 2;
+const PRIVILEGE_AVG_SCORE_THRESHOLD = 75;
 
 /* ====================================================== */
 
@@ -47,6 +52,11 @@ function isBillingRoute(req) {
   return req.originalUrl.startsWith("/api/billing");
 }
 
+function average(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
 /* ======================================================
    AUTH REQUIRED
 ====================================================== */
@@ -60,7 +70,7 @@ function authRequired(req, res, next) {
 
   try {
     payload = verify(token, "access");
-  } catch (err) {
+  } catch {
     return error(res, 401, "Token expired or invalid");
   }
 
@@ -68,25 +78,17 @@ function authRequired(req, res, next) {
     return error(res, 401, "Invalid token payload");
   }
 
-  /* ================= JTI REVOCATION ================= */
-
   if (sessionAdapter.isRevoked(payload.jti)) {
     return error(res, 401, "Session revoked");
   }
 
   const db = readDb();
   const user = (db.users || []).find(u => idEq(u.id, payload.id));
-
-  if (!user) {
-    return error(res, 401, "User no longer exists");
-  }
+  if (!user) return error(res, 401, "User no longer exists");
 
   /* ================= TOKEN VERSION ================= */
 
-  const tokenVersion = Number(payload.tokenVersion || 0);
-  const currentVersion = Number(user.tokenVersion || 0);
-
-  if (tokenVersion !== currentVersion) {
+  if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
     sessionAdapter.revokeToken(payload.jti);
     return error(res, 401, "Session expired");
   }
@@ -119,6 +121,7 @@ function authRequired(req, res, next) {
   if (!deviceCheck.match) {
 
     if (DEVICE_STRICT || deviceCheck.score >= DEVICE_RISK_BLOCK_THRESHOLD) {
+
       sessionAdapter.revokeAllUserSessions(user.id);
 
       writeAudit({
@@ -148,9 +151,7 @@ function authRequired(req, res, next) {
       c => idEq(c.id, user.companyId)
     );
 
-    if (!company) {
-      return error(res, 403, "Company not found");
-    }
+    if (!company) return error(res, 403, "Company not found");
 
     if (company.status === "Suspended") {
       return error(res, 403, "Company suspended");
@@ -158,6 +159,59 @@ function authRequired(req, res, next) {
 
     if (isInactiveStatus(company.subscriptionStatus) && !isBillingRoute(req)) {
       return error(res, 403, "Company subscription inactive");
+    }
+  }
+
+  /* ======================================================
+     🔥 AUTONOMOUS PRIVILEGE DOWNGRADE
+  ====================================================== */
+
+  let effectiveRole = user.role;
+  let privilegeDowngraded = false;
+
+  const isHighPrivilege =
+    norm(user.role) === "admin" ||
+    norm(user.role) === "finance";
+
+  if (isHighPrivilege) {
+
+    const decisions = db.brain?.decisions || [];
+
+    const recent = decisions
+      .filter(d => d.userId === user.id)
+      .slice(-PRIVILEGE_ACCELERATION_WINDOW);
+
+    const criticalCount = recent.filter(
+      d => d.level === "Critical"
+    ).length;
+
+    const avgScore = average(
+      recent.map(d => d.combinedScore)
+    );
+
+    const accelerationFlag = recent.some(
+      d => d.accelerationDetected === true
+    );
+
+    if (
+      criticalCount >= PRIVILEGE_CRITICAL_THRESHOLD ||
+      avgScore >= PRIVILEGE_AVG_SCORE_THRESHOLD ||
+      accelerationFlag
+    ) {
+
+      privilegeDowngraded = true;
+      effectiveRole = "restricted_admin";
+
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "PRIVILEGE_AUTO_DOWNGRADE",
+        detail: {
+          criticalCount,
+          avgScore,
+          accelerationFlag
+        }
+      });
     }
   }
 
@@ -173,19 +227,19 @@ function authRequired(req, res, next) {
 
   req.user = {
     id: user.id,
-    role: user.role,
+    role: effectiveRole,
+    originalRole: user.role,
+    privilegeDowngraded,
     companyId: user.companyId || null,
     subscriptionStatus: user.subscriptionStatus,
     subscriptionTier: user.subscriptionTier || "free"
   };
 
   req.securityContext = {
-    tokenVersion,
+    tokenVersion: payload.tokenVersion,
     jti: payload.jti,
     verifiedAt: Date.now(),
-    highPrivilege:
-      norm(user.role) === "admin" ||
-      norm(user.role) === "finance"
+    highPrivilege: isHighPrivilege
   };
 
   return next();
