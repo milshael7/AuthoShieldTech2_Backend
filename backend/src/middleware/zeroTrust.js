@@ -1,6 +1,6 @@
 // backend/src/middleware/zeroTrust.js
-// AutoShield Tech — Enterprise Zero Trust Engine v8
-// Adaptive • Explainable • Acceleration-Aware • Self-Healing • Stable
+// AutoShield Tech — Enterprise Zero Trust Engine v9
+// Adaptive • Acceleration-Aware • Self-Healing • Cross-User Correlated • Stable
 
 const crypto = require("crypto");
 const { readDb, updateDb } = require("../lib/db");
@@ -94,6 +94,43 @@ async function zeroTrust(req, res, next) {
       failedLogins: user.securityFlags?.failedLogins || 0
     });
 
+    /* =========================================================
+       CROSS-USER CORRELATION CONTEXT
+    ========================================================== */
+
+    const decisions = db.brain?.decisions || [];
+    const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+
+    const sameIpUserCount = decisions
+      .filter(d => d.ip === ip && d.userId !== user.id)
+      .map(d => d.userId)
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .length;
+
+    const sameFingerprintUserCount = decisions
+      .filter(d =>
+        d.breakdown?.risk?.device?.fingerprint === user.activeDeviceFingerprint &&
+        d.userId !== user.id
+      )
+      .map(d => d.userId)
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .length;
+
+    const elevatedUsersLast5Min = decisions
+      .filter(d =>
+        new Date(d.timestamp).getTime() >= fiveMinutesAgo &&
+        (d.level === "High" || d.level === "Critical")
+      )
+      .map(d => d.userId)
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .length;
+
+    const correlationContext = {
+      sameIpUserCount,
+      sameFingerprintUserCount,
+      elevatedUsersLast5Min
+    };
+
     /* ================= RISK ================= */
 
     const risk = calculateRisk({
@@ -107,31 +144,18 @@ async function zeroTrust(req, res, next) {
       },
       behavior: {
         failedLogins: user.securityFlags?.failedLogins || 0
-      }
+      },
+      role: user.role,
+      correlationContext
     });
 
-    const isHighPrivilege =
-      req.user.role === "admin" ||
-      req.user.role === "finance";
-
-    const privilegeMultiplier = isHighPrivilege ? 1.15 : 1;
-
-    let combinedScore = clamp(
-      Math.round(
-        ((threat.threatScore * 0.6) +
-          (risk.riskScore * 0.4)) * privilegeMultiplier
-      ),
-      0,
-      100
-    );
-
-    let level = deriveLevel(combinedScore);
+    let combinedScore = risk.riskScore;
+    let level = risk.level;
 
     /* =========================================================
        ACCELERATION DETECTION
     ========================================================== */
 
-    const decisions = db.brain?.decisions || [];
     const userHistory = decisions
       .filter(d => d.userId === user.id)
       .slice(-20);
@@ -154,7 +178,7 @@ async function zeroTrust(req, res, next) {
     }
 
     /* =========================================================
-       STABILIZATION DETECTION (SELF-HEALING)
+       STABILIZATION
     ========================================================== */
 
     const recent = decisions
@@ -165,13 +189,8 @@ async function zeroTrust(req, res, next) {
 
       const avgRecent = average(recent.map(d => d.combinedScore));
       const hasCritical = recent.some(d => d.level === "Critical");
-      const hasAcceleration = recent.some(d => d.accelerationDetected);
 
-      if (
-        avgRecent <= STABLE_AVG_THRESHOLD &&
-        !hasCritical &&
-        !hasAcceleration
-      ) {
+      if (avgRecent <= STABLE_AVG_THRESHOLD && !hasCritical) {
         stabilizationDetected = true;
 
         writeAudit({
@@ -186,10 +205,9 @@ async function zeroTrust(req, res, next) {
     req.zeroTrust = {
       combinedScore,
       level,
-      threatScore: threat.threatScore,
-      riskScore: risk.riskScore,
       accelerationDetected,
-      stabilizationDetected
+      stabilizationDetected,
+      correlationContext
     };
 
     /* =========================================================
@@ -215,15 +233,9 @@ async function zeroTrust(req, res, next) {
         level,
         accelerationDetected,
         stabilizationDetected,
-        privilegeMultiplier,
-        breakdown: {
-          threat: threat.breakdown,
-          risk: risk.breakdown
-        },
-        signals: [
-          ...(threat.signals || []),
-          ...(risk.signals || [])
-        ]
+        correlationContext,
+        breakdown: risk.breakdown,
+        signals: risk.signals
       });
 
       if (dbState.brain.decisions.length > MAX_AI_DECISIONS) {
@@ -245,8 +257,8 @@ async function zeroTrust(req, res, next) {
 
       dbState.securityEvents.push({
         id: `zt_${uid()}`,
-        title: accelerationDetected
-          ? "Risk Acceleration Detected"
+        title: correlationContext.elevatedUsersLast5Min >= 3
+          ? "Coordinated Risk Activity Detected"
           : "Zero Trust Risk Evaluation",
         description: `Level: ${level}`,
         severity:
@@ -271,10 +283,8 @@ async function zeroTrust(req, res, next) {
     writeAudit({
       actor: user.id,
       role: user.role,
-      action: accelerationDetected
-        ? "ZERO_TRUST_ACCELERATION_DETECTED"
-        : "ZERO_TRUST_EVALUATION",
-      detail: { combinedScore, level }
+      action: "ZERO_TRUST_EVALUATION",
+      detail: { combinedScore, level, correlationContext }
     });
 
     if (ZERO_TRUST_STRICT && (level === "Critical" || level === "High")) {
