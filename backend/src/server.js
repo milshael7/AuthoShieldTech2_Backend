@@ -12,9 +12,7 @@ const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
 
-const {
-  classifyDeviceRisk
-} = require("./lib/deviceFingerprint");
+const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
 
 const users = require("./users/user.service");
 const tenantMiddleware = require("./middleware/tenant");
@@ -65,8 +63,8 @@ app.get("/health", (_, res) => {
       status: "operational",
       securityStatus: globalSecurityStatus,
       uptime: process.uptime(),
-      timestamp: Date.now()
-    }
+      timestamp: Date.now(),
+    },
   });
 });
 
@@ -105,60 +103,118 @@ const wss = new WebSocketServer({
   path: "/ws/market",
 });
 
+function wsClose(ws, code = 1008) {
+  try {
+    ws.close(code);
+  } catch {}
+}
+
+function norm(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function isInactiveStatus(v) {
+  const s = norm(v);
+  return s === "locked" || s === "past due" || s === "past_due";
+}
+
 wss.on("connection", (ws, req) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
-    if (!token) return ws.close(1008);
+    if (!token) return wsClose(ws, 1008);
 
     const payload = verify(token, "access");
 
-    if (!payload?.jti || sessionAdapter.isRevoked(payload.jti)) {
-      return ws.close(1008);
+    // Must have jti and not be revoked
+    if (!payload?.id || !payload?.jti || sessionAdapter.isRevoked(payload.jti)) {
+      return wsClose(ws, 1008);
     }
 
     const db = readDb();
-    const user = (db.users || []).find(u => u.id === payload.id);
-    if (!user) return ws.close(1008);
+    const user = (db.users || []).find((u) => u.id === payload.id);
+    if (!user) return wsClose(ws, 1008);
 
-    if ((payload.tokenVersion || 0) !== (user.tokenVersion || 0)) {
+    // TokenVersion sync
+    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
       sessionAdapter.revokeToken(payload.jti);
-      return ws.close(1008);
+      return wsClose(ws, 1008);
     }
 
-    const deviceRisk = classifyDeviceRisk(
-      user.activeDeviceFingerprint,
-      req
-    );
+    // Role tamper protection
+    if (norm(payload.role) !== norm(user.role)) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws, 1008);
+    }
 
+    // Approval + account lock (match auth middleware intent)
+    if (user.locked === true) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws, 1008);
+    }
+
+    if (user.status !== users.APPROVAL_STATUS.APPROVED) {
+      return wsClose(ws, 1008);
+    }
+
+    // Subscription enforcement (user)
+    if (isInactiveStatus(user.subscriptionStatus)) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws, 1008);
+    }
+
+    // Company enforcement (if bound)
+    if (user.companyId) {
+      const company = (db.companies || []).find(
+        (c) => String(c.id) === String(user.companyId)
+      );
+
+      if (!company) return wsClose(ws, 1008);
+
+      if (company.status === "Suspended") {
+        sessionAdapter.revokeToken(payload.jti);
+        return wsClose(ws, 1008);
+      }
+
+      if (isInactiveStatus(company.subscriptionStatus)) {
+        sessionAdapter.revokeToken(payload.jti);
+        return wsClose(ws, 1008);
+      }
+    }
+
+    // Device binding enforcement
+    const deviceRisk = classifyDeviceRisk(user.activeDeviceFingerprint, req);
     if (!deviceRisk.match) {
       sessionAdapter.revokeAllUserSessions(user.id);
-      return ws.close(1008);
+      return wsClose(ws, 1008);
     }
 
-    sessionAdapter.registerSession(user.id, payload.jti);
+    // Register session (pass TTL if your store supports it)
+    const ttlMs = 15 * 60 * 1000; // match access token lifetime (15m)
+    sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
 
     ws.user = {
       id: user.id,
       role: user.role,
       companyId: user.companyId || null,
-      jti: payload.jti
+      jti: payload.jti,
     };
-
   } catch {
-    ws.close(1008);
+    wsClose(ws, 1008);
   }
 });
 
 /* ================= AUTO TERMINATE REVOKED ================= */
 
 setInterval(() => {
-  wss.clients.forEach(client => {
+  wss.clients.forEach((client) => {
     if (client.readyState !== 1) return;
     if (!client.user?.jti) return;
 
     if (sessionAdapter.isRevoked(client.user.jti)) {
-      try { client.close(1008); } catch {}
+      try {
+        client.close(1008);
+      } catch {}
     }
   });
 }, 10000);
