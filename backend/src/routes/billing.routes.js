@@ -1,6 +1,6 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Enterprise Hardened
-// Stripe Safe • Entitlement Synced • Revenue Protected
+// Billing & Subscription Control — Enterprise Hardened v2
+// Stripe Safe • Entitlement Synced • Revenue Protected • Session Safe
 
 const express = require("express");
 const router = express.Router();
@@ -10,6 +10,7 @@ const users = require("../users/user.service");
 const companies = require("../companies/company.service");
 const { readDb, writeDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
+const sessionAdapter = require("../lib/sessionAdapter");
 
 const {
   grantTool,
@@ -42,6 +43,8 @@ const PLAN_TOOL_MAP = {
   enterprise: ["enterprise-monitor", "autodev-65", "threat-feed"]
 };
 
+const ALLOWED_PLANS = Object.keys(PLAN_TOOL_MAP);
+
 function clean(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
@@ -56,18 +59,20 @@ function requireUser(req, res) {
 
 function saveUser(updatedUser) {
   const db = readDb();
-  const idx = db.users.findIndex((u) => u.id === updatedUser.id);
+  const idx = db.users.findIndex((u) => String(u.id) === String(updatedUser.id));
   if (idx !== -1) {
     db.users[idx] = updatedUser;
     writeDb(db);
   }
 }
 
+function validatePlan(planType) {
+  return ALLOWED_PLANS.includes(planType);
+}
+
 function grantPlanTools(userId, planType) {
   const tools = PLAN_TOOL_MAP[planType] || [];
-  tools.forEach(toolId => {
-    grantTool(userId, toolId);
-  });
+  tools.forEach(toolId => grantTool(userId, toolId));
 }
 
 function revokePlanTools(userId) {
@@ -97,6 +102,7 @@ router.get("/me", authRequired, (req, res) => {
           tier: company.tier,
           maxUsers: company.maxUsers,
           status: company.status,
+          subscriptionStatus: company.subscriptionStatus || null,
         };
       }
     }
@@ -127,6 +133,14 @@ router.post("/checkout", authRequired, async (req, res) => {
     if (!user) return;
 
     const type = clean(req.body?.type, 50);
+
+    if (!validatePlan(type)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid subscription type",
+      });
+    }
+
     const dbUser = users.findById(user.id);
     if (!dbUser) {
       return res.status(404).json({ ok: false, error: "User not found" });
@@ -167,7 +181,7 @@ router.post("/checkout", authRequired, async (req, res) => {
 });
 
 /* =========================================================
-   ACTIVATE PLAN (Webhook or Admin Hook)
+   ADMIN ACTIVATE PLAN
 ========================================================= */
 
 router.post(
@@ -178,6 +192,13 @@ router.post(
     try {
       const userId = clean(req.body?.userId);
       const planType = clean(req.body?.planType);
+
+      if (!validatePlan(planType)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid plan type",
+        });
+      }
 
       const dbUser = users.findById(userId);
       if (!dbUser) {
@@ -228,6 +249,9 @@ router.post("/cancel", authRequired, async (req, res) => {
     saveUser(dbUser);
 
     revokePlanTools(user.id);
+
+    // 🔥 CRITICAL: revoke sessions immediately
+    sessionAdapter.revokeAllUserSessions(user.id);
 
     audit({
       actorId: user.id,
