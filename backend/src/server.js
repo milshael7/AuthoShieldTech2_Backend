@@ -4,11 +4,10 @@ const cors = require("cors");
 const morgan = require("morgan");
 const helmet = require("helmet");
 const http = require("http");
-const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 
-const { ensureDb, readDb, updateDb } = require("./lib/db");
-const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
+const { ensureDb, readDb } = require("./lib/db");
+const { verifyAuditIntegrity } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
 
@@ -30,6 +29,7 @@ function requireEnv(name) {
 
 requireEnv("JWT_SECRET");
 requireEnv("STRIPE_SECRET_KEY");
+requireEnv("STRIPE_WEBHOOK_SECRET");
 
 ensureDb();
 users.ensureAdminFromEnv();
@@ -47,6 +47,17 @@ if (!integrityCheck.ok) {
 
 const app = express();
 app.set("trust proxy", 1);
+
+/* =========================================================
+   🔥 STRIPE WEBHOOK MUST COME BEFORE express.json()
+========================================================= */
+
+app.use(
+  "/api/stripe/webhook",
+  require("./routes/stripe.webhook.routes")
+);
+
+/* ================= CORE MIDDLEWARE ================= */
 
 app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
 app.use(helmet());
@@ -87,8 +98,6 @@ app.use("/api/tools", require("./routes/tools.routes"));
 app.use("/api/entitlements", require("./routes/entitlements.routes"));
 app.use("/api/billing", require("./routes/billing.routes"));
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
-
-/* 🔥 MISSING ROUTES ADDED */
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 
@@ -126,28 +135,24 @@ wss.on("connection", (ws, req) => {
 
     const payload = verify(token, "access");
 
-    // Must have jti and not be revoked
     if (!payload?.id || !payload?.jti || sessionAdapter.isRevoked(payload.jti)) {
       return wsClose(ws, 1008);
     }
 
     const db = readDb();
-    const user = (db.users || []).find((u) => u.id === payload.id);
+    const user = (db.users || []).find((u) => String(u.id) === String(payload.id));
     if (!user) return wsClose(ws, 1008);
 
-    // TokenVersion sync
     if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws, 1008);
     }
 
-    // Role tamper protection
     if (norm(payload.role) !== norm(user.role)) {
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws, 1008);
     }
 
-    // Approval + account lock (match auth middleware intent)
     if (user.locked === true) {
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws, 1008);
@@ -157,13 +162,11 @@ wss.on("connection", (ws, req) => {
       return wsClose(ws, 1008);
     }
 
-    // Subscription enforcement (user)
     if (isInactiveStatus(user.subscriptionStatus)) {
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws, 1008);
     }
 
-    // Company enforcement (if bound)
     if (user.companyId) {
       const company = (db.companies || []).find(
         (c) => String(c.id) === String(user.companyId)
@@ -182,15 +185,13 @@ wss.on("connection", (ws, req) => {
       }
     }
 
-    // Device binding enforcement
     const deviceRisk = classifyDeviceRisk(user.activeDeviceFingerprint, req);
     if (!deviceRisk.match) {
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws, 1008);
     }
 
-    // Register session (pass TTL if your store supports it)
-    const ttlMs = 15 * 60 * 1000; // match access token lifetime (15m)
+    const ttlMs = 15 * 60 * 1000;
     sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
 
     ws.user = {
@@ -199,6 +200,7 @@ wss.on("connection", (ws, req) => {
       companyId: user.companyId || null,
       jti: payload.jti,
     };
+
   } catch {
     wsClose(ws, 1008);
   }
