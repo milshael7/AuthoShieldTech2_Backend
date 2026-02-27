@@ -1,18 +1,33 @@
 // backend/src/lib/db.js
-// Enterprise DB — Phase 25.1 Tool Governance Layer (Hardened)
+// AutoShield Tech — Enterprise DB Core v26
+// Atomic Writes • Backup Safety • Migration Hardened • ZeroTrust Ready
 
 const fs = require("fs");
 const path = require("path");
 
 const DB_PATH = path.join(__dirname, "..", "data", "db.json");
 const TMP_PATH = DB_PATH + ".tmp";
+const BACKUP_PATH = DB_PATH + ".bak";
 
-const SCHEMA_VERSION = 13; // 🔥 bumped again for grant alignment
+const SCHEMA_VERSION = 14; // 🔥 upgraded for ZeroTrust + integrity hardening
+const MAX_COMPANY_RISK_HISTORY = 50;
+
+/* =========================================================
+   UTIL
+========================================================= */
 
 function ensureDir(p) {
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+/* =========================================================
+   DEFAULT DB
+========================================================= */
 
 function defaultDb() {
   return {
@@ -23,10 +38,10 @@ function defaultDb() {
     companies: [],
     notifications: [],
 
-    /* 🔥 TOOL GOVERNANCE LAYER */
-    tools: [],                // master registry
-    toolRequests: [],         // approval workflow
-    toolGrants: [],           // 🔥 timed access grants (replaces entitlements)
+    /* TOOL GOVERNANCE */
+    tools: [],
+    toolRequests: [],
+    toolGrants: [],
 
     /* ASSETS */
     assets: [],
@@ -39,6 +54,7 @@ function defaultDb() {
     systemState: {
       securityStatus: "NORMAL",
       lastComplianceCheck: null,
+      lastZeroTrustRun: null,
     },
 
     scans: [],
@@ -103,12 +119,15 @@ function defaultDb() {
   };
 }
 
+/* =========================================================
+   MIGRATION
+========================================================= */
+
 function migrate(db) {
   if (!db || typeof db !== "object") return defaultDb();
   if (!db.schemaVersion) db.schemaVersion = 1;
 
-  /* 🔥 Backward Compatibility Migration */
-  // If old schema used "entitlements", migrate them to toolGrants
+  /* Backward compatibility: entitlements → toolGrants */
   if (Array.isArray(db.entitlements) && !Array.isArray(db.toolGrants)) {
     db.toolGrants = db.entitlements;
   }
@@ -117,12 +136,9 @@ function migrate(db) {
     "users",
     "companies",
     "notifications",
-
-    /* TOOL LAYER */
     "tools",
     "toolRequests",
     "toolGrants",
-
     "assets",
     "scans",
     "scanCredits",
@@ -142,41 +158,54 @@ function migrate(db) {
     if (!Array.isArray(db[field])) db[field] = [];
   }
 
-  if (!db.systemState)
+  /* Ensure systemState */
+  if (!db.systemState) {
     db.systemState = {
       securityStatus: "NORMAL",
       lastComplianceCheck: null,
+      lastZeroTrustRun: null,
     };
+  }
 
-  if (!db.revenueSummary)
-    db.revenueSummary = {
-      totalRevenue: 0,
-      autoprotekRevenue: 0,
-      subscriptionRevenue: 0,
-      toolRevenue: 0,
-      refundedAmount: 0,
-      disputedAmount: 0,
-    };
+  /* Ensure company ZeroTrust fields */
+  for (const company of db.companies) {
+    if (!company.enforcementThreshold)
+      company.enforcementThreshold = 75;
 
-  if (!db.auditMeta)
+    if (!Array.isArray(company.riskHistory))
+      company.riskHistory = [];
+
+    if (company.riskHistory.length > MAX_COMPANY_RISK_HISTORY) {
+      company.riskHistory =
+        company.riskHistory.slice(-MAX_COMPANY_RISK_HISTORY);
+    }
+  }
+
+  if (!db.revenueSummary) {
+    db.revenueSummary = defaultDb().revenueSummary;
+  }
+
+  if (!db.auditMeta) {
     db.auditMeta = {
       lastHash: null,
       lastSequence: 0,
       integrityVersion: 1,
     };
+  }
 
   if (!db.autoprotek) db.autoprotek = { users: {} };
 
   if (!db.retentionPolicy)
-    db.retentionPolicy = {
-      auditRetentionDays: 365 * 2,
-      financialRetentionDays: 365 * 7,
-      snapshotRetentionDays: 365 * 3,
-    };
+    db.retentionPolicy = defaultDb().retentionPolicy;
 
   db.schemaVersion = SCHEMA_VERSION;
+
   return db;
 }
+
+/* =========================================================
+   CORE FILE OPS (ATOMIC SAFE)
+========================================================= */
 
 function ensureDb() {
   ensureDir(DB_PATH);
@@ -190,21 +219,46 @@ function ensureDb() {
     const raw = fs.readFileSync(DB_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     const migrated = migrate(parsed);
-    fs.writeFileSync(DB_PATH, JSON.stringify(migrated, null, 2));
-  } catch {
+    writeDb(migrated);
+  } catch (err) {
+    console.error("[DB] Corruption detected. Restoring default.");
     fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
   }
 }
 
 function readDb() {
   ensureDb();
-  return migrate(JSON.parse(fs.readFileSync(DB_PATH, "utf-8")));
+
+  try {
+    const raw = fs.readFileSync(DB_PATH, "utf-8");
+    return migrate(JSON.parse(raw));
+  } catch (err) {
+    console.error("[DB] Read failure. Attempting backup restore.");
+    if (fs.existsSync(BACKUP_PATH)) {
+      const raw = fs.readFileSync(BACKUP_PATH, "utf-8");
+      return migrate(JSON.parse(raw));
+    }
+    return defaultDb();
+  }
 }
 
 function writeDb(db) {
-  const safe = migrate(db);
-  fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
-  fs.renameSync(TMP_PATH, DB_PATH);
+  const safe = migrate(deepClone(db));
+
+  try {
+    fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
+
+    // backup current DB before overwrite
+    if (fs.existsSync(DB_PATH)) {
+      fs.copyFileSync(DB_PATH, BACKUP_PATH);
+    }
+
+    fs.renameSync(TMP_PATH, DB_PATH);
+
+  } catch (err) {
+    console.error("[DB] Atomic write failed:", err);
+    throw err;
+  }
 }
 
 function updateDb(mutator) {
