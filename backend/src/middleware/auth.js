@@ -1,7 +1,7 @@
 // backend/src/middleware/auth.js
-// AutoShield Tech — Zero Trust Identity Firewall v8
+// AutoShield Tech — Zero Trust Identity Firewall v9
 // Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard
-// Company Guard • Privilege Auto-Downgrade • Audit Logged
+// Company Guard • Privilege Auto-Downgrade • Dev Override Safe • Audit Logged
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -14,6 +14,7 @@ const users = require("../users/user.service");
 /* ====================================================== */
 
 const DEVICE_STRICT = process.env.DEVICE_BINDING_STRICT === "true";
+const DEV_AUTH_BYPASS = process.env.DEV_AUTH_BYPASS === "true";
 const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 const DEVICE_RISK_BLOCK_THRESHOLD = 70;
 
@@ -100,15 +101,44 @@ function authRequired(req, res, next) {
     return error(res, 403, "Privilege mismatch");
   }
 
-  /* ================= ACCOUNT STATUS ================= */
+  /* ================= ACCOUNT LOCK ================= */
 
   if (user.locked === true) {
     sessionAdapter.revokeToken(payload.jti);
     return error(res, 403, "Account locked");
   }
 
-  if (user.status !== users.APPROVAL_STATUS.APPROVED) {
-    return error(res, 403, "Account not approved");
+  /* ======================================================
+     🔥 DEV AUTH BYPASS (CONTROLLED)
+     Only active if DEV_AUTH_BYPASS=true
+  ====================================================== */
+
+  if (!DEV_AUTH_BYPASS) {
+
+    if (user.status !== users.APPROVAL_STATUS.APPROVED) {
+      return error(res, 403, "Account not approved");
+    }
+
+    if (isInactiveStatus(user.subscriptionStatus) && !isBillingRoute(req)) {
+      return error(res, 403, "Subscription inactive");
+    }
+
+    if (user.companyId && Array.isArray(db.companies)) {
+
+      const company = db.companies.find(
+        c => idEq(c.id, user.companyId)
+      );
+
+      if (!company) return error(res, 403, "Company not found");
+
+      if (company.status === "Suspended") {
+        return error(res, 403, "Company suspended");
+      }
+
+      if (isInactiveStatus(company.subscriptionStatus) && !isBillingRoute(req)) {
+        return error(res, 403, "Company subscription inactive");
+      }
+    }
   }
 
   /* ================= DEVICE BINDING ================= */
@@ -135,30 +165,6 @@ function authRequired(req, res, next) {
       });
 
       return error(res, 401, "Device verification failed");
-    }
-  }
-
-  /* ================= USER SUBSCRIPTION ================= */
-
-  if (isInactiveStatus(user.subscriptionStatus) && !isBillingRoute(req)) {
-    return error(res, 403, "Subscription inactive");
-  }
-
-  /* ================= COMPANY STATUS ================= */
-
-  if (user.companyId && Array.isArray(db.companies)) {
-    const company = db.companies.find(
-      c => idEq(c.id, user.companyId)
-    );
-
-    if (!company) return error(res, 403, "Company not found");
-
-    if (company.status === "Suspended") {
-      return error(res, 403, "Company suspended");
-    }
-
-    if (isInactiveStatus(company.subscriptionStatus) && !isBillingRoute(req)) {
-      return error(res, 403, "Company subscription inactive");
     }
   }
 
@@ -223,8 +229,6 @@ function authRequired(req, res, next) {
     ACCESS_TOKEN_TTL_MS
   );
 
-  /* ================= CONTEXT ================= */
-
   req.user = {
     id: user.id,
     role: effectiveRole,
@@ -235,37 +239,9 @@ function authRequired(req, res, next) {
     subscriptionTier: user.subscriptionTier || "free"
   };
 
-  req.securityContext = {
-    tokenVersion: payload.tokenVersion,
-    jti: payload.jti,
-    verifiedAt: Date.now(),
-    highPrivilege: isHighPrivilege
-  };
-
   return next();
 }
 
-/* ======================================================
-   ROLE GUARD
-====================================================== */
-
-function requireRole(...roles) {
-  const allow = new Set(roles.map(r => norm(r)));
-
-  return (req, res, next) => {
-    if (!req.user) {
-      return error(res, 401, "Missing auth context");
-    }
-
-    if (!allow.has(norm(req.user.role))) {
-      return error(res, 403, "Forbidden");
-    }
-
-    return next();
-  };
-}
-
 module.exports = {
-  authRequired,
-  requireRole
+  authRequired
 };
