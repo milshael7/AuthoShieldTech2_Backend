@@ -1,5 +1,5 @@
-// Phase 39 — Enterprise Immutable Audit Ledger
-// Hash Chain • Snapshot Anchors • Versioned Integrity • Truncation Detection • Tamper Resistant
+// AutoShield Tech — Enterprise Immutable Audit Ledger v40
+// Hash Chain • Snapshot Anchors • Version Enforcement • Truncation Guard • Bounded Growth
 
 const crypto = require("crypto");
 const { updateDb, readDb } = require("./db");
@@ -9,8 +9,10 @@ const { updateDb, readDb } = require("./db");
 ========================================================= */
 
 const GENESIS_HASH = "GENESIS";
-const INTEGRITY_VERSION = 2;
-const SNAPSHOT_INTERVAL = 1000; // Every 1000 records we anchor snapshot
+const INTEGRITY_VERSION = 3;
+const SNAPSHOT_INTERVAL = 1000;
+const MAX_SNAPSHOTS = 500;          // 🔒 bounded memory
+const MAX_AUDIT_RECORDS = 250000;   // 🔒 hard cap safety
 
 /* =========================================================
    HASH UTIL
@@ -38,7 +40,7 @@ function computeRecordHash(record) {
 }
 
 /* =========================================================
-   WRITE AUDIT — HARDENED
+   WRITE AUDIT
 ========================================================= */
 
 function writeAudit(input = {}) {
@@ -95,6 +97,11 @@ function writeAudit(input = {}) {
 
       db2.audit.push(record);
 
+      /* 🔒 Hard cap safety */
+      if (db2.audit.length > MAX_AUDIT_RECORDS) {
+        db2.audit = db2.audit.slice(-MAX_AUDIT_RECORDS);
+      }
+
       db2.auditMeta.lastHash = record.hash;
       db2.auditMeta.lastSequence = seq;
       db2.auditMeta.integrityVersion = INTEGRITY_VERSION;
@@ -106,6 +113,12 @@ function writeAudit(input = {}) {
           hash: record.hash,
           ts: Date.now(),
         });
+
+        /* 🔒 Snapshot bound */
+        if (db2.auditMeta.snapshots.length > MAX_SNAPSHOTS) {
+          db2.auditMeta.snapshots =
+            db2.auditMeta.snapshots.slice(-MAX_SNAPSHOTS);
+        }
       }
 
       return db2;
@@ -120,7 +133,7 @@ function writeAudit(input = {}) {
 }
 
 /* =========================================================
-   VERIFY AUDIT INTEGRITY — HARDENED
+   VERIFY AUDIT INTEGRITY
 ========================================================= */
 
 function verifyAuditIntegrity() {
@@ -130,9 +143,13 @@ function verifyAuditIntegrity() {
     const meta = db.auditMeta || {};
 
     if (logs.length === 0) {
+      return { ok: true, message: "No audit records" };
+    }
+
+    if (meta.integrityVersion !== INTEGRITY_VERSION) {
       return {
-        ok: true,
-        message: "No audit records",
+        ok: false,
+        error: "Integrity version mismatch",
       };
     }
 
@@ -142,25 +159,14 @@ function verifyAuditIntegrity() {
     for (let i = 0; i < logs.length; i++) {
       const current = logs[i];
 
-      /* Sequence validation */
       if (current.seq !== expectedSeq) {
-        return {
-          ok: false,
-          error: "Sequence mismatch",
-          index: i,
-        };
+        return { ok: false, error: "Sequence mismatch", index: i };
       }
 
-      /* Chain validation */
       if (current.prevHash !== expectedPrevHash) {
-        return {
-          ok: false,
-          error: "Broken hash chain",
-          index: i,
-        };
+        return { ok: false, error: "Broken hash chain", index: i };
       }
 
-      /* Hash recalculation */
       const expectedHash = computeRecordHash(current);
       if (current.hash !== expectedHash) {
         return {
@@ -188,6 +194,27 @@ function verifyAuditIntegrity() {
         ok: false,
         error: "Meta sequence mismatch",
       };
+    }
+
+    /* Snapshot validation */
+    if (Array.isArray(meta.snapshots)) {
+      for (const snap of meta.snapshots) {
+        if (snap.seq > logs.length) {
+          return {
+            ok: false,
+            error: "Snapshot beyond log length (truncation detected)",
+          };
+        }
+
+        const record = logs[snap.seq - 1];
+        if (!record || record.hash !== snap.hash) {
+          return {
+            ok: false,
+            error: "Snapshot anchor mismatch",
+            seq: snap.seq,
+          };
+        }
+      }
     }
 
     return {
