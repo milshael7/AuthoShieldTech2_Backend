@@ -1,6 +1,6 @@
 // backend/src/lib/jwt.js
-// Enterprise JWT Core — Rotation Ready v2
-// Key Rotation • Strict Claims • Multi-Key Verify • Replay Foundation
+// AutoShield Tech — Enterprise JWT Core v3
+// Rotation Safe • Type Strict • Lifetime Bounded • Replay Ready • Version Enforced
 
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -16,32 +16,53 @@ const JWT_ISSUER = process.env.JWT_ISSUER || "autoshield-tech";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "autoshield-clients";
 
 const JWT_ALGORITHM = "HS256";
-const MAX_ACCESS_LIFETIME = 60 * 60 * 24; // 24 hours max
+
+const MAX_ACCESS_LIFETIME = 60 * 60 * 24;      // 24h hard cap
+const MAX_REFRESH_LIFETIME = 60 * 60 * 24 * 30; // 30d hard cap
 
 if (!ACTIVE_SECRET || ACTIVE_SECRET.length < 32) {
   throw new Error("JWT_SECRET must be at least 32 chars");
 }
 
 /* =========================================================
-   SIGN BASE
+   ERROR TYPES
+========================================================= */
+
+class JWTError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = "JWTError";
+    this.code = code;
+  }
+}
+
+/* =========================================================
+   INTERNAL SIGN
 ========================================================= */
 
 function baseSign(payload, { expiresIn, type }) {
   if (!payload || typeof payload !== "object") {
-    throw new Error("Invalid JWT payload");
+    throw new JWTError("Invalid JWT payload", "INVALID_PAYLOAD");
   }
 
   if (!type) {
-    throw new Error("JWT type required");
+    throw new JWTError("JWT type required", "TYPE_REQUIRED");
+  }
+
+  if (!payload.id || !payload.role) {
+    throw new JWTError("Missing required claims", "MISSING_CLAIMS");
   }
 
   const jti = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
 
   const token = jwt.sign(
     {
       ...payload,
       type,
       jti,
+      iat: now,
+      nbf: now,
     },
     ACTIVE_SECRET,
     {
@@ -50,7 +71,8 @@ function baseSign(payload, { expiresIn, type }) {
       audience: JWT_AUDIENCE,
       algorithm: JWT_ALGORITHM,
       header: {
-        kid: "active",
+        kid: "active-v1",
+        alg: JWT_ALGORITHM,
       },
     }
   );
@@ -59,7 +81,7 @@ function baseSign(payload, { expiresIn, type }) {
 }
 
 /* =========================================================
-   ACCESS TOKEN
+   SIGNERS
 ========================================================= */
 
 function signAccess(payload, expiresIn = "15m") {
@@ -69,10 +91,6 @@ function signAccess(payload, expiresIn = "15m") {
   });
 }
 
-/* =========================================================
-   REFRESH TOKEN
-========================================================= */
-
 function signRefresh(payload, expiresIn = "7d") {
   return baseSign(payload, {
     expiresIn,
@@ -80,16 +98,13 @@ function signRefresh(payload, expiresIn = "7d") {
   });
 }
 
-/* =========================================================
-   BACKWARD COMPAT SIGN
-========================================================= */
-
+/* Backward compatible */
 function sign(payload, _ignoredSecret, expiresIn = "15m") {
   return signAccess(payload, expiresIn);
 }
 
 /* =========================================================
-   VERIFY
+   VERIFY CORE
 ========================================================= */
 
 function tryVerify(token, secret) {
@@ -101,9 +116,23 @@ function tryVerify(token, secret) {
   });
 }
 
+function enforceLifetime(decoded, expectedType) {
+  if (!decoded.iat || !decoded.exp) return;
+
+  const lifetime = decoded.exp - decoded.iat;
+
+  if (expectedType === "access" && lifetime > MAX_ACCESS_LIFETIME) {
+    throw new JWTError("Access token lifetime exceeds policy", "LIFETIME_EXCEEDED");
+  }
+
+  if (expectedType === "refresh" && lifetime > MAX_REFRESH_LIFETIME) {
+    throw new JWTError("Refresh token lifetime exceeds policy", "LIFETIME_EXCEEDED");
+  }
+}
+
 function verify(token, expectedType = "access") {
   if (!token || typeof token !== "string") {
-    throw new Error("Invalid token");
+    throw new JWTError("Invalid token", "INVALID_TOKEN");
   }
 
   let decoded;
@@ -111,37 +140,30 @@ function verify(token, expectedType = "access") {
   try {
     decoded = tryVerify(token, ACTIVE_SECRET);
   } catch (err) {
-    if (!PREVIOUS_SECRET) throw err;
+    if (!PREVIOUS_SECRET) {
+      throw new JWTError("Token verification failed", "VERIFY_FAILED");
+    }
 
     try {
       decoded = tryVerify(token, PREVIOUS_SECRET);
     } catch {
-      throw err;
+      throw new JWTError("Token verification failed", "VERIFY_FAILED");
     }
   }
 
   if (!decoded || typeof decoded !== "object") {
-    throw new Error("Invalid token payload");
+    throw new JWTError("Invalid token payload", "INVALID_PAYLOAD");
   }
 
   if (decoded.type !== expectedType) {
-    throw new Error("Invalid token type");
+    throw new JWTError("Invalid token type", "INVALID_TYPE");
   }
 
-  if (!decoded.id || !decoded.role) {
-    throw new Error("Malformed token payload");
+  if (!decoded.id || !decoded.role || !decoded.jti) {
+    throw new JWTError("Malformed token payload", "MALFORMED");
   }
 
-  /* =========================================================
-     ABSOLUTE LIFETIME ENFORCEMENT
-  ========================================================= */
-
-  if (decoded.iat && decoded.exp) {
-    const lifetime = decoded.exp - decoded.iat;
-    if (lifetime > MAX_ACCESS_LIFETIME && expectedType === "access") {
-      throw new Error("Token lifetime exceeds policy");
-    }
-  }
+  enforceLifetime(decoded, expectedType);
 
   return decoded;
 }
@@ -151,4 +173,5 @@ module.exports = {
   signAccess,
   signRefresh,
   verify,
+  JWTError,
 };
