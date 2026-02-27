@@ -1,7 +1,6 @@
 // backend/src/lib/riskEngine.js
-// Enterprise Risk Engine — Adaptive v2 (Deterministic + Auditable)
-// Device • Geo • Session • Behavioral • Weighted Correlation
-// ZeroTrust + WebSocket Compatible
+// AutoShield Tech — Enterprise Risk Engine v3
+// Deterministic • Weighted • Correlation Aware • Privilege Sensitive • Auditable
 
 /* =========================================================
    CONFIG
@@ -18,9 +17,15 @@ const DEVICE_WEIGHT = 0.25;
 const SESSION_WEIGHT = 0.25;
 const BEHAVIOR_WEIGHT = 0.30;
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* Weight drift protection */
+const TOTAL_WEIGHT =
+  GEO_WEIGHT + DEVICE_WEIGHT + SESSION_WEIGHT + BEHAVIOR_WEIGHT;
+
+if (Math.round(TOTAL_WEIGHT * 100) !== 100) {
+  throw new Error("Risk weights must total 1.0");
+}
+
+/* ========================================================= */
 
 function clamp(num, min, max) {
   return Math.max(min, Math.min(max, num));
@@ -36,28 +41,24 @@ function normalize(str) {
 
 function geoRisk(geo) {
   let score = 0;
-
-  if (!geo) {
-    return {
-      score: 15,
-      signals: ["geo_missing"]
-    };
-  }
-
   const signals = [];
 
+  if (!geo) {
+    return { score: 20, signals: ["geo_missing"] };
+  }
+
   if (!geo.country) {
-    score += 15;
+    score += 20;
     signals.push("country_missing");
   }
 
   if (geo.country && HIGH_RISK_COUNTRIES.has(normalize(geo.country))) {
-    score += 40;
+    score += 45;
     signals.push("high_risk_country");
   }
 
   if (geo.source === "fallback") {
-    score += 10;
+    score += 15;
     signals.push("geo_fallback");
   }
 
@@ -75,22 +76,22 @@ function deviceRisk(device = {}) {
   const ua = normalize(device.userAgent);
 
   if (!ua) {
-    score += 25;
+    score += 30;
     signals.push("ua_missing");
   }
 
   if (ua.includes("headless")) {
-    score += 40;
+    score += 45;
     signals.push("headless_browser");
   }
 
   if (ua.includes("phantom")) {
-    score += 35;
+    score += 40;
     signals.push("phantom_driver");
   }
 
   if (ua.includes("selenium")) {
-    score += 40;
+    score += 45;
     signals.push("selenium_driver");
   }
 
@@ -118,12 +119,12 @@ function sessionRisk(session = {}) {
   const activeSessions = Number(session.activeSessions || 0);
 
   if (activeSessions > 3) {
-    score += 20;
+    score += 25;
     signals.push("multi_session");
   }
 
   if (activeSessions > 5) {
-    score += 40;
+    score += 45;
     signals.push("excessive_sessions");
   }
 
@@ -146,22 +147,22 @@ function behaviorRisk(behavior = {}) {
   const failedLogins = Number(behavior.failedLogins || 0);
 
   if (failedLogins >= 3) {
-    score += 20;
+    score += 25;
     signals.push("multiple_failed_logins");
   }
 
   if (failedLogins >= 5) {
-    score += 40;
+    score += 45;
     signals.push("excessive_failed_logins");
   }
 
   if (behavior.rapidRequests === true) {
-    score += 25;
+    score += 30;
     signals.push("rapid_requests");
   }
 
   if (behavior.privilegeEscalationAttempt === true) {
-    score += 50;
+    score += 60;
     signals.push("privilege_escalation_attempt");
   }
 
@@ -169,18 +170,33 @@ function behaviorRisk(behavior = {}) {
 }
 
 /* =========================================================
+   CORRELATION BOOST
+========================================================= */
+
+function correlationBoost(geoRes, deviceRes) {
+  if (
+    geoRes.signals.includes("high_risk_country") &&
+    deviceRes.signals.includes("headless_browser")
+  ) {
+    return 15; // automation from hostile region
+  }
+
+  return 0;
+}
+
+/* =========================================================
    LEVEL DERIVATION
 ========================================================= */
 
 function deriveLevel(score) {
-  if (score >= 75) return "Critical";
-  if (score >= 50) return "High";
-  if (score >= 25) return "Medium";
+  if (score >= 80) return "Critical";
+  if (score >= 60) return "High";
+  if (score >= 35) return "Medium";
   return "Low";
 }
 
 /* =========================================================
-   MAIN RISK CALCULATOR
+   MAIN CALCULATOR
 ========================================================= */
 
 function calculateRisk({
@@ -188,7 +204,8 @@ function calculateRisk({
   device,
   session = {},
   behavior = {},
-  baselineScore = null
+  baselineScore = null,
+  role = null
 }) {
   try {
     const geoRes = geoRisk(geo);
@@ -196,20 +213,44 @@ function calculateRisk({
     const sessionRes = sessionRisk(session);
     const behaviorRes = behaviorRisk(behavior);
 
-    // Weighted model (deterministic)
     const weighted =
       geoRes.score * GEO_WEIGHT +
       deviceRes.score * DEVICE_WEIGHT +
       sessionRes.score * SESSION_WEIGHT +
       behaviorRes.score * BEHAVIOR_WEIGHT;
 
-    const finalScore = clamp(Math.round(weighted), 0, 100);
+    let finalScore = weighted;
+
+    /* Correlation spike */
+    finalScore += correlationBoost(geoRes, deviceRes);
+
+    /* Privilege sensitivity */
+    if (role === "admin" || role === "finance") {
+      finalScore *= 1.15;
+    }
+
+    finalScore = clamp(Math.round(finalScore), 0, 100);
+
+    /* Prevent zero bypass */
+    if (finalScore === 0) {
+      finalScore = 5;
+    }
+
     const level = deriveLevel(finalScore);
 
     const delta =
       baselineScore !== null
         ? finalScore - Number(baselineScore || 0)
         : null;
+
+    const signals = Array.from(
+      new Set([
+        ...geoRes.signals,
+        ...deviceRes.signals,
+        ...sessionRes.signals,
+        ...behaviorRes.signals
+      ])
+    );
 
     return {
       riskScore: finalScore,
@@ -221,28 +262,19 @@ function calculateRisk({
         session: sessionRes,
         behavior: behaviorRes
       },
-      signals: [
-        ...geoRes.signals,
-        ...deviceRes.signals,
-        ...sessionRes.signals,
-        ...behaviorRes.signals
-      ],
+      signals,
       timestamp: Date.now()
     };
 
   } catch {
     return {
-      riskScore: 50,
-      level: "Medium",
+      riskScore: 60,
+      level: "High",
       fallback: true,
       timestamp: Date.now()
     };
   }
 }
-
-/* =========================================================
-   EXPORTS
-========================================================= */
 
 module.exports = {
   calculateRisk
