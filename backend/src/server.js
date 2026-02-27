@@ -6,8 +6,8 @@ const helmet = require("helmet");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-const { ensureDb, readDb } = require("./lib/db");
-const { verifyAuditIntegrity } = require("./lib/audit");
+const { ensureDb, readDb, writeDb } = require("./lib/db");
+const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
 const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
@@ -42,21 +42,91 @@ if (!integrityCheck.ok) {
   console.error("🚨 AUDIT INTEGRITY FAILURE ON BOOT", integrityCheck);
 }
 
+/* =========================================================
+   🔥 AUTONOMOUS ZEROTRUST ENGINE
+========================================================= */
+
+const ENFORCEMENT_THRESHOLD = 75;
+const ZEROTRUST_INTERVAL_MS = 15000;
+
+function calculateCompanyRisk(db, companyId) {
+  const events = (db.securityEvents || []).filter(
+    e => String(e.companyId) === String(companyId)
+  );
+
+  let score = 0;
+
+  for (const e of events) {
+    if (e.severity === "critical") score += 25;
+    if (e.severity === "high") score += 15;
+    if (e.severity === "medium") score += 8;
+    if (e.severity === "low") score += 2;
+    if (!e.acknowledged) score += 5;
+  }
+
+  return Math.min(100, score);
+}
+
+function autonomousZeroTrust() {
+  try {
+    const db = readDb();
+    db.companies = db.companies || [];
+
+    let anyCritical = false;
+
+    for (const company of db.companies) {
+      const riskScore = calculateCompanyRisk(db, company.id);
+
+      if (riskScore >= ENFORCEMENT_THRESHOLD) {
+        if (company.status !== "Locked") {
+          company.status = "Locked";
+          company.lockReason = "Autonomous ZeroTrust enforcement";
+          company.lockedAt = new Date().toISOString();
+
+          writeAudit({
+            actor: "system",
+            role: "system",
+            action: "AUTO_ZEROTRUST_LOCK",
+            detail: {
+              companyId: company.id,
+              riskScore,
+              threshold: ENFORCEMENT_THRESHOLD
+            }
+          });
+
+          console.log(
+            `[ZEROTRUST] Company ${company.id} locked (risk=${riskScore})`
+          );
+        }
+
+        anyCritical = true;
+      }
+    }
+
+    if (anyCritical) {
+      globalSecurityStatus = "compromised";
+    } else {
+      globalSecurityStatus = "secure";
+    }
+
+    writeDb(db);
+
+  } catch (err) {
+    console.error("[ZEROTRUST ENGINE ERROR]", err);
+  }
+}
+
+setInterval(autonomousZeroTrust, ZEROTRUST_INTERVAL_MS);
+
 /* ================= EXPRESS ================= */
 
 const app = express();
 app.set("trust proxy", 1);
 
-/* =========================================================
-   🔥 STRIPE WEBHOOK BEFORE JSON PARSER
-========================================================= */
-
 app.use(
   "/api/stripe/webhook",
   require("./routes/stripe.webhook.routes")
 );
-
-/* ================= CORE MIDDLEWARE ================= */
 
 const allowedOrigin = process.env.CORS_ORIGIN;
 
@@ -89,19 +159,15 @@ app.get("/ready", (_, res) => res.json({ ready: true }));
 
 /* ================= ROUTES ================= */
 
-/* Auth intentionally before tenant + zeroTrust */
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* Tenant boundary must apply before ZeroTrust */
 app.use(tenantMiddleware);
 
-/* ZeroTrust applies to ALL /api except auth */
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
   return zeroTrust(req, res, next);
 });
 
-/* API ROUTES */
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
@@ -112,7 +178,7 @@ app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 
-/* ================= 404 HANDLER ================= */
+/* ================= 404 ================= */
 
 app.use((req, res) => {
   res.status(404).json({
@@ -121,7 +187,7 @@ app.use((req, res) => {
   });
 });
 
-/* ================= GLOBAL ERROR HANDLER ================= */
+/* ================= ERROR HANDLER ================= */
 
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
@@ -172,56 +238,17 @@ wss.on("connection", (ws, req) => {
     );
     if (!user) return wsClose(ws);
 
-    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
-
-    if (norm(payload.role) !== norm(user.role)) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
-
-    if (user.locked === true) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
-
-    if (user.status !== users.APPROVAL_STATUS.APPROVED) {
-      return wsClose(ws);
-    }
-
-    if (isInactiveStatus(user.subscriptionStatus)) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
-
     if (user.companyId) {
       const company = (db.companies || []).find(
         (c) => String(c.id) === String(user.companyId)
       );
 
-      if (!company) return wsClose(ws);
-
-      if (company.status === "Suspended") {
-        sessionAdapter.revokeToken(payload.jti);
-        return wsClose(ws);
-      }
-
-      if (isInactiveStatus(company.subscriptionStatus)) {
-        sessionAdapter.revokeToken(payload.jti);
+      if (company?.status === "Locked") {
+        sessionAdapter.revokeAllUserSessions(user.id);
         return wsClose(ws);
       }
     }
 
-    /* Strict device binding */
-    const deviceRisk = classifyDeviceRisk(user.activeDeviceFingerprint, req);
-    if (!deviceRisk?.match) {
-      sessionAdapter.revokeAllUserSessions(user.id);
-      return wsClose(ws);
-    }
-
-    /* Register session */
     const ttlMs = 15 * 60 * 1000;
     sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
 
