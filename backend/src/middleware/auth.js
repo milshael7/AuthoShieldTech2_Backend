@@ -1,18 +1,22 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Zero Trust Core v6
-// Token Versioned • JTI Revocation • Device Binding • Subscription Guard • Company Guard • Tier Aware
+// AutoShield Tech — Zero Trust Identity Firewall v7
+// Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard • Company Guard • Audit Logged
 
-const { verify } = require("../lib/jwt");
+const { verify, JWTError } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const sessionAdapter = require("../lib/sessionAdapter");
 const { classifyDeviceRisk } = require("../lib/deviceFingerprint");
+const { writeAudit } = require("../lib/audit");
 
 const users = require("../users/user.service");
 
 /* ====================================================== */
 
 const DEVICE_STRICT = process.env.DEVICE_BINDING_STRICT === "true";
-const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+const DEVICE_RISK_BLOCK_THRESHOLD = 70;
+
+/* ====================================================== */
 
 function extractToken(req) {
   const header = String(req.headers.authorization || "");
@@ -24,10 +28,6 @@ function extractToken(req) {
 
 function error(res, code, message) {
   return res.status(code).json({ ok: false, error: message });
-}
-
-function isBillingRoute(req) {
-  return req.originalUrl.startsWith("/api/billing");
 }
 
 function norm(v) {
@@ -43,6 +43,10 @@ function isInactiveStatus(v) {
   return s === "locked" || s === "past_due" || s === "past due";
 }
 
+function isBillingRoute(req) {
+  return req.originalUrl.startsWith("/api/billing");
+}
+
 /* ======================================================
    AUTH REQUIRED
 ====================================================== */
@@ -56,7 +60,7 @@ function authRequired(req, res, next) {
 
   try {
     payload = verify(token, "access");
-  } catch {
+  } catch (err) {
     return error(res, 401, "Token expired or invalid");
   }
 
@@ -94,7 +98,7 @@ function authRequired(req, res, next) {
     return error(res, 403, "Privilege mismatch");
   }
 
-  /* ================= ACCOUNT LOCK ================= */
+  /* ================= ACCOUNT STATUS ================= */
 
   if (user.locked === true) {
     sessionAdapter.revokeToken(payload.jti);
@@ -113,8 +117,20 @@ function authRequired(req, res, next) {
   );
 
   if (!deviceCheck.match) {
-    if (DEVICE_STRICT) {
+
+    if (DEVICE_STRICT || deviceCheck.score >= DEVICE_RISK_BLOCK_THRESHOLD) {
       sessionAdapter.revokeAllUserSessions(user.id);
+
+      writeAudit({
+        actor: user.id,
+        role: user.role,
+        action: "DEVICE_VERIFICATION_FAILED",
+        detail: {
+          riskScore: deviceCheck.score,
+          riskLevel: deviceCheck.risk
+        }
+      });
+
       return error(res, 401, "Device verification failed");
     }
   }
@@ -145,7 +161,7 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ================= REGISTER SESSION (TTL ALIGNED) ================= */
+  /* ================= REGISTER SESSION ================= */
 
   sessionAdapter.registerSession(
     user.id,
