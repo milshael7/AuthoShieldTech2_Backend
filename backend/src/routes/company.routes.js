@@ -1,6 +1,6 @@
 // backend/src/routes/company.routes.js
-// Enterprise Company Control Layer — Hardened v3
-// Admin + Manager Scoped • Seat Enforced • Tier Ready • Audit Safe
+// Enterprise Company Control Layer — Hardened v4
+// Subscription Propagation • Seat Enforcement • Lock Cascade • Audit Safe
 
 const express = require("express");
 const router = express.Router();
@@ -33,57 +33,63 @@ function isCompany(user) {
   return normalize(user.role) === normalize(users.ROLES.COMPANY);
 }
 
-/* =========================================================
-   COMPANY ACCESS GUARD
-========================================================= */
-
 function requireCompanyAccess(req, companyId) {
   if (isAdmin(req.user)) return;
 
-  if (!req.user.companyId) {
-    const err = new Error("No company access");
-    err.status = 403;
-    throw err;
-  }
+  if (!req.user.companyId)
+    throw Object.assign(new Error("No company access"), { status: 403 });
 
-  if (String(req.user.companyId) !== String(companyId)) {
-    const err = new Error("Access denied to this company");
-    err.status = 403;
-    throw err;
-  }
+  if (String(req.user.companyId) !== String(companyId))
+    throw Object.assign(new Error("Access denied"), { status: 403 });
 }
 
 /* =========================================================
-   CREATE COMPANY (ADMIN ONLY)
+   SUBSCRIPTION HELPERS
 ========================================================= */
 
-router.post("/", (req, res) => {
-  try {
-    if (!isAdmin(req.user)) {
-      return res.status(403).json({
-        ok: false,
-        error: "Admin only"
-      });
-    }
+function lockCompany(companyId) {
+  updateDb((db) => {
+    const company = db.companies.find(
+      (c) => String(c.id) === String(companyId)
+    );
+    if (!company) return db;
 
-    const company = companyService.createCompany({
-      ...req.body,
-      createdBy: req.user.id,
+    company.subscriptionStatus = "Locked";
+
+    // Lock all seat users
+    db.users.forEach((u) => {
+      if (String(u.companyId) === String(companyId)) {
+        u.subscriptionStatus = "Locked";
+      }
     });
 
-    writeAudit({
-      actor: req.user.id,
-      role: req.user.role,
-      action: "COMPANY_CREATED",
-      detail: { companyId: company.id }
+    // Purge tool grants for this company
+    db.toolGrants = (db.toolGrants || []).filter(
+      (g) => String(g.companyId) !== String(companyId)
+    );
+
+    return db;
+  });
+}
+
+function propagateTier(companyId, tier) {
+  updateDb((db) => {
+    const company = db.companies.find(
+      (c) => String(c.id) === String(companyId)
+    );
+    if (!company) return db;
+
+    company.subscriptionTier = tier;
+
+    db.users.forEach((u) => {
+      if (String(u.companyId) === String(companyId)) {
+        u.subscriptionTier = tier;
+      }
     });
 
-    res.status(201).json({ ok: true, company });
-
-  } catch (e) {
-    res.status(e.status || 400).json({ ok: false, error: e.message });
-  }
-});
+    return db;
+  });
+}
 
 /* =========================================================
    LIST COMPANIES
@@ -93,21 +99,18 @@ router.get("/", (req, res) => {
   try {
     const all = companyService.listCompanies();
 
-    // Admin sees all
-    if (isAdmin(req.user)) {
+    if (isAdmin(req.user))
       return res.json({ ok: true, companies: all });
-    }
 
-    // Manager sees companies they manage
     if (isManager(req.user)) {
-      const managed = all.filter(c =>
-        Array.isArray(c.managers) &&
-        c.managers.includes(req.user.id)
+      const managed = all.filter(
+        (c) =>
+          Array.isArray(c.managers) &&
+          c.managers.includes(req.user.id)
       );
       return res.json({ ok: true, companies: managed });
     }
 
-    // Company role sees only itself
     if (isCompany(req.user)) {
       const own = all.filter(
         (c) => String(c.id) === String(req.user.companyId)
@@ -115,10 +118,7 @@ router.get("/", (req, res) => {
       return res.json({ ok: true, companies: own });
     }
 
-    return res.status(403).json({
-      ok: false,
-      error: "Forbidden"
-    });
+    return res.status(403).json({ ok: false });
 
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -126,76 +126,7 @@ router.get("/", (req, res) => {
 });
 
 /* =========================================================
-   COMPANY OPERATIONAL OVERVIEW
-========================================================= */
-
-router.get("/:id/overview", (req, res) => {
-  try {
-    requireCompanyAccess(req, req.params.id);
-
-    const db = readDb();
-    const companies = db.companies || [];
-    const usersArr = db.users || [];
-    const vulnerabilities = db.vulnerabilities || [];
-    const incidents = db.incidents || [];
-
-    const company = companies.find(
-      (c) => String(c.id) === String(req.params.id)
-    );
-
-    if (!company) {
-      return res.status(404).json({
-        ok: false,
-        error: "Company not found",
-      });
-    }
-
-    const members = usersArr.filter(
-      (u) => String(u.companyId) === String(req.params.id)
-    );
-
-    const vulns = vulnerabilities.filter(
-      (v) => String(v.companyId) === String(req.params.id)
-    );
-
-    const companyIncidents = incidents.filter(
-      (i) => String(i.companyId) === String(req.params.id)
-    );
-
-    const critical = vulns.filter(v => v.severity === "critical").length;
-    const high = vulns.filter(v => v.severity === "high").length;
-    const medium = vulns.filter(v => v.severity === "medium").length;
-    const low = vulns.filter(v => v.severity === "low").length;
-
-    let riskScore =
-      100 - (critical * 15 + high * 8 + medium * 4);
-
-    riskScore = Math.max(5, Math.min(100, riskScore));
-
-    res.json({
-      ok: true,
-      overview: {
-        company,
-        tier: company.tier || "standard",
-        seatLimit: company.seatLimit || null,
-        memberCount: members.length,
-        incidentCount: companyIncidents.length,
-        vulnerabilityCounts: { critical, high, medium, low },
-        riskScore: Math.round(riskScore),
-        lastUpdated: Date.now(),
-      },
-    });
-
-  } catch (e) {
-    res.status(e.status || 400).json({
-      ok: false,
-      error: e.message,
-    });
-  }
-});
-
-/* =========================================================
-   ADD MEMBER (SEAT ENFORCED)
+   ADD MEMBER (SUBSCRIPTION ENFORCED)
 ========================================================= */
 
 router.post("/:id/members", (req, res) => {
@@ -207,10 +138,13 @@ router.post("/:id/members", (req, res) => {
       (c) => String(c.id) === String(req.params.id)
     );
 
-    if (!company) {
-      return res.status(404).json({
+    if (!company)
+      return res.status(404).json({ ok: false });
+
+    if (company.subscriptionStatus === "Locked") {
+      return res.status(403).json({
         ok: false,
-        error: "Company not found"
+        error: "Company subscription locked",
       });
     }
 
@@ -224,7 +158,7 @@ router.post("/:id/members", (req, res) => {
     ) {
       return res.status(403).json({
         ok: false,
-        error: "Seat limit reached"
+        error: "Seat limit reached",
       });
     }
 
@@ -235,17 +169,22 @@ router.post("/:id/members", (req, res) => {
       req.body.position
     );
 
+    // Propagate tier to new member
+    propagateTier(req.params.id, company.subscriptionTier || "free");
+
     writeAudit({
       actor: req.user.id,
-      role: req.user.role,
       action: "COMPANY_MEMBER_ADDED",
-      detail: { companyId: req.params.id }
+      detail: { companyId: req.params.id },
     });
 
     res.json({ ok: true, company: updated });
 
   } catch (e) {
-    res.status(e.status || 400).json({ ok: false, error: e.message });
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
+    });
   }
 });
 
@@ -265,57 +204,17 @@ router.delete("/:id/members/:userId", (req, res) => {
 
     writeAudit({
       actor: req.user.id,
-      role: req.user.role,
       action: "COMPANY_MEMBER_REMOVED",
-      detail: { companyId: req.params.id }
+      detail: { companyId: req.params.id },
     });
 
     res.json({ ok: true, company: updated });
 
   } catch (e) {
-    res.status(e.status || 400).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================================================
-   AUTOPROTECT EMAIL CONFIG
-========================================================= */
-
-router.post("/:id/autoprotect/email", (req, res) => {
-  try {
-    requireCompanyAccess(req, req.params.id);
-
-    const { email } = req.body;
-
-    updateDb((db) => {
-      db.autoprotek = db.autoprotek || { users: {} };
-      db.autoprotek.users = db.autoprotek.users || {};
-
-      const userId = req.user.id;
-
-      if (!db.autoprotek.users[userId]) {
-        db.autoprotek.users[userId] = { companies: {} };
-      }
-
-      db.autoprotek.users[userId].companies =
-        db.autoprotek.users[userId].companies || {};
-
-      db.autoprotek.users[userId].companies[req.params.id] = {
-        email: String(email || "").trim().slice(0, 200),
-      };
+    res.status(e.status || 400).json({
+      ok: false,
+      error: e.message,
     });
-
-    writeAudit({
-      actor: req.user.id,
-      role: req.user.role,
-      action: "AUTOPROTECT_EMAIL_UPDATED",
-      detail: { companyId: req.params.id }
-    });
-
-    res.json({ ok: true });
-
-  } catch (e) {
-    res.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
 
