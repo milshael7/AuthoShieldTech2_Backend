@@ -1,67 +1,44 @@
 // backend/src/middleware/deviceBinding.js
-// Enterprise Device Binding Middleware — v1
-// Fingerprint Enforcement • Hijack Detection • Audit Safe
+// Enterprise Device Binding Middleware — v2
+// Risk Engine Based • Strict Safe • TokenVersion Safe • Audit Clean
 
-const { readDb } = require("../lib/db");
+const { readDb, updateDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
-const { revokeAllUserSessions } = require("../lib/sessionAdapter");
-const { buildFingerprint } = require("../lib/deviceFingerprint");
-
-/* =========================================================
-   CONFIG
-========================================================= */
+const sessionAdapter = require("../lib/sessionAdapter");
+const { classifyDeviceRisk } = require("../lib/deviceFingerprint");
 
 const STRICT_MODE = process.env.DEVICE_BINDING_STRICT === "true";
 
-/*
-  STRICT_MODE = false (default)
-  - Logs mismatch
-  - Raises audit event
-  - Does NOT block
-
-  STRICT_MODE = true
-  - Revokes sessions
-  - Blocks request
-*/
-
-/* =========================================================
-   MIDDLEWARE
-========================================================= */
+/* ========================================================= */
 
 async function deviceBinding(req, res, next) {
   try {
-    if (!req.user) {
-      return next();
-    }
+    if (!req.user) return next();
 
     const db = readDb();
     const user = (db.users || []).find(u => u.id === req.user.id);
+    if (!user) return next();
 
-    if (!user) {
+    if (!user.activeDeviceFingerprint) return next();
+
+    const deviceRisk = classifyDeviceRisk(
+      user.activeDeviceFingerprint,
+      req
+    );
+
+    if (deviceRisk.match) {
       return next();
     }
 
-    const currentFingerprint = buildFingerprint(req);
-    const storedFingerprint = user.activeDeviceFingerprint;
+    /* ================= AUDIT ================= */
 
-    // First login scenario
-    if (!storedFingerprint) {
-      return next();
-    }
-
-    // Match — allow
-    if (storedFingerprint === currentFingerprint) {
-      return next();
-    }
-
-    // Mismatch detected
     writeAudit({
       actor: user.id,
       role: user.role,
       action: "DEVICE_BINDING_MISMATCH",
       detail: {
-        previousFingerprint: storedFingerprint,
-        newFingerprint: currentFingerprint
+        riskScore: deviceRisk.riskScore || null,
+        reason: deviceRisk.reason || "fingerprint_mismatch"
       }
     });
 
@@ -69,8 +46,17 @@ async function deviceBinding(req, res, next) {
       return next();
     }
 
-    // STRICT MODE: revoke sessions + block
-    revokeAllUserSessions(user.id);
+    /* ================= STRICT ENFORCEMENT ================= */
+
+    sessionAdapter.revokeAllUserSessions(user.id);
+
+    updateDb((db2) => {
+      const u = db2.users.find(x => x.id === user.id);
+      if (u) {
+        u.tokenVersion = (u.tokenVersion || 0) + 1;
+      }
+      return db2;
+    });
 
     return res.status(403).json({
       ok: false,
