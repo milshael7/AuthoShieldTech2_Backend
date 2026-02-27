@@ -10,7 +10,6 @@ const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
-
 const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
 
 const users = require("./users/user.service");
@@ -49,7 +48,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* =========================================================
-   🔥 STRIPE WEBHOOK MUST COME BEFORE express.json()
+   🔥 STRIPE WEBHOOK BEFORE JSON PARSER
 ========================================================= */
 
 app.use(
@@ -59,7 +58,13 @@ app.use(
 
 /* ================= CORE MIDDLEWARE ================= */
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
+const allowedOrigin = process.env.CORS_ORIGIN;
+
+app.use(cors({
+  origin: allowedOrigin ? allowedOrigin : false,
+  credentials: true
+}));
+
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
@@ -84,13 +89,19 @@ app.get("/ready", (_, res) => res.json({ ready: true }));
 
 /* ================= ROUTES ================= */
 
+/* Auth intentionally before tenant + zeroTrust */
 app.use("/api/auth", require("./routes/auth.routes"));
 
+/* Tenant boundary must apply before ZeroTrust */
 app.use(tenantMiddleware);
 
-/* 🔥 ZERO TRUST APPLIED GLOBALLY AFTER AUTH */
-app.use("/api", zeroTrust);
+/* ZeroTrust applies to ALL /api except auth */
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return zeroTrust(req, res, next);
+});
 
+/* API ROUTES */
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
 app.use("/api/incidents", require("./routes/incidents.routes"));
@@ -100,6 +111,25 @@ app.use("/api/billing", require("./routes/billing.routes"));
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
+
+/* ================= 404 HANDLER ================= */
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Route not found"
+  });
+});
+
+/* ================= GLOBAL ERROR HANDLER ================= */
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({
+    ok: false,
+    error: "Internal server error"
+  });
+});
 
 /* ================= SERVER ================= */
 
@@ -113,9 +143,7 @@ const wss = new WebSocketServer({
 });
 
 function wsClose(ws, code = 1008) {
-  try {
-    ws.close(code);
-  } catch {}
+  try { ws.close(code); } catch {}
 }
 
 function norm(v) {
@@ -131,40 +159,41 @@ wss.on("connection", (ws, req) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
-    if (!token) return wsClose(ws, 1008);
+    if (!token) return wsClose(ws);
 
     const payload = verify(token, "access");
+    if (!payload?.id || !payload?.jti) return wsClose(ws);
 
-    if (!payload?.id || !payload?.jti || sessionAdapter.isRevoked(payload.jti)) {
-      return wsClose(ws, 1008);
-    }
+    if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
 
     const db = readDb();
-    const user = (db.users || []).find((u) => String(u.id) === String(payload.id));
-    if (!user) return wsClose(ws, 1008);
+    const user = (db.users || []).find(
+      (u) => String(u.id) === String(payload.id)
+    );
+    if (!user) return wsClose(ws);
 
     if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
       sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
     if (norm(payload.role) !== norm(user.role)) {
       sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
     if (user.locked === true) {
       sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
     if (user.status !== users.APPROVAL_STATUS.APPROVED) {
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
     if (isInactiveStatus(user.subscriptionStatus)) {
       sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
     if (user.companyId) {
@@ -172,25 +201,27 @@ wss.on("connection", (ws, req) => {
         (c) => String(c.id) === String(user.companyId)
       );
 
-      if (!company) return wsClose(ws, 1008);
+      if (!company) return wsClose(ws);
 
       if (company.status === "Suspended") {
         sessionAdapter.revokeToken(payload.jti);
-        return wsClose(ws, 1008);
+        return wsClose(ws);
       }
 
       if (isInactiveStatus(company.subscriptionStatus)) {
         sessionAdapter.revokeToken(payload.jti);
-        return wsClose(ws, 1008);
+        return wsClose(ws);
       }
     }
 
+    /* Strict device binding */
     const deviceRisk = classifyDeviceRisk(user.activeDeviceFingerprint, req);
-    if (!deviceRisk.match) {
+    if (!deviceRisk?.match) {
       sessionAdapter.revokeAllUserSessions(user.id);
-      return wsClose(ws, 1008);
+      return wsClose(ws);
     }
 
+    /* Register session */
     const ttlMs = 15 * 60 * 1000;
     sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
 
@@ -202,7 +233,7 @@ wss.on("connection", (ws, req) => {
     };
 
   } catch {
-    wsClose(ws, 1008);
+    wsClose(ws);
   }
 });
 
@@ -214,9 +245,7 @@ setInterval(() => {
     if (!client.user?.jti) return;
 
     if (sessionAdapter.isRevoked(client.user.jti)) {
-      try {
-        client.close(1008);
-      } catch {}
+      try { client.close(1008); } catch {}
     }
   });
 }, 10000);
