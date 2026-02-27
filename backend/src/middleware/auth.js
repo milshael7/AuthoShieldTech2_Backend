@@ -1,14 +1,12 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Zero Trust Core v4
-// Token Versioned • JTI Revocation • Device Binding • Subscription Guard • Company Guard
+// Enterprise Access Governance Layer — Zero Trust Core v5
+// Token Versioned • JTI Revocation • Device Binding • Subscription Guard • Company Guard • Tier Aware
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 const sessionAdapter = require("../lib/sessionAdapter");
-const {
-  classifyDeviceRisk
-} = require("../lib/deviceFingerprint");
+const { classifyDeviceRisk } = require("../lib/deviceFingerprint");
 
 const users = require("../users/user.service");
 
@@ -60,12 +58,6 @@ function authRequired(req, res, next) {
   /* ================= JTI REVOCATION ================= */
 
   if (sessionAdapter.isRevoked(payload.jti)) {
-    writeAudit({
-      actor: payload.id,
-      role: payload.role,
-      action: "ACCESS_DENIED_REVOKED_TOKEN"
-    });
-
     return error(res, 401, "Session revoked");
   }
 
@@ -82,45 +74,21 @@ function authRequired(req, res, next) {
   const currentVersion = Number(user.tokenVersion || 0);
 
   if (tokenVersion !== currentVersion) {
-
     sessionAdapter.revokeToken(payload.jti);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "ACCESS_DENIED_TOKEN_VERSION_MISMATCH"
-    });
-
     return error(res, 401, "Session expired");
   }
 
   /* ================= ROLE TAMPER ================= */
 
   if (norm(payload.role) !== norm(user.role)) {
-
     sessionAdapter.revokeToken(payload.jti);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "ACCESS_DENIED_ROLE_TAMPER_DETECTED"
-    });
-
     return error(res, 403, "Privilege mismatch");
   }
 
   /* ================= ACCOUNT LOCK ================= */
 
   if (user.locked === true) {
-
     sessionAdapter.revokeToken(payload.jti);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "ACCESS_DENIED_ACCOUNT_LOCKED"
-    });
-
     return error(res, 403, "Account locked");
   }
 
@@ -136,55 +104,43 @@ function authRequired(req, res, next) {
   );
 
   if (!deviceCheck.match) {
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "DEVICE_MISMATCH_DETECTED",
-      detail: { risk: deviceCheck.risk }
-    });
-
     if (DEVICE_STRICT) {
       sessionAdapter.revokeAllUserSessions(user.id);
       return error(res, 401, "Device verification failed");
     }
   }
 
-  /* ================= SUBSCRIPTION ================= */
+  /* ================= SUBSCRIPTION (USER LEVEL) ================= */
 
-  const inactive =
-    user.subscriptionStatus === users.SUBSCRIPTION.LOCKED ||
-    user.subscriptionStatus === users.SUBSCRIPTION.PAST_DUE;
+  const userInactive =
+    norm(user.subscriptionStatus) === "locked" ||
+    norm(user.subscriptionStatus) === "past_due";
 
-  if (inactive && !isBillingRoute(req)) {
-
-    sessionAdapter.revokeToken(payload.jti);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "ACCESS_DENIED_SUBSCRIPTION_INACTIVE"
-    });
-
+  if (userInactive && !isBillingRoute(req)) {
     return error(res, 403, "Subscription inactive");
   }
 
-  /* ================= COMPANY STATUS ================= */
+  /* ================= COMPANY STATUS + BILLING ================= */
 
   if (user.companyId && Array.isArray(db.companies)) {
-    const company = db.companies.find(c => c.id === user.companyId);
+    const company = db.companies.find(
+      c => String(c.id) === String(user.companyId)
+    );
 
-    if (!company || company.status === "Suspended") {
+    if (!company) {
+      return error(res, 403, "Company not found");
+    }
 
-      sessionAdapter.revokeToken(payload.jti);
-
-      writeAudit({
-        actor: user.id,
-        role: user.role,
-        action: "ACCESS_DENIED_COMPANY_SUSPENDED"
-      });
-
+    if (company.status === "Suspended") {
       return error(res, 403, "Company suspended");
+    }
+
+    const companyInactive =
+      norm(company.subscriptionStatus) === "locked" ||
+      norm(company.subscriptionStatus) === "past_due";
+
+    if (companyInactive && !isBillingRoute(req)) {
+      return error(res, 403, "Company subscription inactive");
     }
   }
 
@@ -198,7 +154,8 @@ function authRequired(req, res, next) {
     id: user.id,
     role: user.role,
     companyId: user.companyId || null,
-    subscriptionStatus: user.subscriptionStatus
+    subscriptionStatus: user.subscriptionStatus,
+    subscriptionTier: user.subscriptionTier || "free"
   };
 
   req.securityContext = {
@@ -209,20 +166,6 @@ function authRequired(req, res, next) {
       norm(user.role) === "admin" ||
       norm(user.role) === "finance"
   };
-
-  /* ================= HIGH PRIVILEGE AUDIT ================= */
-
-  if (req.securityContext.highPrivilege) {
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "HIGH_PRIVILEGE_ACCESS",
-      detail: {
-        path: req.originalUrl,
-        method: req.method
-      }
-    });
-  }
 
   return next();
 }
@@ -240,14 +183,6 @@ function requireRole(...roles) {
     }
 
     if (!allow.has(norm(req.user.role))) {
-
-      writeAudit({
-        actor: req.user.id,
-        role: req.user.role,
-        action: "ACCESS_DENIED_ROLE_MISMATCH",
-        detail: { path: req.originalUrl }
-      });
-
       return error(res, 403, "Forbidden");
     }
 
