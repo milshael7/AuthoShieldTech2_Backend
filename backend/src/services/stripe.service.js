@@ -1,9 +1,10 @@
 // backend/src/services/stripe.service.js
-// Phase 21 — Revenue → Entitlement Enforcement Engine
-// Ledger Verified • Tier Synced • Tool Grants Purged On Lock • Company Safe
+// Revenue → Entitlement Enforcement Engine v2
+// Webhook Verified • Ledger Safe • Session Safe • Tier Synced
 
 const Stripe = require("stripe");
 const crypto = require("crypto");
+const sessionAdapter = require("../lib/sessionAdapter");
 const users = require("../users/user.service");
 const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
@@ -12,13 +13,14 @@ const { nanoid } = require("nanoid");
 if (!process.env.STRIPE_SECRET_KEY)
   throw new Error("STRIPE_SECRET_KEY missing");
 
+if (!process.env.STRIPE_WEBHOOK_SECRET)
+  throw new Error("STRIPE_WEBHOOK_SECRET missing");
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
 });
 
-/* =========================================================
-   HASH UTIL
-========================================================= */
+/* ========================================================= */
 
 function sha256(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
@@ -28,9 +30,9 @@ function computeLedgerHash(entry) {
   return sha256(JSON.stringify(entry));
 }
 
-/* =========================================================
-   FINANCIAL INIT
-========================================================= */
+function clampRevenue(n) {
+  return Math.max(0, Number(n) || 0);
+}
 
 function ensureFinancialArrays(db) {
   if (!Array.isArray(db.payments)) db.payments = [];
@@ -50,13 +52,9 @@ function ensureFinancialArrays(db) {
   }
 }
 
-/* =========================================================
-   ENTITLEMENT HELPERS
-========================================================= */
-
 function saveUser(updatedUser) {
   const db = readDb();
-  const idx = db.users.findIndex((u) => u.id === updatedUser.id);
+  const idx = db.users.findIndex((u) => String(u.id) === String(updatedUser.id));
   if (idx !== -1) {
     db.users[idx] = updatedUser;
     writeDb(db);
@@ -66,7 +64,7 @@ function saveUser(updatedUser) {
 function purgeToolGrantsForUser(userId) {
   updateDb((db) => {
     db.toolGrants = db.toolGrants.filter(
-      (g) => g.userId !== userId && g.companyId !== userId
+      (g) => String(g.userId) !== String(userId)
     );
     return db;
   });
@@ -75,7 +73,11 @@ function purgeToolGrantsForUser(userId) {
 function lockUser(user) {
   user.subscriptionStatus = "Locked";
   saveUser(user);
+
   purgeToolGrantsForUser(user.id);
+
+  // 🔥 Immediately kill sessions
+  sessionAdapter.revokeAllUserSessions(user.id);
 
   audit({
     actorId: user.id,
@@ -83,9 +85,9 @@ function lockUser(user) {
   });
 }
 
-function activateUser(user, nextBillingDate) {
+function activateUser(user, nextBillingDate, planType = "paid") {
   user.subscriptionStatus = "Active";
-  user.subscriptionTier = "paid";
+  user.subscriptionTier = planType;
   saveUser(user);
 
   updateDb((db) => {
@@ -100,7 +102,20 @@ function activateUser(user, nextBillingDate) {
   audit({
     actorId: user.id,
     action: "SUBSCRIPTION_ACTIVATED",
+    metadata: { planType },
   });
+}
+
+/* =========================================================
+   WEBHOOK VERIFICATION
+========================================================= */
+
+function verifyStripeWebhook(rawBody, signature) {
+  return stripe.webhooks.constructEvent(
+    rawBody,
+    signature,
+    process.env.STRIPE_WEBHOOK_SECRET
+  );
 }
 
 /* =========================================================
@@ -112,6 +127,7 @@ async function handleStripeWebhook(event) {
   if (event.type === "invoice.payment_succeeded") {
 
     const invoiceObj = event.data.object;
+
     const subscription = await stripe.subscriptions.retrieve(
       invoiceObj.subscription
     );
@@ -148,15 +164,20 @@ async function handleStripeWebhook(event) {
       ensureFinancialArrays(ledgerDb);
 
       ledgerDb.payments.push(paymentEntry);
-      ledgerDb.revenueSummary.totalRevenue += amount;
-      ledgerDb.revenueSummary.subscriptionRevenue += amount;
+
+      ledgerDb.revenueSummary.totalRevenue =
+        clampRevenue(ledgerDb.revenueSummary.totalRevenue + amount);
+
+      ledgerDb.revenueSummary.subscriptionRevenue =
+        clampRevenue(ledgerDb.revenueSummary.subscriptionRevenue + amount);
 
       return ledgerDb;
     });
 
     activateUser(
       user,
-      new Date(subscription.current_period_end * 1000).toISOString()
+      new Date(subscription.current_period_end * 1000).toISOString(),
+      subscription.metadata?.planType || "paid"
     );
   }
 
@@ -181,8 +202,12 @@ async function handleStripeWebhook(event) {
 
       const refundAmount = charge.amount_refunded / 100;
 
-      ledgerDb.revenueSummary.totalRevenue -= refundAmount;
-      ledgerDb.revenueSummary.subscriptionRevenue -= refundAmount;
+      ledgerDb.revenueSummary.totalRevenue =
+        clampRevenue(ledgerDb.revenueSummary.totalRevenue - refundAmount);
+
+      ledgerDb.revenueSummary.subscriptionRevenue =
+        clampRevenue(ledgerDb.revenueSummary.subscriptionRevenue - refundAmount);
+
       ledgerDb.revenueSummary.refundedAmount += refundAmount;
 
       return ledgerDb;
@@ -218,26 +243,8 @@ async function handleStripeWebhook(event) {
   }
 }
 
-/* =========================================================
-   CANCEL
-========================================================= */
-
-async function cancelSubscription(userId) {
-  const user = users.findById(userId);
-  if (!user?.stripeSubscriptionId)
-    throw new Error("No active subscription");
-
-  await stripe.subscriptions.cancel(user.stripeSubscriptionId);
-
-  lockUser(user);
-
-  audit({
-    actorId: user.id,
-    action: "SUBSCRIPTION_CANCELLED",
-  });
-}
-
 module.exports = {
   cancelSubscription,
   handleStripeWebhook,
+  verifyStripeWebhook,
 };
