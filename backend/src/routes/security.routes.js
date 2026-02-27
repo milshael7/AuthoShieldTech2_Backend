@@ -1,6 +1,6 @@
 // backend/src/routes/security.routes.js
-// Enterprise Security Firewall — Hardened v7
-// Deterministic Tenant Scope • Manager Scope • Memory Bounded • Blueprint Aligned
+// Enterprise Security Firewall — ZeroTrust Enforcement v8
+// Deterministic Tenant Scope • Adaptive Enforcement • Memory Bounded
 
 const express = require("express");
 const router = express.Router();
@@ -11,6 +11,7 @@ const { writeAudit } = require("../lib/audit");
 const { getActiveSessionCount } = require("../lib/sessionStore");
 
 const MAX_SECURITY_EVENTS = 2000;
+const DEFAULT_ENFORCEMENT_THRESHOLD = 75;
 
 /* =========================================================
    HELPERS
@@ -36,7 +37,6 @@ function normalizeArray(v) {
 
 function getScopedCompanyIds(req) {
   if (isAdmin(req.user)) {
-    // Admin global mode
     if (!req.companyId) return null;
     return [req.companyId];
   }
@@ -53,8 +53,36 @@ function getScopedCompanyIds(req) {
 }
 
 function scopeByCompany(items, companyIds) {
-  if (companyIds === null) return items; // Admin global
+  if (companyIds === null) return items;
   return items.filter(i => companyIds.includes(String(i.companyId)));
+}
+
+/* =========================================================
+   ZERO TRUST RISK CALCULATION
+========================================================= */
+
+function calculateCompanyRisk(db, companyId) {
+  const events = normalizeArray(db.securityEvents)
+    .filter(e => String(e.companyId) === String(companyId));
+
+  let score = 0;
+
+  events.forEach(e => {
+    if (e.severity === "critical") score += 25;
+    if (e.severity === "high") score += 15;
+    if (e.severity === "medium") score += 8;
+    if (e.severity === "low") score += 2;
+    if (!e.acknowledged) score += 5;
+  });
+
+  return Math.min(100, score);
+}
+
+function riskLevel(score) {
+  if (score >= 75) return "CRITICAL";
+  if (score >= 50) return "ELEVATED";
+  if (score >= 25) return "MODERATE";
+  return "LOW";
 }
 
 /* =========================================================
@@ -77,11 +105,11 @@ router.post("/public-device-risk", (req, res) => {
 
     riskScore = Math.min(100, riskScore);
 
-    let level = "Low";
-    if (riskScore > 60) level = "High";
-    else if (riskScore > 30) level = "Medium";
-
-    return res.json({ ok: true, riskScore, level });
+    return res.json({
+      ok: true,
+      riskScore,
+      level: riskLevel(riskScore)
+    });
 
   } catch {
     return res.status(500).json({ ok: false });
@@ -95,84 +123,67 @@ router.post("/public-device-risk", (req, res) => {
 router.use(authRequired);
 
 /* =========================================================
-   POSTURE SUMMARY (SCOPED)
+   ZERO TRUST ENFORCEMENT ENDPOINT
 ========================================================= */
 
-router.get("/posture-summary", (req, res) => {
+router.post("/enforce/:companyId", (req, res) => {
   try {
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({ ok: false, error: "Admin only" });
+    }
+
+    const { companyId } = req.params;
+    const { threshold } = req.body || {};
+
     const db = readDb();
+    db.companies = db.companies || [];
 
-    const vulnerabilitiesArr = normalizeArray(db.vulnerabilities);
-    const usersArr = normalizeArray(db.users);
-
-    const companyScope = getScopedCompanyIds(req);
-
-    const scopedVulns = scopeByCompany(vulnerabilitiesArr, companyScope);
-    const scopedUsers = scopeByCompany(usersArr, companyScope);
-
-    const critical = scopedVulns.filter(v => v.severity === "critical").length;
-    const high = scopedVulns.filter(v => v.severity === "high").length;
-    const medium = scopedVulns.filter(v => v.severity === "medium").length;
-    const low = scopedVulns.filter(v => v.severity === "low").length;
-
-    let riskScore = 100 - (critical * 15 + high * 8 + medium * 4 + low);
-    riskScore = Math.max(5, Math.min(100, riskScore));
-
-    return res.json({
-      ok: true,
-      scope: companyScope === null ? "global" : "tenant",
-      totalUsers: scopedUsers.length,
-      riskScore: Math.round(riskScore),
-      critical,
-      high,
-      medium,
-      low,
-      timestamp: Date.now(),
-    });
-
-  } catch {
-    return res.status(500).json({ ok: false });
-  }
-});
-
-/* =========================================================
-   POSTURE RECENT (Blueprint Required)
-========================================================= */
-
-router.get("/posture-recent", (req, res) => {
-  try {
-    const db = readDb();
-    const companyScope = getScopedCompanyIds(req);
-
-    let events = normalizeArray(db.securityEvents);
-    events = scopeByCompany(events, companyScope);
-
-    events.sort((a, b) =>
-      new Date(b.createdAt) - new Date(a.createdAt)
+    const company = db.companies.find(
+      c => String(c.id) === String(companyId)
     );
 
-    return res.json({
-      ok: true,
-      events: events.slice(0, 20)
+    if (!company) {
+      return res.status(404).json({ ok: false, error: "Company not found" });
+    }
+
+    const enforcementThreshold =
+      Number(threshold) || company.enforcementThreshold || DEFAULT_ENFORCEMENT_THRESHOLD;
+
+    const riskScore = calculateCompanyRisk(db, companyId);
+
+    let enforced = false;
+    let action = "NO_ACTION";
+
+    if (riskScore >= enforcementThreshold) {
+      company.status = "Locked";
+      company.lockReason = "ZeroTrust enforcement";
+      company.lockedAt = new Date().toISOString();
+      enforced = true;
+      action = "COMPANY_LOCKED";
+    }
+
+    writeDb(db);
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ZEROTRUST_ENFORCEMENT",
+      detail: {
+        companyId,
+        riskScore,
+        threshold: enforcementThreshold,
+        enforced
+      }
     });
 
-  } catch {
-    return res.status(500).json({ ok: false });
-  }
-});
-
-/* =========================================================
-   ACTIVE SESSION MONITOR
-========================================================= */
-
-router.get("/sessions", (req, res) => {
-  try {
-    const activeSessions = getActiveSessionCount(req.user.id);
-
     return res.json({
       ok: true,
-      userId: req.user.id,
-      activeSessions,
+      companyId,
+      riskScore,
+      level: riskLevel(riskScore),
+      threshold: enforcementThreshold,
+      enforced,
+      action,
       timestamp: Date.now()
     });
 
@@ -244,7 +255,6 @@ router.post("/events", (req, res) => {
 
     db.securityEvents.push(newEvent);
 
-    // Memory bound
     if (db.securityEvents.length > MAX_SECURITY_EVENTS) {
       db.securityEvents = db.securityEvents.slice(-MAX_SECURITY_EVENTS);
     }
