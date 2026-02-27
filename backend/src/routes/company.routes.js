@@ -1,6 +1,6 @@
 // backend/src/routes/company.routes.js
-// Enterprise Company Control Layer — Hardened v4
-// Subscription Propagation • Seat Enforcement • Lock Cascade • Audit Safe
+// Enterprise Company Control Layer — Hardened v5
+// Subscription Propagation • Seat Enforcement • Lock Cascade • Session Kill • Audit Safe
 
 const express = require("express");
 const router = express.Router();
@@ -9,6 +9,7 @@ const { authRequired } = require("../middleware/auth");
 const companyService = require("../companies/company.service");
 const { updateDb, readDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
+const sessionAdapter = require("../lib/sessionAdapter");
 const users = require("../users/user.service");
 
 router.use(authRequired);
@@ -19,6 +20,10 @@ router.use(authRequired);
 
 function normalize(role) {
   return String(role || "").toLowerCase();
+}
+
+function idEq(a, b) {
+  return String(a) === String(b);
 }
 
 function isAdmin(user) {
@@ -39,7 +44,7 @@ function requireCompanyAccess(req, companyId) {
   if (!req.user.companyId)
     throw Object.assign(new Error("No company access"), { status: 403 });
 
-  if (String(req.user.companyId) !== String(companyId))
+  if (!idEq(req.user.companyId, companyId))
     throw Object.assign(new Error("Access denied"), { status: 403 });
 }
 
@@ -49,23 +54,22 @@ function requireCompanyAccess(req, companyId) {
 
 function lockCompany(companyId) {
   updateDb((db) => {
-    const company = db.companies.find(
-      (c) => String(c.id) === String(companyId)
-    );
+    const company = db.companies.find((c) => idEq(c.id, companyId));
     if (!company) return db;
 
     company.subscriptionStatus = "Locked";
 
-    // Lock all seat users
     db.users.forEach((u) => {
-      if (String(u.companyId) === String(companyId)) {
+      if (idEq(u.companyId, companyId)) {
         u.subscriptionStatus = "Locked";
+
+        // 🔥 Kill active sessions
+        sessionAdapter.revokeAllUserSessions(u.id);
       }
     });
 
-    // Purge tool grants for this company
     db.toolGrants = (db.toolGrants || []).filter(
-      (g) => String(g.companyId) !== String(companyId)
+      (g) => !idEq(g.companyId, companyId)
     );
 
     return db;
@@ -74,15 +78,13 @@ function lockCompany(companyId) {
 
 function propagateTier(companyId, tier) {
   updateDb((db) => {
-    const company = db.companies.find(
-      (c) => String(c.id) === String(companyId)
-    );
+    const company = db.companies.find((c) => idEq(c.id, companyId));
     if (!company) return db;
 
     company.subscriptionTier = tier;
 
     db.users.forEach((u) => {
-      if (String(u.companyId) === String(companyId)) {
+      if (idEq(u.companyId, companyId)) {
         u.subscriptionTier = tier;
       }
     });
@@ -113,7 +115,7 @@ router.get("/", (req, res) => {
 
     if (isCompany(req.user)) {
       const own = all.filter(
-        (c) => String(c.id) === String(req.user.companyId)
+        (c) => idEq(c.id, req.user.companyId)
       );
       return res.json({ ok: true, companies: own });
     }
@@ -126,7 +128,7 @@ router.get("/", (req, res) => {
 });
 
 /* =========================================================
-   ADD MEMBER (SUBSCRIPTION ENFORCED)
+   ADD MEMBER (STRICT SEAT ENFORCEMENT)
 ========================================================= */
 
 router.post("/:id/members", (req, res) => {
@@ -135,7 +137,7 @@ router.post("/:id/members", (req, res) => {
 
     const db = readDb();
     const company = db.companies.find(
-      (c) => String(c.id) === String(req.params.id)
+      (c) => idEq(c.id, req.params.id)
     );
 
     if (!company)
@@ -148,14 +150,15 @@ router.post("/:id/members", (req, res) => {
       });
     }
 
-    const currentMembers = db.users.filter(
-      (u) => String(u.companyId) === String(req.params.id)
+    const seatLimit = Number(company.seatLimit || 0);
+
+    const activeMembers = db.users.filter(
+      (u) =>
+        idEq(u.companyId, req.params.id) &&
+        u.subscriptionStatus !== "Locked"
     );
 
-    if (
-      company.seatLimit &&
-      currentMembers.length >= company.seatLimit
-    ) {
+    if (seatLimit > 0 && activeMembers.length >= seatLimit) {
       return res.status(403).json({
         ok: false,
         error: "Seat limit reached",
@@ -169,7 +172,6 @@ router.post("/:id/members", (req, res) => {
       req.body.position
     );
 
-    // Propagate tier to new member
     propagateTier(req.params.id, company.subscriptionTier || "free");
 
     writeAudit({
@@ -201,6 +203,9 @@ router.delete("/:id/members/:userId", (req, res) => {
       req.params.userId,
       req.user.id
     );
+
+    // Kill removed user's sessions
+    sessionAdapter.revokeAllUserSessions(req.params.userId);
 
     writeAudit({
       actor: req.user.id,
