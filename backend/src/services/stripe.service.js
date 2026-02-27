@@ -1,6 +1,6 @@
 // backend/src/services/stripe.service.js
-// Phase 20 — SOC2 Stripe Reconciliation Engine
-// Idempotent • Immutable • Drift Safe • Ledger Verified
+// Phase 21 — Revenue → Entitlement Enforcement Engine
+// Ledger Verified • Tier Synced • Tool Grants Purged On Lock • Company Safe
 
 const Stripe = require("stripe");
 const crypto = require("crypto");
@@ -9,9 +9,8 @@ const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 const { nanoid } = require("nanoid");
 
-if (!process.env.STRIPE_SECRET_KEY) {
+if (!process.env.STRIPE_SECRET_KEY)
   throw new Error("STRIPE_SECRET_KEY missing");
-}
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
@@ -30,13 +29,14 @@ function computeLedgerHash(entry) {
 }
 
 /* =========================================================
-   SAFE INITIALIZER
+   FINANCIAL INIT
 ========================================================= */
 
 function ensureFinancialArrays(db) {
   if (!Array.isArray(db.payments)) db.payments = [];
   if (!Array.isArray(db.refunds)) db.refunds = [];
   if (!Array.isArray(db.disputes)) db.disputes = [];
+  if (!Array.isArray(db.toolGrants)) db.toolGrants = [];
 
   if (!db.revenueSummary) {
     db.revenueSummary = {
@@ -51,7 +51,7 @@ function ensureFinancialArrays(db) {
 }
 
 /* =========================================================
-   USER SAVE
+   ENTITLEMENT HELPERS
 ========================================================= */
 
 function saveUser(updatedUser) {
@@ -63,31 +63,43 @@ function saveUser(updatedUser) {
   }
 }
 
-/* =========================================================
-   BILLING CONTROL
-========================================================= */
-
-function activateBilling(userId, nextBillingDate) {
+function purgeToolGrantsForUser(userId) {
   updateDb((db) => {
-    db.autoprotek = db.autoprotek || { users: {} };
-    const existing = db.autoprotek.users[userId] || {};
-
-    db.autoprotek.users[userId] = {
-      ...existing,
-      status: "ACTIVE",
-      subscriptionStatus: "ACTIVE",
-      nextBillingDate,
-    };
+    db.toolGrants = db.toolGrants.filter(
+      (g) => g.userId !== userId && g.companyId !== userId
+    );
+    return db;
   });
 }
 
-function lockUserBilling(userId) {
-  if (!userId) return;
+function lockUser(user) {
+  user.subscriptionStatus = "Locked";
+  saveUser(user);
+  purgeToolGrantsForUser(user.id);
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_LOCKED",
+  });
+}
+
+function activateUser(user, nextBillingDate) {
+  user.subscriptionStatus = "Active";
+  user.subscriptionTier = "paid";
+  saveUser(user);
 
   updateDb((db) => {
-    if (!db.autoprotek?.users?.[userId]) return;
-    db.autoprotek.users[userId].status = "INACTIVE";
-    db.autoprotek.users[userId].subscriptionStatus = "LOCKED";
+    db.autoprotek = db.autoprotek || { users: {} };
+    db.autoprotek.users[user.id] = {
+      status: "ACTIVE",
+      nextBillingDate,
+    };
+    return db;
+  });
+
+  audit({
+    actorId: user.id,
+    action: "SUBSCRIPTION_ACTIVATED",
   });
 }
 
@@ -96,19 +108,9 @@ function lockUserBilling(userId) {
 ========================================================= */
 
 async function handleStripeWebhook(event) {
-  updateDb((db) => {
-    if (!Array.isArray(db.processedStripeEvents))
-      db.processedStripeEvents = [];
-
-    if (db.processedStripeEvents.includes(event.id)) {
-      return db;
-    }
-
-    db.processedStripeEvents.push(event.id);
-    return db;
-  });
 
   if (event.type === "invoice.payment_succeeded") {
+
     const invoiceObj = event.data.object;
     const subscription = await stripe.subscriptions.retrieve(
       invoiceObj.subscription
@@ -124,10 +126,11 @@ async function handleStripeWebhook(event) {
 
     const amount = invoiceObj.amount_paid / 100;
 
-    const existing = db.payments.find(
-      (p) => p.stripePaymentIntentId === invoiceObj.payment_intent
-    );
-    if (existing) return;
+    if (
+      db.payments.find(
+        (p) => p.stripePaymentIntentId === invoiceObj.payment_intent
+      )
+    ) return;
 
     const paymentEntry = {
       id: nanoid(),
@@ -151,53 +154,32 @@ async function handleStripeWebhook(event) {
       return ledgerDb;
     });
 
-    user.subscriptionStatus = "Active";
-    saveUser(user);
-
-    activateBilling(
-      user.id,
+    activateUser(
+      user,
       new Date(subscription.current_period_end * 1000).toISOString()
     );
-
-    audit({
-      actorId: user.id,
-      action: "PAYMENT_RECORDED",
-      targetId: paymentEntry.id,
-      metadata: { amount },
-    });
   }
 
   if (event.type === "charge.refunded") {
+
     const charge = event.data.object;
     if (!charge.payment_intent) return;
 
-    const refundAmount = charge.amount_refunded / 100;
+    const db = readDb();
+    const payment = db.payments.find(
+      (p) => p.stripePaymentIntentId === charge.payment_intent
+    );
+    if (!payment) return;
+
+    const user = db.users.find((u) => u.id === payment.userId);
+    if (!user) return;
+
+    lockUser(user);
 
     updateDb((ledgerDb) => {
       ensureFinancialArrays(ledgerDb);
 
-      const payment = ledgerDb.payments.find(
-        (p) => p.stripePaymentIntentId === charge.payment_intent
-      );
-      if (!payment) return ledgerDb;
-
-      if (
-        ledgerDb.refunds.find(
-          (r) => r.stripePaymentIntentId === charge.payment_intent
-        )
-      ) return ledgerDb;
-
-      const refundEntry = {
-        id: nanoid(),
-        userId: payment.userId,
-        stripePaymentIntentId: charge.payment_intent,
-        amount: refundAmount,
-        createdAt: new Date().toISOString(),
-      };
-
-      refundEntry.hash = computeLedgerHash(refundEntry);
-
-      ledgerDb.refunds.push(refundEntry);
+      const refundAmount = charge.amount_refunded / 100;
 
       ledgerDb.revenueSummary.totalRevenue -= refundAmount;
       ledgerDb.revenueSummary.subscriptionRevenue -= refundAmount;
@@ -205,82 +187,53 @@ async function handleStripeWebhook(event) {
 
       return ledgerDb;
     });
-
-    audit({
-      actorId: "system",
-      action: "REFUND_RECORDED",
-      targetId: charge.payment_intent,
-      metadata: { refundAmount },
-    });
   }
 
   if (event.type === "charge.dispute.created") {
+
     const dispute = event.data.object;
+    const db = readDb();
 
-    updateDb((ledgerDb) => {
-      ensureFinancialArrays(ledgerDb);
+    const payment = db.payments.find(
+      (p) => p.stripePaymentIntentId === dispute.payment_intent
+    );
+    if (!payment) return;
 
-      if (
-        ledgerDb.disputes.find(
-          (d) => d.stripePaymentIntentId === dispute.payment_intent
-        )
-      ) return ledgerDb;
+    const user = db.users.find((u) => u.id === payment.userId);
+    if (!user) return;
 
-      const disputeEntry = {
-        id: nanoid(),
-        stripePaymentIntentId: dispute.payment_intent,
-        amount: dispute.amount / 100,
-        status: dispute.status,
-        createdAt: new Date().toISOString(),
-      };
-
-      disputeEntry.hash = computeLedgerHash(disputeEntry);
-
-      ledgerDb.disputes.push(disputeEntry);
-      ledgerDb.revenueSummary.disputedAmount += dispute.amount / 100;
-
-      return ledgerDb;
-    });
-
-    audit({
-      actorId: "system",
-      action: "DISPUTE_CREATED",
-      targetId: dispute.id,
-    });
+    lockUser(user);
   }
 
   if (event.type === "customer.subscription.deleted") {
-    const subscription = event.data.object;
 
+    const subscription = event.data.object;
     const db = readDb();
+
     const user = db.users.find(
       (u) => u.stripeSubscriptionId === subscription.id
     );
 
-    if (user) {
-      user.subscriptionStatus = "Locked";
-      saveUser(user);
-      lockUserBilling(user.id);
-    }
+    if (user) lockUser(user);
   }
 }
 
+/* =========================================================
+   CANCEL
+========================================================= */
+
 async function cancelSubscription(userId) {
   const user = users.findById(userId);
-  if (!user?.stripeSubscriptionId) {
+  if (!user?.stripeSubscriptionId)
     throw new Error("No active subscription");
-  }
 
   await stripe.subscriptions.cancel(user.stripeSubscriptionId);
 
-  user.subscriptionStatus = "Locked";
-  saveUser(user);
-  lockUserBilling(user.id);
+  lockUser(user);
 
   audit({
     actorId: user.id,
     action: "SUBSCRIPTION_CANCELLED",
-    targetId: user.id,
   });
 }
 
