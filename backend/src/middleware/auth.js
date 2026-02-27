@@ -1,10 +1,9 @@
 // backend/src/middleware/auth.js
-// Enterprise Access Governance Layer — Zero Trust Core v5
+// Enterprise Access Governance Layer — Zero Trust Core v6
 // Token Versioned • JTI Revocation • Device Binding • Subscription Guard • Company Guard • Tier Aware
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
-const { writeAudit } = require("../lib/audit");
 const sessionAdapter = require("../lib/sessionAdapter");
 const { classifyDeviceRisk } = require("../lib/deviceFingerprint");
 
@@ -13,6 +12,7 @@ const users = require("../users/user.service");
 /* ====================================================== */
 
 const DEVICE_STRICT = process.env.DEVICE_BINDING_STRICT === "true";
+const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 function extractToken(req) {
   const header = String(req.headers.authorization || "");
@@ -32,6 +32,15 @@ function isBillingRoute(req) {
 
 function norm(v) {
   return String(v || "").trim().toLowerCase();
+}
+
+function idEq(a, b) {
+  return String(a) === String(b);
+}
+
+function isInactiveStatus(v) {
+  const s = norm(v);
+  return s === "locked" || s === "past_due" || s === "past due";
 }
 
 /* ======================================================
@@ -62,7 +71,7 @@ function authRequired(req, res, next) {
   }
 
   const db = readDb();
-  const user = (db.users || []).find(u => u.id === payload.id);
+  const user = (db.users || []).find(u => idEq(u.id, payload.id));
 
   if (!user) {
     return error(res, 401, "User no longer exists");
@@ -110,21 +119,17 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ================= SUBSCRIPTION (USER LEVEL) ================= */
+  /* ================= USER SUBSCRIPTION ================= */
 
-  const userInactive =
-    norm(user.subscriptionStatus) === "locked" ||
-    norm(user.subscriptionStatus) === "past_due";
-
-  if (userInactive && !isBillingRoute(req)) {
+  if (isInactiveStatus(user.subscriptionStatus) && !isBillingRoute(req)) {
     return error(res, 403, "Subscription inactive");
   }
 
-  /* ================= COMPANY STATUS + BILLING ================= */
+  /* ================= COMPANY STATUS ================= */
 
   if (user.companyId && Array.isArray(db.companies)) {
     const company = db.companies.find(
-      c => String(c.id) === String(user.companyId)
+      c => idEq(c.id, user.companyId)
     );
 
     if (!company) {
@@ -135,18 +140,18 @@ function authRequired(req, res, next) {
       return error(res, 403, "Company suspended");
     }
 
-    const companyInactive =
-      norm(company.subscriptionStatus) === "locked" ||
-      norm(company.subscriptionStatus) === "past_due";
-
-    if (companyInactive && !isBillingRoute(req)) {
+    if (isInactiveStatus(company.subscriptionStatus) && !isBillingRoute(req)) {
       return error(res, 403, "Company subscription inactive");
     }
   }
 
-  /* ================= REGISTER SESSION ================= */
+  /* ================= REGISTER SESSION (TTL ALIGNED) ================= */
 
-  sessionAdapter.registerSession(user.id, payload.jti);
+  sessionAdapter.registerSession(
+    user.id,
+    payload.jti,
+    ACCESS_TOKEN_TTL_MS
+  );
 
   /* ================= CONTEXT ================= */
 
