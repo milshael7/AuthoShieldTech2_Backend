@@ -1,6 +1,6 @@
 // backend/src/routes/users.routes.js
-// Enterprise User Control Layer — Hardened v2
-// Admin + Manager Scoped • Company Bound • Seat Safe • Audit Logged
+// Enterprise User Control Layer — Hardened v3
+// Deterministic Tenant Scope • Manager Multi-Company • Role Normalized • Audit Complete
 
 const express = require("express");
 const router = express.Router();
@@ -8,28 +8,45 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { readDb, writeDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
-const users = require("../users/user.service");
 
 router.use(authRequired);
 
 /* =========================================================
-   ROLE HELPERS
+   HELPERS
 ========================================================= */
 
 function normalize(role) {
-  return String(role || "").toLowerCase();
+  return String(role || "").trim().toLowerCase();
 }
 
 function isAdmin(user) {
-  return normalize(user.role) === normalize(users.ROLES.ADMIN);
+  return normalize(user.role) === "admin";
 }
 
 function isManager(user) {
-  return normalize(user.role) === normalize(users.ROLES.MANAGER);
+  return normalize(user.role) === "manager";
 }
 
-function sameCompany(actor, target) {
-  return actor.companyId && actor.companyId === target.companyId;
+function getManagedCompanyIds(user) {
+  if (!Array.isArray(user.managedCompanies)) return [];
+  return user.managedCompanies.map(String);
+}
+
+function canAccessUser(req, target) {
+  if (isAdmin(req.user)) return true;
+
+  if (req.user.id === target.id) return true;
+
+  if (isManager(req.user)) {
+    const managed = getManagedCompanyIds(req.user);
+    return managed.includes(String(target.companyId));
+  }
+
+  if (req.companyId) {
+    return String(req.companyId) === String(target.companyId);
+  }
+
+  return false;
 }
 
 function safeUser(u) {
@@ -56,20 +73,34 @@ router.get("/", (req, res) => {
     let list = db.users || [];
 
     if (isAdmin(req.user)) {
+      writeAudit({
+        actor: req.user.id,
+        role: req.user.role,
+        action: "USER_LIST_VIEWED_GLOBAL",
+      });
+
       return res.json({
         ok: true,
-        users: list.map(safeUser)
+        users: list.map(safeUser),
       });
     }
 
     if (isManager(req.user)) {
+      const managed = getManagedCompanyIds(req.user);
+
       list = list.filter(
-        u => u.companyId === req.user.companyId
+        u => managed.includes(String(u.companyId))
       );
+
+      writeAudit({
+        actor: req.user.id,
+        role: req.user.role,
+        action: "USER_LIST_VIEWED_MANAGER_SCOPE",
+      });
 
       return res.json({
         ok: true,
-        users: list.map(safeUser)
+        users: list.map(safeUser),
       });
     }
 
@@ -77,11 +108,11 @@ router.get("/", (req, res) => {
 
     return res.json({
       ok: true,
-      users: self ? [safeUser(self)] : []
+      users: self ? [safeUser(self)] : [],
     });
 
   } catch {
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false });
   }
 });
 
@@ -93,60 +124,63 @@ router.get("/:id", (req, res) => {
   try {
     const db = readDb();
     const user = (db.users || []).find(
-      u => u.id === req.params.id
+      u => String(u.id) === String(req.params.id)
     );
 
     if (!user) {
       return res.status(404).json({
         ok: false,
-        error: "User not found"
+        error: "User not found",
       });
     }
 
-    if (!isAdmin(req.user)) {
-      if (!sameCompany(req.user, user) && req.user.id !== user.id) {
-        return res.status(403).json({
-          ok: false,
-          error: "Forbidden"
-        });
-      }
+    if (!canAccessUser(req, user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Forbidden",
+      });
     }
 
-    res.json({
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "USER_VIEWED",
+      metadata: { targetUser: user.id },
+    });
+
+    return res.json({
       ok: true,
-      user: safeUser(user)
+      user: safeUser(user),
     });
 
   } catch {
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   UPDATE USER (ROLE SAFE)
+   UPDATE USER
 ========================================================= */
 
 router.patch("/:id", (req, res) => {
   try {
     const db = readDb();
     const user = (db.users || []).find(
-      u => u.id === req.params.id
+      u => String(u.id) === String(req.params.id)
     );
 
     if (!user) {
       return res.status(404).json({
         ok: false,
-        error: "User not found"
+        error: "User not found",
       });
     }
 
-    if (!isAdmin(req.user)) {
-      if (!isManager(req.user) || !sameCompany(req.user, user)) {
-        return res.status(403).json({
-          ok: false,
-          error: "Forbidden"
-        });
-      }
+    if (!canAccessUser(req, user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Forbidden",
+      });
     }
 
     const {
@@ -164,7 +198,7 @@ router.patch("/:id", (req, res) => {
       user.subscriptionStatus = subscriptionStatus;
     }
 
-    if (typeof locked === "boolean") {
+    if (typeof locked === "boolean" && isAdmin(req.user)) {
       user.locked = locked;
     }
 
@@ -180,16 +214,16 @@ router.patch("/:id", (req, res) => {
       actor: req.user.id,
       role: req.user.role,
       action: "USER_UPDATED",
-      detail: { targetUser: user.id }
+      metadata: { targetUser: user.id },
     });
 
-    res.json({
+    return res.json({
       ok: true,
-      user: safeUser(user)
+      user: safeUser(user),
     });
 
   } catch {
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false });
   }
 });
 
@@ -202,13 +236,13 @@ router.delete("/:id", (req, res) => {
     if (!isAdmin(req.user)) {
       return res.status(403).json({
         ok: false,
-        error: "Admin only"
+        error: "Admin only",
       });
     }
 
     const db = readDb();
     db.users = (db.users || []).filter(
-      u => u.id !== req.params.id
+      u => String(u.id) !== String(req.params.id)
     );
 
     writeDb(db);
@@ -217,13 +251,13 @@ router.delete("/:id", (req, res) => {
       actor: req.user.id,
       role: req.user.role,
       action: "USER_DELETED",
-      detail: { targetUser: req.params.id }
+      metadata: { targetUser: req.params.id },
     });
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
 
   } catch {
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false });
   }
 });
 
