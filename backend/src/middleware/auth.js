@@ -1,7 +1,7 @@
 // backend/src/middleware/auth.js
-// AutoShield Tech — Zero Trust Identity Firewall v9
+// AutoShield Tech — Zero Trust Identity Firewall v10
 // Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard
-// Company Guard • Privilege Auto-Downgrade • Dev Override Safe • Audit Logged
+// Company Guard • Privilege Auto-Downgrade • Dev Override Safe • Role Guard Restored
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -87,31 +87,22 @@ function authRequired(req, res, next) {
   const user = (db.users || []).find(u => idEq(u.id, payload.id));
   if (!user) return error(res, 401, "User no longer exists");
 
-  /* ================= TOKEN VERSION ================= */
-
   if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
     sessionAdapter.revokeToken(payload.jti);
     return error(res, 401, "Session expired");
   }
-
-  /* ================= ROLE TAMPER ================= */
 
   if (norm(payload.role) !== norm(user.role)) {
     sessionAdapter.revokeToken(payload.jti);
     return error(res, 403, "Privilege mismatch");
   }
 
-  /* ================= ACCOUNT LOCK ================= */
-
   if (user.locked === true) {
     sessionAdapter.revokeToken(payload.jti);
     return error(res, 403, "Account locked");
   }
 
-  /* ======================================================
-     🔥 DEV AUTH BYPASS (CONTROLLED)
-     Only active if DEV_AUTH_BYPASS=true
-  ====================================================== */
+  /* ===== DEV BYPASS (ONLY IF ENABLED) ===== */
 
   if (!DEV_AUTH_BYPASS) {
 
@@ -141,7 +132,7 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ================= DEVICE BINDING ================= */
+  /* ===== DEVICE CHECK ===== */
 
   const deviceCheck = classifyDeviceRisk(
     user.activeDeviceFingerprint,
@@ -168,9 +159,7 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ======================================================
-     🔥 AUTONOMOUS PRIVILEGE DOWNGRADE
-  ====================================================== */
+  /* ===== PRIVILEGE AUTO DOWNGRADE ===== */
 
   let effectiveRole = user.role;
   let privilegeDowngraded = false;
@@ -187,17 +176,9 @@ function authRequired(req, res, next) {
       .filter(d => d.userId === user.id)
       .slice(-PRIVILEGE_ACCELERATION_WINDOW);
 
-    const criticalCount = recent.filter(
-      d => d.level === "Critical"
-    ).length;
-
-    const avgScore = average(
-      recent.map(d => d.combinedScore)
-    );
-
-    const accelerationFlag = recent.some(
-      d => d.accelerationDetected === true
-    );
+    const criticalCount = recent.filter(d => d.level === "Critical").length;
+    const avgScore = average(recent.map(d => d.combinedScore));
+    const accelerationFlag = recent.some(d => d.accelerationDetected === true);
 
     if (
       criticalCount >= PRIVILEGE_CRITICAL_THRESHOLD ||
@@ -212,16 +193,10 @@ function authRequired(req, res, next) {
         actor: user.id,
         role: user.role,
         action: "PRIVILEGE_AUTO_DOWNGRADE",
-        detail: {
-          criticalCount,
-          avgScore,
-          accelerationFlag
-        }
+        detail: { criticalCount, avgScore, accelerationFlag }
       });
     }
   }
-
-  /* ================= REGISTER SESSION ================= */
 
   sessionAdapter.registerSession(
     user.id,
@@ -242,6 +217,27 @@ function authRequired(req, res, next) {
   return next();
 }
 
+/* ======================================================
+   ROLE GUARD (RESTORED)
+====================================================== */
+
+function requireRole(...roles) {
+  const allow = new Set(roles.map(r => norm(r)));
+
+  return (req, res, next) => {
+    if (!req.user) {
+      return error(res, 401, "Missing auth context");
+    }
+
+    if (!allow.has(norm(req.user.role))) {
+      return error(res, 403, "Forbidden");
+    }
+
+    return next();
+  };
+}
+
 module.exports = {
-  authRequired
+  authRequired,
+  requireRole
 };
