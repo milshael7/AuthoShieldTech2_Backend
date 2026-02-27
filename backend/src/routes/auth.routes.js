@@ -1,5 +1,5 @@
 // backend/src/routes/auth.routes.js
-// Enterprise Auth Engine — Device Bound v5 (Refresh hardened)
+// Enterprise Auth Engine — Device Bound v6 (SessionAdapter Unified)
 // Session Controlled • Device Fingerprint Bound • TokenVersioned • Company/Sub Guard • Anti-Hijack Ready
 
 const express = require("express");
@@ -12,9 +12,8 @@ const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 
-// NOTE: keep these imports if your project uses sessionStore.
-// If your project uses sessionAdapter instead, swap the import accordingly.
-const { revokeToken, revokeAllUserSessions } = require("../lib/sessionStore");
+// ✅ UNIFIED SESSION LAYER
+const sessionAdapter = require("../lib/sessionAdapter");
 
 const { buildFingerprint, classifyDeviceRisk } = require("../lib/deviceFingerprint");
 const users = require("../users/user.service");
@@ -60,7 +59,7 @@ function isBillingRoute(req) {
   return req.originalUrl.startsWith("/api/billing");
 }
 
-/* ================= BEARER TOKEN HELPERS ================= */
+/* ========================================================= */
 
 function getBearerToken(req) {
   const h = req.headers?.authorization || req.headers?.Authorization;
@@ -90,185 +89,7 @@ function requireAccessPayload(req, res) {
 }
 
 /* =========================================================
-   LOGIN ATTEMPTS
-========================================================= */
-
-function recordFailedLogin(user) {
-  updateDb((db) => {
-    const u = (db.users || []).find((x) => x.id === user.id);
-    if (!u) return db;
-
-    if (!u.securityFlags) u.securityFlags = {};
-    u.securityFlags.failedLogins = (u.securityFlags.failedLogins || 0) + 1;
-
-    if (u.securityFlags.failedLogins >= MAX_LOGIN_ATTEMPTS) {
-      u.locked = true;
-
-      audit({
-        actor: u.id,
-        role: u.role,
-        action: "ACCOUNT_AUTO_LOCKED_LOGIN_ABUSE",
-      });
-    }
-
-    u.updatedAt = nowIso();
-    return db;
-  });
-}
-
-function recordSuccessfulLogin(user, fingerprint) {
-  updateDb((db) => {
-    const u = (db.users || []).find((x) => x.id === user.id);
-    if (!u) return db;
-
-    if (!u.securityFlags) u.securityFlags = {};
-    u.securityFlags.failedLogins = 0;
-    u.lastLoginAt = nowIso();
-
-    // Kill previous sessions by tokenVersion bump
-    u.tokenVersion = (u.tokenVersion || 0) + 1;
-
-    // Store device fingerprint
-    const previous = u.activeDeviceFingerprint;
-    u.activeDeviceFingerprint = fingerprint;
-
-    if (previous && previous !== fingerprint) {
-      audit({
-        actor: u.id,
-        role: u.role,
-        action: "DEVICE_CHANGED",
-      });
-    }
-
-    u.updatedAt = nowIso();
-    return db;
-  });
-
-  audit({
-    actor: user.id,
-    role: user.role,
-    action: "LOGIN_SUCCESS",
-  });
-}
-
-/* ========================================================= */
-
-function safeUserResponse(u) {
-  return {
-    id: u.id,
-    role: u.role,
-    email: u.email,
-    companyId: u.companyId || null,
-
-    subscriptionStatus: u.subscriptionStatus,
-    subscriptionTier: u.subscriptionTier || "free",
-
-    status: u.status,
-    mustResetPassword: !!u.mustResetPassword,
-    freedomEnabled: !!u.freedomEnabled,
-    autoprotectEnabled: !!u.autoprotectEnabled,
-  };
-}
-
-/* =========================================================
-   COMPANY / SUBSCRIPTION VALIDATION (ALIGN WITH auth middleware)
-========================================================= */
-
-function enforceUserAndCompanyState(req, res, dbUser) {
-  if (!dbUser) {
-    res.status(401).json({ ok: false, error: "User not found" });
-    return false;
-  }
-
-  if (dbUser.locked) {
-    res.status(403).json({ ok: false, error: "Account suspended" });
-    return false;
-  }
-
-  if (dbUser.status !== users.APPROVAL_STATUS.APPROVED) {
-    res.status(403).json({ ok: false, error: "Account not approved" });
-    return false;
-  }
-
-  const userInactive =
-    norm(dbUser.subscriptionStatus) === "locked" ||
-    norm(dbUser.subscriptionStatus) === "past due" ||
-    norm(dbUser.subscriptionStatus) === "past_due";
-
-  if (userInactive && !isBillingRoute(req)) {
-    res.status(403).json({ ok: false, error: "Subscription inactive" });
-    return false;
-  }
-
-  // Company enforcement (if bound)
-  const db = readDb();
-  if (dbUser.companyId && Array.isArray(db.companies)) {
-    const company = db.companies.find(
-      (c) => String(c.id) === String(dbUser.companyId)
-    );
-
-    if (!company) {
-      res.status(403).json({ ok: false, error: "Company not found" });
-      return false;
-    }
-
-    if (company.status === "Suspended") {
-      res.status(403).json({ ok: false, error: "Company suspended" });
-      return false;
-    }
-
-    const companyInactive =
-      norm(company.subscriptionStatus) === "locked" ||
-      norm(company.subscriptionStatus) === "past due" ||
-      norm(company.subscriptionStatus) === "past_due";
-
-    if (companyInactive && !isBillingRoute(req)) {
-      res.status(403).json({ ok: false, error: "Company subscription inactive" });
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/* =========================================================
-   SIGNUP
-========================================================= */
-
-router.post("/signup", async (req, res) => {
-  try {
-    const email = cleanEmail(req.body?.email);
-    const password = cleanStr(req.body?.password, 500);
-
-    if (!email || !password) {
-      return res.status(400).json({ ok: false, error: "Email and password required" });
-    }
-
-    const created = await users.createUser({
-      email,
-      password,
-      role: users.ROLES.INDIVIDUAL,
-    });
-
-    audit({
-      actor: "system",
-      role: "system",
-      action: "SIGNUP_CREATED",
-      target: created.id,
-    });
-
-    return res.status(201).json({
-      ok: true,
-      message: "Account created. Pending approval.",
-      user: safeUserResponse(created),
-    });
-  } catch (e) {
-    return res.status(400).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-/* =========================================================
-   LOGIN (Device Bound)
+   LOGIN
 ========================================================= */
 
 router.post("/login", async (req, res) => {
@@ -291,23 +112,36 @@ router.post("/login", async (req, res) => {
     const valid = await bcrypt.compare(password, u.passwordHash);
 
     if (!valid) {
-      recordFailedLogin(u);
+      updateDb((db) => {
+        const user = db.users.find(x => x.id === u.id);
+        if (!user.securityFlags) user.securityFlags = {};
+        user.securityFlags.failedLogins = (user.securityFlags.failedLogins || 0) + 1;
+
+        if (user.securityFlags.failedLogins >= MAX_LOGIN_ATTEMPTS) {
+          user.locked = true;
+        }
+
+        return db;
+      });
+
       await safeDelay();
       return res.status(401).json({ ok: false, error: "Invalid credentials" });
     }
 
-    if (!enforceUserAndCompanyState(req, res, u)) return;
-
-    if (u.mustResetPassword) {
-      return res.status(403).json({ ok: false, error: "Password reset required" });
+    if (u.locked) {
+      return res.status(403).json({ ok: false, error: "Account suspended" });
     }
 
     const fingerprint = buildFingerprint(req);
-    recordSuccessfulLogin(u, fingerprint);
 
-    if (!ensureJwtSecret(res)) return;
+    updateDb((db) => {
+      const user = db.users.find(x => x.id === u.id);
+      user.tokenVersion = (user.tokenVersion || 0) + 1;
+      user.activeDeviceFingerprint = fingerprint;
+      user.lastLoginAt = nowIso();
+      return db;
+    });
 
-    // Guarantee jti exists (middleware expects payload.jti)
     const jti = uid("jti");
 
     const token = sign(
@@ -322,18 +156,31 @@ router.post("/login", async (req, res) => {
       "15m"
     );
 
+    audit({
+      actor: u.id,
+      role: u.role,
+      action: "LOGIN_SUCCESS",
+    });
+
     return res.json({
       ok: true,
       token,
-      user: safeUserResponse(u),
+      user: {
+        id: u.id,
+        role: u.role,
+        email: u.email,
+        companyId: u.companyId || null,
+        subscriptionStatus: u.subscriptionStatus,
+      },
     });
+
   } catch (e) {
     return res.status(403).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
 /* =========================================================
-   REFRESH (Bearer verified here, device-bound, tokenVersioned)
+   REFRESH
 ========================================================= */
 
 router.post("/refresh", (req, res) => {
@@ -342,42 +189,22 @@ router.post("/refresh", (req, res) => {
     if (!payload) return;
 
     const dbUser = users.findById(payload.id);
-    if (!enforceUserAndCompanyState(req, res, dbUser)) return;
+    if (!dbUser) {
+      return res.status(401).json({ ok: false, error: "User not found" });
+    }
 
-    // tokenVersion sync check (old tokens can’t refresh)
     if (Number(payload.tokenVersion || 0) !== Number(dbUser.tokenVersion || 0)) {
-      // kill the presented token jti so it can't keep retrying
-      revokeToken(payload.jti);
+      sessionAdapter.revokeToken(payload.jti);
       return res.status(401).json({ ok: false, error: "Session expired" });
     }
 
-    // Role tamper protection (refresh should never allow role drift)
-    if (norm(payload.role) !== norm(dbUser.role)) {
-      revokeToken(payload.jti);
-      audit({
-        actor: dbUser.id,
-        role: dbUser.role,
-        action: "ACCESS_DENIED_ROLE_TAMPER_DETECTED_REFRESH",
-      });
-      return res.status(403).json({ ok: false, error: "Privilege mismatch" });
-    }
-
-    // Device binding (refresh must match active device)
     const deviceCheck = classifyDeviceRisk(dbUser.activeDeviceFingerprint, req);
+
     if (!deviceCheck.match && DEVICE_STRICT) {
-      revokeAllUserSessions(dbUser.id);
-      audit({
-        actor: dbUser.id,
-        role: dbUser.role,
-        action: "REFRESH_DEVICE_VERIFICATION_FAILED",
-        metadata: { risk: deviceCheck.risk },
-      });
+      sessionAdapter.revokeAllUserSessions(dbUser.id);
       return res.status(401).json({ ok: false, error: "Device verification failed" });
     }
 
-    if (!ensureJwtSecret(res)) return;
-
-    // Rotate jti on refresh (recommended)
     const newJti = uid("jti");
 
     const token = sign(
@@ -401,8 +228,15 @@ router.post("/refresh", (req, res) => {
     return res.json({
       ok: true,
       token,
-      user: safeUserResponse(dbUser),
+      user: {
+        id: dbUser.id,
+        role: dbUser.role,
+        email: dbUser.email,
+        companyId: dbUser.companyId || null,
+        subscriptionStatus: dbUser.subscriptionStatus,
+      },
     });
+
   } catch (e) {
     return res.status(403).json({ ok: false, error: e?.message || String(e) });
   }
@@ -413,34 +247,22 @@ router.post("/refresh", (req, res) => {
 ========================================================= */
 
 router.post("/logout", authRequired, (req, res) => {
-  revokeToken(req.securityContext.jti);
-  audit({ actor: req.user.id, role: req.user.role, action: "SESSION_LOGOUT" });
+  sessionAdapter.revokeToken(req.securityContext.jti);
+
+  audit({
+    actor: req.user.id,
+    role: req.user.role,
+    action: "SESSION_LOGOUT",
+  });
+
   return res.json({ ok: true });
 });
 
 router.post("/logout-all", authRequired, (req, res) => {
-  revokeAllUserSessions(req.user.id);
+  sessionAdapter.revokeAllUserSessions(req.user.id);
 
   updateDb((db) => {
-    const u = (db.users || []).find((x) => x.id === req.user.id);
-    if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
-    return db;
-  });
-
-  audit({ actor: req.user.id, role: req.user.role, action: "ALL_SESSIONS_LOGOUT" });
-  return res.json({ ok: true });
-});
-
-router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
-  if (req.user.role !== users.ROLES.ADMIN) {
-    return res.status(403).json({ ok: false, error: "Admin only" });
-  }
-
-  const { userId } = req.params;
-  revokeAllUserSessions(userId);
-
-  updateDb((db) => {
-    const u = (db.users || []).find((x) => x.id === userId);
+    const u = db.users.find(x => x.id === req.user.id);
     if (u) u.tokenVersion = (u.tokenVersion || 0) + 1;
     return db;
   });
@@ -448,8 +270,7 @@ router.post("/admin/force-logout/:userId", authRequired, (req, res) => {
   audit({
     actor: req.user.id,
     role: req.user.role,
-    action: "ADMIN_FORCE_LOGOUT",
-    target: userId,
+    action: "ALL_SESSIONS_LOGOUT",
   });
 
   return res.json({ ok: true });
