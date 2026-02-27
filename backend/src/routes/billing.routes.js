@@ -1,22 +1,14 @@
 // backend/src/routes/billing.routes.js
-// Billing & Subscription Control — Enterprise Hardened v2
-// Stripe Safe • Entitlement Synced • Revenue Protected • Session Safe
+// AutoShield Tech — Billing & Subscription Control v3
+// Stripe Safe • ToolGrant Aligned • Revenue Accurate • Session Secure • Audit Clean
 
 const express = require("express");
 const router = express.Router();
 
 const { authRequired, requireRole } = require("../middleware/auth");
-const users = require("../users/user.service");
-const companies = require("../companies/company.service");
-const { readDb, writeDb } = require("../lib/db");
+const { readDb, writeDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 const sessionAdapter = require("../lib/sessionAdapter");
-
-const {
-  grantTool,
-  revokeTool,
-  revokeAllTools
-} = require("../lib/entitlement.engine");
 
 const {
   createCheckoutSession,
@@ -34,7 +26,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 /* =========================================================
-   PLAN CONTROL
+   PLAN DEFINITIONS (Aligned With Tool Governance)
 ========================================================= */
 
 const PLAN_TOOL_MAP = {
@@ -45,38 +37,55 @@ const PLAN_TOOL_MAP = {
 
 const ALLOWED_PLANS = Object.keys(PLAN_TOOL_MAP);
 
+/* ========================================================= */
+
 function clean(v, max = 200) {
   return String(v || "").trim().slice(0, max);
 }
 
-function requireUser(req, res) {
-  if (!req.user?.id) {
-    res.status(401).json({ ok: false, error: "Invalid auth context" });
-    return null;
-  }
-  return req.user;
-}
-
-function saveUser(updatedUser) {
-  const db = readDb();
-  const idx = db.users.findIndex((u) => String(u.id) === String(updatedUser.id));
-  if (idx !== -1) {
-    db.users[idx] = updatedUser;
-    writeDb(db);
-  }
+function normalize(v) {
+  return String(v || "").trim().toLowerCase();
 }
 
 function validatePlan(planType) {
   return ALLOWED_PLANS.includes(planType);
 }
 
-function grantPlanTools(userId, planType) {
-  const tools = PLAN_TOOL_MAP[planType] || [];
-  tools.forEach(toolId => grantTool(userId, toolId));
+function findUser(db, userId) {
+  return (db.users || []).find(u => String(u.id) === String(userId));
 }
 
-function revokePlanTools(userId) {
-  revokeAllTools(userId);
+/* =========================================================
+   TOOL GRANT SYNC (NEW SYSTEM)
+========================================================= */
+
+function grantPlanTools(db, userId, planType) {
+  const tools = PLAN_TOOL_MAP[planType] || [];
+
+  const grants = tools.map(toolId => ({
+    id: `plan_${toolId}_${Date.now()}`,
+    toolId,
+    userId,
+    companyId: null,
+    durationMinutes: null,
+    expiresAt: new Date("2100-01-01").toISOString(), // long-term
+    approvedBy: "system_plan",
+    approvedByRole: "system",
+    createdAt: new Date().toISOString()
+  }));
+
+  db.toolGrants = db.toolGrants || [];
+
+  // Remove previous grants for this user
+  db.toolGrants = db.toolGrants.filter(g => g.userId !== userId);
+
+  db.toolGrants.push(...grants);
+}
+
+function revokePlanTools(db, userId) {
+  db.toolGrants = (db.toolGrants || []).filter(
+    g => g.userId !== userId
+  );
 }
 
 /* =========================================================
@@ -85,41 +94,22 @@ function revokePlanTools(userId) {
 
 router.get("/me", authRequired, (req, res) => {
   try {
-    const user = requireUser(req, res);
-    if (!user) return;
+    const db = readDb();
+    const user = findUser(db, req.user.id);
+    if (!user) return res.status(404).json({ ok: false });
 
-    const dbUser = users.findById(user.id);
-    if (!dbUser) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
-
-    let companyPlan = null;
-
-    if (dbUser.companyId) {
-      const company = companies.getCompany(dbUser.companyId);
-      if (company) {
-        companyPlan = {
-          tier: company.tier,
-          maxUsers: company.maxUsers,
-          status: company.status,
-          subscriptionStatus: company.subscriptionStatus || null,
-        };
-      }
-    }
-
-    res.json({
+    return res.json({
       ok: true,
       subscription: {
-        status: dbUser.subscriptionStatus,
-        stripeCustomerId: dbUser.stripeCustomerId || null,
-        stripeSubscriptionId: dbUser.stripeSubscriptionId || null,
-        companyPlan,
-        entitlements: dbUser.entitlements || { tools: [] }
+        status: user.subscriptionStatus,
+        plan: user.subscriptionTier || null,
+        stripeCustomerId: user.stripeCustomerId || null,
+        stripeSubscriptionId: user.stripeSubscriptionId || null,
       },
     });
 
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+  } catch {
+    return res.status(500).json({ ok: false });
   }
 });
 
@@ -129,21 +119,14 @@ router.get("/me", authRequired, (req, res) => {
 
 router.post("/checkout", authRequired, async (req, res) => {
   try {
-    const user = requireUser(req, res);
-    if (!user) return;
+    const db = readDb();
+    const user = findUser(db, req.user.id);
+    if (!user) return res.status(404).json({ ok: false });
 
     const type = clean(req.body?.type, 50);
 
     if (!validatePlan(type)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid subscription type",
-      });
-    }
-
-    const dbUser = users.findById(user.id);
-    if (!dbUser) {
-      return res.status(404).json({ ok: false, error: "User not found" });
+      return res.status(400).json({ ok: false, error: "Invalid plan type" });
     }
 
     const successUrl =
@@ -167,16 +150,16 @@ router.post("/checkout", authRequired, async (req, res) => {
     });
 
     audit({
-      actorId: user.id,
+      actor: user.id,
+      role: user.role,
       action: "SUBSCRIPTION_CHECKOUT_STARTED",
-      targetType: "Plan",
-      targetId: type,
+      detail: { plan: type }
     });
 
-    res.json({ ok: true, checkoutUrl });
+    return res.json({ ok: true, checkoutUrl });
 
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
+    return res.status(400).json({ ok: false, error: e.message });
   }
 });
 
@@ -187,41 +170,40 @@ router.post("/checkout", authRequired, async (req, res) => {
 router.post(
   "/admin/activate",
   authRequired,
-  requireRole(users.ROLES.ADMIN),
+  requireRole("admin"),
   (req, res) => {
     try {
+      const db = readDb();
+
       const userId = clean(req.body?.userId);
       const planType = clean(req.body?.planType);
 
       if (!validatePlan(planType)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Invalid plan type",
-        });
+        return res.status(400).json({ ok: false });
       }
 
-      const dbUser = users.findById(userId);
-      if (!dbUser) {
-        return res.status(404).json({ ok: false, error: "User not found" });
-      }
+      const user = findUser(db, userId);
+      if (!user) return res.status(404).json({ ok: false });
 
-      dbUser.subscriptionStatus = users.SUBSCRIPTION.ACTIVE;
-      saveUser(dbUser);
+      user.subscriptionStatus = "active";
+      user.subscriptionTier = normalize(planType);
 
-      grantPlanTools(userId, planType);
+      revokePlanTools(db, userId);
+      grantPlanTools(db, userId, planType);
+
+      writeDb(db);
 
       audit({
-        actorId: req.user.id,
-        action: "PLAN_ACTIVATED",
-        targetType: "User",
-        targetId: userId,
-        metadata: { planType },
+        actor: req.user.id,
+        role: req.user.role,
+        action: "ADMIN_PLAN_ACTIVATED",
+        detail: { userId, planType }
       });
 
-      res.json({ ok: true });
+      return res.json({ ok: true });
 
-    } catch (e) {
-      res.status(400).json({ ok: false, error: e.message });
+    } catch {
+      return res.status(500).json({ ok: false });
     }
   }
 );
@@ -232,41 +214,39 @@ router.post(
 
 router.post("/cancel", authRequired, async (req, res) => {
   try {
-    const user = requireUser(req, res);
-    if (!user) return;
+    const db = readDb();
+    const user = findUser(db, req.user.id);
+    if (!user) return res.status(404).json({ ok: false });
 
-    const dbUser = users.findById(user.id);
-    if (!dbUser?.stripeSubscriptionId) {
-      return res.status(400).json({
-        ok: false,
-        error: "No active subscription",
-      });
+    if (!user.stripeSubscriptionId) {
+      return res.status(400).json({ ok: false });
     }
 
     await cancelSubscription(user.id);
 
-    dbUser.subscriptionStatus = users.SUBSCRIPTION.LOCKED;
-    saveUser(dbUser);
+    user.subscriptionStatus = "locked";
+    user.subscriptionTier = null;
+    user.stripeSubscriptionId = null;
 
-    revokePlanTools(user.id);
+    revokePlanTools(db, user.id);
 
-    // 🔥 CRITICAL: revoke sessions immediately
+    writeDb(db);
+
     sessionAdapter.revokeAllUserSessions(user.id);
 
     audit({
-      actorId: user.id,
-      action: "SUBSCRIPTION_CANCELLED",
-      targetType: "User",
-      targetId: user.id,
+      actor: user.id,
+      role: user.role,
+      action: "SUBSCRIPTION_CANCELLED"
     });
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "Subscription cancelled and entitlements revoked",
+      message: "Subscription cancelled and access revoked",
     });
 
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
+    return res.status(400).json({ ok: false, error: e.message });
   }
 });
 
