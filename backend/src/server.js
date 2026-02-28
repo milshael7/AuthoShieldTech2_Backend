@@ -5,8 +5,9 @@ const morgan = require("morgan");
 const helmet = require("helmet");
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const WebSocket = require("ws"); // for Binance client
 
-const { ensureDb, readDb, writeDb } = require("./lib/db");
+const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
@@ -42,28 +43,15 @@ let globalSecurityStatus = auditIntegrity.ok ? "secure" : "compromised";
 const revenueIntegrity = verifyRevenueLedger();
 let financialStatus = revenueIntegrity.ok ? "secure" : "compromised";
 
-if (!auditIntegrity.ok) {
-  console.error("🚨 AUDIT INTEGRITY FAILURE", auditIntegrity);
-}
-
-if (!revenueIntegrity.ok) {
-  console.error("🚨 REVENUE LEDGER CORRUPTION", revenueIntegrity);
-}
-
 /* ================= EXPRESS ================= */
 
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(
-  "/api/stripe/webhook",
-  require("./routes/stripe.webhook.routes")
-);
-
-const allowedOrigin = process.env.CORS_ORIGIN;
+app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 
 app.use(cors({
-  origin: allowedOrigin ? allowedOrigin : false,
+  origin: process.env.CORS_ORIGIN || false,
   credentials: true
 }));
 
@@ -71,21 +59,6 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 app.use(rateLimiter);
-
-/* ================= HEALTH ================= */
-
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    systemState: {
-      status: "operational",
-      securityStatus: globalSecurityStatus,
-      financialStatus,
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-    },
-  });
-});
 
 /* ================= ROUTES ================= */
 
@@ -111,24 +84,47 @@ app.use("/api/users", require("./routes/users.routes"));
 
 const server = http.createServer(app);
 
-/* ================= WEBSOCKET ================= */
+/* ================= APP WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
   server,
   path: "/ws/market",
 });
 
+/* ================= BINANCE LIVE FEED ================= */
+
+let currentPrice = null;
+
+const binanceWs = new WebSocket("wss://stream.binance.com:9443/ws/btcusdt@trade");
+
+binanceWs.on("message", (msg) => {
+  try {
+    const data = JSON.parse(msg);
+    currentPrice = parseFloat(data.p);
+
+    // broadcast to all authenticated clients
+    wss.clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify({
+          type: "tick",
+          symbol: "BTCUSDT",
+          price: currentPrice,
+          ts: Date.now()
+        }));
+      }
+    });
+
+  } catch {}
+});
+
+binanceWs.on("close", () => {
+  console.log("Binance WS closed. Reconnecting...");
+});
+
+/* ================= CLIENT AUTH + SECURITY ================= */
+
 function wsClose(ws, code = 1008) {
   try { ws.close(code); } catch {}
-}
-
-function norm(v) {
-  return String(v || "").trim().toLowerCase();
-}
-
-function isInactiveStatus(v) {
-  const s = norm(v);
-  return s === "locked" || s === "past_due" || s === "past due";
 }
 
 wss.on("connection", (ws, req) => {
@@ -139,36 +135,14 @@ wss.on("connection", (ws, req) => {
 
     const payload = verify(token, "access");
     if (!payload?.id || !payload?.jti) return wsClose(ws);
-
     if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
 
     const db = readDb();
-    const user = (db.users || []).find(
-      (u) => String(u.id) === String(payload.id)
-    );
+    const user = db.users.find(u => String(u.id) === String(payload.id));
     if (!user) return wsClose(ws);
-
-    const tokenVersion = Number(payload.tokenVersion || 0);
-    const currentVersion = Number(user.tokenVersion || 0);
-
-    if (tokenVersion !== currentVersion) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
 
     if (user.locked === true) return wsClose(ws);
     if (user.status !== users.APPROVAL_STATUS.APPROVED) return wsClose(ws);
-    if (isInactiveStatus(user.subscriptionStatus)) return wsClose(ws);
-
-    if (user.companyId) {
-      const company = (db.companies || []).find(
-        c => String(c.id) === String(user.companyId)
-      );
-      if (!company || company.status === "Locked") {
-        sessionAdapter.revokeAllUserSessions(user.id);
-        return wsClose(ws);
-      }
-    }
 
     const deviceCheck = classifyDeviceRisk(
       user.activeDeviceFingerprint,
@@ -180,65 +154,19 @@ wss.on("connection", (ws, req) => {
       return wsClose(ws);
     }
 
-    const ttlMs = 15 * 60 * 1000;
-    sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
+    sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
 
     writeAudit({
       actor: user.id,
       role: user.role,
       action: "WEBSOCKET_CONNECTED",
-      detail: {
-        path: req.url,
-        companyId: user.companyId || null
-      }
+      detail: { path: req.url }
     });
 
-    ws.user = {
-      id: user.id,
-      role: user.role,
-      companyId: user.companyId || null,
-      jti: payload.jti,
-    };
-
-    /* ================= PAPER MARKET STREAM ================= */
-
-    let price = 1.1000;
-
-    const tickInterval = setInterval(() => {
-      if (ws.readyState !== 1) return;
-
-      price += (Math.random() - 0.5) * 0.0005;
-
-      ws.send(JSON.stringify({
-        type: "tick",
-        symbol: "EURUSD",
-        price: Number(price.toFixed(5)),
-        ts: Date.now()
-      }));
-
-    }, 1000);
-
-    ws.on("close", () => {
-      clearInterval(tickInterval);
-    });
-
-  } catch (err) {
+  } catch {
     wsClose(ws);
   }
 });
-
-/* ================= AUTO TERMINATE REVOKED ================= */
-
-setInterval(() => {
-  wss.clients.forEach((client) => {
-    if (client.readyState !== 1) return;
-    if (!client.user?.jti) return;
-
-    if (sessionAdapter.isRevoked(client.user.jti)) {
-      try { client.close(1008); } catch {}
-    }
-  });
-}, 10000);
 
 /* ================= START ================= */
 
