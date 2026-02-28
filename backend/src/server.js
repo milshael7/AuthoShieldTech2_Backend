@@ -5,7 +5,6 @@ const morgan = require("morgan");
 const helmet = require("helmet");
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const WebSocket = require("ws"); // for Binance client
 
 const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
@@ -37,11 +36,8 @@ users.ensureAdminFromEnv();
 
 /* ================= INTEGRITY ================= */
 
-const auditIntegrity = verifyAuditIntegrity();
-let globalSecurityStatus = auditIntegrity.ok ? "secure" : "compromised";
-
-const revenueIntegrity = verifyRevenueLedger();
-let financialStatus = revenueIntegrity.ok ? "secure" : "compromised";
+verifyAuditIntegrity();
+verifyRevenueLedger();
 
 /* ================= EXPRESS ================= */
 
@@ -84,47 +80,15 @@ app.use("/api/users", require("./routes/users.routes"));
 
 const server = http.createServer(app);
 
-/* ================= APP WEBSOCKET ================= */
+/* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
   server,
   path: "/ws/market",
 });
 
-/* ================= BINANCE LIVE FEED ================= */
-
-let currentPrice = null;
-
-const binanceWs = new WebSocket("wss://stream.binance.com:9443/ws/btcusdt@trade");
-
-binanceWs.on("message", (msg) => {
-  try {
-    const data = JSON.parse(msg);
-    currentPrice = parseFloat(data.p);
-
-    // broadcast to all authenticated clients
-    wss.clients.forEach(client => {
-      if (client.readyState === 1) {
-        client.send(JSON.stringify({
-          type: "tick",
-          symbol: "BTCUSDT",
-          price: currentPrice,
-          ts: Date.now()
-        }));
-      }
-    });
-
-  } catch {}
-});
-
-binanceWs.on("close", () => {
-  console.log("Binance WS closed. Reconnecting...");
-});
-
-/* ================= CLIENT AUTH + SECURITY ================= */
-
-function wsClose(ws, code = 1008) {
-  try { ws.close(code); } catch {}
+function wsClose(ws) {
+  try { ws.close(); } catch {}
 }
 
 wss.on("connection", (ws, req) => {
@@ -138,7 +102,9 @@ wss.on("connection", (ws, req) => {
     if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
 
     const db = readDb();
-    const user = db.users.find(u => String(u.id) === String(payload.id));
+    const user = (db.users || []).find(
+      (u) => String(u.id) === String(payload.id)
+    );
     if (!user) return wsClose(ws);
 
     if (user.locked === true) return wsClose(ws);
@@ -161,6 +127,28 @@ wss.on("connection", (ws, req) => {
       role: user.role,
       action: "WEBSOCKET_CONNECTED",
       detail: { path: req.url }
+    });
+
+    /* ================= STABLE PAPER STREAM ================= */
+
+    let price = 1.1000;
+
+    const tickInterval = setInterval(() => {
+      if (ws.readyState !== 1) return;
+
+      price += (Math.random() - 0.5) * 0.002;
+
+      ws.send(JSON.stringify({
+        type: "tick",
+        symbol: "EURUSD",
+        price: Number(price.toFixed(5)),
+        ts: Date.now()
+      }));
+
+    }, 500); // faster movement
+
+    ws.on("close", () => {
+      clearInterval(tickInterval);
     });
 
   } catch {
