@@ -148,8 +148,6 @@ wss.on("connection", (ws, req) => {
     );
     if (!user) return wsClose(ws);
 
-    /* ===== TOKEN VERSION ===== */
-
     const tokenVersion = Number(payload.tokenVersion || 0);
     const currentVersion = Number(user.tokenVersion || 0);
 
@@ -158,36 +156,19 @@ wss.on("connection", (ws, req) => {
       return wsClose(ws);
     }
 
-    /* ===== ACCOUNT LOCK ===== */
-
-    if (user.locked === true) {
-      return wsClose(ws);
-    }
-
-    if (user.status !== users.APPROVAL_STATUS.APPROVED) {
-      return wsClose(ws);
-    }
-
-    /* ===== SUBSCRIPTION ===== */
-
-    if (isInactiveStatus(user.subscriptionStatus)) {
-      return wsClose(ws);
-    }
-
-    /* ===== COMPANY STATUS ===== */
+    if (user.locked === true) return wsClose(ws);
+    if (user.status !== users.APPROVAL_STATUS.APPROVED) return wsClose(ws);
+    if (isInactiveStatus(user.subscriptionStatus)) return wsClose(ws);
 
     if (user.companyId) {
       const company = (db.companies || []).find(
         c => String(c.id) === String(user.companyId)
       );
-
       if (!company || company.status === "Locked") {
         sessionAdapter.revokeAllUserSessions(user.id);
         return wsClose(ws);
       }
     }
-
-    /* ===== DEVICE BINDING ===== */
 
     const deviceCheck = classifyDeviceRisk(
       user.activeDeviceFingerprint,
@@ -198,8 +179,6 @@ wss.on("connection", (ws, req) => {
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws);
     }
-
-    /* ===== REGISTER SESSION ===== */
 
     const ttlMs = 15 * 60 * 1000;
     sessionAdapter.registerSession(user.id, payload.jti, ttlMs);
@@ -220,6 +199,28 @@ wss.on("connection", (ws, req) => {
       companyId: user.companyId || null,
       jti: payload.jti,
     };
+
+    /* ================= PAPER MARKET STREAM ================= */
+
+    let price = 1.1000;
+
+    const tickInterval = setInterval(() => {
+      if (ws.readyState !== 1) return;
+
+      price += (Math.random() - 0.5) * 0.0005;
+
+      ws.send(JSON.stringify({
+        type: "tick",
+        symbol: "EURUSD",
+        price: Number(price.toFixed(5)),
+        ts: Date.now()
+      }));
+
+    }, 1000);
+
+    ws.on("close", () => {
+      clearInterval(tickInterval);
+    });
 
   } catch (err) {
     wsClose(ws);
