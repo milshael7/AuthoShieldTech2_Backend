@@ -1,165 +1,232 @@
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const helmet = require("helmet");
-const http = require("http");
-const { WebSocketServer } = require("ws");
+// frontend/src/pages/TradingRoom.jsx
+// ============================================================
+// TRADING ROOM — REAL BACKEND LIVE STREAM CONNECTED
+// ============================================================
 
-const { ensureDb, readDb } = require("./lib/db");
-const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
-const { verify } = require("./lib/jwt");
-const sessionAdapter = require("./lib/sessionAdapter");
-const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
-const { verifyRevenueLedger } = require("./lib/revenueIntegrity");
+import React, { useEffect, useRef, useState } from "react";
+import { createChart } from "lightweight-charts";
+import { getSavedUser, getToken } from "../lib/api.js";
+import { Navigate } from "react-router-dom";
 
-const users = require("./users/user.service");
-const tenantMiddleware = require("./middleware/tenant");
-const rateLimiter = require("./middleware/rateLimiter");
-const zeroTrust = require("./middleware/zeroTrust");
-
-/* ================= SAFE BOOT ================= */
-
-function requireEnv(name) {
-  if (!process.env[name]) {
-    console.error(`[BOOT] Missing required env var: ${name}`);
-    process.exit(1);
+function timeframeToSeconds(tf) {
+  switch (tf) {
+    case "1M": return 60;
+    case "5M": return 300;
+    case "15M": return 900;
+    case "30M": return 1800;
+    case "1H": return 3600;
+    case "4H": return 14400;
+    case "1D": return 86400;
+    default: return 60;
   }
 }
 
-requireEnv("JWT_SECRET");
-requireEnv("STRIPE_SECRET_KEY");
-requireEnv("STRIPE_WEBHOOK_SECRET");
+export default function TradingRoom() {
 
-ensureDb();
-users.ensureAdminFromEnv();
+  const user = getSavedUser();
+  const role = String(user?.role || "").toLowerCase();
+  if (!user || (role !== "admin" && role !== "manager")) {
+    return <Navigate to="/admin" replace />;
+  }
 
-/* ================= INTEGRITY ================= */
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const containerRef = useRef(null);
+  const wsRef = useRef(null);
+  const candleDataRef = useRef([]);
 
-verifyAuditIntegrity();
-verifyRevenueLedger();
+  const [timeframe, setTimeframe] = useState("1M");
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [activeTab, setActiveTab] = useState("positions");
 
-/* ================= EXPRESS ================= */
+  // ================= CHART INIT =================
 
-const app = express();
-app.set("trust proxy", 1);
+  useEffect(() => {
+    if (!containerRef.current) return;
 
-app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
+    chartRef.current = createChart(containerRef.current, {
+      layout: {
+        background: { color: "#0f1626" },
+        textColor: "#d1d5db",
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,.04)" },
+        horzLines: { color: "rgba(255,255,255,.04)" },
+      },
+      width: containerRef.current.clientWidth,
+      height: containerRef.current.clientHeight,
+    });
 
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || false,
-  credentials: true
-}));
+    seriesRef.current = chartRef.current.addCandlestickSeries({
+      upColor: "#16a34a",
+      downColor: "#dc2626",
+      wickUpColor: "#16a34a",
+      wickDownColor: "#dc2626",
+      borderUpColor: "#16a34a",
+      borderDownColor: "#dc2626",
+    });
 
-app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
-app.use(morgan("dev"));
-app.use(rateLimiter);
+    return () => chartRef.current?.remove();
+  }, []);
 
-/* ================= ROUTES ================= */
+  // ================= WEBSOCKET CONNECT =================
 
-app.use("/api/auth", require("./routes/auth.routes"));
-app.use(tenantMiddleware);
+  useEffect(() => {
 
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) return next();
-  return zeroTrust(req, res, next);
-});
+    const token = getToken();
+    if (!token) return;
 
-app.use("/api/admin", require("./routes/admin.routes"));
-app.use("/api/security", require("./routes/security.routes"));
-app.use("/api/incidents", require("./routes/incidents.routes"));
-app.use("/api/tools", require("./routes/tools.routes"));
-app.use("/api/entitlements", require("./routes/entitlements.routes"));
-app.use("/api/billing", require("./routes/billing.routes"));
-app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
-app.use("/api/company", require("./routes/company.routes"));
-app.use("/api/users", require("./routes/users.routes"));
+    const ws = new WebSocket(`ws://localhost:5000/ws/market?token=${token}`);
+    wsRef.current = ws;
 
-/* ================= SERVER ================= */
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
 
-const server = http.createServer(app);
+      if (data.type === "tick") {
+        updateCandle(data.price, data.ts);
+      }
+    };
 
-/* ================= WEBSOCKET ================= */
+    return () => ws.close();
 
-const wss = new WebSocketServer({
-  server,
-  path: "/ws/market",
-});
+  }, [timeframe]);
 
-function wsClose(ws) {
-  try { ws.close(); } catch {}
-}
+  // ================= CANDLE ENGINE =================
 
-wss.on("connection", (ws, req) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const token = url.searchParams.get("token");
-    if (!token) return wsClose(ws);
+  function updateCandle(price, timestamp) {
 
-    const payload = verify(token, "access");
-    if (!payload?.id || !payload?.jti) return wsClose(ws);
-    if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
+    const tfSeconds = timeframeToSeconds(timeframe);
+    const bucket = Math.floor(timestamp / 1000 / tfSeconds) * tfSeconds;
 
-    const db = readDb();
-    const user = (db.users || []).find(
-      (u) => String(u.id) === String(payload.id)
-    );
-    if (!user) return wsClose(ws);
+    const last = candleDataRef.current[candleDataRef.current.length - 1];
 
-    if (user.locked === true) return wsClose(ws);
-    if (user.status !== users.APPROVAL_STATUS.APPROVED) return wsClose(ws);
+    if (!last || last.time !== bucket) {
+      const newCandle = {
+        time: bucket,
+        open: last ? last.close : price,
+        high: price,
+        low: price,
+        close: price
+      };
 
-    const deviceCheck = classifyDeviceRisk(
-      user.activeDeviceFingerprint,
-      req
-    );
+      candleDataRef.current.push(newCandle);
+      seriesRef.current.update(newCandle);
+    } else {
+      last.high = Math.max(last.high, price);
+      last.low = Math.min(last.low, price);
+      last.close = price;
 
-    if (!deviceCheck.match) {
-      sessionAdapter.revokeAllUserSessions(user.id);
-      return wsClose(ws);
+      seriesRef.current.update(last);
     }
 
-    sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "WEBSOCKET_CONNECTED",
-      detail: { path: req.url }
-    });
-
-    /* ================= STABLE PAPER STREAM ================= */
-
-    let price = 1.1000;
-
-    const tickInterval = setInterval(() => {
-      if (ws.readyState !== 1) return;
-
-      price += (Math.random() - 0.5) * 0.002;
-
-      ws.send(JSON.stringify({
-        type: "tick",
-        symbol: "EURUSD",
-        price: Number(price.toFixed(5)),
-        ts: Date.now()
-      }));
-
-    }, 500); // faster movement
-
-    ws.on("close", () => {
-      clearInterval(tickInterval);
-    });
-
-  } catch {
-    wsClose(ws);
+    chartRef.current.timeScale().scrollToRealTime();
   }
-});
 
-/* ================= START ================= */
+  // ================= UI =================
 
-const port = process.env.PORT || 5000;
+  return (
+    <div style={{ display: "flex", height: "100vh", background: "#0a0f1c", color: "#fff" }}>
 
-server.listen(port, () => {
-  console.log(`[BOOT] Running on port ${port}`);
-});
+      <div style={{ width: 60, background: "#111827" }} />
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: 20 }}>
+
+        {/* HEADER */}
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+          <div style={{ fontWeight: 700 }}>
+            EURUSD • LIVE
+          </div>
+
+          <button
+            onClick={() => setPanelOpen(!panelOpen)}
+            style={{
+              padding: "6px 14px",
+              background: "#1e2536",
+              border: "1px solid rgba(255,255,255,.1)",
+              cursor: "pointer"
+            }}
+          >
+            Execute Order
+          </button>
+        </div>
+
+        {/* TIMEFRAME BUTTONS */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          {["1M","5M","15M","30M","1H","4H","1D"].map(tf => (
+            <button
+              key={tf}
+              onClick={() => setTimeframe(tf)}
+              style={{
+                padding: "4px 10px",
+                background: timeframe === tf ? "#2563eb" : "transparent",
+                border: "1px solid rgba(255,255,255,.1)",
+                color: "#fff",
+                cursor: "pointer"
+              }}
+            >
+              {tf}
+            </button>
+          ))}
+        </div>
+
+        {/* CHART */}
+        <div style={{
+          flex: 1,
+          background: "#111827",
+          borderRadius: 12,
+          overflow: "hidden",
+        }}>
+          <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+        </div>
+
+        {/* BOTTOM PANEL */}
+        <div style={{
+          height: 220,
+          marginTop: 20,
+          background: "#111827",
+          borderRadius: 12,
+          border: "1px solid rgba(255,255,255,.08)",
+          display: "flex",
+          flexDirection: "column"
+        }}>
+          <div style={{ display: "flex", borderBottom: "1px solid rgba(255,255,255,.08)" }}>
+            {["positions","orders","news","signals"].map(tab => (
+              <div
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                style={{
+                  padding: "12px 18px",
+                  cursor: "pointer",
+                  background: activeTab === tab ? "#1e2536" : "transparent"
+                }}
+              >
+                {tab.toUpperCase()}
+              </div>
+            ))}
+          </div>
+
+          <div style={{ flex: 1, padding: 16 }}>
+            {activeTab === "positions" && <div>No open positions</div>}
+            {activeTab === "orders" && <div>No pending orders</div>}
+            {activeTab === "news" && <div>No live news</div>}
+            {activeTab === "signals" && <div>Waiting for AI signal...</div>}
+          </div>
+        </div>
+
+      </div>
+
+      {panelOpen && (
+        <div style={{
+          width: 360,
+          background: "#111827",
+          borderLeft: "1px solid rgba(255,255,255,.08)",
+          padding: 20
+        }}>
+          <div style={{ fontWeight: 700 }}>AI Engine Status</div>
+          <div style={{ marginTop: 10 }}>State: LIVE STREAM ACTIVE</div>
+        </div>
+      )}
+
+    </div>
+  );
+}
