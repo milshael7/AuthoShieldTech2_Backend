@@ -1,6 +1,6 @@
 // backend/src/routes/security.routes.js
-// Enterprise Security Firewall — ZeroTrust Enforcement v8
-// Deterministic Tenant Scope • Adaptive Enforcement • Memory Bounded
+// Enterprise Security Firewall — ZeroTrust Enforcement v9
+// Deterministic Tenant Scope • Adaptive Enforcement • Memory Bounded • Audit Safe
 
 const express = require("express");
 const router = express.Router();
@@ -8,7 +8,6 @@ const router = express.Router();
 const { authRequired } = require("../middleware/auth");
 const { readDb, writeDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
-const { getActiveSessionCount } = require("../lib/sessionStore");
 
 const MAX_SECURITY_EVENTS = 2000;
 const DEFAULT_ENFORCEMENT_THRESHOLD = 75;
@@ -35,26 +34,43 @@ function normalizeArray(v) {
   return Object.values(v);
 }
 
+/* =========================================================
+   TENANT SCOPING
+========================================================= */
+
 function getScopedCompanyIds(req) {
+
   if (isAdmin(req.user)) {
+
     if (!req.companyId) return null;
-    return [req.companyId];
+    return [String(req.companyId)];
+
   }
 
   if (isManager(req.user) && Array.isArray(req.user.managedCompanies)) {
+
     return req.user.managedCompanies.map(String);
+
   }
 
-  if (req.companyId) {
-    return [String(req.companyId)];
+  if (req.user.companyId) {
+
+    return [String(req.user.companyId)];
+
   }
 
   return [];
+
 }
 
 function scopeByCompany(items, companyIds) {
+
   if (companyIds === null) return items;
-  return items.filter(i => companyIds.includes(String(i.companyId)));
+
+  return items.filter(
+    i => companyIds.includes(String(i.companyId))
+  );
+
 }
 
 /* =========================================================
@@ -62,27 +78,34 @@ function scopeByCompany(items, companyIds) {
 ========================================================= */
 
 function calculateCompanyRisk(db, companyId) {
+
   const events = normalizeArray(db.securityEvents)
     .filter(e => String(e.companyId) === String(companyId));
 
   let score = 0;
 
   events.forEach(e => {
+
     if (e.severity === "critical") score += 25;
     if (e.severity === "high") score += 15;
     if (e.severity === "medium") score += 8;
     if (e.severity === "low") score += 2;
+
     if (!e.acknowledged) score += 5;
+
   });
 
   return Math.min(100, score);
+
 }
 
 function riskLevel(score) {
+
   if (score >= 75) return "CRITICAL";
   if (score >= 50) return "ELEVATED";
   if (score >= 25) return "MODERATE";
   return "LOW";
+
 }
 
 /* =========================================================
@@ -90,7 +113,9 @@ function riskLevel(score) {
 ========================================================= */
 
 router.post("/public-device-risk", (req, res) => {
+
   try {
+
     const { userAgent, language, timezone } = req.body || {};
 
     let riskScore = 10;
@@ -99,7 +124,7 @@ router.post("/public-device-risk", (req, res) => {
     if (!language) riskScore += 10;
     if (!timezone) riskScore += 10;
 
-    if (String(userAgent).toLowerCase().includes("headless")) {
+    if (String(userAgent || "").toLowerCase().includes("headless")) {
       riskScore += 40;
     }
 
@@ -112,8 +137,11 @@ router.post("/public-device-risk", (req, res) => {
     });
 
   } catch {
+
     return res.status(500).json({ ok: false });
+
   }
+
 });
 
 /* =========================================================
@@ -123,31 +151,44 @@ router.post("/public-device-risk", (req, res) => {
 router.use(authRequired);
 
 /* =========================================================
-   ZERO TRUST ENFORCEMENT ENDPOINT
+   ZERO TRUST ENFORCEMENT
 ========================================================= */
 
 router.post("/enforce/:companyId", (req, res) => {
+
   try {
+
     if (!isAdmin(req.user)) {
-      return res.status(403).json({ ok: false, error: "Admin only" });
+
+      return res.status(403).json({
+        ok: false,
+        error: "Admin only"
+      });
+
     }
 
     const { companyId } = req.params;
     const { threshold } = req.body || {};
 
     const db = readDb();
-    db.companies = db.companies || [];
 
-    const company = db.companies.find(
+    const company = db.companies?.find(
       c => String(c.id) === String(companyId)
     );
 
     if (!company) {
-      return res.status(404).json({ ok: false, error: "Company not found" });
+
+      return res.status(404).json({
+        ok: false,
+        error: "Company not found"
+      });
+
     }
 
     const enforcementThreshold =
-      Number(threshold) || company.enforcementThreshold || DEFAULT_ENFORCEMENT_THRESHOLD;
+      Number(threshold) ||
+      company.enforcementThreshold ||
+      DEFAULT_ENFORCEMENT_THRESHOLD;
 
     const riskScore = calculateCompanyRisk(db, companyId);
 
@@ -155,28 +196,35 @@ router.post("/enforce/:companyId", (req, res) => {
     let action = "NO_ACTION";
 
     if (riskScore >= enforcementThreshold) {
+
       company.status = "Locked";
       company.lockReason = "ZeroTrust enforcement";
       company.lockedAt = new Date().toISOString();
+
       enforced = true;
       action = "COMPANY_LOCKED";
+
     }
 
     writeDb(db);
 
     writeAudit({
+
       actor: req.user.id,
       role: req.user.role,
       action: "ZEROTRUST_ENFORCEMENT",
+
       detail: {
         companyId,
         riskScore,
         threshold: enforcementThreshold,
         enforced
       }
+
     });
 
     return res.json({
+
       ok: true,
       companyId,
       riskScore,
@@ -185,27 +233,36 @@ router.post("/enforce/:companyId", (req, res) => {
       enforced,
       action,
       timestamp: Date.now()
+
     });
 
   } catch {
+
     return res.status(500).json({ ok: false });
+
   }
+
 });
 
 /* =========================================================
-   SECURITY EVENTS (SCOPED)
+   SECURITY EVENTS (SOC FEED)
 ========================================================= */
 
 router.get("/events", (req, res) => {
+
   try {
+
     const db = readDb();
     const companyScope = getScopedCompanyIds(req);
 
     let events = normalizeArray(db.securityEvents);
+
     events = scopeByCompany(events, companyScope);
 
-    events.sort((a, b) =>
-      new Date(b.createdAt) - new Date(a.createdAt)
+    events.sort(
+      (a, b) =>
+        new Date(b.createdAt) -
+        new Date(a.createdAt)
     );
 
     return res.json({
@@ -214,8 +271,11 @@ router.get("/events", (req, res) => {
     });
 
   } catch {
+
     return res.status(500).json({ ok: false });
+
   }
+
 });
 
 /* =========================================================
@@ -223,14 +283,18 @@ router.get("/events", (req, res) => {
 ========================================================= */
 
 router.post("/events", (req, res) => {
+
   try {
+
     const { title, description, severity = "low" } = req.body;
 
     if (!title) {
+
       return res.status(400).json({
         ok: false,
         error: "Title required"
       });
+
     }
 
     const db = readDb();
@@ -244,38 +308,62 @@ router.post("/events", (req, res) => {
         : "low";
 
     const newEvent = {
+
       id: Date.now().toString(),
+
       title,
+
       description: description || "",
+
       severity: normalizedSeverity,
+
       acknowledged: false,
-      companyId: req.companyId || null,
+
+      companyId: req.user.companyId || null,
+
       createdAt: new Date().toISOString(),
+
+      createdBy: req.user.id
+
     };
 
     db.securityEvents.push(newEvent);
 
     if (db.securityEvents.length > MAX_SECURITY_EVENTS) {
-      db.securityEvents = db.securityEvents.slice(-MAX_SECURITY_EVENTS);
+
+      db.securityEvents =
+        db.securityEvents.slice(-MAX_SECURITY_EVENTS);
+
     }
 
     writeDb(db);
 
     writeAudit({
+
       actor: req.user.id,
       role: req.user.role,
       action: "SECURITY_EVENT_CREATED",
-      detail: { eventId: newEvent.id }
+
+      detail: {
+        eventId: newEvent.id,
+        companyId: newEvent.companyId
+      }
+
     });
 
     return res.status(201).json({
+
       ok: true,
       event: newEvent
+
     });
 
   } catch {
+
     return res.status(500).json({ ok: false });
+
   }
+
 });
 
 /* =========================================================
@@ -283,21 +371,29 @@ router.post("/events", (req, res) => {
 ========================================================= */
 
 router.get("/vulnerabilities", (req, res) => {
+
   try {
+
     const db = readDb();
     const companyScope = getScopedCompanyIds(req);
 
     let vulns = normalizeArray(db.vulnerabilities);
+
     vulns = scopeByCompany(vulns, companyScope);
 
     return res.json({
+
       ok: true,
       vulnerabilities: vulns
+
     });
 
   } catch {
+
     return res.status(500).json({ ok: false });
+
   }
+
 });
 
 module.exports = router;
