@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 14,
+
+  "users": [
+    {
+      "id": "admin_001",
+      "email": "admin@autoshield.local",
+      "passwordHash": "$2a$10$7EqJtq98hPqEX7fNZaFWoOHIq0e2F4Fh4Qq8UjM90BzGyF/F7kh9K",
+      "role": "admin",
+      "companyId": null,
+      "subscriptionStatus": "active",
+      "locked": false,
+      "tokenVersion": 1,
+      "createdAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+
+  "companies": [],
+  "notifications": [],
+
+  "tools": [],
+  "toolRequests": [],
+  "toolGrants": [],
+
+  "assets": [],
+
+  "incidents": [],
+  "vulnerabilities": [],
+  "securityEvents": [],
+
+  "systemState": {
+    "securityStatus": "NORMAL",
+    "lastComplianceCheck": null,
+    "lastZeroTrustRun": null
+  },
+
+  "scans": [],
+  "scanCredits": [],
+  "processedStripeEvents": [],
+
+  "audit": [],
+  "auditMeta": {
+    "lastHash": null,
+    "lastSequence": 0,
+    "integrityVersion": 1
+  },
+
+  "invoices": [],
+  "payments": [],
+  "refunds": [],
+  "disputes": [],
+
+  "revenueSummary": {
+    "totalRevenue": 0,
+    "autoprotekRevenue": 0,
+    "subscriptionRevenue": 0,
+    "toolRevenue": 0,
+    "refundedAmount": 0,
+    "disputedAmount": 0
+  },
+
+  "autoprotek": {
+    "users": {}
+  },
+
+  "complianceSnapshots": [],
+
+  "retentionPolicy": {
+    "auditRetentionDays": 730,
+    "financialRetentionDays": 2555,
+    "snapshotRetentionDays": 1095
+  },
+
+  "brain": {
+    "memory": [],
+    "notes": []
+  },
+
+  "paper": {
+    "summary": {
+      "startBalance": 0,
+      "balance": 0,
+      "pnl": 0,
+      "wins": 0,
+      "losses": 0,
+      "totalGain": 0,
+      "totalLoss": 0,
+      "fees": 0,
+      "slippage": 0,
+      "spread": 0,
+      "lastTradeTs": 0
+    },
+    "trades": [],
+    "daily": []
+  },
+
+  "live": {
+    "events": []
+  }
+}
