@@ -1,5 +1,5 @@
 // backend/src/routes/incidents.routes.js
-// Enterprise Incident Engine — Hardened v3
+// Enterprise Incident Engine — Hardened v4
 // Auth Protected • Company Scoped • Audit Safe • Status Validation
 
 const express = require("express");
@@ -24,6 +24,10 @@ router.use(authRequired);
 
 function isAdmin(role) {
   return String(role) === ADMIN_ROLE;
+}
+
+function resolveCompany(req) {
+  return req.headers["x-company-id"] || req.user.companyId || null;
 }
 
 function requireCompanyAccess(req, companyId) {
@@ -59,6 +63,16 @@ const VALID_STATUSES = [
 ];
 
 /* =========================================================
+   SAFE DB ACCESS
+========================================================= */
+
+function getDb() {
+  const db = readDb() || {};
+  if (!db.incidents) db.incidents = [];
+  return db;
+}
+
+/* =========================================================
    GET INCIDENTS (SCOPED)
 ========================================================= */
 
@@ -66,21 +80,24 @@ router.get("/", (req, res) => {
 
   try {
 
-    const db = readDb();
+    const db = getDb();
+
     let incidents = db.incidents || [];
+
+    const companyId = resolveCompany(req);
 
     if (!isAdmin(req.user.role)) {
 
       incidents = incidents.filter(
-        (i) => i.companyId === req.user.companyId
+        (i) => String(i.companyId) === String(companyId)
       );
 
     }
 
     incidents.sort(
       (a, b) =>
-        new Date(b.createdAt).getTime() -
-        new Date(a.createdAt).getTime()
+        new Date(b.createdAt || 0).getTime() -
+        new Date(a.createdAt || 0).getTime()
     );
 
     res.json({
@@ -107,14 +124,13 @@ router.post("/", (req, res) => {
 
   try {
 
-    const db = readDb();
-
-    if (!db.incidents) db.incidents = [];
+    const db = getDb();
 
     const {
       title,
       description,
-      severity = "medium"
+      severity = "medium",
+      priority = "P3"
     } = req.body;
 
     if (!title) {
@@ -126,22 +142,35 @@ router.post("/", (req, res) => {
 
     }
 
+    const companyId = resolveCompany(req);
+
     const newIncident = {
 
-      id: Date.now().toString(),
+      id: `inc-${Date.now()}-${Math.random().toString(16).slice(2)}`,
 
       title,
       description: description || "",
 
       severity,
+      priority,
 
       status: "open",
 
-      companyId: req.user.companyId || null,
+      companyId,
 
       createdAt: new Date().toISOString(),
 
       createdBy: req.user.id,
+
+      activity: [
+        {
+          time: new Date(),
+          action: "CREATED",
+          actor: req.user.id
+        }
+      ],
+
+      resolution: null
 
     };
 
@@ -191,13 +220,13 @@ router.patch("/:id/status", (req, res) => {
 
   try {
 
-    const db = readDb();
+    const db = getDb();
 
     const { id } = req.params;
 
     const { status } = req.body;
 
-    const incident = db.incidents?.find(
+    const incident = db.incidents.find(
       (i) => String(i.id) === String(id)
     );
 
@@ -224,6 +253,14 @@ router.patch("/:id/status", (req, res) => {
       }
 
       incident.status = status;
+
+      if (!incident.activity) incident.activity = [];
+
+      incident.activity.unshift({
+        time: new Date(),
+        action: `STATUS_${status.toUpperCase()}`,
+        actor: req.user.id
+      });
 
     }
 
@@ -260,6 +297,74 @@ router.patch("/:id/status", (req, res) => {
 
       error: err.message || "Failed to update incident",
 
+    });
+
+  }
+
+});
+
+/* =========================================================
+   DELETE INCIDENT (ADMIN ONLY)
+========================================================= */
+
+router.delete("/:id", (req, res) => {
+
+  try {
+
+    if (!isAdmin(req.user.role)) {
+
+      return res.status(403).json({
+        ok: false,
+        error: "Admin only",
+      });
+
+    }
+
+    const db = getDb();
+
+    const { id } = req.params;
+
+    const index = db.incidents.findIndex(
+      (i) => String(i.id) === String(id)
+    );
+
+    if (index === -1) {
+
+      return res.status(404).json({
+        ok: false,
+        error: "Incident not found",
+      });
+
+    }
+
+    const removed = db.incidents.splice(index, 1)[0];
+
+    writeDb(db);
+
+    writeAudit({
+
+      actor: req.user.id,
+
+      role: req.user.role,
+
+      action: "INCIDENT_DELETED",
+
+      detail: {
+        incidentId: removed.id,
+      }
+
+    });
+
+    res.json({
+      ok: true,
+      removed,
+    });
+
+  } catch (err) {
+
+    res.status(500).json({
+      ok: false,
+      error: "Failed to delete incident",
     });
 
   }
