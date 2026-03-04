@@ -14,9 +14,11 @@ const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
 const { verifyRevenueLedger } = require("./lib/revenueIntegrity");
 
 const users = require("./users/user.service");
+
 const tenantMiddleware = require("./middleware/tenant");
 const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
+const { authRequired } = require("./middleware/auth");
 
 /* ================= SAFE BOOT ================= */
 
@@ -56,15 +58,30 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 app.use(rateLimiter);
 
-/* ================= ROUTES ================= */
+/* ================= PUBLIC ROUTES ================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
-app.use(tenantMiddleware);
+
+/* ================= PROTECTED ROUTES =================
+   Correct order:
+   1. authRequired
+   2. tenantMiddleware
+   3. zeroTrust
+*/
+
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return authRequired(req, res, next);
+});
+
+app.use("/api", tenantMiddleware);
 
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
   return zeroTrust(req, res, next);
 });
+
+/* ================= API ROUTES ================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
@@ -75,9 +92,6 @@ app.use("/api/billing", require("./routes/billing.routes"));
 app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
-
-/* ================= SOC ALERT ROUTES (NEW) ================= */
-
 app.use("/api/soc", require("./routes/soc.routes"));
 
 /* ================= SERVER ================= */
@@ -96,23 +110,29 @@ function wsClose(ws) {
 }
 
 wss.on("connection", (ws, req) => {
+
   try {
+
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
+
     if (!token) return wsClose(ws);
 
     const payload = verify(token, "access");
+
     if (!payload?.id || !payload?.jti) return wsClose(ws);
+
     if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
 
     const db = readDb();
+
     const user = (db.users || []).find(
-      (u) => String(u.id) === String(payload.id)
+      u => String(u.id) === String(payload.id)
     );
+
     if (!user) return wsClose(ws);
 
     if (user.locked === true) return wsClose(ws);
-    if (user.status !== users.APPROVAL_STATUS.APPROVED) return wsClose(ws);
 
     const deviceCheck = classifyDeviceRisk(
       user.activeDeviceFingerprint,
@@ -133,11 +153,12 @@ wss.on("connection", (ws, req) => {
       detail: { path: req.url }
     });
 
-    /* ================= LIVE MARKET STREAM ================= */
+    /* ================= MARKET STREAM ================= */
 
     let price = 1.1000;
 
     const tickInterval = setInterval(() => {
+
       if (ws.readyState !== 1) return;
 
       price += (Math.random() - 0.5) * 0.002;
@@ -158,6 +179,7 @@ wss.on("connection", (ws, req) => {
   } catch {
     wsClose(ws);
   }
+
 });
 
 /* ================= START ================= */
