@@ -1,4 +1,4 @@
-// AutoShield Tech — Enterprise Immutable Audit Ledger v40
+// AutoShield Tech — Enterprise Immutable Audit Ledger v41
 // Hash Chain • Snapshot Anchors • Version Enforcement • Truncation Guard • Bounded Growth
 
 const crypto = require("crypto");
@@ -10,9 +10,19 @@ const { updateDb, readDb } = require("./db");
 
 const GENESIS_HASH = "GENESIS";
 const INTEGRITY_VERSION = 3;
+
 const SNAPSHOT_INTERVAL = 1000;
-const MAX_SNAPSHOTS = 500;          // 🔒 bounded memory
-const MAX_AUDIT_RECORDS = 250000;   // 🔒 hard cap safety
+const MAX_SNAPSHOTS = 500;
+const MAX_AUDIT_RECORDS = 250000;
+
+/* =========================================================
+   SAFE UUID
+========================================================= */
+
+function safeUUID() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return crypto.randomBytes(16).toString("hex");
+}
 
 /* =========================================================
    HASH UTIL
@@ -23,6 +33,7 @@ function sha256(data) {
 }
 
 function computeRecordHash(record) {
+
   const base = JSON.stringify({
     v: INTEGRITY_VERSION,
     seq: record.seq,
@@ -37,6 +48,7 @@ function computeRecordHash(record) {
   });
 
   return sha256(base);
+
 }
 
 /* =========================================================
@@ -44,30 +56,41 @@ function computeRecordHash(record) {
 ========================================================= */
 
 function writeAudit(input = {}) {
+
   try {
+
     const db = readDb();
 
     if (!Array.isArray(db.audit)) db.audit = [];
 
     if (!db.auditMeta) {
+
       db.auditMeta = {
         lastHash: null,
         lastSequence: 0,
         integrityVersion: INTEGRITY_VERSION,
         snapshots: [],
       };
+
+    }
+
+    if (!Array.isArray(db.auditMeta.snapshots)) {
+      db.auditMeta.snapshots = [];
     }
 
     const prevHash = db.auditMeta.lastHash || GENESIS_HASH;
     const seq = db.auditMeta.lastSequence + 1;
 
     const record = {
-      id: crypto.randomUUID(),
+
+      id: safeUUID(),
+
       seq,
       ts: Date.now(),
 
       actor: String(input.actor || "system"),
       role: String(input.role || "system"),
+
       action: String(input.action || "UNKNOWN"),
 
       target: input.target ? String(input.target) : null,
@@ -80,24 +103,34 @@ function writeAudit(input = {}) {
 
       prevHash,
       hash: null,
+
     };
 
     record.hash = computeRecordHash(record);
 
     updateDb((db2) => {
+
       if (!Array.isArray(db2.audit)) db2.audit = [];
+
       if (!db2.auditMeta) {
+
         db2.auditMeta = {
           lastHash: null,
           lastSequence: 0,
           integrityVersion: INTEGRITY_VERSION,
           snapshots: [],
         };
+
+      }
+
+      if (!Array.isArray(db2.auditMeta.snapshots)) {
+        db2.auditMeta.snapshots = [];
       }
 
       db2.audit.push(record);
 
-      /* 🔒 Hard cap safety */
+      /* HARD CAP PROTECTION */
+
       if (db2.audit.length > MAX_AUDIT_RECORDS) {
         db2.audit = db2.audit.slice(-MAX_AUDIT_RECORDS);
       }
@@ -106,30 +139,38 @@ function writeAudit(input = {}) {
       db2.auditMeta.lastSequence = seq;
       db2.auditMeta.integrityVersion = INTEGRITY_VERSION;
 
-      /* Snapshot Anchoring */
+      /* SNAPSHOT ANCHOR */
+
       if (seq % SNAPSHOT_INTERVAL === 0) {
+
         db2.auditMeta.snapshots.push({
           seq,
           hash: record.hash,
           ts: Date.now(),
         });
 
-        /* 🔒 Snapshot bound */
         if (db2.auditMeta.snapshots.length > MAX_SNAPSHOTS) {
+
           db2.auditMeta.snapshots =
             db2.auditMeta.snapshots.slice(-MAX_SNAPSHOTS);
+
         }
+
       }
 
       return db2;
+
     });
 
     return record;
 
   } catch (err) {
+
     console.error("⚠️ Audit write failed:", err);
     return null;
+
   }
+
 }
 
 /* =========================================================
@@ -137,99 +178,147 @@ function writeAudit(input = {}) {
 ========================================================= */
 
 function verifyAuditIntegrity() {
+
   try {
+
     const db = readDb();
+
     const logs = db.audit || [];
     const meta = db.auditMeta || {};
 
     if (logs.length === 0) {
-      return { ok: true, message: "No audit records" };
+
+      return {
+        ok: true,
+        message: "No audit records"
+      };
+
     }
 
     if (meta.integrityVersion !== INTEGRITY_VERSION) {
+
       return {
         ok: false,
-        error: "Integrity version mismatch",
+        error: "Integrity version mismatch"
       };
+
     }
 
     let expectedPrevHash = GENESIS_HASH;
     let expectedSeq = 1;
 
     for (let i = 0; i < logs.length; i++) {
+
       const current = logs[i];
 
       if (current.seq !== expectedSeq) {
-        return { ok: false, error: "Sequence mismatch", index: i };
+
+        return {
+          ok: false,
+          error: "Sequence mismatch",
+          index: i
+        };
+
       }
 
       if (current.prevHash !== expectedPrevHash) {
-        return { ok: false, error: "Broken hash chain", index: i };
+
+        return {
+          ok: false,
+          error: "Broken hash chain",
+          index: i
+        };
+
       }
 
       const expectedHash = computeRecordHash(current);
+
       if (current.hash !== expectedHash) {
+
         return {
           ok: false,
           error: "Tampered record",
           index: i,
-          recordId: current.id,
+          recordId: current.id
         };
+
       }
 
       expectedPrevHash = current.hash;
       expectedSeq++;
+
     }
 
-    /* Meta validation */
+    /* META VALIDATION */
+
     if (meta.lastHash !== expectedPrevHash) {
+
       return {
         ok: false,
-        error: "Meta hash mismatch (possible truncation)",
+        error: "Meta hash mismatch (possible truncation)"
       };
+
     }
 
     if (meta.lastSequence !== logs.length) {
+
       return {
         ok: false,
-        error: "Meta sequence mismatch",
+        error: "Meta sequence mismatch"
       };
+
     }
 
-    /* Snapshot validation */
+    /* SNAPSHOT VALIDATION */
+
     if (Array.isArray(meta.snapshots)) {
+
       for (const snap of meta.snapshots) {
+
         if (snap.seq > logs.length) {
+
           return {
             ok: false,
-            error: "Snapshot beyond log length (truncation detected)",
+            error: "Snapshot beyond log length (truncation detected)"
           };
+
         }
 
         const record = logs[snap.seq - 1];
+
         if (!record || record.hash !== snap.hash) {
+
           return {
             ok: false,
             error: "Snapshot anchor mismatch",
-            seq: snap.seq,
+            seq: snap.seq
           };
+
         }
+
       }
+
     }
 
     return {
+
       ok: true,
+
       totalRecords: logs.length,
       lastHash: meta.lastHash,
       integrityVersion: meta.integrityVersion,
+
     };
 
   } catch (err) {
+
     return {
       ok: false,
-      error: err.message,
+      error: err.message
     };
+
   }
+
 }
 
 /* =========================================================
@@ -237,14 +326,23 @@ function verifyAuditIntegrity() {
 ========================================================= */
 
 function audit(input = {}) {
+
   return writeAudit({
+
     actor: input.actorId || input.actor || "system",
+
     role: input.role || "system",
+
     action: input.action,
+
     target: input.targetId || input.target,
+
     companyId: input.companyId,
+
     detail: input.metadata || input.detail,
+
   });
+
 }
 
 module.exports = {
