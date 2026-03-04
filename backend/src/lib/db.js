@@ -169,15 +169,12 @@ function migrate(db) {
 
   /* Ensure company ZeroTrust fields */
   for (const company of db.companies) {
-    if (!company.enforcementThreshold)
-      company.enforcementThreshold = 75;
+    if (!company.enforcementThreshold) company.enforcementThreshold = 75;
 
-    if (!Array.isArray(company.riskHistory))
-      company.riskHistory = [];
+    if (!Array.isArray(company.riskHistory)) company.riskHistory = [];
 
     if (company.riskHistory.length > MAX_COMPANY_RISK_HISTORY) {
-      company.riskHistory =
-        company.riskHistory.slice(-MAX_COMPANY_RISK_HISTORY);
+      company.riskHistory = company.riskHistory.slice(-MAX_COMPANY_RISK_HISTORY);
     }
   }
 
@@ -195,8 +192,7 @@ function migrate(db) {
 
   if (!db.autoprotek) db.autoprotek = { users: {} };
 
-  if (!db.retentionPolicy)
-    db.retentionPolicy = defaultDb().retentionPolicy;
+  if (!db.retentionPolicy) db.retentionPolicy = defaultDb().retentionPolicy;
 
   db.schemaVersion = SCHEMA_VERSION;
 
@@ -211,7 +207,7 @@ function ensureDb() {
   ensureDir(DB_PATH);
 
   if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2), { encoding: "utf-8" });
     return;
   }
 
@@ -222,7 +218,7 @@ function ensureDb() {
     writeDb(migrated);
   } catch (err) {
     console.error("[DB] Corruption detected. Restoring default.");
-    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2));
+    fs.writeFileSync(DB_PATH, JSON.stringify(defaultDb(), null, 2), { encoding: "utf-8" });
   }
 }
 
@@ -246,7 +242,14 @@ function writeDb(db) {
   const safe = migrate(deepClone(db));
 
   try {
-    fs.writeFileSync(TMP_PATH, JSON.stringify(safe, null, 2));
+    const payload = JSON.stringify(safe, null, 2);
+
+    // Prevent empty/partial write corruption
+    if (!payload || payload.length < 10) {
+      throw new Error("Refusing to write empty DB payload");
+    }
+
+    fs.writeFileSync(TMP_PATH, payload, { encoding: "utf-8" });
 
     // backup current DB before overwrite
     if (fs.existsSync(DB_PATH)) {
@@ -254,9 +257,19 @@ function writeDb(db) {
     }
 
     fs.renameSync(TMP_PATH, DB_PATH);
-
   } catch (err) {
     console.error("[DB] Atomic write failed:", err);
+
+    // Attempt recovery from backup
+    try {
+      if (fs.existsSync(BACKUP_PATH)) {
+        fs.copyFileSync(BACKUP_PATH, DB_PATH);
+        console.warn("[DB] Backup restored after failed write.");
+      }
+    } catch (restoreErr) {
+      console.error("[DB] Backup restore failed:", restoreErr);
+    }
+
     throw err;
   }
 }
