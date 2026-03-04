@@ -62,12 +62,7 @@ app.use(rateLimiter);
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* ================= PROTECTED ROUTES =================
-   Correct order:
-   1. authRequired
-   2. tenantMiddleware
-   3. zeroTrust
-*/
+/* ================= PROTECTED ROUTES ================= */
 
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
@@ -132,7 +127,18 @@ wss.on("connection", (ws, req) => {
 
     if (!user) return wsClose(ws);
 
+    /* ===== LOCK CHECK ===== */
+
     if (user.locked === true) return wsClose(ws);
+
+    /* ===== TOKEN VERSION CHECK (IMPORTANT) ===== */
+
+    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws);
+    }
+
+    /* ===== DEVICE FINGERPRINT CHECK ===== */
 
     const deviceCheck = classifyDeviceRisk(
       user.activeDeviceFingerprint,
@@ -143,6 +149,8 @@ wss.on("connection", (ws, req) => {
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws);
     }
+
+    /* ===== REGISTER SESSION ===== */
 
     sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
 
@@ -176,8 +184,11 @@ wss.on("connection", (ws, req) => {
       clearInterval(tickInterval);
     });
 
-  } catch {
+  } catch (err) {
+
+    console.error("WS connection error:", err);
     wsClose(ws);
+
   }
 
 });
