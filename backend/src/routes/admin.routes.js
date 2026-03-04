@@ -1,6 +1,7 @@
 // backend/src/routes/admin.routes.js
-// AutoShield Tech — Enterprise Admin Control v12
+// AutoShield Tech — Enterprise Admin Control v13
 // Deterministic • Audit-Safe • Trend + AI Brain Explorer
+// + Global Governance Endpoints (Companies, Managers, Corporate Entities, User Governance)
 
 const express = require("express");
 const router = express.Router();
@@ -60,8 +61,6 @@ router.get("/ai-decisions", requireFinanceOrAdmin, (req, res) => {
       signal
     } = req.query;
 
-    /* ===== FILTERS ===== */
-
     if (userId) {
       decisions = decisions.filter(d =>
         String(d.userId) === String(userId)
@@ -95,14 +94,10 @@ router.get("/ai-decisions", requireFinanceOrAdmin, (req, res) => {
       );
     }
 
-    /* ===== SORT DESC ===== */
-
     decisions.sort(
       (a, b) =>
         new Date(b.timestamp) - new Date(a.timestamp)
     );
-
-    /* ===== DRIFT DETECTION ===== */
 
     let drift = null;
 
@@ -115,8 +110,6 @@ router.get("/ai-decisions", requireFinanceOrAdmin, (req, res) => {
 
       drift = avg(last10) - avg(prev10);
     }
-
-    /* ===== PAGINATION ===== */
 
     const pageNum = Math.max(1, Number(page));
     const perPage = Math.max(1, Math.min(100, Number(limit)));
@@ -219,6 +212,7 @@ router.get("/platform-health", requireAdmin, (req, res) => {
       ok: true,
       health: {
         totalUsers: (db.users || []).length,
+        totalCompanies: (db.companies || []).length,
         totalSecurityEvents: (db.securityEvents || []).length,
         totalSnapshots: (db.complianceSnapshots || []).length,
         totalAIDecisions: (db.brain?.decisions || []).length
@@ -227,6 +221,101 @@ router.get("/platform-health", requireAdmin, (req, res) => {
 
   } catch {
     return res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================================================
+   GLOBAL GOVERNANCE — COMPANIES
+========================================================= */
+
+router.get("/companies", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const companies = db.companies || [];
+
+    res.json({
+      ok: true,
+      total: companies.length,
+      companies
+    });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================================================
+   GLOBAL GOVERNANCE — MANAGERS
+========================================================= */
+
+router.get("/managers", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+
+    const managers = (db.users || []).filter(
+      u => normalize(u.role) === "manager"
+    );
+
+    res.json({
+      ok: true,
+      total: managers.length,
+      managers
+    });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================================================
+   CORPORATE ENTITIES
+========================================================= */
+
+router.get("/corporate-entities", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+
+    const entities = (db.companies || []).map(c => ({
+      id: c.id,
+      name: c.name,
+      tier: c.subscriptionTier || "free",
+      members: (db.users || []).filter(u => u.companyId === c.id).length,
+      status: c.subscriptionStatus || "active"
+    }));
+
+    res.json({
+      ok: true,
+      entities
+    });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================================================
+   USER GOVERNANCE
+========================================================= */
+
+router.get("/user-governance", requireAdmin, (req, res) => {
+  try {
+    const db = readDb();
+    const users = db.users || [];
+
+    res.json({
+      ok: true,
+      totalUsers: users.length,
+      users: users.map(u => ({
+        id: u.id,
+        email: u.email,
+        role: u.role,
+        companyId: u.companyId || null,
+        subscriptionStatus: u.subscriptionStatus || "inactive"
+      }))
+    });
+
+  } catch {
+    res.status(500).json({ ok: false });
   }
 });
 
