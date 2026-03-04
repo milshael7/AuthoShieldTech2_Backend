@@ -76,6 +76,10 @@ app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 
+/* ================= SOC ALERT ROUTES (NEW) ================= */
+
+app.use("/api/soc", require("./routes/soc.routes"));
+
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
