@@ -1,23 +1,31 @@
 // backend/src/routes/market.routes.js
 // ==========================================================
-// Market Data API
-// Provides candles + price from marketEngine
+// Market Data API — STABLE VERSION
+// Single-auth • Tenant-safe • WS-consistent
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
-const { authRequired } = require("../middleware/auth");
 const marketEngine = require("../services/marketEngine");
 
-/* ================= AUTH ================= */
+/* =========================================================
+   TENANT RESOLUTION (MATCHES WS + PAPER ENGINE)
+========================================================= */
 
-router.use(authRequired);
+function resolveTenant(req) {
+  // DO NOT use req.tenant here — trading must match WS logic
+  return req.user?.companyId || req.user?.id || null;
+}
 
-/* ================= HELPERS ================= */
+function normalizeSymbol(v) {
+  return String(v || "BTCUSDT").trim().toUpperCase();
+}
 
-function getTenant(req){
-  return req.tenant?.id || req.user?.companyId || req.user?.id || null;
+function clamp(n, min, max) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, x));
 }
 
 /* =========================================================
@@ -25,37 +33,28 @@ function getTenant(req){
    GET /api/market/price?symbol=BTCUSDT
 ========================================================= */
 
-router.get("/price",(req,res)=>{
-
-  try{
-
-    const tenantId = getTenant(req);
-    const symbol = String(req.query.symbol || "BTCUSDT");
-
-    if(!tenantId){
-      return res.status(400).json({
-        ok:false,
-        error:"Missing tenant"
-      });
+router.get("/price", (req, res) => {
+  try {
+    const tenantId = resolveTenant(req);
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "Missing tenant" });
     }
 
-    const price = marketEngine.getPrice(tenantId,symbol);
+    const symbol = normalizeSymbol(req.query.symbol);
+    const price = marketEngine.getPrice(tenantId, symbol);
 
-    res.json({
-      ok:true,
+    return res.json({
+      ok: true,
       symbol,
-      price
+      price: price ?? null,
+      ts: Date.now(),
     });
-
-  }catch(e){
-
-    res.status(500).json({
-      ok:false,
-      error:e.message
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: "Market price unavailable",
     });
-
   }
-
 });
 
 /* =========================================================
@@ -63,38 +62,31 @@ router.get("/price",(req,res)=>{
    GET /api/market/candles?symbol=BTCUSDT&limit=200
 ========================================================= */
 
-router.get("/candles",(req,res)=>{
-
-  try{
-
-    const tenantId = getTenant(req);
-    const symbol = String(req.query.symbol || "BTCUSDT");
-    const limit = Number(req.query.limit || 200);
-
-    if(!tenantId){
-      return res.status(400).json({
-        ok:false,
-        error:"Missing tenant"
-      });
+router.get("/candles", (req, res) => {
+  try {
+    const tenantId = resolveTenant(req);
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "Missing tenant" });
     }
 
-    const candles = marketEngine.getCandles(tenantId,symbol,limit);
+    const symbol = normalizeSymbol(req.query.symbol);
+    const limit = clamp(req.query.limit, 20, 500);
 
-    res.json({
-      ok:true,
+    const candles = marketEngine.getCandles(tenantId, symbol, limit) || [];
+
+    return res.json({
+      ok: true,
       symbol,
-      candles
+      candles,
+      count: candles.length,
+      ts: Date.now(),
     });
-
-  }catch(e){
-
-    res.status(500).json({
-      ok:false,
-      error:e.message
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: "Market candles unavailable",
     });
-
   }
-
 });
 
 module.exports = router;
