@@ -2,6 +2,7 @@
 // ==========================================================
 // Institutional Execution Engine
 // Paper Trading + Live Trading Auto Router
+// AI Capital Guard Enabled
 // Deterministic Accounting
 // ==========================================================
 
@@ -16,12 +17,32 @@ CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
+
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
+
   baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0004),
+
   maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.0015),
-  minOrderUsd: 50,
-  maxCapitalFraction: 0.5,
-  simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 10),
+
+  minOrderUsd: Number(process.env.PAPER_MIN_ORDER_USD || 50),
+
+  maxCapitalFraction:
+    Number(process.env.PAPER_MAX_CAPITAL_FRACTION || 0.5),
+
+  simulatedLatencyMs:
+    Number(process.env.PAPER_LATENCY_MS || 10),
+
+  /* ===== AI CAPITAL GUARD ===== */
+
+  maxDailyTrades:
+    Number(process.env.LIVE_MAX_TRADES_PER_DAY || 12),
+
+  maxNotionalUsd:
+    Number(process.env.LIVE_MAX_NOTIONAL_USD || 25000),
+
+  minAccountBalance:
+    Number(process.env.LIVE_MIN_ACCOUNT_BALANCE || 50),
+
 });
 
 /* =========================================================
@@ -62,10 +83,8 @@ function randomBetween(min, max) {
 
 function simulateSlippage(price, side) {
 
-  const slipPct = randomBetween(
-    CONFIG.baseSlippagePct,
-    CONFIG.maxSlippagePct
-  );
+  const slipPct =
+    randomBetween(CONFIG.baseSlippagePct, CONFIG.maxSlippagePct);
 
   return side === "BUY"
     ? price * (1 + slipPct)
@@ -89,10 +108,8 @@ function recalcEquity(state) {
 
   }
 
-  state.peakEquity = Math.max(
-    state.peakEquity || 0,
-    state.equity
-  );
+  state.peakEquity =
+    Math.max(state.peakEquity || 0, state.equity);
 }
 
 function buildExecutionId() {
@@ -104,6 +121,7 @@ PAPER EXECUTION
 ========================================================= */
 
 function executePaperOrder({
+
   tenantId,
   symbol,
   action,
@@ -111,6 +129,7 @@ function executePaperOrder({
   riskPct,
   state,
   ts = Date.now(),
+
 }) {
 
   if (!state) return null;
@@ -124,11 +143,8 @@ function executePaperOrder({
 
   if (action === "BUY" && !state.position) {
 
-    const safeRisk = clamp(
-      Number(riskPct) || 0,
-      0,
-      CONFIG.maxCapitalFraction
-    );
+    const safeRisk =
+      clamp(Number(riskPct) || 0, 0, CONFIG.maxCapitalFraction);
 
     const usd = clamp(
       state.cashBalance * safeRisk,
@@ -143,9 +159,11 @@ function executePaperOrder({
     const qty = usd / fillPrice;
 
     const notional = qty * fillPrice;
+
     const fee = notional * CONFIG.feeRate;
 
     state.cashBalance -= notional + fee;
+
     state.costs.feePaid += fee;
 
     state.position = {
@@ -171,14 +189,12 @@ function executePaperOrder({
         executionId
       }
     };
+
   }
 
   /* ================= EXIT ================= */
 
-  if (
-    (action === "SELL" || action === "CLOSE") &&
-    state.position
-  ) {
+  if ((action === "SELL" || action === "CLOSE") && state.position) {
 
     const pos = state.position;
 
@@ -240,6 +256,7 @@ function executePaperOrder({
         executionId
       }
     };
+
   }
 
   return null;
@@ -278,6 +295,48 @@ async function executeLiveOrder(params = {}) {
 }
 
 /* =========================================================
+AI CAPITAL GUARD
+========================================================= */
+
+async function capitalGuard(params = {}) {
+
+  if (process.env.EXECUTION_KILL_SWITCH === "true") {
+
+    return {
+      ok: false,
+      reason: "Execution blocked by kill switch"
+    };
+
+  }
+
+  const balance =
+    await krakenConnector.getBalance();
+
+  const usd =
+    Number(balance?.USD || balance?.ZUSD || 0);
+
+  if (usd < CONFIG.minAccountBalance) {
+
+    return {
+      ok: false,
+      reason: "Insufficient account balance"
+    };
+
+  }
+
+  if (params?.notionalUsd > CONFIG.maxNotionalUsd) {
+
+    return {
+      ok: false,
+      reason: "Order exceeds max notional limit"
+    };
+
+  }
+
+  return { ok: true };
+}
+
+/* =========================================================
 AUTO ROUTER
 ========================================================= */
 
@@ -292,8 +351,19 @@ async function executeOrder(params) {
 
   }
 
+  const guard =
+    await capitalGuard(params);
+
+  if (!guard.ok) {
+
+    console.log("[GUARD BLOCKED]", guard.reason);
+
+    return executePaperOrder(params);
+
+  }
+
   const balance =
-    await krakenConnector.getAccountBalance();
+    await krakenConnector.getBalance();
 
   const usd =
     Number(balance?.USD || balance?.ZUSD || 0);
