@@ -25,14 +25,23 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
-/* ===== NEW AI LAB ROUTES ===== */
+/* ===== OPTIONAL AI LAB ROUTES (SAFE LOAD) ===== */
 
-const trainingRoutes = require("./routes/training.routes");
-const replayRoutes = require("./routes/replay.routes");
+let trainingRoutes;
+let replayRoutes;
+let dataRoutes;
 
-/* ===== MARKET DATA DOWNLOAD ROUTE ===== */
+try {
+  trainingRoutes = require("./routes/training.routes");
+} catch {}
 
-const dataRoutes = require("./routes/data.routes");
+try {
+  replayRoutes = require("./routes/replay.routes");
+} catch {}
+
+try {
+  dataRoutes = require("./routes/data.routes");
+} catch {}
 
 /* ===== ENGINES ===== */
 
@@ -65,6 +74,7 @@ verifyRevenueLedger();
 const app = express();
 app.set("trust proxy", 1);
 
+/* Stripe webhook must come before json parser */
 app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 
 app.use(cors({
@@ -113,14 +123,11 @@ app.use("/api/soc", require("./routes/soc.routes"));
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* ===== AI TRAINING LAB ===== */
+/* ===== OPTIONAL ROUTES ===== */
 
-app.use("/api/training", trainingRoutes);
-app.use("/api/replay", replayRoutes);
-
-/* ===== MARKET DATA DOWNLOAD ===== */
-
-app.use("/api/data", dataRoutes);
+if (trainingRoutes) app.use("/api/training", trainingRoutes);
+if (replayRoutes) app.use("/api/replay", replayRoutes);
+if (dataRoutes) app.use("/api/data", dataRoutes);
 
 /* ================= SERVER ================= */
 
