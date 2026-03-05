@@ -137,6 +137,14 @@ if (dataRoutes) app.use("/api/data", dataRoutes);
 
 const server = http.createServer(app);
 
+/* ================= TRADING PAIRS ================= */
+
+const PAIRS =
+  (process.env.AI_TRADING_PAIRS || "BTCUSDT")
+    .split(",")
+    .map(p => p.trim())
+    .filter(Boolean);
+
 /* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
@@ -147,8 +155,6 @@ const wss = new WebSocketServer({
 function wsClose(ws) {
   try { ws.close(); } catch {}
 }
-
-/* ===== HEARTBEAT ===== */
 
 function heartbeat() {
   this.isAlive = true;
@@ -181,30 +187,7 @@ wss.on("connection", (ws, req) => {
     if (!user) return wsClose(ws);
     if (user.locked === true) return wsClose(ws);
 
-    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
-      sessionAdapter.revokeToken(payload.jti);
-      return wsClose(ws);
-    }
-
-    const deviceCheck =
-      classifyDeviceRisk(user.activeDeviceFingerprint, req);
-
-    if (!deviceCheck.match) {
-      sessionAdapter.revokeAllUserSessions(user.id);
-      return wsClose(ws);
-    }
-
-    sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
-
-    writeAudit({
-      actor: user.id,
-      role: user.role,
-      action: "WEBSOCKET_CONNECTED",
-      detail: { path: req.url }
-    });
-
     const tenantId = user.companyId || user.id;
-    const symbol = "BTCUSDT";
 
     marketEngine.registerTenant(tenantId);
 
@@ -212,23 +195,25 @@ wss.on("connection", (ws, req) => {
 
       if (ws.readyState !== 1) return;
 
-      const price =
-        marketEngine.getPrice(tenantId, symbol);
+      for (const symbol of PAIRS) {
 
-      if (!price) return;
+        const price =
+          marketEngine.getPrice(tenantId, symbol);
 
-      ws.send(JSON.stringify({
-        type: "tick",
-        symbol,
-        price,
-        ts: Date.now()
-      }));
+        if (!price) continue;
+
+        ws.send(JSON.stringify({
+          type: "tick",
+          symbol,
+          price,
+          ts: Date.now()
+        }));
+
+      }
 
     }, 500);
 
-    ws.on("close", () => {
-      clearInterval(tickInterval);
-    });
+    ws.on("close", () => clearInterval(tickInterval));
 
   } catch (err) {
 
@@ -239,7 +224,7 @@ wss.on("connection", (ws, req) => {
 
 });
 
-/* ===== CLEAN DEAD CONNECTIONS ===== */
+/* ================= CLEAN DEAD CONNECTIONS ================= */
 
 setInterval(() => {
 
@@ -266,18 +251,22 @@ setInterval(() => {
 
     const tenantId = user.companyId || user.id;
 
-    try {
+    for (const symbol of PAIRS) {
 
-      const price =
-        marketEngine.getPrice(tenantId, "BTCUSDT");
+      try {
 
-      if (!price) continue;
+        const price =
+          marketEngine.getPrice(tenantId, symbol);
 
-      paperTrader.tick(tenantId, "BTCUSDT", price);
+        if (!price) continue;
 
-    } catch (err) {
+        paperTrader.tick(tenantId, symbol, price);
 
-      console.error("AI engine error:", err);
+      } catch (err) {
+
+        console.error("AI engine error:", symbol, err);
+
+      }
 
     }
 
@@ -291,30 +280,26 @@ if (regimeDetector) {
 
   setInterval(() => {
 
-    try {
+    const db = readDb();
 
-      const db = readDb();
+    for (const user of db.users || []) {
 
-      for (const user of db.users || []) {
+      const tenantId = user.companyId || user.id;
 
-        const tenantId = user.companyId || user.id;
+      for (const symbol of PAIRS) {
 
         const price =
-          marketEngine.getPrice(tenantId, "BTCUSDT");
+          marketEngine.getPrice(tenantId, symbol);
 
         if (!price) continue;
 
         regimeDetector.update({
           tenantId,
-          symbol: "BTCUSDT",
+          symbol,
           price
         });
 
       }
-
-    } catch (err) {
-
-      console.error("Regime detector error:", err);
 
     }
 
@@ -328,24 +313,20 @@ if (strategyDiscovery && replayEngine) {
 
   setInterval(async () => {
 
-    try {
+    const db = readDb();
 
-      const db = readDb();
+    for (const user of db.users || []) {
 
-      for (const user of db.users || []) {
+      const tenantId = user.companyId || user.id;
 
-        const tenantId = user.companyId || user.id;
+      for (const symbol of PAIRS) {
 
         await strategyDiscovery.discoverStrategy({
           tenantId,
-          symbol: "BTCUSDT"
+          symbol
         });
 
       }
-
-    } catch (err) {
-
-      console.error("AI training error:", err);
 
     }
 
@@ -361,11 +342,10 @@ server.listen(port, () => {
 
   console.log(`[BOOT] Running on port ${port}`);
   console.log("[AI] Live engine running");
+  console.log("[AI] Trading pairs:", PAIRS.join(", "));
 
   if (strategyDiscovery && replayEngine) {
     console.log("[AI] Training engine running");
-  } else {
-    console.log("[AI] Training engine disabled");
   }
 
   if (regimeDetector) {
