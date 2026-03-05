@@ -1,11 +1,13 @@
 // backend/src/services/executionEngine.js
 // ==========================================================
 // Institutional Execution Engine
-// Stable Paper Trading + Live Trading
+// Paper Trading + Live Trading Auto Router
 // Deterministic Accounting
 // ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
+const krakenConnector = require("./krakenConnector");
+const liveTradingGuard = require("./liveTradingGuard");
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -20,10 +22,6 @@ const CONFIG = Object.freeze({
   minOrderUsd: 50,
   maxCapitalFraction: 0.5,
   simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 10),
-  liveDryRun:
-    String(process.env.LIVE_DRY_RUN || "true")
-      .toLowerCase()
-      .trim() !== "false",
 });
 
 /* =========================================================
@@ -98,11 +96,7 @@ function recalcEquity(state) {
 }
 
 function buildExecutionId() {
-
-  return `${Date.now()}_${Math.random()
-    .toString(16)
-    .slice(2)}`;
-
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 /* =========================================================
@@ -259,16 +253,6 @@ async function executeLiveOrder(params = {}) {
 
   const executionId = buildExecutionId();
 
-  if (CONFIG.liveDryRun) {
-
-    return {
-      ok: true,
-      dryRun: true,
-      executionId
-    };
-
-  }
-
   try {
 
     const routed =
@@ -293,7 +277,39 @@ async function executeLiveOrder(params = {}) {
 
 }
 
+/* =========================================================
+AUTO ROUTER
+========================================================= */
+
+async function executeOrder(params) {
+
+  const tradingEnabled =
+    await liveTradingGuard.isTradingEnabled();
+
+  if (!tradingEnabled) {
+
+    return executePaperOrder(params);
+
+  }
+
+  const balance =
+    await krakenConnector.getAccountBalance();
+
+  const usd =
+    Number(balance?.USD || balance?.ZUSD || 0);
+
+  if (usd <= 0) {
+
+    return executePaperOrder(params);
+
+  }
+
+  return executeLiveOrder(params);
+
+}
+
 module.exports = {
   executePaperOrder,
-  executeLiveOrder
+  executeLiveOrder,
+  executeOrder
 };
