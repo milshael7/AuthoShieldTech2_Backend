@@ -1,29 +1,33 @@
 // backend/src/services/strategyEngine.js
-// Phase 11 — Institutional Regime-Aware Strategy Core (Upgraded)
-// Persistent Learning + Regime Detection + Adaptive Risk
+// Phase 12 — Institutional Regime-Aware Strategy Core
+// Learning + Pattern Detection + Regime Memory + Order Flow
 // Tenant Safe • Deterministic • Crash Safe
 
 const fs = require("fs");
 const path = require("path");
 
-const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+const patternEngine = require("./patternEngine");
+const regimeMemory = require("./regimeMemory");
+const orderFlowEngine = require("./orderFlowEngine");
+
+const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 /* =========================================================
 BASE CONFIG
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
-  minConfidence: Number(process.env.TRADE_MIN_CONF || 0.62),
-  minEdge: Number(process.env.TRADE_MIN_EDGE || 0.0007),
 
-  baseRiskPct: Number(process.env.TRADE_BASE_RISK || 0.01),
-  maxRiskPct: Number(process.env.TRADE_MAX_RISK || 0.02),
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.62),
+  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.0007),
 
-  maxDailyTrades: Number(process.env.TRADE_MAX_TRADES_PER_DAY || 15),
+  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
+  maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.02),
 
-  regimeTrendEdgeBoost: 1.25,
-  regimeRangeEdgeCut: 0.75,
-  regimeExpansionBoost: 1.35
+  regimeTrendEdgeBoost:1.25,
+  regimeRangeEdgeCut:0.75,
+  regimeExpansionBoost:1.35
+
 });
 
 /* =========================================================
@@ -34,7 +38,7 @@ const LEARNING_VERSION = 4;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
-  path.join("/tmp", "strategy_learning");
+  path.join("/tmp","strategy_learning");
 
 function ensureDir(p){
   if(!fs.existsSync(p))
@@ -42,9 +46,16 @@ function ensureDir(p){
 }
 
 function learningPath(tenantId){
+
   ensureDir(LEARNING_DIR);
+
   const key = tenantId || "__default__";
-  return path.join(LEARNING_DIR,`learning_${key}.json`);
+
+  return path.join(
+    LEARNING_DIR,
+    `learning_${key}.json`
+  );
+
 }
 
 /* =========================================================
@@ -52,14 +63,21 @@ DEFAULT LEARNING STATE
 ========================================================= */
 
 function defaultLearning(){
+
   return{
+
     version:LEARNING_VERSION,
+
     edgeMultiplier:1,
     confidenceMultiplier:1,
+
     lastWinRate:0.5,
     lastEvaluatedTradeCount:0,
+
     lastUpdated:Date.now()
+
   };
+
 }
 
 const LEARNING_CACHE = new Map();
@@ -94,9 +112,7 @@ function loadLearning(tenantId){
 
     }
 
-  }catch{
-    state = defaultLearning();
-  }
+  }catch{}
 
   LEARNING_CACHE.set(key,state);
 
@@ -107,6 +123,7 @@ function loadLearning(tenantId){
 function saveLearning(tenantId){
 
   const key = tenantId || "__default__";
+
   const state = LEARNING_CACHE.get(key);
 
   if(!state) return;
@@ -133,21 +150,11 @@ REGIME DETECTION
 
 function detectRegime({price,lastPrice,volatility}){
 
-  if(!lastPrice) return "neutral";
-
-  const move =
-    Math.abs((price-lastPrice)/lastPrice);
-
-  if(volatility > 0.02 && move > 0.01)
-    return "expansion";
-
-  if(move > volatility*1.5)
-    return "trend";
-
-  if(move < volatility*0.5)
-    return "range";
-
-  return "neutral";
+  return regimeMemory.detectRegime({
+    price,
+    lastPrice,
+    volatility
+  });
 
 }
 
@@ -281,7 +288,6 @@ function buildDecision(context={}){
     lastPrice,
     volatility,
     ticksSeen=0,
-    limits={},
     paperState=null
   } = context;
 
@@ -289,12 +295,19 @@ function buildDecision(context={}){
 
   adaptFromPerformance(tenantId,paperState);
 
-  const regime =
-    detectRegime({
-      price,
-      lastPrice,
-      volatility
-    });
+  /* =====================================================
+  REGIME
+  ===================================================== */
+
+  const regime = detectRegime({
+    price,
+    lastPrice,
+    volatility
+  });
+
+  /* =====================================================
+  EDGE
+  ===================================================== */
 
   let edge =
     computeEdge({
@@ -304,12 +317,51 @@ function buildDecision(context={}){
       regime
     });
 
+  /* =====================================================
+  PATTERN BOOST
+  ===================================================== */
+
+  edge *= patternEngine.getPatternEdgeBoost({
+    tenantId,
+    symbol,
+    volatility
+  });
+
+  /* =====================================================
+  REGIME BOOST
+  ===================================================== */
+
+  edge *= regimeMemory.getRegimeBoost({
+    tenantId,
+    regime
+  });
+
+  /* =====================================================
+  CONFIDENCE
+  ===================================================== */
+
   let confidence =
     computeConfidence({
       edge,
       ticksSeen,
       regime
     });
+
+  /* =====================================================
+  ORDER FLOW
+  ===================================================== */
+
+  const flow =
+    orderFlowEngine.analyzeFlow({
+      tenantId
+    });
+
+  confidence *= flow.boost;
+  edge *= flow.boost;
+
+  /* =====================================================
+  LEARNING
+  ===================================================== */
 
   edge *= learning.edgeMultiplier;
   confidence *= learning.confidenceMultiplier;
@@ -327,12 +379,11 @@ function buildDecision(context={}){
     return {action:"WAIT",confidence,edge};
 
   /* =====================================================
-  DYNAMIC RISK MODEL
+  DYNAMIC RISK
   ===================================================== */
 
   let riskPct =
-    BASE_CONFIG.baseRiskPct *
-    confidence;
+    BASE_CONFIG.baseRiskPct * confidence;
 
   if(regime==="expansion")
     riskPct *= 1.4;
@@ -350,12 +401,15 @@ function buildDecision(context={}){
   return{
 
     symbol,
+
     action:edge>0 ? "BUY":"SELL",
 
     confidence,
     edge,
     riskPct,
+
     regime,
+    flow:flow.type,
 
     learning,
 
@@ -365,6 +419,6 @@ function buildDecision(context={}){
 
 }
 
-module.exports = {
+module.exports={
   buildDecision
 };
