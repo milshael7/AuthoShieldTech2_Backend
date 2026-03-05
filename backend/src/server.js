@@ -20,13 +20,14 @@ const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
-/* ===== PAPER ENGINE ===== */
+/* ===== ROUTES ===== */
 
 const paperRoutes = require("./routes/paper.routes");
+const marketRoutes = require("./routes/market.routes");
+
+/* ===== ENGINES ===== */
+
 const paperTrader = require("./services/paperTrader");
-
-/* ===== MARKET ENGINE ===== */
-
 const marketEngine = require("./services/marketEngine");
 
 /* ================= SAFE BOOT ================= */
@@ -98,9 +99,10 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ===== PAPER TRADING API ===== */
+/* ===== MARKET + PAPER API ===== */
 
 app.use("/api/paper", paperRoutes);
+app.use("/api/market", marketRoutes);
 
 /* ================= SERVER ================= */
 
@@ -171,8 +173,6 @@ wss.on("connection", (ws, req) => {
     const tenantId = user.companyId || user.id;
     const symbol = "BTCUSDT";
 
-    /* Register tenant in market engine */
-
     marketEngine.registerTenant(tenantId);
 
     const tickInterval = setInterval(() => {
@@ -183,16 +183,12 @@ wss.on("connection", (ws, req) => {
 
       if (!price) return;
 
-      /* ===== SEND TO FRONTEND ===== */
-
       ws.send(JSON.stringify({
         type: "tick",
         symbol,
         price,
         ts: Date.now()
       }));
-
-      /* ===== SEND TO AI ENGINE ===== */
 
       try {
         paperTrader.tick(tenantId, symbol, price);
