@@ -1,10 +1,12 @@
 // backend/src/services/tradeBrain.js
-// Phase 11 — Dual Mode Behavioral Core
+// Phase 12 — Dual Mode Behavioral Core
 // Paper = Unlimited Learning
 // Live = Capital Discipline
 // Deterministic • Tenant Safe
+// Memory Brain Integrated
 
 const aiBrain = require("./aiBrain");
+const memoryBrain = require("./memoryBrain");
 const { buildDecision } = require("./strategyEngine");
 
 /* ================= SAFETY CONSTANTS ================= */
@@ -72,6 +74,7 @@ function clamp(n, min, max) {
 /* ================= PERFORMANCE TRACKING ================= */
 
 function updatePerformance(brain, paper) {
+
   const realizedNet = safeNum(paper?.realized?.net, 0);
   const delta = realizedNet - brain.lastRealizedNet;
 
@@ -86,8 +89,6 @@ function updatePerformance(brain, paper) {
   }
 
   brain.lastRealizedNet = realizedNet;
-
-  /* Aggression scaling (learning behavior) */
 
   if (brain.winStreak >= 2) {
     brain.aggressionFactor = clamp(
@@ -104,11 +105,13 @@ function updatePerformance(brain, paper) {
       1
     );
   }
+
 }
 
 /* ================= CORE ================= */
 
 function makeDecision(context = {}) {
+
   const {
     tenantId,
     symbol = "BTCUSDT",
@@ -128,8 +131,6 @@ function makeDecision(context = {}) {
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
   const volatility = safeNum(paper.volatility, 0);
-
-  /* 🔥 DETECT PAPER MODE */
 
   const isPaper =
     paper?.cashBalance !== undefined &&
@@ -168,9 +169,16 @@ function makeDecision(context = {}) {
   /* ================= AI OVERLAY ================= */
 
   try {
+
     if (typeof aiBrain.decide === "function") {
+
       const aiView =
-        aiBrain.decide({ tenantId, symbol, last, paper }) || {};
+        aiBrain.decide({
+          tenantId,
+          symbol,
+          last,
+          paper
+        }) || {};
 
       if (
         aiView.action &&
@@ -178,14 +186,21 @@ function makeDecision(context = {}) {
           String(aiView.action).toUpperCase()
         )
       ) {
+
         confidence = Math.max(
           confidence,
           safeNum(aiView.confidence, 0)
         );
 
-        edge = Math.max(edge, safeNum(aiView.edge, 0));
+        edge = Math.max(
+          edge,
+          safeNum(aiView.edge, 0)
+        );
+
       }
+
     }
+
   } catch {}
 
   /* ================= SMOOTHING ================= */
@@ -208,7 +223,7 @@ function makeDecision(context = {}) {
     confidence *= isPaper ? 0.9 : 0.75;
   }
 
-  /* ================= HARD SAFETY (LIVE ONLY) ================= */
+  /* ================= HARD SAFETY ================= */
 
   if (!isPaper) {
 
@@ -231,6 +246,7 @@ function makeDecision(context = {}) {
       action = "WAIT";
       reason = "Loss streak protection.";
     }
+
   }
 
   /* ================= RISK ================= */
@@ -258,22 +274,52 @@ function makeDecision(context = {}) {
 
   brain.lastAction = action;
 
+  /* ================= MEMORY BRAIN RECORD ================= */
+
+  try {
+
+    memoryBrain.recordSignal({
+      tenantId,
+      symbol,
+      action,
+      confidence,
+      edge,
+      price,
+      volatility
+    });
+
+    memoryBrain.recordMarketState({
+      tenantId,
+      symbol,
+      price,
+      volatility
+    });
+
+  } catch {}
+
   return {
+
     symbol,
     action,
     confidence,
     edge,
     riskPct,
     reason,
+
     behavioral: {
       winStreak: brain.winStreak,
       lossStreak: brain.lossStreak,
       aggressionFactor: brain.aggressionFactor,
-      mode: isPaper ? "paper-learning" : "live-capital",
+      mode: isPaper
+        ? "paper-learning"
+        : "live-capital",
     },
+
     learning: strategyView.learning,
+
     ts: Date.now(),
   };
+
 }
 
 function resetTenant(tenantId) {
