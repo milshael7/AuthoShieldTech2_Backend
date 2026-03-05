@@ -1,6 +1,6 @@
 // ==========================================================
 // Kraken Exchange Connector
-// Handles account balance and order execution
+// Secure Signing • Balance Detection • Order Execution
 // ==========================================================
 
 const crypto = require("crypto");
@@ -11,44 +11,44 @@ const API_SECRET = process.env.KRAKEN_SECRET;
 
 const BASE_URL = "https://api.kraken.com";
 
-/* ================= UTIL ================= */
+/* =========================================================
+UTIL
+========================================================= */
 
-function getSignature(path, request, secret, nonce) {
+function signKrakenRequest(path, nonce, body) {
 
-  const message = nonce + request;
-  const secretBuffer = Buffer.from(secret, "base64");
-
-  const hash = crypto
-    .createHash("sha256")
-    .update(message)
-    .digest();
-
-  const hmac = crypto
-    .createHmac("sha512", secretBuffer)
-    .update(path + hash)
-    .digest("base64");
-
-  return hmac;
-
-}
-
-/* ================= PRIVATE REQUEST ================= */
-
-async function privateRequest(path, body = {}) {
-
-  const nonce = Date.now().toString();
-
-  const payload = new URLSearchParams({
+  const postData = new URLSearchParams({
     nonce,
     ...body
   }).toString();
 
-  const signature = getSignature(
-    path,
-    payload,
-    API_SECRET,
-    nonce
-  );
+  const hash = crypto
+    .createHash("sha256")
+    .update(nonce + postData)
+    .digest();
+
+  const hmac = crypto
+    .createHmac("sha512", Buffer.from(API_SECRET, "base64"))
+    .update(path + hash)
+    .digest("base64");
+
+  return { signature: hmac, postData };
+}
+
+/* =========================================================
+PRIVATE REQUEST
+========================================================= */
+
+async function privateRequest(path, body = {}) {
+
+  if (!API_KEY || !API_SECRET) {
+    throw new Error("Kraken API keys missing");
+  }
+
+  const nonce = Date.now().toString();
+
+  const { signature, postData } =
+    signKrakenRequest(path, nonce, body);
 
   const res = await fetch(BASE_URL + path, {
     method: "POST",
@@ -57,26 +57,30 @@ async function privateRequest(path, body = {}) {
       "API-Sign": signature,
       "Content-Type": "application/x-www-form-urlencoded"
     },
-    body: payload
+    body: postData
   });
 
-  return res.json();
+  const json = await res.json();
 
+  if (json.error && json.error.length) {
+    throw new Error(json.error.join(","));
+  }
+
+  return json.result;
 }
 
-/* ================= BALANCE ================= */
+/* =========================================================
+ACCOUNT BALANCE
+========================================================= */
 
-async function getBalance() {
+async function getAccountBalance() {
 
   try {
 
-    const data = await privateRequest("/0/private/Balance");
+    const result =
+      await privateRequest("/0/private/Balance");
 
-    if (data.error && data.error.length) {
-      throw new Error(data.error.join(","));
-    }
-
-    return data.result;
+    return result;
 
   } catch (err) {
 
@@ -88,20 +92,28 @@ async function getBalance() {
 
 }
 
-/* ================= PLACE ORDER ================= */
+/* =========================================================
+PLACE ORDER
+========================================================= */
 
-async function placeOrder({ pair, side, volume, type = "market" }) {
+async function placeOrder({
+  pair = "BTCUSD",
+  side = "buy",
+  volume,
+  type = "market"
+}) {
 
   try {
 
-    const data = await privateRequest("/0/private/AddOrder", {
-      pair,
-      type: side,
-      ordertype: type,
-      volume
-    });
+    const result =
+      await privateRequest("/0/private/AddOrder", {
+        pair,
+        type: side,
+        ordertype: type,
+        volume
+      });
 
-    return data;
+    return result;
 
   } catch (err) {
 
@@ -113,7 +125,35 @@ async function placeOrder({ pair, side, volume, type = "market" }) {
 
 }
 
+/* =========================================================
+LIVE EXECUTION ADAPTER
+========================================================= */
+
+async function executeLiveOrder({
+  symbol = "BTCUSD",
+  action = "BUY",
+  qty
+}) {
+
+  const side =
+    action === "BUY" ? "buy" : "sell";
+
+  const result =
+    await placeOrder({
+      pair: symbol,
+      side,
+      volume: qty
+    });
+
+  return {
+    ok: true,
+    order: result
+  };
+
+}
+
 module.exports = {
-  getBalance,
-  placeOrder
+  getAccountBalance,
+  placeOrder,
+  executeLiveOrder
 };
