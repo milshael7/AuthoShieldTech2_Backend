@@ -1,6 +1,6 @@
 // backend/src/services/strategyEngine.js
-// Phase 12 — Institutional Regime-Aware Strategy Core
-// Learning + Pattern Detection + Regime Memory + Order Flow
+// Phase 13 — Institutional Strategy Core
+// Pattern + Regime + Order Flow + Correlation + Counterfactual Learning
 // Tenant Safe • Deterministic • Crash Safe
 
 const fs = require("fs");
@@ -9,6 +9,8 @@ const path = require("path");
 const patternEngine = require("./patternEngine");
 const regimeMemory = require("./regimeMemory");
 const orderFlowEngine = require("./orderFlowEngine");
+const correlationEngine = require("./correlationEngine");
+const counterfactualEngine = require("./counterfactualEngine");
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
@@ -34,7 +36,7 @@ const BASE_CONFIG = Object.freeze({
 LEARNING CONFIG
 ========================================================= */
 
-const LEARNING_VERSION = 4;
+const LEARNING_VERSION = 5;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
@@ -295,19 +297,16 @@ function buildDecision(context={}){
 
   adaptFromPerformance(tenantId,paperState);
 
-  /* =====================================================
-  REGIME
-  ===================================================== */
+  /* ================= REGIME ================= */
 
-  const regime = detectRegime({
-    price,
-    lastPrice,
-    volatility
-  });
+  const regime =
+    detectRegime({
+      price,
+      lastPrice,
+      volatility
+    });
 
-  /* =====================================================
-  EDGE
-  ===================================================== */
+  /* ================= EDGE ================= */
 
   let edge =
     computeEdge({
@@ -317,9 +316,7 @@ function buildDecision(context={}){
       regime
     });
 
-  /* =====================================================
-  PATTERN BOOST
-  ===================================================== */
+  /* ================= PATTERN BOOST ================= */
 
   edge *= patternEngine.getPatternEdgeBoost({
     tenantId,
@@ -327,18 +324,21 @@ function buildDecision(context={}){
     volatility
   });
 
-  /* =====================================================
-  REGIME BOOST
-  ===================================================== */
+  /* ================= REGIME MEMORY ================= */
 
   edge *= regimeMemory.getRegimeBoost({
     tenantId,
     regime
   });
 
-  /* =====================================================
-  CONFIDENCE
-  ===================================================== */
+  /* ================= CORRELATION ================= */
+
+  edge *= correlationEngine.getCorrelationBoost({
+    tenantId,
+    symbol
+  });
+
+  /* ================= CONFIDENCE ================= */
 
   let confidence =
     computeConfidence({
@@ -347,9 +347,7 @@ function buildDecision(context={}){
       regime
     });
 
-  /* =====================================================
-  ORDER FLOW
-  ===================================================== */
+  /* ================= ORDER FLOW ================= */
 
   const flow =
     orderFlowEngine.analyzeFlow({
@@ -359,9 +357,17 @@ function buildDecision(context={}){
   confidence *= flow.boost;
   edge *= flow.boost;
 
-  /* =====================================================
-  LEARNING
-  ===================================================== */
+  /* ================= COUNTERFACTUAL ================= */
+
+  const missedBoost =
+    counterfactualEngine.getLearningAdjustment?.({
+      tenantId
+    }) || 1;
+
+  confidence *= missedBoost;
+  edge *= missedBoost;
+
+  /* ================= LEARNING ================= */
 
   edge *= learning.edgeMultiplier;
   confidence *= learning.confidenceMultiplier;
@@ -378,9 +384,7 @@ function buildDecision(context={}){
   if(Math.abs(edge) < BASE_CONFIG.minEdge)
     return {action:"WAIT",confidence,edge};
 
-  /* =====================================================
-  DYNAMIC RISK
-  ===================================================== */
+  /* ================= RISK ================= */
 
   let riskPct =
     BASE_CONFIG.baseRiskPct * confidence;
