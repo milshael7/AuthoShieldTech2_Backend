@@ -6,40 +6,63 @@
 const kraken = require("./krakenConnector");
 const liveGuard = require("./liveTradingGuard");
 
-/* ================= EXECUTE ORDER ================= */
+/* =========================================================
+EXECUTE ORDER
+========================================================= */
 
 async function executeOrder({
-  pair = "BTCUSD",
-  side,
-  volume
+
+  symbol = "BTCUSD",
+  action = "BUY",
+  qty
+
 }) {
 
-  const canTrade = await liveGuard.canTradeLive();
+  const canTrade =
+    await liveGuard.canTradeLive();
+
+  /* ===== PAPER MODE ===== */
 
   if (!canTrade) {
 
     console.log("[EXCHANGE] Paper mode active");
 
     return {
+
       ok: true,
       mode: "paper",
-      message: "Paper trade executed"
+      order: {
+        symbol,
+        action,
+        qty
+      }
+
     };
 
   }
 
+  /* ===== LIVE MODE ===== */
+
   try {
 
-    const result = await kraken.placeOrder({
-      pair,
-      side,
-      volume
-    });
+    const side =
+      action === "BUY" ? "buy" : "sell";
+
+    const result =
+      await kraken.placeOrder({
+
+        pair: symbol,
+        side,
+        volume: qty
+
+      });
 
     return {
+
       ok: true,
       mode: "live",
       result
+
     };
 
   } catch (err) {
@@ -47,27 +70,33 @@ async function executeOrder({
     console.error("Exchange order error:", err);
 
     return {
+
       ok: false,
       error: err.message
+
     };
 
   }
 
 }
 
-/* ================= BALANCE ================= */
+/* =========================================================
+BALANCE
+========================================================= */
 
-async function getAccountBalance() {
+async function getBalance() {
 
   try {
 
-    const balance = await kraken.getBalance();
+    const balance =
+      await kraken.getBalance();
 
     return balance;
 
   } catch (err) {
 
     console.error("Balance error:", err);
+
     return null;
 
   }
@@ -75,6 +104,8 @@ async function getAccountBalance() {
 }
 
 module.exports = {
+
   executeOrder,
-  getAccountBalance
+  getBalance
+
 };
