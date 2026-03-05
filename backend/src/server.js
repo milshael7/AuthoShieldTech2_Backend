@@ -20,9 +20,10 @@ const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
-/* ================= PAPER ENGINE ROUTE ================= */
+/* ===== PAPER ENGINE ===== */
 
 const paperRoutes = require("./routes/paper.routes");
+const paperTrader = require("./services/paperTrader");
 
 /* ================= SAFE BOOT ================= */
 
@@ -93,7 +94,7 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ================= PAPER TRADING API ================= */
+/* ===== PAPER TRADING API ===== */
 
 app.use("/api/paper", paperRoutes);
 
@@ -163,6 +164,9 @@ wss.on("connection", (ws, req) => {
 
     /* ================= MARKET STREAM ================= */
 
+    const tenantId = user.companyId || user.id;
+    const symbol = "EURUSD";
+
     let price = 1.1000;
 
     const tickInterval = setInterval(() => {
@@ -171,12 +175,24 @@ wss.on("connection", (ws, req) => {
 
       price += (Math.random() - 0.5) * 0.002;
 
+      price = Number(price.toFixed(5));
+
+      /* ===== SEND TO FRONTEND ===== */
+
       ws.send(JSON.stringify({
         type: "tick",
-        symbol: "EURUSD",
-        price: Number(price.toFixed(5)),
+        symbol,
+        price,
         ts: Date.now()
       }));
+
+      /* ===== SEND TO AI ENGINE ===== */
+
+      try {
+        paperTrader.tick(tenantId, symbol, price);
+      } catch (err) {
+        console.error("paperTrader error:", err);
+      }
 
     }, 500);
 
