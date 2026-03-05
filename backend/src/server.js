@@ -6,6 +6,8 @@ const helmet = require("helmet");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
+/* ================= CORE LIBS ================= */
+
 const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
@@ -20,33 +22,33 @@ const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
-/* ===== ROUTES ===== */
+/* ================= ROUTES ================= */
 
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
-/* ===== OPTIONAL AI LAB ROUTES (SAFE LOAD) ===== */
+/* ===== OPTIONAL ROUTES (SAFE LOAD) ===== */
 
 let trainingRoutes;
 let replayRoutes;
 let dataRoutes;
 
-try {
-  trainingRoutes = require("./routes/training.routes");
-} catch {}
+try { trainingRoutes = require("./routes/training.routes"); } catch {}
+try { replayRoutes = require("./routes/replay.routes"); } catch {}
+try { dataRoutes = require("./routes/data.routes"); } catch {}
 
-try {
-  replayRoutes = require("./routes/replay.routes");
-} catch {}
-
-try {
-  dataRoutes = require("./routes/data.routes");
-} catch {}
-
-/* ===== ENGINES ===== */
+/* ================= ENGINES ================= */
 
 const paperTrader = require("./services/paperTrader");
 const marketEngine = require("./services/marketEngine");
+
+/* ===== OPTIONAL AI ENGINES ===== */
+
+let strategyDiscovery;
+let replayEngine;
+
+try { strategyDiscovery = require("./services/strategyDiscovery"); } catch {}
+try { replayEngine = require("./services/marketReplayEngine"); } catch {}
 
 /* ================= SAFE BOOT ================= */
 
@@ -74,7 +76,7 @@ verifyRevenueLedger();
 const app = express();
 app.set("trust proxy", 1);
 
-/* Stripe webhook must come before json parser */
+/* Stripe webhook BEFORE json parser */
 app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 
 app.use(cors({
@@ -105,7 +107,7 @@ app.use("/api", (req, res, next) => {
   return zeroTrust(req, res, next);
 });
 
-/* ================= API ROUTES ================= */
+/* ================= CORE API ================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
@@ -118,12 +120,12 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ===== MARKET + PAPER API ===== */
+/* ================= MARKET + PAPER ================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* ===== OPTIONAL ROUTES ===== */
+/* ================= OPTIONAL ROUTES ================= */
 
 if (trainingRoutes) app.use("/api/training", trainingRoutes);
 if (replayRoutes) app.use("/api/replay", replayRoutes);
@@ -166,22 +168,23 @@ wss.on("connection", (ws, req) => {
     );
 
     if (!user) return wsClose(ws);
-
     if (user.locked === true) return wsClose(ws);
 
     if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
+
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws);
+
     }
 
-    const deviceCheck = classifyDeviceRisk(
-      user.activeDeviceFingerprint,
-      req
-    );
+    const deviceCheck =
+      classifyDeviceRisk(user.activeDeviceFingerprint, req);
 
     if (!deviceCheck.match) {
+
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws);
+
     }
 
     sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
@@ -202,7 +205,8 @@ wss.on("connection", (ws, req) => {
 
       if (ws.readyState !== 1) return;
 
-      const price = marketEngine.getPrice(tenantId, symbol);
+      const price =
+        marketEngine.getPrice(tenantId, symbol);
 
       if (!price) return;
 
@@ -228,7 +232,7 @@ wss.on("connection", (ws, req) => {
 
 });
 
-/* ================= GLOBAL AI ENGINE LOOP ================= */
+/* ================= LIVE AI LOOP ================= */
 
 setInterval(() => {
 
@@ -240,7 +244,8 @@ setInterval(() => {
 
     try {
 
-      const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+      const price =
+        marketEngine.getPrice(tenantId, "BTCUSDT");
 
       if (!price) continue;
 
@@ -256,10 +261,45 @@ setInterval(() => {
 
 }, 1000);
 
+/* ================= AI TRAINING LOOP ================= */
+
+if (strategyDiscovery && replayEngine) {
+
+  setInterval(async () => {
+
+    try {
+
+      const db = readDb();
+
+      for (const user of db.users || []) {
+
+        const tenantId = user.companyId || user.id;
+
+        await strategyDiscovery.discoverStrategy({
+          tenantId,
+          symbol: "BTCUSDT"
+        });
+
+      }
+
+    } catch (err) {
+
+      console.error("AI training error:", err);
+
+    }
+
+  }, 300000); // every 5 minutes
+
+}
+
 /* ================= START ================= */
 
 const port = process.env.PORT || 5000;
 
 server.listen(port, () => {
+
   console.log(`[BOOT] Running on port ${port}`);
+  console.log("[AI] Live engine running");
+  console.log("[AI] Training engine running");
+
 });
