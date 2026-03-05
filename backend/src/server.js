@@ -27,7 +27,7 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
-/* ===== OPTIONAL ROUTES (SAFE LOAD) ===== */
+/* ===== OPTIONAL ROUTES ===== */
 
 let trainingRoutes;
 let replayRoutes;
@@ -46,9 +46,11 @@ const marketEngine = require("./services/marketEngine");
 
 let strategyDiscovery;
 let replayEngine;
+let regimeDetector;
 
 try { strategyDiscovery = require("./services/strategyDiscovery"); } catch {}
 try { replayEngine = require("./services/marketReplayEngine"); } catch {}
+try { regimeDetector = require("./services/marketRegimeDetector"); } catch {}
 
 /* ================= SAFE BOOT ================= */
 
@@ -146,7 +148,16 @@ function wsClose(ws) {
   try { ws.close(); } catch {}
 }
 
+/* ===== HEARTBEAT ===== */
+
+function heartbeat() {
+  this.isAlive = true;
+}
+
 wss.on("connection", (ws, req) => {
+
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
 
   try {
 
@@ -171,20 +182,16 @@ wss.on("connection", (ws, req) => {
     if (user.locked === true) return wsClose(ws);
 
     if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
-
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws);
-
     }
 
     const deviceCheck =
       classifyDeviceRisk(user.activeDeviceFingerprint, req);
 
     if (!deviceCheck.match) {
-
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws);
-
     }
 
     sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
@@ -232,6 +239,23 @@ wss.on("connection", (ws, req) => {
 
 });
 
+/* ===== CLEAN DEAD CONNECTIONS ===== */
+
+setInterval(() => {
+
+  wss.clients.forEach((ws) => {
+
+    if (ws.isAlive === false) {
+      return ws.terminate();
+    }
+
+    ws.isAlive = false;
+    ws.ping();
+
+  });
+
+}, 30000);
+
 /* ================= LIVE AI LOOP ================= */
 
 setInterval(() => {
@@ -261,6 +285,43 @@ setInterval(() => {
 
 }, 1000);
 
+/* ================= REGIME DETECTOR ================= */
+
+if (regimeDetector) {
+
+  setInterval(() => {
+
+    try {
+
+      const db = readDb();
+
+      for (const user of db.users || []) {
+
+        const tenantId = user.companyId || user.id;
+
+        const price =
+          marketEngine.getPrice(tenantId, "BTCUSDT");
+
+        if (!price) continue;
+
+        regimeDetector.update({
+          tenantId,
+          symbol: "BTCUSDT",
+          price
+        });
+
+      }
+
+    } catch (err) {
+
+      console.error("Regime detector error:", err);
+
+    }
+
+  }, 5000);
+
+}
+
 /* ================= AI TRAINING LOOP ================= */
 
 if (strategyDiscovery && replayEngine) {
@@ -288,7 +349,7 @@ if (strategyDiscovery && replayEngine) {
 
     }
 
-  }, 300000); // every 5 minutes
+  }, 300000);
 
 }
 
@@ -300,6 +361,15 @@ server.listen(port, () => {
 
   console.log(`[BOOT] Running on port ${port}`);
   console.log("[AI] Live engine running");
-  console.log("[AI] Training engine running");
+
+  if (strategyDiscovery && replayEngine) {
+    console.log("[AI] Training engine running");
+  } else {
+    console.log("[AI] Training engine disabled");
+  }
+
+  if (regimeDetector) {
+    console.log("[AI] Market regime detector active");
+  }
 
 });
