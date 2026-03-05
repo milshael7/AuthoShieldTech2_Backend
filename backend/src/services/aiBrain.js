@@ -227,4 +227,122 @@ function adaptBehavior(brain){
 
 /* =========================================================
 SIGNAL MEMORY
-=========================================================
+========================================================= */
+
+function recordSignal({ tenantId, action, confidence, edge }) {
+
+  const brain = getBrain(tenantId);
+
+  brain.signalMemory.push({
+    ts: Date.now(),
+    action,
+    confidence,
+    edge
+  });
+
+  brain.signalMemory =
+    brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
+
+  saveBrain();
+}
+
+/* =========================================================
+DECISION OVERLAY
+========================================================= */
+
+function decide(context = {}) {
+
+  const {
+    tenantId,
+    last,
+    paper = {}
+  } = context;
+
+  const brain = getBrain(tenantId);
+
+  const learn = paper.learnStats || {};
+
+  const baseEdge = safeNum(learn.trendEdge, 0);
+  const baseConfidence = safeNum(learn.confidence, 0);
+
+  if (!Number.isFinite(last)) {
+    return { action: "WAIT", confidence: 0, edge: 0 };
+  }
+
+  if (Math.abs(baseEdge) < 0.0005) {
+    return { action: "WAIT", confidence: 0, edge: 0 };
+  }
+
+  let edge =
+    baseEdge * brain.adaptive.edgeAmplifier;
+
+  let confidence =
+    baseConfidence * brain.adaptive.confidenceBoost;
+
+  confidence = clamp(confidence, 0, 1);
+
+  if (confidence > 0.7 && Math.abs(edge) > 0.001) {
+
+    const action = edge > 0 ? "BUY" : "SELL";
+
+    recordSignal({
+      tenantId,
+      action,
+      confidence,
+      edge
+    });
+
+    return {
+      action,
+      confidence,
+      edge
+    };
+  }
+
+  return {
+    action: "WAIT",
+    confidence,
+    edge
+  };
+}
+
+/* =========================================================
+SNAPSHOT
+========================================================= */
+
+function getSnapshot(tenantId) {
+
+  const brain = getBrain(tenantId);
+
+  return {
+    ok: true,
+    stats: brain.stats,
+    adaptive: brain.adaptive,
+    signalMemory: brain.signalMemory.length,
+    tradeMemory: brain.tradeOutcomes.length
+  };
+
+}
+
+/* =========================================================
+RESET
+========================================================= */
+
+function resetBrain(tenantId) {
+
+  const key = tenantId || "__default__";
+
+  BRAINS.set(key, defaultBrain());
+
+  saveBrain();
+}
+
+/* ========================================================= */
+
+module.exports = {
+  decide,
+  recordTradeOutcome,
+  recordSignal,
+  getSnapshot,
+  resetBrain
+};
