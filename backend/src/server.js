@@ -9,12 +9,9 @@ const { WebSocketServer } = require("ws");
 /* ================= CORE LIBS ================= */
 
 const { ensureDb, readDb } = require("./lib/db");
-const { verifyAuditIntegrity, writeAudit } = require("./lib/audit");
+const { verifyAuditIntegrity } = require("./lib/audit");
 const { verify } = require("./lib/jwt");
 const sessionAdapter = require("./lib/sessionAdapter");
-const { classifyDeviceRisk } = require("./lib/deviceFingerprint");
-const { verifyRevenueLedger } = require("./lib/revenueIntegrity");
-
 const users = require("./users/user.service");
 
 const tenantMiddleware = require("./middleware/tenant");
@@ -26,31 +23,6 @@ const { authRequired } = require("./middleware/auth");
 
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
-
-/* ===== OPTIONAL ROUTES ===== */
-
-let trainingRoutes;
-let replayRoutes;
-let dataRoutes;
-
-try { trainingRoutes = require("./routes/training.routes"); } catch {}
-try { replayRoutes = require("./routes/replay.routes"); } catch {}
-try { dataRoutes = require("./routes/data.routes"); } catch {}
-
-/* ================= ENGINES ================= */
-
-const paperTrader = require("./services/paperTrader");
-const marketEngine = require("./services/marketEngine");
-
-/* ===== OPTIONAL AI ENGINES ===== */
-
-let strategyDiscovery;
-let replayEngine;
-let regimeDetector;
-
-try { strategyDiscovery = require("./services/strategyDiscovery"); } catch {}
-try { replayEngine = require("./services/marketReplayEngine"); } catch {}
-try { regimeDetector = require("./services/marketRegimeDetector"); } catch {}
 
 /* ================= SAFE BOOT ================= */
 
@@ -68,10 +40,7 @@ requireEnv("STRIPE_WEBHOOK_SECRET");
 ensureDb();
 users.ensureAdminFromEnv();
 
-/* ================= INTEGRITY ================= */
-
 verifyAuditIntegrity();
-verifyRevenueLedger();
 
 /* ================= EXPRESS ================= */
 
@@ -95,7 +64,7 @@ app.use(rateLimiter);
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* ================= PROTECTED ROUTES ================= */
+/* ================= AUTH + TENANT ================= */
 
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
@@ -104,46 +73,39 @@ app.use("/api", (req, res, next) => {
 
 app.use("/api", tenantMiddleware);
 
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) return next();
-  return zeroTrust(req, res, next);
-});
-
 /* ================= CORE API ================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
+app.use("/api/security/tools", require("./routes/tools.routes")); // ✅ FIX
 app.use("/api/incidents", require("./routes/incidents.routes"));
-app.use("/api/tools", require("./routes/tools.routes"));
 app.use("/api/entitlements", require("./routes/entitlements.routes"));
 app.use("/api/billing", require("./routes/billing.routes"));
-app.use("/api/autoprotect", require("./routes/autoprotect.routes"));
 app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ================= MARKET + PAPER ================= */
+/* ================= MARKET + PAPER (NO ZERO TRUST) ================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* ================= OPTIONAL ROUTES ================= */
+/* ================= ZERO TRUST (SAFE SCOPE ONLY) ================= */
 
-if (trainingRoutes) app.use("/api/training", trainingRoutes);
-if (replayRoutes) app.use("/api/replay", replayRoutes);
-if (dataRoutes) app.use("/api/data", dataRoutes);
+app.use("/api", (req, res, next) => {
+  if (
+    req.path.startsWith("/auth") ||
+    req.path.startsWith("/market") ||
+    req.path.startsWith("/paper")
+  ) {
+    return next();
+  }
+  return zeroTrust(req, res, next);
+});
 
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
-
-/* ================= TRADING PAIRS ================= */
-
-const PAIRS =
-  (process.env.AI_TRADING_PAIRS || "BTCUSDT")
-    .split(",")
-    .map(p => p.trim())
-    .filter(Boolean);
 
 /* ================= WEBSOCKET ================= */
 
@@ -156,200 +118,55 @@ function wsClose(ws) {
   try { ws.close(); } catch {}
 }
 
-function heartbeat() {
-  this.isAlive = true;
-}
-
 wss.on("connection", (ws, req) => {
 
   ws.isAlive = true;
-  ws.on("pong", heartbeat);
+  ws.on("pong", () => { ws.isAlive = true; });
 
   try {
-
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
-
     if (!token) return wsClose(ws);
 
     const payload = verify(token, "access");
-
     if (!payload?.id || !payload?.jti) return wsClose(ws);
-
     if (sessionAdapter.isRevoked(payload.jti)) return wsClose(ws);
 
     const db = readDb();
-
-    const user = (db.users || []).find(
-      u => String(u.id) === String(payload.id)
-    );
-
+    const user = (db.users || []).find(u => String(u.id) === String(payload.id));
     if (!user) return wsClose(ws);
-    if (user.locked === true) return wsClose(ws);
 
-    const tenantId = user.companyId || user.id;
-
-    marketEngine.registerTenant(tenantId);
+    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
+      sessionAdapter.revokeToken(payload.jti);
+      return wsClose(ws);
+    }
 
     const tickInterval = setInterval(() => {
-
       if (ws.readyState !== 1) return;
-
-      for (const symbol of PAIRS) {
-
-        const price =
-          marketEngine.getPrice(tenantId, symbol);
-
-        if (!price) continue;
-
-        ws.send(JSON.stringify({
-          type: "tick",
-          symbol,
-          price,
-          ts: Date.now()
-        }));
-
-      }
-
-    }, 500);
+      ws.send(JSON.stringify({ type: "heartbeat", ts: Date.now() }));
+    }, 1000);
 
     ws.on("close", () => clearInterval(tickInterval));
 
   } catch (err) {
-
-    console.error("WS connection error:", err);
+    console.error("WS error:", err);
     wsClose(ws);
-
   }
-
 });
 
 /* ================= CLEAN DEAD CONNECTIONS ================= */
 
 setInterval(() => {
-
-  wss.clients.forEach((ws) => {
-
-    if (ws.isAlive === false) {
-      return ws.terminate();
-    }
-
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
-
   });
-
 }, 30000);
-
-/* ================= LIVE AI LOOP ================= */
-
-setInterval(() => {
-
-  const db = readDb();
-
-  for (const user of db.users || []) {
-
-    const tenantId = user.companyId || user.id;
-
-    for (const symbol of PAIRS) {
-
-      try {
-
-        const price =
-          marketEngine.getPrice(tenantId, symbol);
-
-        if (!price) continue;
-
-        paperTrader.tick(tenantId, symbol, price);
-
-      } catch (err) {
-
-        console.error("AI engine error:", symbol, err);
-
-      }
-
-    }
-
-  }
-
-}, 1000);
-
-/* ================= REGIME DETECTOR ================= */
-
-if (regimeDetector) {
-
-  setInterval(() => {
-
-    const db = readDb();
-
-    for (const user of db.users || []) {
-
-      const tenantId = user.companyId || user.id;
-
-      for (const symbol of PAIRS) {
-
-        const price =
-          marketEngine.getPrice(tenantId, symbol);
-
-        if (!price) continue;
-
-        regimeDetector.update({
-          tenantId,
-          symbol,
-          price
-        });
-
-      }
-
-    }
-
-  }, 5000);
-
-}
-
-/* ================= AI TRAINING LOOP ================= */
-
-if (strategyDiscovery && replayEngine) {
-
-  setInterval(async () => {
-
-    const db = readDb();
-
-    for (const user of db.users || []) {
-
-      const tenantId = user.companyId || user.id;
-
-      for (const symbol of PAIRS) {
-
-        await strategyDiscovery.discoverStrategy({
-          tenantId,
-          symbol
-        });
-
-      }
-
-    }
-
-  }, 300000);
-
-}
 
 /* ================= START ================= */
 
 const port = process.env.PORT || 5000;
-
 server.listen(port, () => {
-
   console.log(`[BOOT] Running on port ${port}`);
-  console.log("[AI] Live engine running");
-  console.log("[AI] Trading pairs:", PAIRS.join(", "));
-
-  if (strategyDiscovery && replayEngine) {
-    console.log("[AI] Training engine running");
-  }
-
-  if (regimeDetector) {
-    console.log("[AI] Market regime detector active");
-  }
-
 });
