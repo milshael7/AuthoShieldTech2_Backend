@@ -20,6 +20,10 @@ const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
+/* ================= PAPER ENGINE ROUTE ================= */
+
+const paperRoutes = require("./routes/paper.routes");
+
 /* ================= SAFE BOOT ================= */
 
 function requireEnv(name) {
@@ -89,6 +93,10 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
+/* ================= PAPER TRADING API ================= */
+
+app.use("/api/paper", paperRoutes);
+
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
@@ -127,18 +135,12 @@ wss.on("connection", (ws, req) => {
 
     if (!user) return wsClose(ws);
 
-    /* ===== LOCK CHECK ===== */
-
     if (user.locked === true) return wsClose(ws);
-
-    /* ===== TOKEN VERSION CHECK (IMPORTANT) ===== */
 
     if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
       sessionAdapter.revokeToken(payload.jti);
       return wsClose(ws);
     }
-
-    /* ===== DEVICE FINGERPRINT CHECK ===== */
 
     const deviceCheck = classifyDeviceRisk(
       user.activeDeviceFingerprint,
@@ -149,8 +151,6 @@ wss.on("connection", (ws, req) => {
       sessionAdapter.revokeAllUserSessions(user.id);
       return wsClose(ws);
     }
-
-    /* ===== REGISTER SESSION ===== */
 
     sessionAdapter.registerSession(user.id, payload.jti, 15 * 60 * 1000);
 
