@@ -25,11 +25,14 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
-/* ===== AI LAB ROUTES ===== */
+/* ===== NEW AI LAB ROUTES ===== */
 
 const trainingRoutes = require("./routes/training.routes");
 const replayRoutes = require("./routes/replay.routes");
-const evolutionRoutes = require("./routes/evolution.routes");
+
+/* ===== MARKET DATA DOWNLOAD ROUTE ===== */
+
+const dataRoutes = require("./routes/data.routes");
 
 /* ===== ENGINES ===== */
 
@@ -114,7 +117,10 @@ app.use("/api/market", marketRoutes);
 
 app.use("/api/training", trainingRoutes);
 app.use("/api/replay", replayRoutes);
-app.use("/api/evolution", evolutionRoutes);
+
+/* ===== MARKET DATA DOWNLOAD ===== */
+
+app.use("/api/data", dataRoutes);
 
 /* ================= SERVER ================= */
 
