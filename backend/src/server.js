@@ -25,6 +25,10 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const paperTrader = require("./services/paperTrader");
 
+/* ===== MARKET ENGINE ===== */
+
+const marketEngine = require("./services/marketEngine");
+
 /* ================= SAFE BOOT ================= */
 
 function requireEnv(name) {
@@ -165,17 +169,19 @@ wss.on("connection", (ws, req) => {
     /* ================= MARKET STREAM ================= */
 
     const tenantId = user.companyId || user.id;
-    const symbol = "EURUSD";
+    const symbol = "BTCUSDT";
 
-    let price = 1.1000;
+    /* Register tenant in market engine */
+
+    marketEngine.registerTenant(tenantId);
 
     const tickInterval = setInterval(() => {
 
       if (ws.readyState !== 1) return;
 
-      price += (Math.random() - 0.5) * 0.002;
+      const price = marketEngine.getPrice(tenantId, symbol);
 
-      price = Number(price.toFixed(5));
+      if (!price) return;
 
       /* ===== SEND TO FRONTEND ===== */
 
