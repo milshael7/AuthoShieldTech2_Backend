@@ -25,6 +25,11 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
+/* ===== NEW AI LAB ROUTES ===== */
+
+const trainingRoutes = require("./routes/training.routes");
+const replayRoutes = require("./routes/replay.routes");
+
 /* ===== ENGINES ===== */
 
 const paperTrader = require("./services/paperTrader");
@@ -103,6 +108,11 @@ app.use("/api/soc", require("./routes/soc.routes"));
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
+
+/* ===== AI TRAINING LAB ===== */
+
+app.use("/api/training", trainingRoutes);
+app.use("/api/replay", replayRoutes);
 
 /* ================= SERVER ================= */
 
@@ -224,7 +234,9 @@ setInterval(() => {
       paperTrader.tick(tenantId, "BTCUSDT", price);
 
     } catch (err) {
+
       console.error("AI engine error:", err);
+
     }
 
   }
