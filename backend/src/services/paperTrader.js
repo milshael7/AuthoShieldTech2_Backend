@@ -1,8 +1,8 @@
 // backend/src/services/paperTrader.js
 // ==========================================================
-// Autonomous Paper Trading Engine (Phase 2 Intelligence)
+// Autonomous Paper Trading Engine (Phase 3 Intelligence)
 // AI Integrated • Risk Managed • Portfolio Managed
-// Order Flow + Counterfactual Learning Integrated
+// Order Flow + Counterfactual + Correlation Intelligence
 // ==========================================================
 
 const fs = require("fs");
@@ -16,6 +16,7 @@ const aiBrain = require("./aiBrain");
 
 const orderFlowEngine = require("./orderFlowEngine");
 const counterfactualEngine = require("./counterfactualEngine");
+const correlationEngine = require("./correlationEngine");
 
 /* ================= CONFIG ================= */
 
@@ -183,6 +184,12 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   counterfactualEngine.recordPrice({
     tenantId,
+    price
+  });
+
+  correlationEngine.recordPrice({
+    tenantId,
+    symbol,
     price
   });
 
