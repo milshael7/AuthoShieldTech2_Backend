@@ -1,7 +1,8 @@
 // backend/src/services/paperTrader.js
 // ==========================================================
-// Autonomous Paper Trading Engine (Stable Version)
+// Autonomous Paper Trading Engine (Phase 2 Intelligence)
 // AI Integrated • Risk Managed • Portfolio Managed
+// Order Flow + Counterfactual Learning Integrated
 // ==========================================================
 
 const fs = require("fs");
@@ -12,6 +13,9 @@ const riskManager = require("./riskManager");
 const portfolioManager = require("./portfolioManager");
 const executionEngine = require("./executionEngine");
 const aiBrain = require("./aiBrain");
+
+const orderFlowEngine = require("./orderFlowEngine");
+const counterfactualEngine = require("./counterfactualEngine");
 
 /* ================= CONFIG ================= */
 
@@ -170,6 +174,20 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   if(!state.running) return;
 
+  /* ================= MARKET MEMORY ================= */
+
+  orderFlowEngine.recordPrice({
+    tenantId,
+    price
+  });
+
+  counterfactualEngine.recordPrice({
+    tenantId,
+    price
+  });
+
+  /* ================= VOLATILITY ================= */
+
   const prev = state.lastPrice;
 
   state.lastPrice = price;
@@ -228,6 +246,20 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     mode:"paper"
 
   });
+
+  /* ================= COUNTERFACTUAL SIGNAL ================= */
+
+  if(plan.action==="WAIT"){
+
+    counterfactualEngine.recordSignal({
+      tenantId,
+      action:"BUY",
+      price,
+      edge:plan.edge,
+      confidence:plan.confidence
+    });
+
+  }
 
   /* ================= ENTRY ================= */
 
@@ -303,6 +335,22 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     save(tenantId);
 
     return;
+
+  }
+
+  /* ================= MISSED TRADE LEARNING ================= */
+
+  const missed =
+    counterfactualEngine.evaluateSignals({
+      tenantId
+    });
+
+  for(const m of missed){
+
+    aiBrain.recordTradeOutcome({
+      tenantId,
+      pnl:m.pnl
+    });
 
   }
 
