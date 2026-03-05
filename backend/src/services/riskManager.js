@@ -1,10 +1,14 @@
 // backend/src/services/riskManager.js
-// Phase 24 — Dual Mode Institutional Risk Engine (Stabilized)
+// ==========================================================
+// Institutional Dual-Mode Risk Engine
+// Live = Capital Protection
+// Paper = Learning Protection
+// ==========================================================
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 /* =========================================================
-   CONFIG
+CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
@@ -13,7 +17,7 @@ const CONFIG = Object.freeze({
   equityFloorPct: Number(process.env.RISK_EQUITY_FLOOR_PCT || 0.35),
 
   lossClusterSize: Number(process.env.RISK_LOSS_CLUSTER_SIZE || 3),
-  baseCooldownMs: Number(process.env.RISK_COOLDOWN_MS || 60_000),
+  baseCooldownMs: Number(process.env.RISK_COOLDOWN_MS || 60000),
 
   highVolatilityCutoff: Number(process.env.RISK_VOL_HIGH || 0.015),
   lowVolatilityCutoff: Number(process.env.RISK_VOL_LOW || 0.002),
@@ -23,97 +27,105 @@ const CONFIG = Object.freeze({
 });
 
 /* =========================================================
-   TENANT STATE
+TENANT STATE
 ========================================================= */
 
 const RISK_STATE = new Map();
 
 function getState(tenantId) {
+
   const key = tenantId || "__default__";
 
   if (!RISK_STATE.has(key)) {
-    RISK_STATE.set(key, {
-      halted: false,
-      haltReason: null,
 
-      cooldownUntil: 0,
-      cooldownLevel: 0,
-      lastClusterTradeCount: 0,
+    RISK_STATE.set(key,{
+      halted:false,
+      haltReason:null,
 
-      peakEquity: null,
-      rollingPeak: null,
-      dailyStartEquity: null,
-      firstEquitySeen: null,
-      lastDayKey: null,
+      cooldownUntil:0,
+      cooldownLevel:0,
+      lastClusterTradeCount:0,
 
-      riskMultiplier: 1,
-      volatilityRegime: "normal",
-      lastMarginPressure: 0,
+      peakEquity:null,
+      rollingPeak:null,
+      dailyStartEquity:null,
+      firstEquitySeen:null,
+      lastDayKey:null,
+
+      volatilityRegime:"normal",
+      lastMarginPressure:0
     });
+
   }
 
   return RISK_STATE.get(key);
 }
 
-function dayKey(ts) {
-  return new Date(ts).toISOString().slice(0, 10);
+function dayKey(ts){
+  return new Date(ts).toISOString().slice(0,10);
 }
 
 /* =========================================================
-   CORE EVALUATION
+EVALUATION
 ========================================================= */
 
 function evaluate({
   tenantId,
   equity,
-  volatility = 0,
-  trades = [],
-  marginUsed = 0,
-  maintenanceRequired = 0,
-  ts = Date.now(),
-  mode = "live", // 🔥 explicit mode
-}) {
+  volatility=0,
+  trades=[],
+  marginUsed=0,
+  maintenanceRequired=0,
+  ts=Date.now(),
+  mode="live"
+}){
+
   const state = getState(tenantId);
   const dk = dayKey(ts);
 
-  if (!Number.isFinite(equity) || equity <= 0) {
-    return {
-      halted: true,
-      haltReason: "invalid_equity",
-      cooling: false,
-      riskMultiplier: 0,
-      drawdown: 1,
-    };
-  }
-
   const isPaper = mode === "paper";
+
+  if(!Number.isFinite(equity) || equity <= 0){
+
+    return{
+      halted:true,
+      haltReason:"invalid_equity",
+      cooling:false,
+      riskMultiplier:0,
+      drawdown:1
+    };
+
+  }
 
   /* ================= DAILY RESET ================= */
 
-  if (state.lastDayKey !== dk) {
+  if(state.lastDayKey !== dk){
+
     state.lastDayKey = dk;
     state.dailyStartEquity = equity;
     state.cooldownLevel = 0;
     state.cooldownUntil = 0;
     state.halted = false;
     state.haltReason = null;
+
   }
 
   /* ================= EQUITY TRACKING ================= */
 
-  if (state.firstEquitySeen == null)
+  if(state.firstEquitySeen == null)
     state.firstEquitySeen = equity;
 
-  if (state.peakEquity == null)
+  if(state.peakEquity == null)
     state.peakEquity = equity;
 
-  state.peakEquity = Math.max(state.peakEquity, equity);
+  state.peakEquity = Math.max(state.peakEquity,equity);
 
-  if (state.rollingPeak == null)
+  if(state.rollingPeak == null)
     state.rollingPeak = equity;
 
   state.rollingPeak =
-    state.rollingPeak * 0.995 + equity * 0.005;
+    state.rollingPeak * 0.995 +
+    equity * 0.005;
 
   const safePeak = state.peakEquity || 1;
   const safeRolling = state.rollingPeak || 1;
@@ -125,12 +137,12 @@ function evaluate({
     (safeRolling - equity) / safeRolling;
 
   /* =====================================================
-     LIVE HARD STOPS ONLY
+  HARD CAPITAL STOPS (LIVE ONLY)
   ===================================================== */
 
-  if (!isPaper) {
+  if(!isPaper){
 
-    if (drawdown >= CONFIG.maxDrawdownPct) {
+    if(drawdown >= CONFIG.maxDrawdownPct){
       state.halted = true;
       state.haltReason = "max_drawdown";
     }
@@ -139,112 +151,136 @@ function evaluate({
       state.firstEquitySeen *
       CONFIG.equityFloorPct;
 
-    if (equity <= floor) {
+    if(equity <= floor){
       state.halted = true;
       state.haltReason = "equity_floor_breach";
     }
 
-    if (state.dailyStartEquity > 0) {
+    if(state.dailyStartEquity > 0){
+
       const dailyLoss =
         (state.dailyStartEquity - equity) /
         state.dailyStartEquity;
 
-      if (dailyLoss >= CONFIG.maxDailyLossPct) {
+      if(dailyLoss >= CONFIG.maxDailyLossPct){
         state.halted = true;
         state.haltReason = "daily_loss_limit";
       }
+
     }
 
-    if (
-      trades.length >= CONFIG.lossClusterSize &&
-      trades.length !== state.lastClusterTradeCount
-    ) {
-      const recent = trades.slice(-CONFIG.lossClusterSize);
-      const allLoss = recent.every(t => t.profit <= 0);
-
-      if (allLoss) {
-        state.cooldownLevel++;
-        const cooldown =
-          CONFIG.baseCooldownMs *
-          Math.pow(1.8, state.cooldownLevel - 1);
-
-        state.cooldownUntil = ts + cooldown;
-      }
-
-      state.lastClusterTradeCount = trades.length;
-    }
   }
 
-  const cooling = !isPaper && ts < state.cooldownUntil;
-
   /* =====================================================
-     VOLATILITY REGIME (BOTH MODES)
+  LOSS CLUSTER COOL-DOWN
   ===================================================== */
 
-  if (volatility >= CONFIG.highVolatilityCutoff)
-    state.volatilityRegime = "high";
-  else if (volatility <= CONFIG.lowVolatilityCutoff)
-    state.volatilityRegime = "low";
-  else
-    state.volatilityRegime = "normal";
+  if(trades.length >= CONFIG.lossClusterSize &&
+     trades.length !== state.lastClusterTradeCount){
 
-  if (state.volatilityRegime === "high")
-    state.riskMultiplier = isPaper ? 0.8 : 0.6;
-  else if (state.volatilityRegime === "low")
-    state.riskMultiplier = isPaper ? 1.3 : 1.2;
-  else
-    state.riskMultiplier = 1;
+    const recent =
+      trades.slice(-CONFIG.lossClusterSize);
+
+    const allLoss =
+      recent.every(t=>t.profit <= 0);
+
+    if(allLoss){
+
+      state.cooldownLevel++;
+
+      const cooldown =
+        CONFIG.baseCooldownMs *
+        Math.pow(1.8,state.cooldownLevel-1);
+
+      state.cooldownUntil = ts + cooldown;
+
+    }
+
+    state.lastClusterTradeCount = trades.length;
+
+  }
+
+  const cooling = ts < state.cooldownUntil;
 
   /* =====================================================
-     MARGIN PROTECTION (LIVE ONLY)
+  VOLATILITY REGIME
   ===================================================== */
 
-  if (!isPaper) {
+  if(volatility >= CONFIG.highVolatilityCutoff)
+    state.volatilityRegime="high";
+  else if(volatility <= CONFIG.lowVolatilityCutoff)
+    state.volatilityRegime="low";
+  else
+    state.volatilityRegime="normal";
+
+  let riskMultiplier = 1;
+
+  if(state.volatilityRegime === "high")
+    riskMultiplier *= isPaper ? 0.85 : 0.65;
+
+  if(state.volatilityRegime === "low")
+    riskMultiplier *= isPaper ? 1.25 : 1.15;
+
+  /* =====================================================
+  DRAWDOWN RISK REDUCTION
+  ===================================================== */
+
+  if(rollingDrawdown > 0.10)
+    riskMultiplier *= 0.75;
+
+  if(rollingDrawdown > 0.18)
+    riskMultiplier *= 0.55;
+
+  /* =====================================================
+  MARGIN PROTECTION (LIVE ONLY)
+  ===================================================== */
+
+  if(!isPaper){
 
     let marginPressure = 0;
 
-    if (marginUsed > 0 && equity > 0)
+    if(marginUsed > 0 && equity > 0)
       marginPressure = marginUsed / equity;
 
     state.lastMarginPressure = marginPressure;
 
-    if (marginPressure >= CONFIG.maxMarginUtilization) {
+    if(marginPressure >= CONFIG.maxMarginUtilization){
+
       state.halted = true;
       state.haltReason = "margin_utilization_limit";
+
     }
 
-    if (
+    if(
       maintenanceRequired > 0 &&
       equity <= maintenanceRequired *
       (1 + CONFIG.liquidationBufferPct)
-    ) {
-      state.riskMultiplier *= 0.25;
+    ){
+      riskMultiplier *= 0.25;
     }
 
-    if (!state.halted && rollingDrawdown > 0.12) {
-      state.riskMultiplier *= 0.75;
-    }
   }
 
-  return {
-    halted: isPaper ? false : state.halted,
-    haltReason: isPaper ? null : state.haltReason,
+  return{
+    halted:isPaper ? false : state.halted,
+    haltReason:isPaper ? null : state.haltReason,
     cooling,
-    riskMultiplier: clamp(state.riskMultiplier, 0.3, 1.6),
+    riskMultiplier:clamp(riskMultiplier,0.25,1.6),
     drawdown,
     rollingDrawdown,
-    volatilityRegime: state.volatilityRegime,
-    cooldownLevel: state.cooldownLevel,
-    marginPressure: state.lastMarginPressure,
-    mode: isPaper ? "paper-learning" : "live-capital",
+    volatilityRegime:state.volatilityRegime,
+    cooldownLevel:state.cooldownLevel,
+    marginPressure:state.lastMarginPressure,
+    mode:isPaper ? "paper-learning" : "live-capital"
   };
+
 }
 
-function resetTenant(tenantId) {
+function resetTenant(tenantId){
   RISK_STATE.delete(tenantId);
 }
 
-module.exports = {
+module.exports={
   evaluate,
-  resetTenant,
+  resetTenant
 };
