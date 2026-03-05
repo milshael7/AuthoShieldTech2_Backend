@@ -1,25 +1,25 @@
 // backend/src/services/executionEngine.js
-// Phase 12 — Hardened Institutional Execution Engine
-// Paper + Live Unified Layer
-// Safe Against Missing State Fields
+// ==========================================================
+// Institutional Execution Engine
+// Stable Paper Trading + Live Trading
+// Deterministic Accounting
+// ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 /* =========================================================
-   CONFIG
+CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
-  baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0005),
-  maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.002),
+  baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0004),
+  maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.0015),
   minOrderUsd: 50,
   maxCapitalFraction: 0.5,
-  partialFillProbability: 0.35,
-  minPartialFillPct: 0.4,
-  simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 15),
+  simulatedLatencyMs: Number(process.env.PAPER_LATENCY_MS || 10),
   liveDryRun:
     String(process.env.LIVE_DRY_RUN || "true")
       .toLowerCase()
@@ -27,24 +27,35 @@ const CONFIG = Object.freeze({
 });
 
 /* =========================================================
-   SAFE STATE INIT
+SAFE STATE
 ========================================================= */
 
 function ensureStateSafety(state) {
-  state.costs = state.costs || { feePaid: 0 };
-  state.limits = state.limits || { tradesToday: 0, lossesToday: 0 };
-  state.realized = state.realized || {
+
+  state.cashBalance ??= 0;
+  state.equity ??= state.cashBalance;
+  state.peakEquity ??= state.cashBalance;
+
+  state.costs ??= { feePaid: 0 };
+
+  state.realized ??= {
     wins: 0,
     losses: 0,
     net: 0,
     grossProfit: 0,
-    grossLoss: 0,
+    grossLoss: 0
   };
-  state.trades = state.trades || [];
+
+  state.limits ??= {
+    tradesToday: 0,
+    lossesToday: 0
+  };
+
+  state.trades ??= [];
 }
 
 /* =========================================================
-   HELPERS
+HELPERS
 ========================================================= */
 
 function randomBetween(min, max) {
@@ -52,6 +63,7 @@ function randomBetween(min, max) {
 }
 
 function simulateSlippage(price, side) {
+
   const slipPct = randomBetween(
     CONFIG.baseSlippagePct,
     CONFIG.maxSlippagePct
@@ -62,28 +74,21 @@ function simulateSlippage(price, side) {
     : price * (1 - slipPct);
 }
 
-function simulatePartialFill(qty) {
-  if (Math.random() > CONFIG.partialFillProbability)
-    return qty;
-
-  const fillPct = randomBetween(
-    CONFIG.minPartialFillPct,
-    0.95
-  );
-
-  return qty * fillPct;
-}
-
 function recalcEquity(state) {
+
   if (!state) return;
 
   if (state.position && state.lastPrice) {
+
     state.equity =
       state.cashBalance +
       (state.lastPrice - state.position.entry) *
         state.position.qty;
+
   } else {
+
     state.equity = state.cashBalance;
+
   }
 
   state.peakEquity = Math.max(
@@ -93,13 +98,15 @@ function recalcEquity(state) {
 }
 
 function buildExecutionId() {
+
   return `${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}`;
+
 }
 
 /* =========================================================
-   PAPER EXECUTION
+PAPER EXECUTION
 ========================================================= */
 
 function executePaperOrder({
@@ -111,6 +118,7 @@ function executePaperOrder({
   state,
   ts = Date.now(),
 }) {
+
   if (!state) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
 
@@ -121,6 +129,7 @@ function executePaperOrder({
   /* ================= ENTRY ================= */
 
   if (action === "BUY" && !state.position) {
+
     const safeRisk = clamp(
       Number(riskPct) || 0,
       0,
@@ -135,12 +144,11 @@ function executePaperOrder({
 
     if (usd <= 0) return null;
 
-    const slippedPrice = simulateSlippage(price, "BUY");
+    const fillPrice = simulateSlippage(price, "BUY");
 
-    let qty = usd / slippedPrice;
-    qty = simulatePartialFill(qty);
+    const qty = usd / fillPrice;
 
-    const notional = qty * slippedPrice;
+    const notional = qty * fillPrice;
     const fee = notional * CONFIG.feeRate;
 
     state.cashBalance -= notional + fee;
@@ -148,12 +156,11 @@ function executePaperOrder({
 
     state.position = {
       symbol,
-      entry: slippedPrice,
+      entry: fillPrice,
       qty,
       ts,
       executionId,
-      riskPct: safeRisk,
-      feesPaid: fee,
+      riskPct: safeRisk
     };
 
     state.limits.tradesToday++;
@@ -163,11 +170,12 @@ function executePaperOrder({
     return {
       result: {
         type: "ENTRY",
+        side: "BUY",
         symbol,
-        price: slippedPrice,
+        price: fillPrice,
         qty,
-        executionId,
-      },
+        executionId
+      }
     };
   }
 
@@ -177,40 +185,51 @@ function executePaperOrder({
     (action === "SELL" || action === "CLOSE") &&
     state.position
   ) {
+
     const pos = state.position;
 
-    const slippedPrice = simulateSlippage(price, "SELL");
+    const fillPrice = simulateSlippage(price, "SELL");
 
-    let qty = simulatePartialFill(pos.qty);
+    const qty = pos.qty;
 
-    const notional = qty * slippedPrice;
-    const gross = (slippedPrice - pos.entry) * qty;
+    const notional = qty * fillPrice;
+
+    const gross = (fillPrice - pos.entry) * qty;
+
     const fee = notional * CONFIG.feeRate;
+
     const pnl = gross - fee;
 
     state.cashBalance += notional - fee;
+
     state.costs.feePaid += fee;
+
     state.realized.net += pnl;
 
     const isWin = pnl > 0;
 
     if (isWin) {
+
       state.realized.wins++;
       state.realized.grossProfit += pnl;
+
     } else {
+
       state.realized.losses++;
       state.realized.grossLoss += Math.abs(pnl);
       state.limits.lossesToday++;
+
     }
 
     state.trades.push({
       time: ts,
+      side: "SELL",
       symbol: pos.symbol,
-      entry: pos.entry,
-      exit: slippedPrice,
       qty,
+      price: fillPrice,
+      entry: pos.entry,
       profit: pnl,
-      executionId,
+      executionId
     });
 
     state.position = null;
@@ -220,11 +239,12 @@ function executePaperOrder({
     return {
       result: {
         type: "EXIT",
+        side: "SELL",
         symbol,
         pnl,
         isWin,
-        executionId,
-      },
+        executionId
+      }
     };
   }
 
@@ -232,40 +252,48 @@ function executePaperOrder({
 }
 
 /* =========================================================
-   LIVE EXECUTION
+LIVE EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
+
   const executionId = buildExecutionId();
 
   if (CONFIG.liveDryRun) {
+
     return {
       ok: true,
       dryRun: true,
-      executionId,
+      executionId
     };
+
   }
 
   try {
+
     const routed =
       await exchangeRouter.routeLiveOrder({
         ...params,
-        executionId,
+        executionId
       });
 
     return routed.ok
       ? { ok: true, executionId, result: routed.result }
       : { ok: false, executionId, error: routed.error };
+
   } catch (err) {
+
     return {
       ok: false,
       executionId,
-      error: String(err?.message || err),
+      error: String(err?.message || err)
     };
+
   }
+
 }
 
 module.exports = {
   executePaperOrder,
-  executeLiveOrder,
+  executeLiveOrder
 };
