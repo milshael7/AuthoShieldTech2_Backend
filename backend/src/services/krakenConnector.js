@@ -2,11 +2,13 @@
 // ==========================================================
 // Kraken Exchange Connector
 // Secure Signing • Balance Detection • Order Execution
-// Production Safe
+// Node 18+ Native Fetch Compatible
 // ==========================================================
 
 const crypto = require("crypto");
-const fetch = require("node-fetch");
+
+// ✅ Node 18+ / Node 22 native fetch
+const fetch = global.fetch;
 
 const API_KEY = process.env.KRAKEN_API_KEY;
 const API_SECRET = process.env.KRAKEN_SECRET;
@@ -21,15 +23,12 @@ UTIL
 ========================================================= */
 
 function withTimeout(promise, ms) {
-
   let timeout;
 
   const timeoutPromise = new Promise((_, reject) => {
-
     timeout = setTimeout(() => {
       reject(new Error("Kraken request timeout"));
     }, ms);
-
   });
 
   return Promise.race([promise, timeoutPromise])
@@ -37,10 +36,9 @@ function withTimeout(promise, ms) {
 }
 
 function signKrakenRequest(path, nonce, body) {
-
   const postData = new URLSearchParams({
     nonce,
-    ...body
+    ...body,
   }).toString();
 
   const hash = crypto
@@ -61,7 +59,6 @@ PRIVATE REQUEST
 ========================================================= */
 
 async function privateRequest(path, body = {}) {
-
   if (!API_KEY || !API_SECRET) {
     throw new Error("Kraken API keys missing");
   }
@@ -72,42 +69,30 @@ async function privateRequest(path, body = {}) {
     signKrakenRequest(path, nonce, body);
 
   const request = fetch(BASE_URL + path, {
-
     method: "POST",
-
     headers: {
       "API-Key": API_KEY,
       "API-Sign": signature,
-      "Content-Type": "application/x-www-form-urlencoded"
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-
-    body: postData
-
+    body: postData,
   });
 
   const res =
     await withTimeout(request, REQUEST_TIMEOUT);
 
   let json;
-
   try {
-
     json = await res.json();
-
   } catch {
-
     throw new Error("Invalid Kraken response");
-
   }
 
   if (json.error && json.error.length) {
-
     throw new Error(json.error.join(","));
-
   }
 
   return json.result;
-
 }
 
 /* =========================================================
@@ -115,9 +100,7 @@ PUBLIC PRICE
 ========================================================= */
 
 async function getTicker(pair = "BTCUSD") {
-
   try {
-
     const url =
       `${BASE_URL}/0/public/Ticker?pair=${pair}`;
 
@@ -131,20 +114,16 @@ async function getTicker(pair = "BTCUSD") {
       Object.values(json.result)[0];
 
     const price =
-      Number(data.c?.[0]);
+      Number(data?.c?.[0]);
 
     return Number.isFinite(price)
       ? price
       : null;
 
   } catch (err) {
-
     console.error("Kraken ticker error:", err);
-
     return null;
-
   }
-
 }
 
 /* =========================================================
@@ -152,22 +131,12 @@ ACCOUNT BALANCE
 ========================================================= */
 
 async function getBalance() {
-
   try {
-
-    const result =
-      await privateRequest("/0/private/Balance");
-
-    return result;
-
+    return await privateRequest("/0/private/Balance");
   } catch (err) {
-
     console.error("Kraken balance error:", err);
-
     return null;
-
   }
-
 }
 
 /* =========================================================
@@ -175,36 +144,22 @@ PLACE ORDER
 ========================================================= */
 
 async function placeOrder({
-
   pair = "BTCUSD",
   side = "buy",
   volume,
-  type = "market"
-
+  type = "market",
 }) {
-
   try {
-
-    const result =
-      await privateRequest("/0/private/AddOrder", {
-
-        pair,
-        type: side,
-        ordertype: type,
-        volume
-
-      });
-
-    return result;
-
+    return await privateRequest("/0/private/AddOrder", {
+      pair,
+      type: side,
+      ordertype: type,
+      volume,
+    });
   } catch (err) {
-
     console.error("Kraken order error:", err);
-
     return null;
-
   }
-
 }
 
 /* =========================================================
@@ -212,45 +167,34 @@ LIVE EXECUTION ADAPTER
 ========================================================= */
 
 async function executeLiveOrder({
-
   symbol = "BTCUSD",
   action = "BUY",
-  qty
-
+  qty,
 }) {
-
   const side =
-    action === "BUY"
-      ? "buy"
-      : "sell";
+    action === "BUY" ? "buy" : "sell";
 
   const result =
     await placeOrder({
       pair: symbol,
       side,
-      volume: qty
+      volume: qty,
     });
 
   if (!result) {
-
     return {
       ok: false,
-      error: "Order rejected by Kraken"
+      error: "Order rejected by Kraken",
     };
-
   }
 
   return {
-
     ok: true,
-
     order: {
       txid: result.txid,
-      descr: result.descr
-    }
-
+      descr: result.descr,
+    },
   };
-
 }
 
 /* =========================================================
@@ -258,10 +202,8 @@ EXPORT
 ========================================================= */
 
 module.exports = {
-
   getBalance,
   getTicker,
   placeOrder,
-  executeLiveOrder
-
+  executeLiveOrder,
 };
