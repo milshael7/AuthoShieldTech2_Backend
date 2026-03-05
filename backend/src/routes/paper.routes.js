@@ -1,31 +1,26 @@
 // backend/src/routes/paper.routes.js
-// Paper Engine API — Institutional Hardened
-// Auth Required • Tenant Safe • Engine Aligned
+// ==========================================================
+// Paper Engine API — STABLE + WS-ALIGNED
+// Single-auth • Tenant-safe • Snapshot-guarded
+// ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
-const { authRequired } = require("../middleware/auth");
 const paperTrader = require("../services/paperTrader");
 
 /* =========================================================
-   MIDDLEWARE
+   TENANT RESOLUTION (MUST MATCH WS + AI LOOP)
 ========================================================= */
 
-router.use(authRequired);
-
-/* =========================================================
-   HELPERS
-========================================================= */
-
-function getTenantId(req) {
-  return req.tenant?.id || null;
+function resolveTenant(req) {
+  return req.user?.companyId || req.user?.id || null;
 }
 
 function resetAllowed(req) {
   const key = String(process.env.PAPER_RESET_KEY || "").trim();
 
-  // If no key configured → allow
+  // No key configured → allow (dev)
   if (!key) return true;
 
   const sent = String(req.headers["x-reset-key"] || "").trim();
@@ -34,12 +29,12 @@ function resetAllowed(req) {
 
 /* =========================================================
    STATUS
+   GET /api/paper/status
 ========================================================= */
 
-// GET /api/paper/status
 router.get("/status", (req, res) => {
   try {
-    const tenantId = getTenantId(req);
+    const tenantId = resolveTenant(req);
 
     if (!tenantId) {
       return res.status(400).json({
@@ -48,7 +43,13 @@ router.get("/status", (req, res) => {
       });
     }
 
-    const snapshot = paperTrader.snapshot(tenantId);
+    const snapshot = paperTrader.snapshot(tenantId) || {
+      equity: 0,
+      cashBalance: 0,
+      position: null,
+      trades: [],
+      limits: {},
+    };
 
     return res.json({
       ok: true,
@@ -56,27 +57,36 @@ router.get("/status", (req, res) => {
       time: new Date().toISOString(),
     });
 
-  } catch (e) {
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: "Paper engine unavailable",
     });
   }
 });
 
 /* =========================================================
-   RESET
+   RESET (ADMIN / MANAGER SAFE)
+   POST /api/paper/reset
 ========================================================= */
 
-// POST /api/paper/reset
 router.post("/reset", (req, res) => {
   try {
-    const tenantId = getTenantId(req);
+    const tenantId = resolveTenant(req);
 
     if (!tenantId) {
       return res.status(400).json({
         ok: false,
         error: "Missing tenant context",
+      });
+    }
+
+    // Extra safety: restrict reset to admin/manager
+    const role = String(req.user?.role || "").toLowerCase();
+    if (role !== "admin" && role !== "manager") {
+      return res.status(403).json({
+        ok: false,
+        error: "Reset not permitted for this role",
       });
     }
 
@@ -96,22 +106,21 @@ router.post("/reset", (req, res) => {
       time: new Date().toISOString(),
     });
 
-  } catch (e) {
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: "Paper reset failed",
     });
   }
 });
 
 /* =========================================================
-   CONFIG VIEW (READ-ONLY)
+   CONFIG (READ ONLY)
 ========================================================= */
 
-// GET /api/paper/config
 router.get("/config", (req, res) => {
   try {
-    const tenantId = getTenantId(req);
+    const tenantId = resolveTenant(req);
 
     if (!tenantId) {
       return res.status(400).json({
@@ -120,7 +129,7 @@ router.get("/config", (req, res) => {
       });
     }
 
-    const snap = paperTrader.snapshot(tenantId);
+    const snap = paperTrader.snapshot(tenantId) || {};
 
     const config = {
       startBalance: Number(process.env.PAPER_START_BALANCE || 100000),
@@ -138,24 +147,23 @@ router.get("/config", (req, res) => {
     return res.json({
       ok: true,
       config,
-      limits: snap?.limits || {},
+      limits: snap.limits || {},
       time: new Date().toISOString(),
     });
 
-  } catch (e) {
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: e?.message || String(e),
+      error: "Paper config unavailable",
     });
   }
 });
 
 /* =========================================================
-   CONFIG UPDATE BLOCK
+   CONFIG UPDATE BLOCK (INTENTIONAL)
 ========================================================= */
 
-// POST /api/paper/config
-router.post("/config", (req, res) => {
+router.post("/config", (_req, res) => {
   return res.status(409).json({
     ok: false,
     error:
