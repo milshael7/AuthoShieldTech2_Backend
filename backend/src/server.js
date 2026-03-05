@@ -190,12 +190,6 @@ wss.on("connection", (ws, req) => {
         ts: Date.now()
       }));
 
-      try {
-        paperTrader.tick(tenantId, symbol, price);
-      } catch (err) {
-        console.error("paperTrader error:", err);
-      }
-
     }, 500);
 
     ws.on("close", () => {
@@ -210,6 +204,32 @@ wss.on("connection", (ws, req) => {
   }
 
 });
+
+/* ================= GLOBAL AI ENGINE LOOP ================= */
+
+setInterval(() => {
+
+  const db = readDb();
+
+  for (const user of db.users || []) {
+
+    const tenantId = user.companyId || user.id;
+
+    try {
+
+      const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+
+      if (!price) continue;
+
+      paperTrader.tick(tenantId, "BTCUSDT", price);
+
+    } catch (err) {
+      console.error("AI engine error:", err);
+    }
+
+  }
+
+}, 1000);
 
 /* ================= START ================= */
 
