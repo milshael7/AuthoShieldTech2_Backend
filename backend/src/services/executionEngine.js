@@ -1,9 +1,8 @@
 // backend/src/services/executionEngine.js
 // ==========================================================
-// Institutional Execution Engine
+// Institutional Execution Engine — STABLE & DETERMINISTIC
 // Paper Trading + Live Trading Auto Router
-// AI Capital Guard Enabled
-// Deterministic Accounting
+// Capital Guard Safe • Accounting Correct
 // ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
@@ -17,22 +16,14 @@ CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
-
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
 
   baseSlippagePct: Number(process.env.PAPER_SLIPPAGE_PCT || 0.0004),
-
   maxSlippagePct: Number(process.env.PAPER_MAX_SLIPPAGE || 0.0015),
 
   minOrderUsd: Number(process.env.PAPER_MIN_ORDER_USD || 50),
-
   maxCapitalFraction:
     Number(process.env.PAPER_MAX_CAPITAL_FRACTION || 0.5),
-
-  simulatedLatencyMs:
-    Number(process.env.PAPER_LATENCY_MS || 10),
-
-  /* ===== AI CAPITAL GUARD ===== */
 
   maxDailyTrades:
     Number(process.env.LIVE_MAX_TRADES_PER_DAY || 12),
@@ -42,7 +33,6 @@ const CONFIG = Object.freeze({
 
   minAccountBalance:
     Number(process.env.LIVE_MIN_ACCOUNT_BALANCE || 50),
-
 });
 
 /* =========================================================
@@ -50,10 +40,11 @@ SAFE STATE
 ========================================================= */
 
 function ensureStateSafety(state) {
-
   state.cashBalance ??= 0;
   state.equity ??= state.cashBalance;
   state.peakEquity ??= state.cashBalance;
+
+  state.lastPrice ??= null;
 
   state.costs ??= { feePaid: 0 };
 
@@ -62,12 +53,13 @@ function ensureStateSafety(state) {
     losses: 0,
     net: 0,
     grossProfit: 0,
-    grossLoss: 0
+    grossLoss: 0,
   };
 
   state.limits ??= {
     tradesToday: 0,
-    lossesToday: 0
+    lossesToday: 0,
+    lastResetDay: new Date().toISOString().slice(0, 10),
   };
 
   state.trades ??= [];
@@ -77,14 +69,19 @@ function ensureStateSafety(state) {
 HELPERS
 ========================================================= */
 
-function randomBetween(min, max) {
-  return Math.random() * (max - min) + min;
+function resetDailyLimitsIfNeeded(state, ts) {
+  const day = new Date(ts).toISOString().slice(0, 10);
+  if (state.limits.lastResetDay !== day) {
+    state.limits.tradesToday = 0;
+    state.limits.lossesToday = 0;
+    state.limits.lastResetDay = day;
+  }
 }
 
-function simulateSlippage(price, side) {
-
+function deterministicSlippage(price, side) {
+  // midpoint slippage → deterministic
   const slipPct =
-    randomBetween(CONFIG.baseSlippagePct, CONFIG.maxSlippagePct);
+    (CONFIG.baseSlippagePct + CONFIG.maxSlippagePct) / 2;
 
   return side === "BUY"
     ? price * (1 + slipPct)
@@ -92,20 +89,13 @@ function simulateSlippage(price, side) {
 }
 
 function recalcEquity(state) {
-
-  if (!state) return;
-
   if (state.position && state.lastPrice) {
-
     state.equity =
       state.cashBalance +
       (state.lastPrice - state.position.entry) *
         state.position.qty;
-
   } else {
-
     state.equity = state.cashBalance;
-
   }
 
   state.peakEquity =
@@ -113,7 +103,9 @@ function recalcEquity(state) {
 }
 
 function buildExecutionId() {
-  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  return `${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}`;
 }
 
 /* =========================================================
@@ -121,7 +113,6 @@ PAPER EXECUTION
 ========================================================= */
 
 function executePaperOrder({
-
   tenantId,
   symbol,
   action,
@@ -129,41 +120,47 @@ function executePaperOrder({
   riskPct,
   state,
   ts = Date.now(),
-
 }) {
-
   if (!state) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
 
   ensureStateSafety(state);
+  resetDailyLimitsIfNeeded(state, ts);
+
+  state.lastPrice = price;
 
   const executionId = buildExecutionId();
 
   /* ================= ENTRY ================= */
 
   if (action === "BUY" && !state.position) {
+    if (state.limits.tradesToday >= CONFIG.maxDailyTrades)
+      return null;
 
     const safeRisk =
       clamp(Number(riskPct) || 0, 0, CONFIG.maxCapitalFraction);
 
+    const maxUsd =
+      state.cashBalance * CONFIG.maxCapitalFraction;
+
     const usd = clamp(
       state.cashBalance * safeRisk,
       CONFIG.minOrderUsd,
-      state.cashBalance * CONFIG.maxCapitalFraction
+      maxUsd
     );
 
-    if (usd <= 0) return null;
+    if (usd <= 0 || usd > state.cashBalance) return null;
 
-    const fillPrice = simulateSlippage(price, "BUY");
+    const fillPrice =
+      deterministicSlippage(price, "BUY");
 
     const qty = usd / fillPrice;
-
     const notional = qty * fillPrice;
-
     const fee = notional * CONFIG.feeRate;
 
-    state.cashBalance -= notional + fee;
+    if (state.cashBalance - notional - fee < 0) return null;
 
+    state.cashBalance -= notional + fee;
     state.costs.feePaid += fee;
 
     state.position = {
@@ -172,7 +169,7 @@ function executePaperOrder({
       qty,
       ts,
       executionId,
-      riskPct: safeRisk
+      riskPct: safeRisk,
     };
 
     state.limits.tradesToday++;
@@ -186,49 +183,37 @@ function executePaperOrder({
         symbol,
         price: fillPrice,
         qty,
-        executionId
-      }
+        executionId,
+      },
     };
-
   }
 
   /* ================= EXIT ================= */
 
   if ((action === "SELL" || action === "CLOSE") && state.position) {
-
     const pos = state.position;
 
-    const fillPrice = simulateSlippage(price, "SELL");
+    const fillPrice =
+      deterministicSlippage(price, "SELL");
 
     const qty = pos.qty;
-
     const notional = qty * fillPrice;
 
     const gross = (fillPrice - pos.entry) * qty;
-
     const fee = notional * CONFIG.feeRate;
-
     const pnl = gross - fee;
 
     state.cashBalance += notional - fee;
-
     state.costs.feePaid += fee;
-
     state.realized.net += pnl;
 
-    const isWin = pnl > 0;
-
-    if (isWin) {
-
+    if (pnl > 0) {
       state.realized.wins++;
       state.realized.grossProfit += pnl;
-
     } else {
-
       state.realized.losses++;
       state.realized.grossLoss += Math.abs(pnl);
       state.limits.lossesToday++;
-
     }
 
     state.trades.push({
@@ -239,7 +224,7 @@ function executePaperOrder({
       price: fillPrice,
       entry: pos.entry,
       profit: pnl,
-      executionId
+      executionId,
     });
 
     state.position = null;
@@ -252,11 +237,10 @@ function executePaperOrder({
         side: "SELL",
         symbol,
         pnl,
-        isWin,
-        executionId
-      }
+        isWin: pnl > 0,
+        executionId,
+      },
     };
-
   }
 
   return null;
@@ -267,46 +251,34 @@ LIVE EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
-
   const executionId = buildExecutionId();
 
   try {
-
     const routed =
       await exchangeRouter.routeLiveOrder({
         ...params,
-        executionId
+        executionId,
       });
 
     return routed.ok
       ? { ok: true, executionId, result: routed.result }
       : { ok: false, executionId, error: routed.error };
-
   } catch (err) {
-
     return {
       ok: false,
       executionId,
-      error: String(err?.message || err)
+      error: String(err?.message || err),
     };
-
   }
-
 }
 
 /* =========================================================
-AI CAPITAL GUARD
+CAPITAL GUARD
 ========================================================= */
 
 async function capitalGuard(params = {}) {
-
   if (process.env.EXECUTION_KILL_SWITCH === "true") {
-
-    return {
-      ok: false,
-      reason: "Execution blocked by kill switch"
-    };
-
+    return { ok: false, reason: "Kill switch active" };
   }
 
   const balance =
@@ -316,21 +288,11 @@ async function capitalGuard(params = {}) {
     Number(balance?.USD || balance?.ZUSD || 0);
 
   if (usd < CONFIG.minAccountBalance) {
-
-    return {
-      ok: false,
-      reason: "Insufficient account balance"
-    };
-
+    return { ok: false, reason: "Low balance" };
   }
 
   if (params?.notionalUsd > CONFIG.maxNotionalUsd) {
-
-    return {
-      ok: false,
-      reason: "Order exceeds max notional limit"
-    };
-
+    return { ok: false, reason: "Max notional exceeded" };
   }
 
   return { ok: true };
@@ -341,45 +303,23 @@ AUTO ROUTER
 ========================================================= */
 
 async function executeOrder(params) {
-
   const tradingEnabled =
     await liveTradingGuard.isTradingEnabled();
 
   if (!tradingEnabled) {
-
     return executePaperOrder(params);
-
   }
 
-  const guard =
-    await capitalGuard(params);
-
+  const guard = await capitalGuard(params);
   if (!guard.ok) {
-
-    console.log("[GUARD BLOCKED]", guard.reason);
-
     return executePaperOrder(params);
-
-  }
-
-  const balance =
-    await krakenConnector.getBalance();
-
-  const usd =
-    Number(balance?.USD || balance?.ZUSD || 0);
-
-  if (usd <= 0) {
-
-    return executePaperOrder(params);
-
   }
 
   return executeLiveOrder(params);
-
 }
 
 module.exports = {
   executePaperOrder,
   executeLiveOrder,
-  executeOrder
+  executeOrder,
 };
