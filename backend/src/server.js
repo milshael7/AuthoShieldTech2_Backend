@@ -25,10 +25,11 @@ const { authRequired } = require("./middleware/auth");
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 
-/* ===== NEW AI LAB ROUTES ===== */
+/* ===== AI LAB ROUTES ===== */
 
 const trainingRoutes = require("./routes/training.routes");
 const replayRoutes = require("./routes/replay.routes");
+const evolutionRoutes = require("./routes/evolution.routes");
 
 /* ===== ENGINES ===== */
 
@@ -113,6 +114,7 @@ app.use("/api/market", marketRoutes);
 
 app.use("/api/training", trainingRoutes);
 app.use("/api/replay", replayRoutes);
+app.use("/api/evolution", evolutionRoutes);
 
 /* ================= SERVER ================= */
 
@@ -177,8 +179,6 @@ wss.on("connection", (ws, req) => {
       action: "WEBSOCKET_CONNECTED",
       detail: { path: req.url }
     });
-
-    /* ================= MARKET STREAM ================= */
 
     const tenantId = user.companyId || user.id;
     const symbol = "BTCUSDT";
