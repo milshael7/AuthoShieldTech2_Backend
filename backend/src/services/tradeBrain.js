@@ -8,6 +8,7 @@
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
 const { buildDecision } = require("./strategyEngine");
+const capitalProtection = require("./capitalProtection");
 
 /* ================= SAFETY CONSTANTS ================= */
 
@@ -41,9 +42,11 @@ const ALLOWED_ACTIONS = new Set([
 const BRAIN_STATE = new Map();
 
 function getBrainState(tenantId) {
+
   const key = tenantId || "__default__";
 
   if (!BRAIN_STATE.has(key)) {
+
     BRAIN_STATE.set(key, {
       smoothedConfidence: 0,
       edgeMomentum: 0,
@@ -55,20 +58,27 @@ function getBrainState(tenantId) {
 
       aggressionFactor: 1,
     });
+
   }
 
   return BRAIN_STATE.get(key);
+
 }
 
 /* ================= HELPERS ================= */
 
 function safeNum(x, fallback = 0) {
+
   const n = Number(x);
+
   return Number.isFinite(n) ? n : fallback;
+
 }
 
 function clamp(n, min, max) {
+
   return Math.max(min, Math.min(max, n));
+
 }
 
 /* ================= PERFORMANCE TRACKING ================= */
@@ -79,31 +89,33 @@ function updatePerformance(brain, paper) {
   const delta = realizedNet - brain.lastRealizedNet;
 
   if (delta > 0) {
+
     brain.winStreak++;
     brain.lossStreak = 0;
+
   }
 
   else if (delta < 0) {
+
     brain.lossStreak++;
     brain.winStreak = 0;
+
   }
 
   brain.lastRealizedNet = realizedNet;
 
   if (brain.winStreak >= 2) {
-    brain.aggressionFactor = clamp(
-      brain.aggressionFactor + 0.1,
-      1,
-      1.8
-    );
+
+    brain.aggressionFactor =
+      clamp(brain.aggressionFactor + 0.1, 1, 1.8);
+
   }
 
   if (brain.lossStreak >= 2) {
-    brain.aggressionFactor = clamp(
-      brain.aggressionFactor * 0.8,
-      0.6,
-      1
-    );
+
+    brain.aggressionFactor =
+      clamp(brain.aggressionFactor * 0.8, 0.6, 1);
+
   }
 
 }
@@ -139,6 +151,7 @@ function makeDecision(context = {}) {
   /* ================= STRATEGY ================= */
 
   const strategyView = buildDecision({
+
     tenantId,
     symbol,
     price,
@@ -147,6 +160,7 @@ function makeDecision(context = {}) {
     ticksSeen: learn.ticksSeen,
     limits,
     paperState: paper,
+
   });
 
   let action = strategyView.action;
@@ -157,13 +171,17 @@ function makeDecision(context = {}) {
   /* ================= NORMALIZE ================= */
 
   if (!hasPosition && action === "SELL") {
+
     action = "WAIT";
     reason = "No position to sell.";
+
   }
 
   if (hasPosition && action === "BUY") {
+
     action = "WAIT";
     reason = "Position already open.";
+
   }
 
   /* ================= AI OVERLAY ================= */
@@ -187,15 +205,11 @@ function makeDecision(context = {}) {
         )
       ) {
 
-        confidence = Math.max(
-          confidence,
-          safeNum(aiView.confidence, 0)
-        );
+        confidence =
+          Math.max(confidence, safeNum(aiView.confidence, 0));
 
-        edge = Math.max(
-          edge,
-          safeNum(aiView.edge, 0)
-        );
+        edge =
+          Math.max(edge, safeNum(aiView.edge, 0));
 
       }
 
@@ -220,7 +234,9 @@ function makeDecision(context = {}) {
   /* ================= VOLATILITY ================= */
 
   if (volatility >= VOL_HIGH) {
+
     confidence *= isPaper ? 0.9 : 0.75;
+
   }
 
   /* ================= HARD SAFETY ================= */
@@ -228,23 +244,31 @@ function makeDecision(context = {}) {
   if (!isPaper) {
 
     if (!Number.isFinite(price)) {
+
       action = "WAIT";
       reason = "Missing price.";
+
     }
 
     else if (limits.halted) {
+
       action = "WAIT";
       reason = "System halted.";
+
     }
 
     else if (tradesToday >= MAX_TRADES_PER_DAY) {
+
       action = "WAIT";
       reason = "Daily trade limit reached.";
+
     }
 
     else if (lossesToday >= MAX_LOSS_STREAK) {
+
       action = "WAIT";
       reason = "Loss streak protection.";
+
     }
 
   }
@@ -265,11 +289,47 @@ function makeDecision(context = {}) {
 
   riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
 
+  /* ================= CAPITAL PROTECTION ================= */
+
+  try {
+
+    const balanceUsd =
+      paper?.equity ||
+      paper?.cashBalance ||
+      0;
+
+    const protection =
+      capitalProtection.validateOrder({
+        balanceUsd,
+        price,
+        riskPct
+      });
+
+    if (!protection.allow) {
+
+      action = "WAIT";
+      confidence = 0;
+      edge = 0;
+      reason = protection.reason;
+
+    }
+
+    else {
+
+      riskPct =
+        protection.usd / balanceUsd;
+
+    }
+
+  } catch {}
+
   /* ================= FINAL ================= */
 
   if (action === "WAIT") {
+
     confidence = 0;
     edge = 0;
+
   }
 
   brain.lastAction = action;
@@ -279,6 +339,7 @@ function makeDecision(context = {}) {
   try {
 
     memoryBrain.recordSignal({
+
       tenantId,
       symbol,
       action,
@@ -286,13 +347,16 @@ function makeDecision(context = {}) {
       edge,
       price,
       volatility
+
     });
 
     memoryBrain.recordMarketState({
+
       tenantId,
       symbol,
       price,
       volatility
+
     });
 
   } catch {}
@@ -307,23 +371,28 @@ function makeDecision(context = {}) {
     reason,
 
     behavioral: {
+
       winStreak: brain.winStreak,
       lossStreak: brain.lossStreak,
       aggressionFactor: brain.aggressionFactor,
       mode: isPaper
         ? "paper-learning"
         : "live-capital",
+
     },
 
     learning: strategyView.learning,
 
     ts: Date.now(),
+
   };
 
 }
 
 function resetTenant(tenantId) {
+
   BRAIN_STATE.delete(tenantId);
+
 }
 
 module.exports = {
