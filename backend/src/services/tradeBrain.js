@@ -1,5 +1,5 @@
 // backend/src/services/tradeBrain.js
-// Phase 14 — Behavioral Core + Order Flow Intelligence
+// Phase 15 — Behavioral Core + Microstructure Intelligence
 
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
@@ -71,7 +71,6 @@ function getBrainState(tenantId) {
 function safeNum(x, fallback = 0) {
 
   const n = Number(x);
-
   return Number.isFinite(n) ? n : fallback;
 
 }
@@ -214,7 +213,7 @@ function makeDecision(context = {}) {
 
   } catch {}
 
-  /* ================= ORDER FLOW ================= */
+  /* ================= ORDER FLOW INTELLIGENCE ================= */
 
   try {
 
@@ -223,10 +222,30 @@ function makeDecision(context = {}) {
 
     confidence *= flow.boost || 1;
 
-    if (flow.type === "fake_breakout") {
+    if (flow.type === "fake_breakout" ||
+        flow.type === "trend_exhaustion") {
 
       action = "WAIT";
-      reason = "Order flow fake breakout";
+      reason = "Order flow risk";
+
+    }
+
+    if (flow.type === "liquidity_sweep") {
+
+      confidence *= 0.7;
+
+    }
+
+    if (flow.type === "compression") {
+
+      action = "WAIT";
+      reason = "Market compression";
+
+    }
+
+    if (flow.type === "volatility_shock") {
+
+      confidence *= 0.5;
 
     }
 
