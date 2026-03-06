@@ -3,6 +3,7 @@
 // Institutional Execution Engine — STABLE & DETERMINISTIC
 // Paper Trading + Live Trading Auto Router
 // Capital Guard Safe • Accounting Correct
+// GLOBAL TRADING MODE SAFETY ADDED
 // ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
@@ -71,6 +72,7 @@ HELPERS
 
 function resetDailyLimitsIfNeeded(state, ts) {
   const day = new Date(ts).toISOString().slice(0, 10);
+
   if (state.limits.lastResetDay !== day) {
     state.limits.tradesToday = 0;
     state.limits.lossesToday = 0;
@@ -79,7 +81,6 @@ function resetDailyLimitsIfNeeded(state, ts) {
 }
 
 function deterministicSlippage(price, side) {
-  // midpoint slippage → deterministic
   const slipPct =
     (CONFIG.baseSlippagePct + CONFIG.maxSlippagePct) / 2;
 
@@ -300,9 +301,22 @@ async function capitalGuard(params = {}) {
 
 /* =========================================================
 AUTO ROUTER
+GLOBAL MODE + SAFETY
 ========================================================= */
 
 async function executeOrder(params) {
+
+  /* ================= GLOBAL TRADING MODE ================= */
+
+  const tradingMode =
+    process.env.TRADING_MODE || "paper";
+
+  if (tradingMode === "paper") {
+    return executePaperOrder(params);
+  }
+
+  /* ================= UI CONTROL SWITCH ================= */
+
   const tradingEnabled =
     await liveTradingGuard.isTradingEnabled();
 
@@ -310,10 +324,15 @@ async function executeOrder(params) {
     return executePaperOrder(params);
   }
 
+  /* ================= CAPITAL SAFETY ================= */
+
   const guard = await capitalGuard(params);
+
   if (!guard.ok) {
     return executePaperOrder(params);
   }
+
+  /* ================= LIVE EXECUTION ================= */
 
   return executeLiveOrder(params);
 }
