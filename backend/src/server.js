@@ -23,6 +23,7 @@ const { authRequired } = require("./middleware/auth");
 
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
+const tradingRoutes = require("./routes/trading.routes"); // ← NEW
 
 /* ================= SAFE BOOT ================= */
 
@@ -75,11 +76,7 @@ app.use("/api", (req, res, next) => {
 app.use("/api", tenantMiddleware);
 
 /* =========================================================
-   ADMIN COMPATIBILITY LAYER (GLOBAL VIEW / NO 404)
-   PURPOSE:
-   - Prevent admin global-room 404s
-   - Allow construction-time access
-   - NO private mutation authority
+ADMIN COMPATIBILITY LAYER
 ========================================================= */
 
 app.use(
@@ -99,28 +96,32 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ================= MARKET + PAPER (REST ONLY) ================= */
+/* ================= TRADING SYSTEM ================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
+/* NEW — unified trading control */
+app.use("/api/trading", tradingRoutes);
+
 /* =========================================================
-   ZERO TRUST (CONTROLLED SCOPE)
-   NOTE:
-   - Still enforced
-   - Admin/owner construction paths pass
+ZERO TRUST
 ========================================================= */
 
 app.use("/api", (req, res, next) => {
+
   if (
     req.path.startsWith("/auth") ||
     req.path.startsWith("/market") ||
     req.path.startsWith("/paper") ||
+    req.path.startsWith("/trading") ||   // ← added
     req.path.startsWith("/admin")
   ) {
     return next();
   }
+
   return zeroTrust(req, res, next);
+
 });
 
 /* ================= HTTP SERVER ================= */
@@ -128,7 +129,7 @@ app.use("/api", (req, res, next) => {
 const server = http.createServer(app);
 
 /* =================================================
-   WEBSOCKET — SECURITY CHANNEL (ADVISORY ONLY)
+WEBSOCKET — SECURITY CHANNEL
 ================================================= */
 
 const securityWss = new WebSocketServer({
@@ -143,19 +144,28 @@ function closeWs(ws) {
 }
 
 securityWss.on("connection", (ws, req) => {
+
   try {
+
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get("token");
+
     if (!token) return closeWs(ws);
 
     const payload = verify(token, "access");
-    if (!payload?.id || !payload?.jti) return closeWs(ws);
-    if (sessionAdapter.isRevoked(payload.jti)) return closeWs(ws);
+
+    if (!payload?.id || !payload?.jti)
+      return closeWs(ws);
+
+    if (sessionAdapter.isRevoked(payload.jti))
+      return closeWs(ws);
 
     const db = readDb();
+
     const user = (db.users || []).find(
       (u) => String(u.id) === String(payload.id)
     );
+
     if (!user) return closeWs(ws);
 
     if (
@@ -167,6 +177,7 @@ securityWss.on("connection", (ws, req) => {
     }
 
     ws.isAlive = true;
+
     ws.on("pong", () => {
       ws.isAlive = true;
     });
@@ -174,28 +185,36 @@ securityWss.on("connection", (ws, req) => {
   } catch {
     closeWs(ws);
   }
+
 });
 
-/* ================= WS HEARTBEAT CLEANUP ================= */
+/* ================= WS HEARTBEAT ================= */
 
 setInterval(() => {
+
   securityWss.clients.forEach((ws) => {
+
     if (ws.isAlive === false) {
       try {
         ws.terminate();
       } catch {}
       return;
     }
+
     ws.isAlive = false;
+
     try {
       ws.ping();
     } catch {}
+
   });
+
 }, 30000);
 
 /* ================= START ================= */
 
 const port = process.env.PORT || 5000;
+
 server.listen(port, () => {
   console.log(`[BOOT] Backend running quietly on port ${port}`);
 });
