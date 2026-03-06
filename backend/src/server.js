@@ -86,7 +86,7 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ================= MARKET + PAPER (SAFE, REST ONLY) ================= */
+/* ================= MARKET + PAPER (REST ONLY) ================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
@@ -104,11 +104,19 @@ app.use("/api", (req, res, next) => {
   return zeroTrust(req, res, next);
 });
 
-/* ================= SERVER ================= */
+/* ================= HTTP SERVER ================= */
 
 const server = http.createServer(app);
 
-/* ================= WEBSOCKET — SECURITY (QUIET) ================= */
+/* =================================================
+   WEBSOCKET — SECURITY CHANNEL (ADVISORY ONLY)
+   PATH: /ws/security
+   PURPOSE:
+   - Exists because frontend expects it
+   - NEVER authoritative
+   - NEVER chatty
+   - NEVER required for correctness
+================================================= */
 
 const securityWss = new WebSocketServer({
   server,
@@ -116,7 +124,9 @@ const securityWss = new WebSocketServer({
 });
 
 function closeWs(ws) {
-  try { ws.close(); } catch {}
+  try {
+    ws.close();
+  } catch {}
 }
 
 securityWss.on("connection", (ws, req) => {
@@ -143,25 +153,31 @@ securityWss.on("connection", (ws, req) => {
       return closeWs(ws);
     }
 
+    // heartbeat only — no push unless real threat exists
     ws.isAlive = true;
-    ws.on("pong", () => { ws.isAlive = true; });
-
-    // 🔇 QUIET MODE:
-    // No messages are sent unless a real security event occurs.
-    // This socket exists to prevent frontend fighting.
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
 
   } catch {
     closeWs(ws);
   }
 });
 
-/* ================= CLEAN DEAD WS ================= */
+/* ================= WS HEARTBEAT CLEANUP ================= */
 
 setInterval(() => {
   securityWss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
+    if (ws.isAlive === false) {
+      try {
+        ws.terminate();
+      } catch {}
+      return;
+    }
     ws.isAlive = false;
-    try { ws.ping(); } catch {}
+    try {
+      ws.ping();
+    } catch {}
   });
 }, 30000);
 
