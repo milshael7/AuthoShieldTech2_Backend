@@ -1,8 +1,9 @@
 // backend/src/routes/security.routes.js
 // =========================================================
-// Enterprise Security Firewall — ZeroTrust Enforcement v10
-// QUIET MODE • NO EVENT SPAM • NO AUDIT FLOOD
-// DETERMINISTIC RESPONSES • CACHE-AWARE • PLATFORM-SAFE
+// ENTERPRISE SECURITY ROUTES — SEALED v11
+// QUIET MODE • REST AUTHORITY • WS-ADVISORY SAFE
+// NO EVENT SPAM • NO AUDIT FLOOD • DETERMINISTIC
+// SINGLE SOURCE OF TRUTH FOR SECURITY STATE
 // =========================================================
 
 const express = require("express");
@@ -17,8 +18,8 @@ const { writeAudit } = require("../lib/audit");
 const MAX_SECURITY_EVENTS = 2000;
 const DEFAULT_ENFORCEMENT_THRESHOLD = 75;
 
-// 🔇 quiet-mode controls
-const POSTURE_CACHE_TTL = 15_000; // 15s
+// quiet-mode controls
+const POSTURE_CACHE_TTL = 15_000; // 15s cache
 const AUDIT_COOLDOWN = 60_000; // 1 min per user+action
 
 /* ================= MEMORY ================= */
@@ -28,16 +29,8 @@ const auditCooldown = new Map(); // key -> ts
 
 /* ================= HELPERS ================= */
 
-function normalize(role) {
-  return String(role || "").toLowerCase();
-}
-
-function isAdmin(user) {
-  return normalize(user.role) === "admin";
-}
-
-function isManager(user) {
-  return normalize(user.role) === "manager";
+function normalize(v) {
+  return String(v || "").toLowerCase();
 }
 
 function normalizeArray(v) {
@@ -51,6 +44,16 @@ function clamp(n, a, b) {
   return Math.max(a, Math.min(b, x));
 }
 
+function isAdmin(user) {
+  return normalize(user.role) === "admin";
+}
+
+function isManager(user) {
+  return normalize(user.role) === "manager";
+}
+
+/* ================= QUIET AUDIT ================= */
+
 function auditQuiet({ actor, role, action, detail }) {
   const key = `${actor}:${action}`;
   const now = Date.now();
@@ -62,11 +65,11 @@ function auditQuiet({ actor, role, action, detail }) {
   writeAudit({ actor, role, action, detail });
 }
 
-/* ================= COMPANY SCOPE ================= */
+/* ================= COMPANY SCOPING ================= */
 
 function getScopedCompanyIds(req) {
   if (isAdmin(req.user)) {
-    if (!req.companyId) return null;
+    if (!req.companyId) return null; // ALL
     return [String(req.companyId)];
   }
 
@@ -86,7 +89,7 @@ function scopeByCompany(items, companyIds) {
   );
 }
 
-/* ================= RISK ================= */
+/* ================= RISK MODEL ================= */
 
 function calculateCompanyRisk(db, companyId) {
   const events = normalizeArray(db.securityEvents).filter(
@@ -126,7 +129,7 @@ router.post("/public-device-risk", (req, res) => {
     if (!userAgent) riskScore += 20;
     if (!language) riskScore += 10;
     if (!timezone) riskScore += 10;
-    if (String(userAgent).toLowerCase().includes("headless")) riskScore += 40;
+    if (normalize(userAgent).includes("headless")) riskScore += 40;
 
     riskScore = Math.min(100, riskScore);
 
@@ -147,13 +150,14 @@ router.post("/public-device-risk", (req, res) => {
 router.use(authRequired);
 
 /* =========================================================
-   POSTURE SUMMARY — QUIET + CACHED
+   POSTURE SUMMARY — REST AUTHORITY
+   (Frontend SecurityContext SINGLE SOURCE)
 ========================================================= */
 
 router.get("/posture-summary", (req, res) => {
   try {
     const companyScope = getScopedCompanyIds(req);
-    const cacheKey = `${req.user.id}:${companyScope || "ALL"}`;
+    const cacheKey = `${req.user.id}:${companyScope ?? "ALL"}`;
 
     const cached = postureCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < POSTURE_CACHE_TTL) {
@@ -162,27 +166,28 @@ router.get("/posture-summary", (req, res) => {
 
     const db = readDb();
 
-    let incidents = scopeByCompany(
+    const incidents = scopeByCompany(
       normalizeArray(db.incidents),
       companyScope
     );
 
-    let events = scopeByCompany(
+    const events = scopeByCompany(
       normalizeArray(db.securityEvents),
       companyScope
     );
 
-    let vulns = scopeByCompany(
+    const vulns = scopeByCompany(
       normalizeArray(db.vulnerabilities),
       companyScope
     );
 
     const criticalAlerts = events.filter(
       (e) =>
-        String(e.severity).toLowerCase() === "critical" &&
+        normalize(e.severity) === "critical" &&
         !e.acknowledged
     ).length;
 
+    // domain posture buckets
     const buckets = {};
     for (const v of vulns) {
       const key = String(
@@ -236,7 +241,7 @@ router.get("/posture-summary", (req, res) => {
 });
 
 /* =========================================================
-   ZERO TRUST ENFORCEMENT (QUIET)
+   ZERO TRUST ENFORCEMENT (ADMIN ONLY, QUIET)
 ========================================================= */
 
 router.post("/enforce/:companyId", (req, res) => {
@@ -247,6 +252,7 @@ router.post("/enforce/:companyId", (req, res) => {
 
     const { companyId } = req.params;
     const db = readDb();
+
     const company = (db.companies || []).find(
       (c) => String(c.id) === String(companyId)
     );
@@ -292,7 +298,7 @@ router.post("/enforce/:companyId", (req, res) => {
 });
 
 /* =========================================================
-   SECURITY EVENTS (READ ONLY, QUIET)
+   SECURITY EVENTS (READ ONLY)
 ========================================================= */
 
 router.get("/events", (req, res) => {
@@ -300,12 +306,10 @@ router.get("/events", (req, res) => {
     const db = readDb();
     const companyScope = getScopedCompanyIds(req);
 
-    let events = scopeByCompany(
+    const events = scopeByCompany(
       normalizeArray(db.securityEvents),
       companyScope
-    );
-
-    events.sort(
+    ).sort(
       (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
     );
 
@@ -319,7 +323,7 @@ router.get("/events", (req, res) => {
 });
 
 /* =========================================================
-   CREATE SECURITY EVENT (NO SPAM)
+   CREATE SECURITY EVENT (CONTROLLED)
 ========================================================= */
 
 router.post("/events", (req, res) => {
@@ -331,9 +335,9 @@ router.post("/events", (req, res) => {
     db.securityEvents = db.securityEvents || [];
 
     const sev = ["low", "medium", "high", "critical"].includes(
-      String(severity).toLowerCase()
+      normalize(severity)
     )
-      ? severity.toLowerCase()
+      ? normalize(severity)
       : "low";
 
     const event = {
@@ -347,8 +351,11 @@ router.post("/events", (req, res) => {
     };
 
     db.securityEvents.push(event);
+
     if (db.securityEvents.length > MAX_SECURITY_EVENTS) {
-      db.securityEvents = db.securityEvents.slice(-MAX_SECURITY_EVENTS);
+      db.securityEvents = db.securityEvents.slice(
+        -MAX_SECURITY_EVENTS
+      );
     }
 
     writeDb(db);
@@ -367,7 +374,7 @@ router.post("/events", (req, res) => {
 });
 
 /* =========================================================
-   VULNERABILITIES (QUIET)
+   VULNERABILITIES (READ ONLY)
 ========================================================= */
 
 router.get("/vulnerabilities", (req, res) => {
