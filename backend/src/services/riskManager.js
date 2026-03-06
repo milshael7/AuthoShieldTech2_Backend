@@ -3,6 +3,7 @@
 // Institutional Dual-Mode Risk Engine
 // Live = Capital Protection
 // Paper = Learning Protection
+// NOW WITH ADAPTIVE AI RISK SCALING
 // ==========================================================
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -12,6 +13,7 @@ CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
+
   maxDailyLossPct: Number(process.env.RISK_MAX_DAILY_LOSS_PCT || 0.04),
   maxDrawdownPct: Number(process.env.RISK_MAX_DRAWDOWN_PCT || 0.25),
   equityFloorPct: Number(process.env.RISK_EQUITY_FLOOR_PCT || 0.35),
@@ -24,6 +26,15 @@ const CONFIG = Object.freeze({
 
   maxMarginUtilization: Number(process.env.RISK_MAX_MARGIN_UTIL || 0.65),
   liquidationBufferPct: Number(process.env.RISK_LIQ_BUFFER || 0.15),
+
+  /* NEW AI ADAPTIVE SETTINGS */
+
+  winStreakBoost: Number(process.env.RISK_WIN_STREAK_BOOST || 0.08),
+  lossStreakPenalty: Number(process.env.RISK_LOSS_STREAK_PENALTY || 0.12),
+
+  maxWinStreakBoost: Number(process.env.RISK_MAX_WIN_BOOST || 1.35),
+  maxLossPenalty: Number(process.env.RISK_MAX_LOSS_PENALTY || 0.45)
+
 });
 
 /* =========================================================
@@ -32,11 +43,11 @@ TENANT STATE
 
 const RISK_STATE = new Map();
 
-function getState(tenantId) {
+function getState(tenantId){
 
   const key = tenantId || "__default__";
 
-  if (!RISK_STATE.has(key)) {
+  if(!RISK_STATE.has(key)){
 
     RISK_STATE.set(key,{
       halted:false,
@@ -53,12 +64,18 @@ function getState(tenantId) {
       lastDayKey:null,
 
       volatilityRegime:"normal",
-      lastMarginPressure:0
+      lastMarginPressure:0,
+
+      /* AI LEARNING STATE */
+
+      winStreak:0,
+      lossStreak:0
     });
 
   }
 
   return RISK_STATE.get(key);
+
 }
 
 function dayKey(ts){
@@ -172,6 +189,28 @@ function evaluate({
   }
 
   /* =====================================================
+  AI STREAK DETECTION
+  ===================================================== */
+
+  if(trades.length){
+
+    const lastTrade = trades[trades.length-1];
+
+    if(lastTrade.profit > 0){
+
+      state.winStreak++;
+      state.lossStreak = 0;
+
+    }else{
+
+      state.lossStreak++;
+      state.winStreak = 0;
+
+    }
+
+  }
+
+  /* =====================================================
   LOSS CLUSTER COOL-DOWN
   ===================================================== */
 
@@ -222,7 +261,31 @@ function evaluate({
     riskMultiplier *= isPaper ? 1.25 : 1.15;
 
   /* =====================================================
-  DRAWDOWN RISK REDUCTION
+  ADAPTIVE AI RISK (NEW)
+  ===================================================== */
+
+  if(state.winStreak >= 2){
+
+    riskMultiplier *=
+      1 + (state.winStreak * CONFIG.winStreakBoost);
+
+    riskMultiplier =
+      Math.min(riskMultiplier, CONFIG.maxWinStreakBoost);
+
+  }
+
+  if(state.lossStreak >= 2){
+
+    riskMultiplier *=
+      1 - (state.lossStreak * CONFIG.lossStreakPenalty);
+
+    riskMultiplier =
+      Math.max(riskMultiplier, CONFIG.maxLossPenalty);
+
+  }
+
+  /* =====================================================
+  DRAWDOWN REDUCTION
   ===================================================== */
 
   if(rollingDrawdown > 0.10)
@@ -232,7 +295,7 @@ function evaluate({
     riskMultiplier *= 0.55;
 
   /* =====================================================
-  MARGIN PROTECTION (LIVE ONLY)
+  MARGIN PROTECTION
   ===================================================== */
 
   if(!isPaper){
@@ -271,6 +334,8 @@ function evaluate({
     volatilityRegime:state.volatilityRegime,
     cooldownLevel:state.cooldownLevel,
     marginPressure:state.lastMarginPressure,
+    winStreak:state.winStreak,
+    lossStreak:state.lossStreak,
     mode:isPaper ? "paper-learning" : "live-capital"
   };
 
