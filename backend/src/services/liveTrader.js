@@ -1,7 +1,8 @@
-// backend/src/services/liveTrader.js
-// Phase 18 — Institutional Live Engine (Fully Explicit)
-// Risk Explicit • Brain Explicit • MarketEngine Integrated
-// AI Reinforcement • Margin Discipline • Tenant Safe
+// --------------------------------------------------
+// AutoShield — Institutional Live Trader (Final)
+// Explicit Risk • Margin Discipline • AI Learning
+// Multi-Tenant • Deterministic • MarketEngine Driven
+// --------------------------------------------------
 
 const fs = require("fs");
 const path = require("path");
@@ -11,335 +12,444 @@ const exchangeRouter = require("./exchangeRouter");
 const aiBrain = require("./aiBrain");
 const riskManager = require("./riskManager");
 
-/* =========================================================
-   CONFIG
-========================================================= */
+/* ================= CONFIG ================= */
 
 const BASE_PATH =
   process.env.LIVE_TRADER_STATE_DIR ||
   path.join("/tmp", "live_trader");
 
-const START_BALANCE = Number(
-  process.env.LIVE_START_BALANCE || 0
-);
+const START_BALANCE =
+  Number(process.env.LIVE_START_BALANCE || 0);
 
-const MAX_ORDERS = 500;
 const MAX_TRADES = 1000;
+const MAX_ORDERS = 500;
 
-/* =========================================================
-   HELPERS
-========================================================= */
-
-function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-}
-
-function statePath(tenantId) {
-  ensureDir(BASE_PATH);
-  return path.join(BASE_PATH, `live_${tenantId}.json`);
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function envTrue(name) {
-  const v = String(process.env[name] || "").toLowerCase().trim();
-  return v === "true" || v === "1" || v === "yes";
-}
-
-function isFridayShutdown(ts) {
-  const d = new Date(ts);
-  return d.getUTCDay() === 5 && d.getUTCHours() >= 20;
-}
-
-/* =========================================================
-   DEFAULT STATE
-========================================================= */
-
-function defaultState() {
-  return {
-    version: 18,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-
-    running: false,
-    enabled: false,
-    execute: false,
-    mode: "live-disabled",
-
-    cashBalance: START_BALANCE,
-    equity: START_BALANCE,
-
-    leverage: 3,
-    initialMarginPct: 1 / 3,
-    maintenanceMarginPct: 0.25,
-    marginUsed: 0,
-    liquidationFlag: false,
-
-    volatility: 0,
-    regime: "NORMAL",
-
-    lastPrices: {},
-    positions: {},
-
-    trades: [],
-    orders: [],
-    lastError: null,
-  };
-}
+/* ================= STATE ================= */
 
 const STATES = new Map();
 
-/* =========================================================
-   PERSISTENCE
-========================================================= */
+/* ================= HELPERS ================= */
 
-function load(tenantId) {
-  if (STATES.has(tenantId)) return STATES.get(tenantId);
+function ensureDir(p){
+  if(!fs.existsSync(p))
+    fs.mkdirSync(p,{recursive:true});
+}
+
+function statePath(tenantId){
+  ensureDir(BASE_PATH);
+  return path.join(BASE_PATH,`live_${tenantId}.json`);
+}
+
+function envTrue(name){
+  const v = String(process.env[name] || "")
+    .toLowerCase()
+    .trim();
+  return v==="true"||v==="1"||v==="yes";
+}
+
+function now(){
+  return Date.now();
+}
+
+/* ================= DEFAULT ================= */
+
+function defaultState(){
+  return{
+
+    version:19,
+
+    running:false,
+    enabled:false,
+    execute:false,
+
+    mode:"live-disabled",
+
+    cashBalance:START_BALANCE,
+    equity:START_BALANCE,
+
+    leverage:3,
+    marginUsed:0,
+
+    liquidationFlag:false,
+
+    lastPrices:{},
+    positions:{},
+
+    trades:[],
+    orders:[],
+
+    volatility:0,
+    regime:"neutral",
+
+    lastError:null
+
+  };
+}
+
+/* ================= LOAD ================= */
+
+function load(tenantId){
+
+  if(STATES.has(tenantId))
+    return STATES.get(tenantId);
 
   let state = defaultState();
   const file = statePath(tenantId);
 
-  try {
-    if (fs.existsSync(file)) {
-      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-      state = { ...state, ...raw };
-    }
-  } catch {}
+  try{
 
-  STATES.set(tenantId, state);
+    if(fs.existsSync(file)){
+
+      const raw =
+        JSON.parse(fs.readFileSync(file,"utf-8"));
+
+      state = {...state,...raw};
+
+    }
+
+  }catch{}
+
+  STATES.set(tenantId,state);
+
   return state;
+
 }
 
-function save(tenantId) {
+/* ================= SAVE ================= */
+
+function save(tenantId){
+
   const state = STATES.get(tenantId);
-  if (!state) return;
+  if(!state) return;
 
-  state.updatedAt = nowIso();
+  try{
 
-  try {
     fs.writeFileSync(
       statePath(tenantId),
-      JSON.stringify(state, null, 2)
+      JSON.stringify(state,null,2)
     );
-  } catch {}
+
+  }catch{}
+
 }
 
-function refreshFlags(state) {
-  state.enabled = envTrue("LIVE_TRADING_ENABLED");
-  state.execute = state.enabled && envTrue("LIVE_TRADING_EXECUTE");
+/* ================= FLAGS ================= */
 
-  if (!state.enabled) state.mode = "live-disabled";
-  else if (state.execute) state.mode = "live-executing";
-  else state.mode = "live-armed";
+function refreshFlags(state){
+
+  state.enabled =
+    envTrue("LIVE_TRADING_ENABLED");
+
+  state.execute =
+    state.enabled &&
+    envTrue("LIVE_TRADING_EXECUTE");
+
+  if(!state.enabled)
+    state.mode="live-disabled";
+
+  else if(state.execute)
+    state.mode="live-executing";
+
+  else
+    state.mode="live-armed";
+
 }
 
-/* =========================================================
-   EQUITY
-========================================================= */
+/* ================= EQUITY ================= */
 
-function recalcEquity(state) {
-  let unrealized = 0;
-  let exposure = 0;
+function recalcEquity(state){
 
-  for (const [symbol, pos] of Object.entries(state.positions)) {
+  let unrealized=0;
+  let exposure=0;
+
+  for(const [symbol,pos] of Object.entries(state.positions)){
+
     const price = state.lastPrices[symbol];
-    if (!price || !pos.qty) continue;
+    if(!price) continue;
 
-    unrealized += (price - pos.avgEntry) * pos.qty;
-    exposure += Math.abs(pos.qty * price);
+    unrealized +=
+      (price-pos.avgEntry)*pos.qty;
+
+    exposure +=
+      Math.abs(pos.qty*price);
+
   }
 
-  state.equity = state.cashBalance + unrealized;
-  state.marginUsed = exposure * state.initialMarginPct;
+  state.equity =
+    state.cashBalance + unrealized;
+
+  state.marginUsed =
+    exposure/state.leverage;
+
 }
 
-function maintenanceRequired(state) {
-  return state.marginUsed * state.maintenanceMarginPct;
-}
+/* ================= POSITION ENGINE ================= */
 
-/* =========================================================
-   POSITION ENGINE
-========================================================= */
+function applyFill(state,{symbol,side,price,qty}){
 
-function applyFill(state, { symbol, side, price, qty }) {
-  state.positions[symbol] = state.positions[symbol] || {
-    qty: 0,
-    avgEntry: 0,
-    realizedPnL: 0,
-  };
+  state.positions[symbol] =
+    state.positions[symbol] ||
+    {qty:0,avgEntry:0};
 
   const pos = state.positions[symbol];
-  const signedQty = side === "BUY" ? qty : -qty;
 
-  if (pos.qty === 0 || Math.sign(pos.qty) === Math.sign(signedQty)) {
-    const totalCost =
-      pos.avgEntry * pos.qty + price * signedQty;
+  const signedQty =
+    side==="BUY" ? qty : -qty;
+
+  if(pos.qty===0 ||
+     Math.sign(pos.qty)===Math.sign(signedQty)){
+
+    const total =
+      pos.avgEntry*pos.qty +
+      price*signedQty;
 
     pos.qty += signedQty;
-    pos.avgEntry =
-      pos.qty !== 0 ? totalCost / pos.qty : 0;
 
-  } else {
-    const closingQty = Math.min(
-      Math.abs(pos.qty),
-      Math.abs(signedQty)
-    );
+    pos.avgEntry =
+      pos.qty!==0 ? total/pos.qty : 0;
+
+  }
+  else{
+
+    const closing =
+      Math.min(
+        Math.abs(pos.qty),
+        Math.abs(signedQty)
+      );
 
     const pnl =
-      (price - pos.avgEntry) *
-      closingQty *
+      (price-pos.avgEntry) *
+      closing *
       Math.sign(pos.qty);
 
-    pos.qty += signedQty;
     state.cashBalance += pnl;
-    pos.realizedPnL += pnl;
+
+    pos.qty += signedQty;
 
     state.trades.push({
-      ts: Date.now(),
+      ts:now(),
       symbol,
-      qty: closingQty,
-      entry: pos.avgEntry,
-      exit: price,
-      profit: pnl,
+      entry:pos.avgEntry,
+      exit:price,
+      qty:closing,
+      profit:pnl
     });
 
-    if (state.trades.length > MAX_TRADES)
-      state.trades = state.trades.slice(-MAX_TRADES);
+    if(state.trades.length>MAX_TRADES)
+      state.trades =
+        state.trades.slice(-MAX_TRADES);
 
-    aiBrain.recordTradeOutcome({ pnl });
+    aiBrain.recordTradeOutcome({
+      tenantId:null,
+      pnl
+    });
+
   }
 
   recalcEquity(state);
+
 }
 
-/* =========================================================
-   MAIN TICK
-========================================================= */
+/* ================= REGIME ================= */
 
-async function tick(tenantId, symbol, price, ts = Date.now()) {
+function updateMarketStats(state,pricePrev,priceNow){
+
+  const move =
+    Math.abs(priceNow-pricePrev)/pricePrev;
+
+  state.volatility =
+    state.volatility*0.9 + move*0.1;
+
+  if(state.volatility>0.02)
+    state.regime="volatile";
+  else if(move>0.005)
+    state.regime="trend";
+  else
+    state.regime="range";
+
+}
+
+/* ================= TICK ================= */
+
+async function tick(
+  tenantId,
+  symbol,
+  price,
+  ts=Date.now()
+){
+
   const state = load(tenantId);
-  if (!state.running) return;
-  if (isFridayShutdown(ts)) return;
+
+  if(!state.running)
+    return;
 
   refreshFlags(state);
 
-  state.lastPrices[symbol] = price;
+  const prev =
+    state.lastPrices[symbol] || price;
+
+  state.lastPrices[symbol]=price;
+
+  updateMarketStats(state,prev,price);
+
   recalcEquity(state);
 
-  /* ================= RISK (Explicit Live Mode) ================= */
+  /* ===== RISK ===== */
 
-  const risk = riskManager.evaluate({
-    tenantId,
-    equity: state.equity,
-    trades: state.trades,
-    marginUsed: state.marginUsed,
-    maintenanceRequired: maintenanceRequired(state),
-    ts,
-    mode: "live"
-  });
-
-  if (risk.halted) {
-    save(tenantId);
-    return;
-  }
-
-  /* ================= DECISION (Explicit Live Mode) ================= */
-
-  const plan = makeDecision({
-    tenantId,
-    symbol,
-    last: price,
-    paper: state,
-    mode: "live" // 🔥 EXPLICIT
-  });
-
-  if (
-    !state.enabled ||
-    !state.execute ||
-    plan.action === "WAIT"
-  ) {
-    save(tenantId);
-    return;
-  }
-
-  try {
-    const result = await exchangeRouter.routeLiveOrder({
+  const risk =
+    riskManager.evaluate({
       tenantId,
-      symbol,
-      side: plan.action,
-      riskPct: plan.riskPct * (risk.riskMultiplier || 1),
-      price,
+      equity:state.equity,
+      trades:state.trades,
+      marginUsed:state.marginUsed,
       ts,
+      mode:"live"
     });
 
-    if (result?.ok && result?.result?.order?.filledQty) {
-      applyFill(state, {
+  if(risk?.halted){
+
+    save(tenantId);
+    return;
+
+  }
+
+  /* ===== DECISION ===== */
+
+  const plan =
+    makeDecision({
+      tenantId,
+      symbol,
+      last:price,
+      paper:state,
+      mode:"live"
+    });
+
+  if(
+    !state.enabled ||
+    !state.execute ||
+    plan.action==="WAIT"
+  ){
+
+    save(tenantId);
+    return;
+
+  }
+
+  try{
+
+    const result =
+      await exchangeRouter.routeLiveOrder({
+
+        tenantId,
         symbol,
-        side: plan.action,
+        side:plan.action,
         price,
-        qty: result.result.order.filledQty,
+        riskPct:
+          plan.riskPct *
+          (risk.riskMultiplier||1)
+
       });
+
+    if(
+      result?.ok &&
+      result?.result?.order?.filledQty
+    ){
+
+      applyFill(
+        state,
+        {
+          symbol,
+          side:plan.action,
+          price,
+          qty:result.result.order.filledQty
+        }
+      );
+
     }
 
     state.orders.push({
       ts,
       symbol,
-      side: plan.action,
-      ok: result?.ok,
+      side:plan.action,
+      ok:result?.ok
     });
 
-    if (state.orders.length > MAX_ORDERS)
-      state.orders = state.orders.slice(-MAX_ORDERS);
+    if(state.orders.length>MAX_ORDERS)
+      state.orders =
+        state.orders.slice(-MAX_ORDERS);
 
-  } catch (err) {
-    state.lastError = String(err?.message || err);
+  }
+  catch(err){
+
+    state.lastError =
+      String(err?.message || err);
+
   }
 
   save(tenantId);
+
 }
 
-/* =========================================================
-   LIFECYCLE
-========================================================= */
+/* ================= LIFECYCLE ================= */
 
-function start(tenantId) {
+function start(tenantId){
+
   const state = load(tenantId);
-  state.running = true;
-  refreshFlags(state);
-  save(tenantId);
-}
 
-function stop(tenantId) {
-  const state = load(tenantId);
-  state.running = false;
-  save(tenantId);
-}
+  state.running=true;
 
-/* =========================================================
-   SNAPSHOT
-========================================================= */
-
-function snapshot(tenantId) {
-  const state = load(tenantId);
   refreshFlags(state);
 
-  return {
-    mode: state.mode,
-    cash: state.cashBalance,
-    equity: state.equity,
-    marginUsed: state.marginUsed,
-    liquidation: state.liquidationFlag,
-    positions: state.positions,
-    trades: state.trades.slice(-10),
-    routerHealth: exchangeRouter.getHealth(),
+  save(tenantId);
+
+}
+
+function stop(tenantId){
+
+  const state = load(tenantId);
+
+  state.running=false;
+
+  save(tenantId);
+
+}
+
+/* ================= SNAPSHOT ================= */
+
+function snapshot(tenantId){
+
+  const state = load(tenantId);
+
+  refreshFlags(state);
+
+  return{
+
+    mode:state.mode,
+
+    equity:state.equity,
+    cash:state.cashBalance,
+
+    marginUsed:state.marginUsed,
+
+    regime:state.regime,
+
+    liquidation:state.liquidationFlag,
+
+    positions:state.positions,
+
+    trades:
+      state.trades.slice(-10),
+
+    router:
+      exchangeRouter.getHealth(),
+
   };
+
 }
 
-module.exports = {
+module.exports={
   start,
   stop,
   tick,
-  snapshot,
+  snapshot
 };
