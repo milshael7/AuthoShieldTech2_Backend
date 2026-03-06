@@ -1,7 +1,7 @@
 // backend/src/services/aiBrain.js
 // ==========================================================
 // Adaptive Reinforcement AI Core (Tenant Safe)
-// Persistent Learning Engine
+// Multi-Signal Fusion + Persistent Learning Engine
 // ==========================================================
 
 const fs = require("fs");
@@ -17,6 +17,17 @@ const MAX_HISTORY = Number(process.env.AI_BRAIN_MAX_HISTORY || 120);
 const MAX_NOTES = Number(process.env.AI_BRAIN_MAX_NOTES || 80);
 const SIGNAL_MEMORY_LIMIT = 100;
 const OUTCOME_MEMORY_LIMIT = 200;
+
+/* Fusion Weights */
+
+const TREND_WEIGHT =
+  Number(process.env.AI_WEIGHT_TREND || 0.45);
+
+const VOL_WEIGHT =
+  Number(process.env.AI_WEIGHT_VOL || 0.25);
+
+const PERFORMANCE_WEIGHT =
+  Number(process.env.AI_WEIGHT_PERF || 0.30);
 
 /* =========================================================
 UTIL
@@ -43,7 +54,7 @@ const BRAINS = new Map();
 
 function defaultBrain() {
   return {
-    version: 14,
+    version: 15,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -73,6 +84,7 @@ function defaultBrain() {
 }
 
 function getBrain(tenantId) {
+
   const key = tenantId || "__default__";
 
   if (!BRAINS.has(key)) {
@@ -80,6 +92,7 @@ function getBrain(tenantId) {
   }
 
   return BRAINS.get(key);
+
 }
 
 /* =========================================================
@@ -87,6 +100,7 @@ LOAD / SAVE
 ========================================================= */
 
 function loadBrain() {
+
   try {
 
     if (!fs.existsSync(BRAIN_PATH)) return;
@@ -96,15 +110,20 @@ function loadBrain() {
     );
 
     for (const tenantId of Object.keys(raw)) {
+
       BRAINS.set(tenantId, {
         ...defaultBrain(),
         ...raw[tenantId],
       });
+
     }
 
   } catch (err) {
+
     console.error("AI brain load error:", err);
+
   }
+
 }
 
 function saveBrain() {
@@ -114,8 +133,10 @@ function saveBrain() {
     const obj = {};
 
     for (const [tenantId, brain] of BRAINS.entries()) {
+
       brain.updatedAt = nowIso();
       obj[tenantId] = brain;
+
     }
 
     const temp = `${BRAIN_PATH}.tmp`;
@@ -128,7 +149,9 @@ function saveBrain() {
     fs.renameSync(temp, BRAIN_PATH);
 
   } catch (err) {
+
     console.error("AI brain save error:", err);
+
   }
 
 }
@@ -162,17 +185,17 @@ function recordTradeOutcome({ tenantId, pnl }) {
   brain.stats.losses = losses.length;
 
   brain.stats.winRate =
-    brain.stats.totalTrades > 0
+    brain.stats.totalTrades
       ? wins.length / brain.stats.totalTrades
       : 0;
 
   brain.stats.avgWin =
-    wins.length > 0
+    wins.length
       ? wins.reduce((a,b)=>a+b.pnl,0)/wins.length
       : 0;
 
   brain.stats.avgLoss =
-    losses.length > 0
+    losses.length
       ? losses.reduce((a,b)=>a+Math.abs(b.pnl),0)/losses.length
       : 0;
 
@@ -183,6 +206,7 @@ function recordTradeOutcome({ tenantId, pnl }) {
   adaptBehavior(brain);
 
   saveBrain();
+
 }
 
 /* =========================================================
@@ -244,6 +268,26 @@ function recordSignal({ tenantId, action, confidence, edge }) {
     brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
 
   saveBrain();
+
+}
+
+/* =========================================================
+MULTI SIGNAL FUSION
+========================================================= */
+
+function fuseSignals({ trendEdge, volatility, expectancy }) {
+
+  const trendScore =
+    clamp(trendEdge * TREND_WEIGHT, -1, 1);
+
+  const volScore =
+    clamp((0.02 - volatility) * VOL_WEIGHT, -1, 1);
+
+  const perfScore =
+    clamp(expectancy * PERFORMANCE_WEIGHT, -1, 1);
+
+  return trendScore + volScore + perfScore;
+
 }
 
 /* =========================================================
@@ -264,26 +308,41 @@ function decide(context = {}) {
 
   const baseEdge = safeNum(learn.trendEdge, 0);
   const baseConfidence = safeNum(learn.confidence, 0);
+  const volatility = safeNum(paper.volatility, 0);
 
   if (!Number.isFinite(last)) {
-    return { action: "WAIT", confidence: 0, edge: 0 };
+
+    return {
+      action:"WAIT",
+      confidence:0,
+      edge:0
+    };
+
   }
 
-  if (Math.abs(baseEdge) < 0.0005) {
-    return { action: "WAIT", confidence: 0, edge: 0 };
-  }
+  /* SIGNAL FUSION */
+
+  const fusedEdge =
+    fuseSignals({
+      trendEdge: baseEdge,
+      volatility,
+      expectancy: brain.stats.expectancy
+    });
 
   let edge =
-    baseEdge * brain.adaptive.edgeAmplifier;
+    fusedEdge * brain.adaptive.edgeAmplifier;
 
   let confidence =
     baseConfidence * brain.adaptive.confidenceBoost;
 
-  confidence = clamp(confidence, 0, 1);
+  confidence = clamp(confidence,0,1);
+
+  /* DECISION */
 
   if (confidence > 0.7 && Math.abs(edge) > 0.001) {
 
-    const action = edge > 0 ? "BUY" : "SELL";
+    const action =
+      edge > 0 ? "BUY" : "SELL";
 
     recordSignal({
       tenantId,
@@ -297,13 +356,15 @@ function decide(context = {}) {
       confidence,
       edge
     };
+
   }
 
   return {
-    action: "WAIT",
+    action:"WAIT",
     confidence,
     edge
   };
+
 }
 
 /* =========================================================
@@ -315,11 +376,11 @@ function getSnapshot(tenantId) {
   const brain = getBrain(tenantId);
 
   return {
-    ok: true,
-    stats: brain.stats,
-    adaptive: brain.adaptive,
-    signalMemory: brain.signalMemory.length,
-    tradeMemory: brain.tradeOutcomes.length
+    ok:true,
+    stats:brain.stats,
+    adaptive:brain.adaptive,
+    signalMemory:brain.signalMemory.length,
+    tradeMemory:brain.tradeOutcomes.length
   };
 
 }
@@ -335,6 +396,7 @@ function resetBrain(tenantId) {
   BRAINS.set(key, defaultBrain());
 
   saveBrain();
+
 }
 
 /* ========================================================= */
