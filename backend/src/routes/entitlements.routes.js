@@ -1,6 +1,10 @@
 // backend/src/routes/entitlements.routes.js
-// Enterprise Entitlement Management — Hardened v4
-// Deterministic Tenant Enforcement • Canonical Context • Audit Safe
+// =========================================================
+// ENTERPRISE ENTITLEMENT MANAGEMENT — HARDENED v5 (SEALED)
+// DETERMINISTIC TENANT ENFORCEMENT • ROLE-AWARE
+// SUBSCRIPTION-GATED • AUDIT-SAFE • QUIET MODE
+// NO ESCALATION LOOPS • PLATFORM-ALIGNED
+// =========================================================
 
 const express = require("express");
 const router = express.Router();
@@ -9,14 +13,16 @@ const { authRequired } = require("../middleware/auth");
 const { readDb, updateDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 
+/* ================= AUTH ================= */
+
 router.use(authRequired);
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
-function normalize(role) {
-  return String(role || "").trim().toLowerCase();
+function normalize(v) {
+  return String(v || "").trim().toLowerCase();
 }
 
 function isAdmin(user) {
@@ -38,9 +44,10 @@ function findUser(db, userId) {
 }
 
 function ensureEntitlements(user) {
-  if (!user.entitlements) {
+  if (!user.entitlements || typeof user.entitlements !== "object") {
     user.entitlements = { tools: [] };
   }
+
   if (!Array.isArray(user.entitlements.tools)) {
     user.entitlements.tools = [];
   }
@@ -52,19 +59,22 @@ function subscriptionActive(user) {
 }
 
 function sameCompanyContext(req, target) {
-  if (!req.companyId) return false;
+  if (!req.companyId || !target?.companyId) return false;
   return String(req.companyId) === String(target.companyId);
 }
 
 /* =========================================================
-   VIEW MY ENTITLEMENTS
+   VIEW MY ENTITLEMENTS (SELF)
 ========================================================= */
 
 router.get("/me", (req, res) => {
   try {
     const db = readDb();
     const user = findUser(db, req.user.id);
-    if (!user) return res.status(404).json({ ok: false });
+
+    if (!user) {
+      return res.status(404).json({ ok: false });
+    }
 
     ensureEntitlements(user);
 
@@ -81,14 +91,13 @@ router.get("/me", (req, res) => {
       subscriptionTier: user.subscriptionTier || "free",
       time: nowISO(),
     });
-
   } catch {
     return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   GRANT TOOL (MANUAL)
+   GRANT TOOL (ADMIN / MANAGER)
 ========================================================= */
 
 router.post("/grant", (req, res) => {
@@ -99,18 +108,21 @@ router.post("/grant", (req, res) => {
     if (!userId || !toolId) {
       return res.status(400).json({
         ok: false,
-        error: "Missing fields"
+        error: "Missing fields",
       });
     }
 
     const db = readDb();
     const target = findUser(db, userId);
-    if (!target) return res.status(404).json({ ok: false });
+
+    if (!target) {
+      return res.status(404).json({ ok: false });
+    }
 
     if (!subscriptionActive(target)) {
       return res.status(403).json({
         ok: false,
-        error: "Subscription inactive"
+        error: "Subscription inactive",
       });
     }
 
@@ -137,7 +149,10 @@ router.post("/grant", (req, res) => {
       actor: actor.id,
       role: actor.role,
       action: "MANUAL_ENTITLEMENT_GRANTED",
-      metadata: { targetUser: userId, toolId },
+      detail: {
+        targetUser: userId,
+        toolId,
+      },
     });
 
     return res.json({
@@ -145,14 +160,13 @@ router.post("/grant", (req, res) => {
       message: "Tool granted",
       time: nowISO(),
     });
-
   } catch {
     return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   REVOKE TOOL
+   REVOKE TOOL (ADMIN / MANAGER)
 ========================================================= */
 
 router.post("/revoke", (req, res) => {
@@ -166,7 +180,10 @@ router.post("/revoke", (req, res) => {
 
     const db = readDb();
     const target = findUser(db, userId);
-    if (!target) return res.status(404).json({ ok: false });
+
+    if (!target) {
+      return res.status(404).json({ ok: false });
+    }
 
     if (!isAdmin(actor)) {
       if (!isManager(actor) || !sameCompanyContext(req, target)) {
@@ -178,10 +195,9 @@ router.post("/revoke", (req, res) => {
       const user = findUser(db2, userId);
       if (!user?.entitlements?.tools) return db2;
 
-      user.entitlements.tools =
-        user.entitlements.tools.filter(
-          (t) => String(t) !== String(toolId)
-        );
+      user.entitlements.tools = user.entitlements.tools.filter(
+        (t) => String(t) !== String(toolId)
+      );
 
       return db2;
     });
@@ -190,7 +206,10 @@ router.post("/revoke", (req, res) => {
       actor: actor.id,
       role: actor.role,
       action: "MANUAL_ENTITLEMENT_REVOKED",
-      metadata: { targetUser: userId, toolId },
+      detail: {
+        targetUser: userId,
+        toolId,
+      },
     });
 
     return res.json({
@@ -198,14 +217,13 @@ router.post("/revoke", (req, res) => {
       message: "Tool revoked",
       time: nowISO(),
     });
-
   } catch {
     return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   REVOKE ALL
+   REVOKE ALL ENTITLEMENTS (ADMIN / MANAGER)
 ========================================================= */
 
 router.post("/revoke-all", (req, res) => {
@@ -219,7 +237,10 @@ router.post("/revoke-all", (req, res) => {
 
     const db = readDb();
     const target = findUser(db, userId);
-    if (!target) return res.status(404).json({ ok: false });
+
+    if (!target) {
+      return res.status(404).json({ ok: false });
+    }
 
     if (!isAdmin(actor)) {
       if (!isManager(actor) || !sameCompanyContext(req, target)) {
@@ -239,7 +260,9 @@ router.post("/revoke-all", (req, res) => {
       actor: actor.id,
       role: actor.role,
       action: "ALL_MANUAL_ENTITLEMENTS_REVOKED",
-      metadata: { targetUser: userId },
+      detail: {
+        targetUser: userId,
+      },
     });
 
     return res.json({
@@ -247,7 +270,6 @@ router.post("/revoke-all", (req, res) => {
       message: "All tools revoked",
       time: nowISO(),
     });
-
   } catch {
     return res.status(500).json({ ok: false });
   }
