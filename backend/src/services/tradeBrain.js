@@ -1,5 +1,5 @@
 // backend/src/services/tradeBrain.js
-// Phase 15 — Behavioral Core + Microstructure Intelligence
+// Phase 16 — Behavioral Core + Microstructure Intelligence (Stable Merge)
 
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
@@ -50,14 +50,14 @@ function getBrainState(tenantId) {
 
   if (!BRAIN_STATE.has(key)) {
 
-    BRAIN_STATE.set(key, {
-      smoothedConfidence: 0,
-      edgeMomentum: 0,
-      lastAction: "WAIT",
-      winStreak: 0,
-      lossStreak: 0,
-      lastRealizedNet: 0,
-      aggressionFactor: 1,
+    BRAIN_STATE.set(key,{
+      smoothedConfidence:0,
+      edgeMomentum:0,
+      lastAction:"WAIT",
+      winStreak:0,
+      lossStreak:0,
+      lastRealizedNet:0,
+      aggressionFactor:1
     });
 
   }
@@ -66,36 +66,33 @@ function getBrainState(tenantId) {
 
 }
 
-/* ================= HELPERS ================= */
+/* ================= UTIL ================= */
 
-function safeNum(x, fallback = 0) {
-
+function safeNum(x,fallback=0){
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
-
 }
 
-function clamp(n, min, max) {
-
-  return Math.max(min, Math.min(max, n));
-
+function clamp(n,min,max){
+  return Math.max(min,Math.min(max,n));
 }
 
 /* ================= PERFORMANCE TRACKING ================= */
 
-function updatePerformance(brain, paper) {
+function updatePerformance(brain,paper){
 
-  const realizedNet = safeNum(paper?.realized?.net, 0);
+  const realizedNet = safeNum(paper?.realized?.net,0);
+
   const delta = realizedNet - brain.lastRealizedNet;
 
-  if (delta > 0) {
+  if(delta > 0){
 
     brain.winStreak++;
     brain.lossStreak = 0;
 
   }
 
-  else if (delta < 0) {
+  else if(delta < 0){
 
     brain.lossStreak++;
     brain.winStreak = 0;
@@ -104,17 +101,17 @@ function updatePerformance(brain, paper) {
 
   brain.lastRealizedNet = realizedNet;
 
-  if (brain.winStreak >= 2) {
+  if(brain.winStreak >= 2){
 
     brain.aggressionFactor =
-      clamp(brain.aggressionFactor + 0.1, 1, 1.8);
+      clamp(brain.aggressionFactor + 0.1,1,1.8);
 
   }
 
-  if (brain.lossStreak >= 2) {
+  if(brain.lossStreak >= 2){
 
     brain.aggressionFactor =
-      clamp(brain.aggressionFactor * 0.8, 0.6, 1);
+      clamp(brain.aggressionFactor * 0.8,0.6,1);
 
   }
 
@@ -122,27 +119,29 @@ function updatePerformance(brain, paper) {
 
 /* ================= CORE ================= */
 
-function makeDecision(context = {}) {
+function makeDecision(context={}){
 
   const {
     tenantId,
-    symbol = "BTCUSDT",
+    symbol="BTCUSDT",
     last,
-    paper = {},
+    paper={}
   } = context;
 
   const brain = getBrainState(tenantId);
 
-  updatePerformance(brain, paper);
+  updatePerformance(brain,paper);
 
-  const price = safeNum(last, NaN);
+  const price = safeNum(last,NaN);
+
   const limits = paper.limits || {};
   const learn = paper.learnStats || {};
+
   const hasPosition = !!paper.position;
 
-  const tradesToday = safeNum(limits.tradesToday, 0);
-  const lossesToday = safeNum(limits.lossesToday, 0);
-  const volatility = safeNum(paper.volatility, 0);
+  const tradesToday = safeNum(limits.tradesToday,0);
+  const lossesToday = safeNum(limits.lossesToday,0);
+  const volatility = safeNum(paper.volatility,0);
 
   const isPaper =
     paper?.cashBalance !== undefined &&
@@ -150,106 +149,105 @@ function makeDecision(context = {}) {
 
   /* ================= STRATEGY ================= */
 
-  const strategyView = buildDecision({
+  let strategyView = {};
 
-    tenantId,
-    symbol,
-    price,
-    lastPrice: paper.lastPrice,
-    volatility,
-    ticksSeen: learn.ticksSeen,
-    limits,
-    paperState: paper,
+  try{
 
-  });
+    strategyView = buildDecision({
+      tenantId,
+      symbol,
+      price,
+      lastPrice:paper.lastPrice,
+      volatility,
+      ticksSeen:learn.ticksSeen,
+      limits,
+      paperState:paper
+    }) || {};
 
-  let action = strategyView.action;
-  let confidence = safeNum(strategyView.confidence, 0);
-  let edge = safeNum(strategyView.edge, 0);
-  let reason = strategyView.reason;
+  }catch{}
+
+  let action = strategyView.action || "WAIT";
+  let confidence = safeNum(strategyView.confidence,0);
+  let edge = safeNum(strategyView.edge,0);
+  let reason = strategyView.reason || "strategy";
 
   /* ================= NORMALIZE ================= */
 
-  if (!hasPosition && action === "SELL") {
-
-    action = "WAIT";
-    reason = "No position to sell.";
-
+  if(!hasPosition && action==="SELL"){
+    action="WAIT";
+    reason="No position to sell.";
   }
 
-  if (hasPosition && action === "BUY") {
-
-    action = "WAIT";
-    reason = "Position already open.";
-
+  if(hasPosition && action==="BUY"){
+    action="WAIT";
+    reason="Position already open.";
   }
 
   /* ================= AI OVERLAY ================= */
 
-  try {
+  try{
 
-    const aiView =
-      aiBrain.decide({
-        tenantId,
-        symbol,
-        last,
-        paper
-      }) || {};
+    const aiView = aiBrain.decide({
+      tenantId,
+      symbol,
+      last,
+      paper
+    }) || {};
 
-    if (
+    if(
       aiView.action &&
       ALLOWED_ACTIONS.has(
         String(aiView.action).toUpperCase()
       )
-    ) {
+    ){
 
       confidence =
-        Math.max(confidence, safeNum(aiView.confidence, 0));
+        Math.max(confidence,safeNum(aiView.confidence,0));
 
       edge =
-        Math.max(edge, safeNum(aiView.edge, 0));
+        Math.max(edge,safeNum(aiView.edge,0));
 
     }
 
-  } catch {}
+  }catch{}
 
-  /* ================= ORDER FLOW INTELLIGENCE ================= */
+  /* ================= ORDER FLOW ================= */
 
-  try {
+  try{
 
     const flow =
-      orderFlowEngine.analyzeFlow({ tenantId });
+      orderFlowEngine.analyzeFlow({tenantId});
 
     confidence *= flow.boost || 1;
 
-    if (flow.type === "fake_breakout" ||
-        flow.type === "trend_exhaustion") {
+    if(flow.type==="fake_breakout" ||
+       flow.type==="trend_exhaustion"){
 
-      action = "WAIT";
-      reason = "Order flow risk";
+      action="WAIT";
+      reason="Order flow risk";
 
     }
 
-    if (flow.type === "liquidity_sweep") {
+    if(flow.type==="compression"){
+
+      action="WAIT";
+      reason="Market compression";
+
+    }
+
+    if(flow.type==="liquidity_sweep"){
 
       confidence *= 0.7;
 
     }
 
-    if (flow.type === "compression") {
-
-      action = "WAIT";
-      reason = "Market compression";
-
-    }
-
-    if (flow.type === "volatility_shock") {
+    if(flow.type==="volatility_shock"){
 
       confidence *= 0.5;
 
     }
 
-  } catch {}
+  }catch{}
 
   /* ================= SMOOTHING ================= */
 
@@ -257,26 +255,26 @@ function makeDecision(context = {}) {
     brain.smoothedConfidence * CONFIDENCE_DECAY +
     confidence * (1 - CONFIDENCE_DECAY);
 
-  confidence = clamp(brain.smoothedConfidence, 0, 1);
+  confidence = clamp(brain.smoothedConfidence,0,1);
 
   brain.edgeMomentum =
     brain.edgeMomentum * EDGE_MEMORY_DECAY +
     edge * (1 - EDGE_MEMORY_DECAY);
 
-  edge = clamp(brain.edgeMomentum, -1, 1);
+  edge = clamp(brain.edgeMomentum,-1,1);
 
   /* ================= CONFIDENCE GATE ================= */
 
-  if (confidence < MIN_CONFIDENCE_TO_TRADE) {
+  if(confidence < MIN_CONFIDENCE_TO_TRADE){
 
-    action = "WAIT";
-    reason = "Confidence below threshold";
+    action="WAIT";
+    reason="Confidence below threshold";
 
   }
 
   /* ================= VOLATILITY ================= */
 
-  if (volatility >= VOL_HIGH) {
+  if(volatility >= VOL_HIGH){
 
     confidence *= isPaper ? 0.9 : 0.75;
 
@@ -284,33 +282,33 @@ function makeDecision(context = {}) {
 
   /* ================= HARD SAFETY ================= */
 
-  if (!isPaper) {
+  if(!isPaper){
 
-    if (!Number.isFinite(price)) {
+    if(!Number.isFinite(price)){
 
-      action = "WAIT";
-      reason = "Missing price.";
-
-    }
-
-    else if (limits.halted) {
-
-      action = "WAIT";
-      reason = "System halted.";
+      action="WAIT";
+      reason="Missing price.";
 
     }
 
-    else if (tradesToday >= MAX_TRADES_PER_DAY) {
+    else if(limits.halted){
 
-      action = "WAIT";
-      reason = "Daily trade limit reached.";
+      action="WAIT";
+      reason="System halted.";
 
     }
 
-    else if (lossesToday >= MAX_LOSS_STREAK) {
+    else if(tradesToday >= MAX_TRADES_PER_DAY){
 
-      action = "WAIT";
-      reason = "Loss streak protection.";
+      action="WAIT";
+      reason="Daily trade limit reached.";
+
+    }
+
+    else if(lossesToday >= MAX_LOSS_STREAK){
+
+      action="WAIT";
+      reason="Loss streak protection.";
 
     }
 
@@ -318,21 +316,21 @@ function makeDecision(context = {}) {
 
   /* ================= RISK ================= */
 
-  let riskPct = safeNum(strategyView.riskPct, 0);
+  let riskPct = safeNum(strategyView.riskPct,0);
 
   riskPct *= brain.aggressionFactor;
 
-  if (confidence < 0.6)
+  if(confidence < 0.6)
     riskPct *= 0.6;
 
-  if (confidence > STRONG_CONFIDENCE)
+  if(confidence > STRONG_CONFIDENCE)
     riskPct *= isPaper ? 1.5 : 1.25;
 
-  riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
+  riskPct = clamp(riskPct,MIN_RISK,MAX_RISK);
 
   /* ================= CAPITAL PROTECTION ================= */
 
-  try {
+  try{
 
     const balanceUsd =
       paper?.equity ||
@@ -346,30 +344,29 @@ function makeDecision(context = {}) {
         riskPct
       });
 
-    if (!protection.allow) {
+    if(!protection.allow){
 
-      action = "WAIT";
-      confidence = 0;
-      edge = 0;
-      reason = protection.reason;
+      action="WAIT";
+      confidence=0;
+      edge=0;
+      reason=protection.reason;
 
     }
-
-    else {
+    else{
 
       riskPct =
         protection.usd / balanceUsd;
 
     }
 
-  } catch {}
+  }catch{}
 
   /* ================= FINAL ================= */
 
-  if (action === "WAIT") {
+  if(action==="WAIT"){
 
-    confidence = 0;
-    edge = 0;
+    confidence=0;
+    edge=0;
 
   }
 
@@ -377,10 +374,9 @@ function makeDecision(context = {}) {
 
   /* ================= MEMORY ================= */
 
-  try {
+  try{
 
     memoryBrain.recordSignal({
-
       tenantId,
       symbol,
       action,
@@ -388,21 +384,18 @@ function makeDecision(context = {}) {
       edge,
       price,
       volatility
-
     });
 
     memoryBrain.recordMarketState({
-
       tenantId,
       symbol,
       price,
       volatility
-
     });
 
-  } catch {}
+  }catch{}
 
-  return {
+  return{
 
     symbol,
     action,
@@ -411,32 +404,32 @@ function makeDecision(context = {}) {
     riskPct,
     reason,
 
-    behavioral: {
-
-      winStreak: brain.winStreak,
-      lossStreak: brain.lossStreak,
-      aggressionFactor: brain.aggressionFactor,
-      mode: isPaper
+    behavioral:{
+      winStreak:brain.winStreak,
+      lossStreak:brain.lossStreak,
+      aggressionFactor:brain.aggressionFactor,
+      mode:isPaper
         ? "paper-learning"
-        : "live-capital",
-
+        : "live-capital"
     },
 
-    learning: strategyView.learning,
+    learning:strategyView.learning,
 
-    ts: Date.now(),
+    ts:Date.now()
 
   };
 
 }
 
-function resetTenant(tenantId) {
+/* ================= RESET ================= */
+
+function resetTenant(tenantId){
 
   BRAIN_STATE.delete(tenantId);
 
 }
 
-module.exports = {
+module.exports={
   makeDecision,
-  resetTenant,
+  resetTenant
 };
