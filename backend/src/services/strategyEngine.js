@@ -1,6 +1,7 @@
 // backend/src/services/strategyEngine.js
-// Phase 13 — Institutional Strategy Core
+// Phase 14 — Institutional Strategy Core
 // Pattern + Regime + Order Flow + Correlation + Counterfactual Learning
+// Advanced Regime Intelligence Added
 // Tenant Safe • Deterministic • Crash Safe
 
 const fs = require("fs");
@@ -161,6 +162,30 @@ function detectRegime({price,lastPrice,volatility}){
 }
 
 /* =========================================================
+ADVANCED REGIME FILTER
+========================================================= */
+
+function refineRegime({
+  regime,
+  volatility,
+  price,
+  lastPrice
+}){
+
+  const move =
+    Math.abs((price-lastPrice)/lastPrice);
+
+  if(volatility > 0.025)
+    return "volatility_shock";
+
+  if(volatility < 0.0015 && move < 0.0005)
+    return "compression";
+
+  return regime;
+
+}
+
+/* =========================================================
 EDGE MODEL
 ========================================================= */
 
@@ -299,11 +324,19 @@ function buildDecision(context={}){
 
   /* ================= REGIME ================= */
 
-  const regime =
+  let regime =
     detectRegime({
       price,
       lastPrice,
       volatility
+    });
+
+  regime =
+    refineRegime({
+      regime,
+      volatility,
+      price,
+      lastPrice
     });
 
   /* ================= EDGE ================= */
@@ -316,22 +349,16 @@ function buildDecision(context={}){
       regime
     });
 
-  /* ================= PATTERN BOOST ================= */
-
   edge *= patternEngine.getPatternEdgeBoost({
     tenantId,
     symbol,
     volatility
   });
 
-  /* ================= REGIME MEMORY ================= */
-
   edge *= regimeMemory.getRegimeBoost({
     tenantId,
     regime
   });
-
-  /* ================= CORRELATION ================= */
 
   edge *= correlationEngine.getCorrelationBoost({
     tenantId,
@@ -378,6 +405,15 @@ function buildDecision(context={}){
   if(!Number.isFinite(price))
     return {action:"WAIT",confidence:0,edge:0};
 
+  if(regime==="compression"){
+    return{
+      action:"WAIT",
+      confidence:confidence*0.7,
+      edge:0,
+      regime
+    };
+  }
+
   if(confidence < BASE_CONFIG.minConfidence)
     return {action:"WAIT",confidence,edge};
 
@@ -394,6 +430,12 @@ function buildDecision(context={}){
 
   if(regime==="range")
     riskPct *= 0.75;
+
+  if(regime==="compression")
+    riskPct *= 0.4;
+
+  if(regime==="volatility_shock")
+    riskPct *= 0.25;
 
   riskPct =
     clamp(
