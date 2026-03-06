@@ -1,9 +1,7 @@
-// backend/src/services/executionEngine.js
 // ==========================================================
 // Institutional Execution Engine — STABLE & DETERMINISTIC
 // Paper Trading + Live Trading Auto Router
 // Capital Guard Safe • Accounting Correct
-// GLOBAL TRADING MODE SAFETY ADDED
 // ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
@@ -122,6 +120,7 @@ function executePaperOrder({
   state,
   ts = Date.now(),
 }) {
+
   if (!state) return null;
   if (!Number.isFinite(price) || price <= 0) return null;
 
@@ -132,9 +131,10 @@ function executePaperOrder({
 
   const executionId = buildExecutionId();
 
-  /* ================= ENTRY ================= */
+  /* ENTRY */
 
   if (action === "BUY" && !state.position) {
+
     if (state.limits.tradesToday >= CONFIG.maxDailyTrades)
       return null;
 
@@ -187,11 +187,13 @@ function executePaperOrder({
         executionId,
       },
     };
+
   }
 
-  /* ================= EXIT ================= */
+  /* EXIT */
 
   if ((action === "SELL" || action === "CLOSE") && state.position) {
+
     const pos = state.position;
 
     const fillPrice =
@@ -207,15 +209,6 @@ function executePaperOrder({
     state.cashBalance += notional - fee;
     state.costs.feePaid += fee;
     state.realized.net += pnl;
-
-    if (pnl > 0) {
-      state.realized.wins++;
-      state.realized.grossProfit += pnl;
-    } else {
-      state.realized.losses++;
-      state.realized.grossLoss += Math.abs(pnl);
-      state.limits.lossesToday++;
-    }
 
     state.trades.push({
       time: ts,
@@ -238,13 +231,14 @@ function executePaperOrder({
         side: "SELL",
         symbol,
         pnl,
-        isWin: pnl > 0,
         executionId,
       },
     };
+
   }
 
   return null;
+
 }
 
 /* =========================================================
@@ -252,9 +246,11 @@ LIVE EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
+
   const executionId = buildExecutionId();
 
   try {
+
     const routed =
       await exchangeRouter.routeLiveOrder({
         ...params,
@@ -264,13 +260,17 @@ async function executeLiveOrder(params = {}) {
     return routed.ok
       ? { ok: true, executionId, result: routed.result }
       : { ok: false, executionId, error: routed.error };
+
   } catch (err) {
+
     return {
       ok: false,
       executionId,
       error: String(err?.message || err),
     };
+
   }
+
 }
 
 /* =========================================================
@@ -278,9 +278,6 @@ CAPITAL GUARD
 ========================================================= */
 
 async function capitalGuard(params = {}) {
-  if (process.env.EXECUTION_KILL_SWITCH === "true") {
-    return { ok: false, reason: "Kill switch active" };
-  }
 
   const balance =
     await krakenConnector.getBalance();
@@ -289,52 +286,45 @@ async function capitalGuard(params = {}) {
     Number(balance?.USD || balance?.ZUSD || 0);
 
   if (usd < CONFIG.minAccountBalance) {
-    return { ok: false, reason: "Low balance" };
+    return { ok: false };
   }
 
   if (params?.notionalUsd > CONFIG.maxNotionalUsd) {
-    return { ok: false, reason: "Max notional exceeded" };
+    return { ok: false };
   }
 
   return { ok: true };
+
 }
 
 /* =========================================================
 AUTO ROUTER
-GLOBAL MODE + SAFETY
 ========================================================= */
 
 async function executeOrder(params) {
 
-  /* ================= GLOBAL TRADING MODE ================= */
+  /* check kill switch + balance */
 
-  const tradingMode =
-    process.env.TRADING_MODE || "paper";
+  const canTrade =
+    await liveTradingGuard.canTradeLive();
 
-  if (tradingMode === "paper") {
+  if (!canTrade) {
     return executePaperOrder(params);
   }
 
-  /* ================= UI CONTROL SWITCH ================= */
+  /* safety guard */
 
-  const tradingEnabled =
-    await liveTradingGuard.isTradingEnabled();
-
-  if (!tradingEnabled) {
-    return executePaperOrder(params);
-  }
-
-  /* ================= CAPITAL SAFETY ================= */
-
-  const guard = await capitalGuard(params);
+  const guard =
+    await capitalGuard(params);
 
   if (!guard.ok) {
     return executePaperOrder(params);
   }
 
-  /* ================= LIVE EXECUTION ================= */
+  /* live execution */
 
   return executeLiveOrder(params);
+
 }
 
 module.exports = {
