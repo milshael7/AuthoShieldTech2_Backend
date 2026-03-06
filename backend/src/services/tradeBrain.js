@@ -1,5 +1,5 @@
 // backend/src/services/tradeBrain.js
-// Phase 12 — Dual Mode Behavioral Core
+// Phase 13 — Dual Mode Behavioral Core + Confidence Gate
 // Paper = Unlimited Learning
 // Live = Capital Discipline
 // Deterministic • Tenant Safe
@@ -26,6 +26,14 @@ const EDGE_MEMORY_DECAY =
 
 const VOL_HIGH =
   Number(process.env.TRADE_VOL_HIGH || 0.02);
+
+/* NEW */
+
+const MIN_CONFIDENCE_TO_TRADE =
+  Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
+
+const STRONG_CONFIDENCE =
+  Number(process.env.TRADE_STRONG_CONFIDENCE || 0.82);
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
@@ -231,6 +239,15 @@ function makeDecision(context = {}) {
 
   edge = clamp(brain.edgeMomentum, -1, 1);
 
+  /* ================= CONFIDENCE GATE ================= */
+
+  if (confidence < MIN_CONFIDENCE_TO_TRADE) {
+
+    action = "WAIT";
+    reason = "Confidence below threshold";
+
+  }
+
   /* ================= VOLATILITY ================= */
 
   if (volatility >= VOL_HIGH) {
@@ -279,13 +296,11 @@ function makeDecision(context = {}) {
 
   riskPct *= brain.aggressionFactor;
 
-  if (confidence < 0.4) {
+  if (confidence < 0.6)
     riskPct *= 0.6;
-  }
 
-  if (confidence > 0.8) {
-    riskPct *= isPaper ? 1.5 : 1.2;
-  }
+  if (confidence > STRONG_CONFIDENCE)
+    riskPct *= isPaper ? 1.5 : 1.25;
 
   riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
 
@@ -334,7 +349,7 @@ function makeDecision(context = {}) {
 
   brain.lastAction = action;
 
-  /* ================= MEMORY BRAIN RECORD ================= */
+  /* ================= MEMORY ================= */
 
   try {
 
