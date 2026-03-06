@@ -1,7 +1,9 @@
 // backend/src/routes/security.routes.js
-// Enterprise Security Firewall — ZeroTrust Enforcement v9
-// Adds: GET /posture-summary (admin/manager safe) to eliminate 404s
-// Deterministic Tenant Scope • Adaptive Enforcement • Memory Bounded
+// =========================================================
+// Enterprise Security Firewall — ZeroTrust Enforcement v10
+// QUIET MODE • NO EVENT SPAM • NO AUDIT FLOOD
+// DETERMINISTIC RESPONSES • CACHE-AWARE • PLATFORM-SAFE
+// =========================================================
 
 const express = require("express");
 const router = express.Router();
@@ -10,12 +12,21 @@ const { authRequired } = require("../middleware/auth");
 const { readDb, writeDb } = require("../lib/db");
 const { writeAudit } = require("../lib/audit");
 
+/* ================= CONFIG ================= */
+
 const MAX_SECURITY_EVENTS = 2000;
 const DEFAULT_ENFORCEMENT_THRESHOLD = 75;
 
-/* =========================================================
-   HELPERS
-========================================================= */
+// 🔇 quiet-mode controls
+const POSTURE_CACHE_TTL = 15_000; // 15s
+const AUDIT_COOLDOWN = 60_000; // 1 min per user+action
+
+/* ================= MEMORY ================= */
+
+const postureCache = new Map(); // key -> { ts, data }
+const auditCooldown = new Map(); // key -> ts
+
+/* ================= HELPERS ================= */
 
 function normalize(role) {
   return String(role || "").toLowerCase();
@@ -31,34 +42,7 @@ function isManager(user) {
 
 function normalizeArray(v) {
   if (!v) return [];
-  if (Array.isArray(v)) return v;
-  return Object.values(v);
-}
-
-// Company scoping rules:
-// - Admin: if req.companyId is set (tenant header), scope to that; else ALL
-// - Manager: if managedCompanies exists, scope to those
-// - Everyone else: scope to req.companyId if present, else empty
-function getScopedCompanyIds(req) {
-  if (isAdmin(req.user)) {
-    if (!req.companyId) return null; // null = all
-    return [String(req.companyId)];
-  }
-
-  if (isManager(req.user) && Array.isArray(req.user.managedCompanies)) {
-    return req.user.managedCompanies.map(String);
-  }
-
-  if (req.companyId) {
-    return [String(req.companyId)];
-  }
-
-  return [];
-}
-
-function scopeByCompany(items, companyIds) {
-  if (companyIds === null) return items;
-  return items.filter((i) => companyIds.includes(String(i.companyId)));
+  return Array.isArray(v) ? v : Object.values(v);
 }
 
 function clamp(n, a, b) {
@@ -67,9 +51,42 @@ function clamp(n, a, b) {
   return Math.max(a, Math.min(b, x));
 }
 
-/* =========================================================
-   ZERO TRUST RISK CALCULATION
-========================================================= */
+function auditQuiet({ actor, role, action, detail }) {
+  const key = `${actor}:${action}`;
+  const now = Date.now();
+  const last = auditCooldown.get(key) || 0;
+
+  if (now - last < AUDIT_COOLDOWN) return;
+  auditCooldown.set(key, now);
+
+  writeAudit({ actor, role, action, detail });
+}
+
+/* ================= COMPANY SCOPE ================= */
+
+function getScopedCompanyIds(req) {
+  if (isAdmin(req.user)) {
+    if (!req.companyId) return null;
+    return [String(req.companyId)];
+  }
+
+  if (isManager(req.user) && Array.isArray(req.user.managedCompanies)) {
+    return req.user.managedCompanies.map(String);
+  }
+
+  if (req.companyId) return [String(req.companyId)];
+
+  return [];
+}
+
+function scopeByCompany(items, companyIds) {
+  if (companyIds === null) return items;
+  return items.filter((i) =>
+    companyIds.includes(String(i.companyId))
+  );
+}
+
+/* ================= RISK ================= */
 
 function calculateCompanyRisk(db, companyId) {
   const events = normalizeArray(db.securityEvents).filter(
@@ -78,13 +95,14 @@ function calculateCompanyRisk(db, companyId) {
 
   let score = 0;
 
-  events.forEach((e) => {
+  for (const e of events) {
     if (e.severity === "critical") score += 25;
-    if (e.severity === "high") score += 15;
-    if (e.severity === "medium") score += 8;
-    if (e.severity === "low") score += 2;
+    else if (e.severity === "high") score += 15;
+    else if (e.severity === "medium") score += 8;
+    else score += 2;
+
     if (!e.acknowledged) score += 5;
-  });
+  }
 
   return Math.min(100, score);
 }
@@ -103,16 +121,12 @@ function riskLevel(score) {
 router.post("/public-device-risk", (req, res) => {
   try {
     const { userAgent, language, timezone } = req.body || {};
-
     let riskScore = 10;
 
     if (!userAgent) riskScore += 20;
     if (!language) riskScore += 10;
     if (!timezone) riskScore += 10;
-
-    if (String(userAgent).toLowerCase().includes("headless")) {
-      riskScore += 40;
-    }
+    if (String(userAgent).toLowerCase().includes("headless")) riskScore += 40;
 
     riskScore = Math.min(100, riskScore);
 
@@ -133,143 +147,135 @@ router.post("/public-device-risk", (req, res) => {
 router.use(authRequired);
 
 /* =========================================================
-   POSTURE SUMMARY (ELIMINATES 404)
-   Expected by frontend: api.postureSummary() -> /api/security/posture-summary
+   POSTURE SUMMARY — QUIET + CACHED
 ========================================================= */
 
 router.get("/posture-summary", (req, res) => {
   try {
-    const db = readDb();
     const companyScope = getScopedCompanyIds(req);
+    const cacheKey = `${req.user.id}:${companyScope || "ALL"}`;
 
-    // Incidents scoped
-    let incidents = normalizeArray(db.incidents);
-    incidents = scopeByCompany(incidents, companyScope);
+    const cached = postureCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < POSTURE_CACHE_TTL) {
+      return res.json(cached.data);
+    }
 
-    // Security events scoped
-    let events = normalizeArray(db.securityEvents);
-    events = scopeByCompany(events, companyScope);
+    const db = readDb();
 
-    // Vulnerabilities scoped
-    let vulns = normalizeArray(db.vulnerabilities);
-    vulns = scopeByCompany(vulns, companyScope);
+    let incidents = scopeByCompany(
+      normalizeArray(db.incidents),
+      companyScope
+    );
+
+    let events = scopeByCompany(
+      normalizeArray(db.securityEvents),
+      companyScope
+    );
+
+    let vulns = scopeByCompany(
+      normalizeArray(db.vulnerabilities),
+      companyScope
+    );
 
     const criticalAlerts = events.filter(
-      (e) => String(e.severity).toLowerCase() === "critical" && !e.acknowledged
+      (e) =>
+        String(e.severity).toLowerCase() === "critical" &&
+        !e.acknowledged
     ).length;
 
-    // Domain-like buckets (keeps UI looking “real” even if vuln schema differs)
-    // We try: v.domain, v.category, v.type, else "General"
     const buckets = {};
-    vulns.forEach((v) => {
-      const key =
-        String(v?.domain || v?.category || v?.type || "General").trim() ||
-        "General";
-      if (!buckets[key]) buckets[key] = { key, label: key, coverage: 90 };
-      // Lower coverage as vuln count grows
-      buckets[key].coverage = clamp(100 - (buckets[key].count || 0) * 5, 10, 100);
-      buckets[key].count = (buckets[key].count || 0) + 1;
-    });
+    for (const v of vulns) {
+      const key = String(
+        v?.domain || v?.category || v?.type || "General"
+      ).trim();
 
-    const domains = Object.values(buckets).map((d) => ({
-      key: d.key,
-      label: d.label,
-      coverage: clamp(d.coverage, 0, 100),
+      if (!buckets[key]) {
+        buckets[key] = { key, label: key, count: 0 };
+      }
+      buckets[key].count++;
+    }
+
+    const domains = Object.values(buckets).map((b) => ({
+      key: b.key,
+      label: b.label,
+      coverage: clamp(100 - b.count * 5, 10, 100),
     }));
 
-    // Simple score model:
-    // start 100, subtract incident + event pressure, subtract critical more
     const score = clamp(
       100 -
         incidents.length * 8 -
         events.length * 2 -
         criticalAlerts * 10 -
-        vulns.length * 1,
+        vulns.length,
       0,
       100
     );
 
-    writeAudit({
-      actor: req.user.id,
-      role: req.user.role,
-      action: "SECURITY_POSTURE_SUMMARY_VIEWED",
-      detail: {
-        scope:
-          companyScope === null
-            ? "ALL"
-            : Array.isArray(companyScope)
-            ? companyScope
-            : [],
-      },
-    });
-
-    return res.json({
+    const payload = {
       ok: true,
       score,
       incidents: incidents.length,
       criticalAlerts,
       domains,
       time: new Date().toISOString(),
+    };
+
+    postureCache.set(cacheKey, { ts: Date.now(), data: payload });
+
+    auditQuiet({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "SECURITY_POSTURE_SUMMARY_VIEWED",
+      detail: { scope: companyScope ?? "ALL" },
     });
+
+    return res.json(payload);
   } catch {
     return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   ZERO TRUST ENFORCEMENT ENDPOINT
+   ZERO TRUST ENFORCEMENT (QUIET)
 ========================================================= */
 
 router.post("/enforce/:companyId", (req, res) => {
   try {
     if (!isAdmin(req.user)) {
-      return res.status(403).json({ ok: false, error: "Admin only" });
+      return res.status(403).json({ ok: false });
     }
 
     const { companyId } = req.params;
-    const { threshold } = req.body || {};
-
     const db = readDb();
-    db.companies = db.companies || [];
-
-    const company = db.companies.find(
+    const company = (db.companies || []).find(
       (c) => String(c.id) === String(companyId)
     );
 
     if (!company) {
-      return res.status(404).json({ ok: false, error: "Company not found" });
+      return res.status(404).json({ ok: false });
     }
 
-    const enforcementThreshold =
-      Number(threshold) ||
+    const threshold =
+      Number(req.body?.threshold) ||
       company.enforcementThreshold ||
       DEFAULT_ENFORCEMENT_THRESHOLD;
 
     const riskScore = calculateCompanyRisk(db, companyId);
-
     let enforced = false;
-    let action = "NO_ACTION";
 
-    if (riskScore >= enforcementThreshold) {
+    if (riskScore >= threshold && company.status !== "Locked") {
       company.status = "Locked";
       company.lockReason = "ZeroTrust enforcement";
       company.lockedAt = new Date().toISOString();
       enforced = true;
-      action = "COMPANY_LOCKED";
+      writeDb(db);
     }
 
-    writeDb(db);
-
-    writeAudit({
+    auditQuiet({
       actor: req.user.id,
       role: req.user.role,
       action: "ZEROTRUST_ENFORCEMENT",
-      detail: {
-        companyId,
-        riskScore,
-        threshold: enforcementThreshold,
-        enforced,
-      },
+      detail: { companyId, riskScore, threshold, enforced },
     });
 
     return res.json({
@@ -277,10 +283,8 @@ router.post("/enforce/:companyId", (req, res) => {
       companyId,
       riskScore,
       level: riskLevel(riskScore),
-      threshold: enforcementThreshold,
+      threshold,
       enforced,
-      action,
-      timestamp: Date.now(),
     });
   } catch {
     return res.status(500).json({ ok: false });
@@ -288,7 +292,7 @@ router.post("/enforce/:companyId", (req, res) => {
 });
 
 /* =========================================================
-   SECURITY EVENTS (SCOPED)
+   SECURITY EVENTS (READ ONLY, QUIET)
 ========================================================= */
 
 router.get("/events", (req, res) => {
@@ -296,10 +300,14 @@ router.get("/events", (req, res) => {
     const db = readDb();
     const companyScope = getScopedCompanyIds(req);
 
-    let events = normalizeArray(db.securityEvents);
-    events = scopeByCompany(events, companyScope);
+    let events = scopeByCompany(
+      normalizeArray(db.securityEvents),
+      companyScope
+    );
 
-    events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    events.sort(
+      (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+    );
 
     return res.json({
       ok: true,
@@ -311,65 +319,55 @@ router.get("/events", (req, res) => {
 });
 
 /* =========================================================
-   CREATE SECURITY EVENT
+   CREATE SECURITY EVENT (NO SPAM)
 ========================================================= */
 
 router.post("/events", (req, res) => {
   try {
     const { title, description, severity = "low" } = req.body;
-
-    if (!title) {
-      return res.status(400).json({
-        ok: false,
-        error: "Title required",
-      });
-    }
+    if (!title) return res.status(400).json({ ok: false });
 
     const db = readDb();
     db.securityEvents = db.securityEvents || [];
 
-    const normalizedSeverity = ["low", "medium", "high", "critical"].includes(
+    const sev = ["low", "medium", "high", "critical"].includes(
       String(severity).toLowerCase()
     )
-      ? String(severity).toLowerCase()
+      ? severity.toLowerCase()
       : "low";
 
-    const newEvent = {
+    const event = {
       id: Date.now().toString(),
       title,
       description: description || "",
-      severity: normalizedSeverity,
+      severity: sev,
       acknowledged: false,
       companyId: req.companyId || null,
       createdAt: new Date().toISOString(),
     };
 
-    db.securityEvents.push(newEvent);
-
+    db.securityEvents.push(event);
     if (db.securityEvents.length > MAX_SECURITY_EVENTS) {
       db.securityEvents = db.securityEvents.slice(-MAX_SECURITY_EVENTS);
     }
 
     writeDb(db);
 
-    writeAudit({
+    auditQuiet({
       actor: req.user.id,
       role: req.user.role,
       action: "SECURITY_EVENT_CREATED",
-      detail: { eventId: newEvent.id },
+      detail: { eventId: event.id },
     });
 
-    return res.status(201).json({
-      ok: true,
-      event: newEvent,
-    });
+    return res.status(201).json({ ok: true, event });
   } catch {
     return res.status(500).json({ ok: false });
   }
 });
 
 /* =========================================================
-   VULNERABILITIES (SCOPED)
+   VULNERABILITIES (QUIET)
 ========================================================= */
 
 router.get("/vulnerabilities", (req, res) => {
@@ -377,12 +375,12 @@ router.get("/vulnerabilities", (req, res) => {
     const db = readDb();
     const companyScope = getScopedCompanyIds(req);
 
-    let vulns = normalizeArray(db.vulnerabilities);
-    vulns = scopeByCompany(vulns, companyScope);
-
     return res.json({
       ok: true,
-      vulnerabilities: vulns,
+      vulnerabilities: scopeByCompany(
+        normalizeArray(db.vulnerabilities),
+        companyScope
+      ),
     });
   } catch {
     return res.status(500).json({ ok: false });
