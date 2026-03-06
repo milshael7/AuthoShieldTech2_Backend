@@ -1,8 +1,8 @@
-// backend/src/routes/trading.routes.js
-// Phase 16 — Institutional Trading Control API
-// Unified Dashboard • Market Feed Integrated
-// Paper + Live + Risk + Portfolio + AI
+// ==========================================================
+// Institutional Trading Control API — FINAL
+// Dashboard + Market + Paper + Live + Risk + AI
 // Tenant Safe • Role Protected • Snapshot Accurate
+// ==========================================================
 
 const express = require("express");
 const router = express.Router();
@@ -19,258 +19,357 @@ const exchangeRouter = require("../services/exchangeRouter");
 const marketEngine = require("../services/marketEngine");
 
 // ---------------- ROLES ----------------
+
 const ADMIN = "Admin";
 const MANAGER = "Manager";
 
 /* =========================================================
-   PUBLIC
+PUBLIC
 ========================================================= */
 
-router.get("/symbols", (req, res) => {
+router.get("/symbols",(req,res)=>{
+
   return res.json({
-    ok: true,
-    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
+    ok:true,
+    symbols:["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
   });
+
 });
 
 /* =========================================================
-   AUTH REQUIRED
+AUTH
 ========================================================= */
 
 router.use(authRequired);
 
 /* =========================================================
-   MARKET (NEW)
+MARKET
 ========================================================= */
 
-router.get("/market/price/:symbol", requireRole(ADMIN, MANAGER), (req, res) => {
-  const tenantId = req.tenant?.id;
-  const { symbol } = req.params;
+router.get("/market/price/:symbol",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
+  const tenantId = req.tenant?.id;
+  const symbol = String(req.params.symbol || "").toUpperCase();
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   marketEngine.registerTenant(tenantId);
 
-  const price = marketEngine.getPrice(tenantId, symbol.toUpperCase());
+  const price =
+    marketEngine.getPrice(tenantId,symbol);
 
   return res.json({
-    ok: true,
+    ok:true,
     tenantId,
-    symbol: symbol.toUpperCase(),
-    price,
+    symbol,
+    price
   });
+
 });
 
-router.get("/market/candles/:symbol", requireRole(ADMIN, MANAGER), (req, res) => {
-  const tenantId = req.tenant?.id;
-  const { symbol } = req.params;
-  const limit = Number(req.query.limit) || 200;
+router.get("/market/candles/:symbol",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
+  const tenantId = req.tenant?.id;
+  const symbol = String(req.params.symbol || "").toUpperCase();
+  const limit = Number(req.query.limit || 200);
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   marketEngine.registerTenant(tenantId);
 
-  const candles = marketEngine.getCandles(
-    tenantId,
-    symbol.toUpperCase(),
-    limit
-  );
+  const candles =
+    marketEngine.getCandles(
+      tenantId,
+      symbol,
+      limit
+    );
 
   return res.json({
-    ok: true,
+    ok:true,
     tenantId,
-    symbol: symbol.toUpperCase(),
-    candles,
+    symbol,
+    candles
   });
+
 });
 
 /* =========================================================
-   PAPER
+DASHBOARD SUPPORT
 ========================================================= */
 
-router.get("/paper/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/price",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const price =
+    paperTrader.getMarketPrice?.(tenantId);
+
+  return res.json({
+    ok:true,
+    price
+  });
+
+});
+
+router.get("/decisions",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = req.tenant?.id;
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const decisions =
+    paperTrader.getDecisions?.(tenantId) || [];
+
+  return res.json(decisions);
+
+});
+
+/* =========================================================
+PAPER
+========================================================= */
+
+router.get("/paper/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = req.tenant?.id;
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   marketEngine.registerTenant(tenantId);
 
-  const snapshot = paperTrader.snapshot(tenantId);
+  const snapshot =
+    paperTrader.snapshot(tenantId);
 
   return res.json({
-    ok: true,
+    ok:true,
     tenantId,
-    snapshot,
-    performance: snapshot.performance,
-    adaptive: snapshot.adaptive,
+    snapshot
   });
+
 });
 
-router.post("/paper/reset", requireRole(ADMIN), (req, res) => {
+router.post("/paper/reset",
+requireRole(ADMIN),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   paperTrader.hardReset(tenantId);
 
   audit({
-    actorId: req.user.id,
-    action: "PAPER_TRADING_RESET",
-    targetType: "TradingState",
-    targetId: "paper",
-    companyId: tenantId,
+    actorId:req.user.id,
+    action:"PAPER_TRADING_RESET",
+    targetType:"TradingState",
+    targetId:"paper",
+    companyId:tenantId
   });
 
-  return res.json({ ok: true });
+  return res.json({ok:true});
+
 });
 
 /* =========================================================
-   LIVE
+LIVE
 ========================================================= */
 
-router.get("/live/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/live/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
 
-  const snapshot = liveTrader.snapshot(tenantId);
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const snapshot =
+    liveTrader.snapshot(tenantId);
 
   return res.json({
-    ok: true,
+    ok:true,
     tenantId,
-    snapshot,
+    snapshot
   });
+
 });
 
 /* =========================================================
-   RISK
+RISK
 ========================================================= */
 
-router.get("/risk/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/risk/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
 
-  const paper = paperTrader.snapshot(tenantId);
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  const risk = riskManager.evaluate({
-    tenantId,
-    equity: paper.equity,
-    volatility: paper.volatility || 0,
-    trades: paper.trades || [],
-    ts: Date.now(),
-  });
+  const paper =
+    paperTrader.snapshot(tenantId);
+
+  const risk =
+    riskManager.evaluate({
+
+      tenantId,
+      equity:paper.equity,
+      volatility:paper.volatility || 0,
+      trades:paper.trades || [],
+      ts:Date.now()
+
+    });
 
   return res.json({
-    ok: true,
+    ok:true,
     tenantId,
-    risk,
+    risk
   });
+
 });
 
 /* =========================================================
-   PORTFOLIO
+PORTFOLIO
 ========================================================= */
 
-router.get("/portfolio/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/portfolio/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
 
-  const paper = paperTrader.snapshot(tenantId);
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  const portfolio = portfolioManager.evaluate({
+  const paper =
+    paperTrader.snapshot(tenantId);
+
+  const portfolio =
+    portfolioManager.snapshot?.(tenantId) || {};
+
+  return res.json({
+    ok:true,
     tenantId,
-    symbol: null,
-    equity: paper.equity,
-    proposedRiskPct: 0,
-    paperState: paper,
-    ts: Date.now(),
+    portfolio
   });
 
-  return res.json({
-    ok: true,
-    tenantId,
-    portfolio,
-  });
 });
 
 /* =========================================================
-   AI
+AI
 ========================================================= */
 
-router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/ai/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const snapshot =
+    aiBrain.getSnapshot?.() || {};
+
   return res.json({
-    ok: true,
-    snapshot: aiBrain.getSnapshot?.() || {},
+    ok:true,
+    snapshot
   });
+
 });
 
 /* =========================================================
-   ROUTER HEALTH
+ROUTER HEALTH
 ========================================================= */
 
-router.get("/router/health", requireRole(ADMIN), (req, res) => {
+router.get("/router/health",
+requireRole(ADMIN),
+(req,res)=>{
+
+  let health = {};
+
+  try{
+    health = exchangeRouter.getHealth();
+  }catch{}
+
   return res.json({
-    ok: true,
-    router: exchangeRouter.getHealth(),
+    ok:true,
+    router:health
   });
+
 });
 
 /* =========================================================
-   UNIFIED DASHBOARD SNAPSHOT
+UNIFIED DASHBOARD
 ========================================================= */
 
-router.get("/dashboard/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+router.get("/dashboard/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
   const tenantId = req.tenant?.id;
-  if (!tenantId)
-    return res.status(400).json({ ok: false, error: "Missing tenant" });
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   marketEngine.registerTenant(tenantId);
 
-  const paper = paperTrader.snapshot(tenantId);
-  const live = liveTrader.snapshot(tenantId);
+  const paper =
+    paperTrader.snapshot(tenantId);
 
-  const risk = riskManager.evaluate({
-    tenantId,
-    equity: paper.equity,
-    volatility: paper.volatility || 0,
-    trades: paper.trades || [],
-    ts: Date.now(),
-  });
+  const live =
+    liveTrader.snapshot?.(tenantId) || {};
 
-  const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+  const risk =
+    riskManager.evaluate({
+
+      tenantId,
+      equity:paper.equity,
+      volatility:paper.volatility || 0,
+      trades:paper.trades || [],
+      ts:Date.now()
+
+    });
+
+  const price =
+    marketEngine.getPrice(tenantId,"BTCUSDT");
 
   return res.json({
-    ok: true,
+
+    ok:true,
     tenantId,
 
-    market: {
-      BTCUSDT: price,
+    market:{
+      BTCUSDT:price
     },
 
-    paper: {
-      equity: paper.equity,
-      unrealized: paper.unrealizedPnL,
-      performance: paper.performance,
-      adaptive: paper.adaptive,
-    },
+    paper:paper,
 
-    live: {
-      mode: live.mode,
-      equity: live.equity,
-      marginUsed: live.marginUsed,
-      liquidation: live.liquidation,
-      regime: live.regime,
-      fusedSignal: live.fusedSignal,
-    },
+    live:live,
 
     risk,
-    router: exchangeRouter.getHealth(),
-    ai: aiBrain.getSnapshot?.() || {},
+
+    router:
+      exchangeRouter.getHealth?.() || {},
+
+    ai:
+      aiBrain.getSnapshot?.() || {}
+
   });
+
 });
 
 /* ========================================================= */
