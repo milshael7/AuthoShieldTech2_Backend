@@ -2,6 +2,7 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — STABLE CORE
 // Non-blocking • Reentrant-safe • Snapshot-safe
+// WITH AI DECISION STREAM
 // ==========================================================
 
 const fs = require("fs");
@@ -28,6 +29,7 @@ const BASE_PATH =
 const CANDLE_MS = 60000;
 const MAX_CANDLES = 2000;
 const MAX_TRADES_MEMORY = 500;
+const MAX_DECISIONS_MEMORY = 200;
 const SAVE_INTERVAL_MS = 5000;
 
 /* ================= FS HELPERS ================= */
@@ -53,6 +55,8 @@ function defaultState() {
 
     position: null,
     trades: [],
+
+    decisions: [],
 
     volatility: 0.002,
     lastPrice: 65000,
@@ -104,6 +108,7 @@ function scheduleSave(tenantId, state) {
   state._lastSave = now;
 
   const file = statePath(tenantId);
+
   const snapshot = JSON.stringify(
     { ...state, _dirty: undefined, _locked: undefined },
     null,
@@ -152,12 +157,14 @@ function updateCandle(state, price) {
 /* ================= TICK ================= */
 
 function tick(tenantId, symbol, price, ts = Date.now()) {
+
   const state = load(tenantId);
 
   if (!state.running || state._locked) return;
   state._locked = true;
 
   try {
+
     orderFlowEngine.recordPrice({ tenantId, price });
     counterfactualEngine.recordPrice({ tenantId, price });
     correlationEngine.recordPrice({ tenantId, symbol, price });
@@ -199,7 +206,23 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       mode: "paper",
     });
 
+    /* ================= AI DECISION STREAM ================= */
+
+    state.decisions.push({
+      time: ts,
+      action: plan.action,
+      price,
+      riskPct: plan.riskPct,
+    });
+
+    if (state.decisions.length > MAX_DECISIONS_MEMORY) {
+      state.decisions = state.decisions.slice(-MAX_DECISIONS_MEMORY);
+    }
+
+    /* ================= BUY ================= */
+
     if (plan.action === "BUY" && !state.position) {
+
       const portfolioCheck = portfolioManager.evaluate({
         tenantId,
         symbol,
@@ -209,6 +232,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       });
 
       if (portfolioCheck.allow) {
+
         executionEngine.executePaperOrder({
           tenantId,
           symbol,
@@ -220,13 +244,18 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
         });
 
         state._dirty = true;
+
       }
+
     }
+
+    /* ================= SELL ================= */
 
     if (
       (plan.action === "SELL" || plan.action === "CLOSE") &&
       state.position
     ) {
+
       const result = executionEngine.executePaperOrder({
         tenantId,
         symbol,
@@ -238,26 +267,34 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       });
 
       if (result?.result?.pnl !== undefined) {
+
         aiBrain.recordTradeOutcome({
           tenantId,
           pnl: result.result.pnl,
         });
+
       }
 
       state.trades = state.trades.slice(-MAX_TRADES_MEMORY);
+
       state._dirty = true;
+
     }
 
     scheduleSave(tenantId, state);
 
   } finally {
+
     state._locked = false;
+
   }
+
 }
 
 /* ================= SNAPSHOT ================= */
 
 function snapshot(tenantId) {
+
   const s = load(tenantId);
 
   return JSON.parse(
@@ -267,6 +304,7 @@ function snapshot(tenantId) {
       peakEquity: s.peakEquity,
       position: s.position,
       trades: s.trades,
+      decisions: s.decisions,
       lastPrice: s.lastPrice,
       volatility: s.volatility,
       unrealizedPnL: s.position
@@ -275,6 +313,7 @@ function snapshot(tenantId) {
       limits: {},
     })
   );
+
 }
 
 /* ================= EXPORTS ================= */
@@ -282,14 +321,20 @@ function snapshot(tenantId) {
 module.exports = {
   tick,
   snapshot,
+
   getCandles: (tenantId, limit = 200) =>
     load(tenantId).candles.slice(-limit).map(c => ({
-      time: Math.floor(c.t / 1000), // CHART FIX
+      time: Math.floor(c.t / 1000),
       open: c.o,
       high: c.h,
       low: c.l,
       close: c.c,
     })),
+
   getMarketPrice: tenantId => load(tenantId).lastPrice,
+
+  getDecisions: tenantId =>
+    load(tenantId).decisions.slice(-50),
+
   hardReset: tenantId => STATES.set(tenantId, defaultState()),
 };
