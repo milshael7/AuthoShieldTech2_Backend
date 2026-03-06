@@ -1,5 +1,8 @@
-// backend/src/services/correlationEngine.js
-// Multi-Asset Correlation Intelligence Engine
+// ======================================================
+// Institutional Correlation Intelligence Engine
+// Multi-Asset Correlation + Regime Awareness
+// Deterministic • Crash Safe • Analytics Ready
+// ======================================================
 
 const CORRELATION = new Map();
 
@@ -16,7 +19,9 @@ function getState(tenantId){
   if(!CORRELATION.has(key)){
 
     CORRELATION.set(key,{
-      markets:{}
+      markets:{},
+      cache:{},
+      lastUpdate:0
     });
 
   }
@@ -37,11 +42,8 @@ function recordPrice({
 
   const state = getState(tenantId);
 
-  if(!state.markets[symbol]){
-
+  if(!state.markets[symbol])
     state.markets[symbol] = [];
-
-  }
 
   state.markets[symbol].push({
     price,
@@ -54,30 +56,55 @@ function recordPrice({
 }
 
 /* =====================================================
-CALCULATE CORRELATION
+RETURNS SERIES
+===================================================== */
+
+function computeReturns(series){
+
+  const returns = [];
+
+  for(let i=1;i<series.length;i++){
+
+    const prev = series[i-1].price;
+    const cur  = series[i].price;
+
+    if(prev>0)
+      returns.push((cur-prev)/prev);
+
+  }
+
+  return returns;
+
+}
+
+/* =====================================================
+PEARSON CORRELATION
 ===================================================== */
 
 function computeCorrelation(a,b){
 
-  const n = Math.min(a.length,b.length);
+  const rA = computeReturns(a);
+  const rB = computeReturns(b);
 
-  if(n < 10)
+  const n = Math.min(rA.length,rB.length);
+
+  if(n < 8)
     return 0;
 
   let sumA=0,sumB=0,sumAB=0,sumA2=0,sumB2=0;
 
   for(let i=0;i<n;i++){
 
-    const x = a[i].price;
-    const y = b[i].price;
+    const x = rA[i];
+    const y = rB[i];
 
-    sumA += x;
-    sumB += y;
+    sumA+=x;
+    sumB+=y;
 
-    sumAB += x*y;
+    sumAB+=x*y;
 
-    sumA2 += x*x;
-    sumB2 += y*y;
+    sumA2+=x*x;
+    sumB2+=y*y;
 
   }
 
@@ -90,7 +117,7 @@ function computeCorrelation(a,b){
       (n*sumB2-sumB*sumB)
     );
 
-  if(denominator===0)
+  if(!denominator || !Number.isFinite(denominator))
     return 0;
 
   return numerator/denominator;
@@ -98,7 +125,7 @@ function computeCorrelation(a,b){
 }
 
 /* =====================================================
-GET CORRELATION BOOST
+CORRELATION BOOST MODEL
 ===================================================== */
 
 function getCorrelationBoost({
@@ -108,14 +135,12 @@ function getCorrelationBoost({
 
   const state = getState(tenantId);
 
-  const symbols =
-    Object.keys(state.markets);
+  const symbols = Object.keys(state.markets);
 
   if(symbols.length < 2)
     return 1;
 
-  const base =
-    state.markets[symbol];
+  const base = state.markets[symbol];
 
   if(!base)
     return 1;
@@ -141,17 +166,74 @@ function getCorrelationBoost({
 
   }
 
-  if(strongest > 0.8)
-    return 1.2;
+  /* ================= BOOST MODEL ================= */
 
-  if(strongest < 0.3)
+  if(strongest > 0.85)
+    return 1.15;
+
+  if(strongest > 0.65)
+    return 1.05;
+
+  if(strongest < 0.25)
     return 0.9;
 
   return 1;
 
 }
 
-module.exports={
+/* =====================================================
+CORRELATION MATRIX (for analytics UI)
+===================================================== */
+
+function getMatrix(tenantId){
+
+  const state = getState(tenantId);
+
+  const symbols =
+    Object.keys(state.markets);
+
+  const matrix={};
+
+  for(const a of symbols){
+
+    matrix[a]={};
+
+    for(const b of symbols){
+
+      if(a===b){
+
+        matrix[a][b]=1;
+        continue;
+
+      }
+
+      matrix[a][b] =
+        computeCorrelation(
+          state.markets[a],
+          state.markets[b]
+        );
+
+    }
+
+  }
+
+  return matrix;
+
+}
+
+/* =====================================================
+RESET
+===================================================== */
+
+function resetTenant(tenantId){
+
+  CORRELATION.delete(tenantId);
+
+}
+
+module.exports = {
   recordPrice,
-  getCorrelationBoost
+  getCorrelationBoost,
+  getMatrix,
+  resetTenant
 };
