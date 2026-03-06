@@ -1,11 +1,13 @@
 // backend/src/services/counterfactualEngine.js
-// Counterfactual Learning Engine
+// Phase 2 Counterfactual Learning Engine
 // Learns from signals that were not executed
+// Adaptive Edge Reinforcement
 
 const MEMORY = new Map();
 
 const MAX_SIGNALS = 200;
-const LOOKAHEAD = 25; // ticks to evaluate outcome
+const LOOKAHEAD = 25;
+const MIN_MOVE = 0.002;
 
 /* ======================================================
 STATE
@@ -16,10 +18,17 @@ function getState(tenantId){
   const key = tenantId || "__default__";
 
   if(!MEMORY.has(key)){
+
     MEMORY.set(key,{
       signals:[],
-      prices:[]
+      prices:[],
+      stats:{
+        goodMissed:0,
+        badMissed:0,
+        adjustment:1
+      }
     });
+
   }
 
   return MEMORY.get(key);
@@ -108,27 +117,82 @@ function evaluateSignals({
     if(s.action === "SELL")
       pnl = -diff;
 
-    if(Math.abs(diff) > 0.002){
+    if(Math.abs(diff) < MIN_MOVE)
+      continue;
 
-      results.push({
-        action:s.action,
-        edge:s.edge,
-        confidence:s.confidence,
-        pnl
-      });
+    const good = pnl > 0;
 
-      s.evaluated = true;
+    if(good)
+      state.stats.goodMissed++;
+    else
+      state.stats.badMissed++;
 
-    }
+    results.push({
+      action:s.action,
+      edge:s.edge,
+      confidence:s.confidence,
+      pnl
+    });
+
+    s.evaluated = true;
 
   }
 
+  adaptLearning(state);
+
   return results;
+
+}
+
+/* ======================================================
+ADAPT LEARNING
+====================================================== */
+
+function adaptLearning(state){
+
+  const good = state.stats.goodMissed;
+  const bad = state.stats.badMissed;
+
+  const total = good + bad;
+
+  if(total < 5)
+    return;
+
+  const accuracy = good / total;
+
+  if(accuracy > 0.6){
+
+    state.stats.adjustment =
+      Math.min(state.stats.adjustment * 1.05,1.5);
+
+  }
+
+  if(accuracy < 0.4){
+
+    state.stats.adjustment =
+      Math.max(state.stats.adjustment * 0.95,0.7);
+
+  }
+
+}
+
+/* ======================================================
+STRATEGY ADJUSTMENT
+====================================================== */
+
+function getLearningAdjustment({
+  tenantId
+}){
+
+  const state = getState(tenantId);
+
+  return state.stats.adjustment || 1;
 
 }
 
 module.exports={
   recordPrice,
   recordSignal,
-  evaluateSignals
+  evaluateSignals,
+  getLearningAdjustment
 };
