@@ -1,14 +1,11 @@
 // backend/src/services/tradeBrain.js
-// Phase 13 — Dual Mode Behavioral Core + Confidence Gate
-// Paper = Unlimited Learning
-// Live = Capital Discipline
-// Deterministic • Tenant Safe
-// Memory Brain Integrated
+// Phase 14 — Behavioral Core + Order Flow Intelligence
 
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
 const { buildDecision } = require("./strategyEngine");
 const capitalProtection = require("./capitalProtection");
+const orderFlowEngine = require("./orderFlowEngine");
 
 /* ================= SAFETY CONSTANTS ================= */
 
@@ -26,8 +23,6 @@ const EDGE_MEMORY_DECAY =
 
 const VOL_HIGH =
   Number(process.env.TRADE_VOL_HIGH || 0.02);
-
-/* NEW */
 
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
@@ -59,11 +54,9 @@ function getBrainState(tenantId) {
       smoothedConfidence: 0,
       edgeMomentum: 0,
       lastAction: "WAIT",
-
       winStreak: 0,
       lossStreak: 0,
       lastRealizedNet: 0,
-
       aggressionFactor: 1,
     });
 
@@ -196,30 +189,44 @@ function makeDecision(context = {}) {
 
   try {
 
-    if (typeof aiBrain.decide === "function") {
+    const aiView =
+      aiBrain.decide({
+        tenantId,
+        symbol,
+        last,
+        paper
+      }) || {};
 
-      const aiView =
-        aiBrain.decide({
-          tenantId,
-          symbol,
-          last,
-          paper
-        }) || {};
+    if (
+      aiView.action &&
+      ALLOWED_ACTIONS.has(
+        String(aiView.action).toUpperCase()
+      )
+    ) {
 
-      if (
-        aiView.action &&
-        ALLOWED_ACTIONS.has(
-          String(aiView.action).toUpperCase()
-        )
-      ) {
+      confidence =
+        Math.max(confidence, safeNum(aiView.confidence, 0));
 
-        confidence =
-          Math.max(confidence, safeNum(aiView.confidence, 0));
+      edge =
+        Math.max(edge, safeNum(aiView.edge, 0));
 
-        edge =
-          Math.max(edge, safeNum(aiView.edge, 0));
+    }
 
-      }
+  } catch {}
+
+  /* ================= ORDER FLOW ================= */
+
+  try {
+
+    const flow =
+      orderFlowEngine.analyzeFlow({ tenantId });
+
+    confidence *= flow.boost || 1;
+
+    if (flow.type === "fake_breakout") {
+
+      action = "WAIT";
+      reason = "Order flow fake breakout";
 
     }
 
