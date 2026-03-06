@@ -20,7 +20,6 @@ function resolveTenant(req) {
 function resetAllowed(req) {
   const key = String(process.env.PAPER_RESET_KEY || "").trim();
 
-  // No key configured → allow (dev)
   if (!key) return true;
 
   const sent = String(req.headers["x-reset-key"] || "").trim();
@@ -29,11 +28,11 @@ function resetAllowed(req) {
 
 /* =========================================================
    STATUS
-   GET /api/paper/status
 ========================================================= */
 
 router.get("/status", (req, res) => {
   try {
+
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -57,7 +56,7 @@ router.get("/status", (req, res) => {
       time: new Date().toISOString(),
     });
 
-  } catch (err) {
+  } catch {
     return res.status(500).json({
       ok: false,
       error: "Paper engine unavailable",
@@ -66,12 +65,13 @@ router.get("/status", (req, res) => {
 });
 
 /* =========================================================
-   RESET (ADMIN / MANAGER SAFE)
-   POST /api/paper/reset
+   AI DECISION STREAM
+   NEW ENDPOINT
 ========================================================= */
 
-router.post("/reset", (req, res) => {
+router.get("/decisions", (req, res) => {
   try {
+
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -81,8 +81,43 @@ router.post("/reset", (req, res) => {
       });
     }
 
-    // Extra safety: restrict reset to admin/manager
+    const decisions =
+      paperTrader.getDecisions?.(tenantId) || [];
+
+    return res.json({
+      ok: true,
+      decisions,
+      time: new Date().toISOString(),
+    });
+
+  } catch {
+
+    return res.status(500).json({
+      ok: false,
+      error: "Decision stream unavailable",
+    });
+
+  }
+});
+
+/* =========================================================
+   RESET
+========================================================= */
+
+router.post("/reset", (req, res) => {
+  try {
+
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
     const role = String(req.user?.role || "").toLowerCase();
+
     if (role !== "admin" && role !== "manager") {
       return res.status(403).json({
         ok: false,
@@ -106,20 +141,23 @@ router.post("/reset", (req, res) => {
       time: new Date().toISOString(),
     });
 
-  } catch (err) {
+  } catch {
+
     return res.status(500).json({
       ok: false,
       error: "Paper reset failed",
     });
+
   }
 });
 
 /* =========================================================
-   CONFIG (READ ONLY)
+   CONFIG
 ========================================================= */
 
 router.get("/config", (req, res) => {
   try {
+
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -151,16 +189,18 @@ router.get("/config", (req, res) => {
       time: new Date().toISOString(),
     });
 
-  } catch (err) {
+  } catch {
+
     return res.status(500).json({
       ok: false,
       error: "Paper config unavailable",
     });
+
   }
 });
 
 /* =========================================================
-   CONFIG UPDATE BLOCK (INTENTIONAL)
+   CONFIG UPDATE BLOCK
 ========================================================= */
 
 router.post("/config", (_req, res) => {
