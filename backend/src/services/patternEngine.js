@@ -1,6 +1,7 @@
 // backend/src/services/patternEngine.js
-// Phase 1 Pattern Discovery Engine
-// Detects repeating profitable market patterns
+// Phase 2 Pattern Discovery Engine
+// Breakout • Fake Breakout • Reversal • Volatility Pattern Learning
+// Tenant Safe
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
@@ -21,7 +22,8 @@ function getState(tenantId){
 
     PATTERN_MEMORY.set(key,{
       signals:[],
-      patterns:{}
+      patterns:{},
+      priceHistory:[]
     });
 
   }
@@ -57,6 +59,92 @@ function recordSignal({
 
   if(state.signals.length > MAX_MEMORY)
     state.signals.shift();
+
+}
+
+/* ======================================================
+PRICE MEMORY
+====================================================== */
+
+function recordPrice({
+  tenantId,
+  price
+}){
+
+  const state = getState(tenantId);
+
+  state.priceHistory.push({
+    price,
+    ts:Date.now()
+  });
+
+  if(state.priceHistory.length > 40)
+    state.priceHistory.shift();
+
+}
+
+/* ======================================================
+PATTERN DETECTION
+====================================================== */
+
+function detectMarketPattern({
+  tenantId
+}){
+
+  const state = getState(tenantId);
+
+  const prices = state.priceHistory;
+
+  if(prices.length < 6)
+    return {type:"neutral",boost:1};
+
+  const first = prices[0].price;
+  const last = prices[prices.length-1].price;
+
+  const move = (last-first)/first;
+
+  const max = Math.max(...prices.map(p=>p.price));
+  const min = Math.min(...prices.map(p=>p.price));
+
+  const range = (max-min)/first;
+
+  /* ================= BREAKOUT ================= */
+
+  if(Math.abs(move) > 0.007){
+
+    return{
+      type:"breakout",
+      boost:1.3
+    };
+
+  }
+
+  /* ================= FAKE BREAKOUT ================= */
+
+  if(range > 0.01 && Math.abs(move) < 0.002){
+
+    return{
+      type:"fake_breakout",
+      boost:0.7
+    };
+
+  }
+
+  /* ================= REVERSAL ================= */
+
+  if(range > 0.006 && Math.abs(move) < 0.0008){
+
+    return{
+      type:"reversal",
+      boost:0.85
+    };
+
+  }
+
+  return{
+    type:"neutral",
+    boost:1
+  };
 
 }
 
@@ -111,27 +199,40 @@ function getPatternEdgeBoost({
 
   const p = state.patterns[key];
 
-  if(!p) return 1;
+  let boost = 1;
 
-  const total = p.wins + p.losses;
+  if(p){
 
-  if(total < MIN_PATTERN_OCCURRENCES)
-    return 1;
+    const total = p.wins + p.losses;
 
-  const winRate = p.wins / total;
+    if(total >= MIN_PATTERN_OCCURRENCES){
 
-  if(winRate > 0.65)
-    return clamp(1 + (winRate - 0.5),1,1.8);
+      const winRate = p.wins / total;
 
-  if(winRate < 0.4)
-    return 0.7;
+      if(winRate > 0.65)
+        boost *= clamp(1 + (winRate - 0.5),1,1.8);
 
-  return 1;
+      if(winRate < 0.4)
+        boost *= 0.7;
+
+    }
+
+  }
+
+  /* ================= LIVE MARKET PATTERN ================= */
+
+  const livePattern =
+    detectMarketPattern({tenantId});
+
+  boost *= livePattern.boost;
+
+  return clamp(boost,0.5,2);
 
 }
 
 module.exports={
   recordSignal,
   recordTrade,
+  recordPrice,
   getPatternEdgeBoost
 };
