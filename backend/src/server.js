@@ -1,189 +1,186 @@
-require("dotenv").config();
+// =========================================================
+// AUTOSHIELD — ADMIN COMPATIBILITY ROUTES v1 (SEALED)
+// PURPOSE:
+// - Prevent 404-based ZeroTrust kickouts for Admin UI
+// - Provide GLOBAL READ access for dashboards & rooms
+// - NO SECURITY AUTHORITY
+// - NO STATE MUTATION (except safe company create)
+// - QUIET • DETERMINISTIC • ADMIN ONLY
+// =========================================================
+
 const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const helmet = require("helmet");
-const http = require("http");
-const { WebSocketServer } = require("ws");
+const router = express.Router();
 
-/* ================= CORE LIBS ================= */
+const { authRequired } = require("../middleware/auth");
+const { readDb, writeDb } = require("../lib/db");
+const { writeAudit } = require("../lib/audit");
 
-const { ensureDb, readDb } = require("./lib/db");
-const { verifyAuditIntegrity } = require("./lib/audit");
-const { verify } = require("./lib/jwt");
-const sessionAdapter = require("./lib/sessionAdapter");
-const users = require("./users/user.service");
+/* ================= HELPERS ================= */
 
-const tenantMiddleware = require("./middleware/tenant");
-const rateLimiter = require("./middleware/rateLimiter");
-const zeroTrust = require("./middleware/zeroTrust");
-const { authRequired } = require("./middleware/auth");
-
-/* ================= ROUTES ================= */
-
-const paperRoutes = require("./routes/paper.routes");
-const marketRoutes = require("./routes/market.routes");
-
-/* ================= SAFE BOOT ================= */
-
-function requireEnv(name) {
-  if (!process.env[name]) {
-    console.error(`[BOOT] Missing required env var: ${name}`);
-    process.exit(1);
-  }
+function normalize(v) {
+  return String(v || "").trim().toLowerCase();
 }
 
-requireEnv("JWT_SECRET");
-requireEnv("STRIPE_SECRET_KEY");
-requireEnv("STRIPE_WEBHOOK_SECRET");
-
-ensureDb();
-users.ensureAdminFromEnv();
-verifyAuditIntegrity();
-
-/* ================= EXPRESS ================= */
-
-const app = express();
-app.set("trust proxy", 1);
-
-/* Stripe webhook BEFORE json parser */
-app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
-
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN || false,
-    credentials: true,
-  })
-);
-
-app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
-app.use(morgan("dev"));
-app.use(rateLimiter);
-
-/* ================= PUBLIC ROUTES ================= */
-
-app.use("/api/auth", require("./routes/auth.routes"));
-
-/* ================= AUTH + TENANT ================= */
-
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) return next();
-  return authRequired(req, res, next);
-});
-
-app.use("/api", tenantMiddleware);
-
-/* ================= CORE API ================= */
-
-app.use("/api/admin", require("./routes/admin.routes"));
-app.use("/api/security", require("./routes/security.routes"));
-app.use("/api/security/tools", require("./routes/tools.routes"));
-app.use("/api/incidents", require("./routes/incidents.routes"));
-app.use("/api/entitlements", require("./routes/entitlements.routes"));
-app.use("/api/billing", require("./routes/billing.routes"));
-app.use("/api/company", require("./routes/company.routes"));
-app.use("/api/users", require("./routes/users.routes"));
-app.use("/api/soc", require("./routes/soc.routes"));
-
-/* ================= MARKET + PAPER (REST ONLY) ================= */
-
-app.use("/api/paper", paperRoutes);
-app.use("/api/market", marketRoutes);
-
-/* ================= ZERO TRUST (CONTROLLED SCOPE) ================= */
-
-app.use("/api", (req, res, next) => {
-  if (
-    req.path.startsWith("/auth") ||
-    req.path.startsWith("/market") ||
-    req.path.startsWith("/paper")
-  ) {
-    return next();
+function requireAdmin(req, res, next) {
+  if (normalize(req.user?.role) !== "admin") {
+    return res.status(403).json({ ok: false, error: "Admin only" });
   }
-  return zeroTrust(req, res, next);
-});
-
-/* ================= HTTP SERVER ================= */
-
-const server = http.createServer(app);
-
-/* =================================================
-   WEBSOCKET — SECURITY CHANNEL (ADVISORY ONLY)
-   PATH: /ws/security
-   PURPOSE:
-   - Exists because frontend expects it
-   - NEVER authoritative
-   - NEVER chatty
-   - NEVER required for correctness
-================================================= */
-
-const securityWss = new WebSocketServer({
-  server,
-  path: "/ws/security",
-});
-
-function closeWs(ws) {
-  try {
-    ws.close();
-  } catch {}
+  next();
 }
 
-securityWss.on("connection", (ws, req) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const token = url.searchParams.get("token");
-    if (!token) return closeWs(ws);
+/* ================= MIDDLEWARE ================= */
 
-    const payload = verify(token, "access");
-    if (!payload?.id || !payload?.jti) return closeWs(ws);
-    if (sessionAdapter.isRevoked(payload.jti)) return closeWs(ws);
+router.use(authRequired);
+router.use(requireAdmin);
+
+/* =========================================================
+   ADMIN — USERS (GLOBAL VIEW)
+   Frontend: api.adminUsers()
+========================================================= */
+
+router.get("/users", (req, res) => {
+  try {
+    const db = readDb();
+
+    return res.json(
+      (db.users || []).map(u => ({
+        id: u.id,
+        email: u.email,
+        role: u.role,
+        companyId: u.companyId || null,
+        subscriptionStatus: u.subscriptionStatus || "inactive",
+        autoprotectEnabled: Boolean(u.autoprotectEnabled)
+      }))
+    );
+  } catch {
+    return res.json([]);
+  }
+});
+
+/* =========================================================
+   ADMIN — COMPANIES (GLOBAL VIEW)
+   Frontend: api.adminCompanies()
+========================================================= */
+
+router.get("/companies", (req, res) => {
+  try {
+    const db = readDb();
+    return res.json(db.companies || []);
+  } catch {
+    return res.json([]);
+  }
+});
+
+/* =========================================================
+   ADMIN — CREATE COMPANY (SAFE)
+========================================================= */
+
+router.post("/companies", (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    if (!name) {
+      return res.status(400).json({ ok: false });
+    }
 
     const db = readDb();
-    const user = (db.users || []).find(
-      (u) => String(u.id) === String(payload.id)
-    );
-    if (!user) return closeWs(ws);
 
-    if (
-      Number(payload.tokenVersion || 0) !==
-      Number(user.tokenVersion || 0)
-    ) {
-      sessionAdapter.revokeToken(payload.jti);
-      return closeWs(ws);
-    }
+    const company = {
+      id: `comp_${Date.now()}`,
+      name,
+      createdAt: new Date().toISOString(),
+      subscriptionStatus: "active",
+      subscriptionTier: "free"
+    };
 
-    // heartbeat only — no push unless real threat exists
-    ws.isAlive = true;
-    ws.on("pong", () => {
-      ws.isAlive = true;
+    db.companies = db.companies || [];
+    db.companies.push(company);
+    writeDb(db);
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "ADMIN_COMPANY_CREATED",
+      detail: { companyId: company.id }
     });
 
+    return res.json({ ok: true, company });
   } catch {
-    closeWs(ws);
+    return res.status(500).json({ ok: false });
   }
 });
 
-/* ================= WS HEARTBEAT CLEANUP ================= */
+/* =========================================================
+   ADMIN — NOTIFICATIONS (GLOBAL)
+   Frontend: api.adminNotifications()
+========================================================= */
 
-setInterval(() => {
-  securityWss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      try {
-        ws.terminate();
-      } catch {}
-      return;
-    }
-    ws.isAlive = false;
-    try {
-      ws.ping();
-    } catch {}
-  });
-}, 30000);
-
-/* ================= START ================= */
-
-const port = process.env.PORT || 5000;
-server.listen(port, () => {
-  console.log(`[BOOT] Backend running quietly on port ${port}`);
+router.get("/notifications", (req, res) => {
+  try {
+    const db = readDb();
+    return res.json(db.notifications || []);
+  } catch {
+    return res.json([]);
+  }
 });
+
+/* =========================================================
+   MANAGER ROOM — OVERVIEW (ADMIN VIEW)
+   Frontend: api.managerOverview()
+========================================================= */
+
+router.get("/manager/overview", (req, res) => {
+  try {
+    const db = readDb();
+
+    return res.json({
+      users: (db.users || []).length,
+      companies: (db.companies || []).length,
+      auditEvents: (db.auditLog || []).length,
+      notifications: (db.notifications || []).length
+    });
+  } catch {
+    return res.json(null);
+  }
+});
+
+/* =========================================================
+   MANAGER ROOM — AUDIT (ADMIN VIEW)
+   Frontend: api.managerAudit(limit)
+========================================================= */
+
+router.get("/manager/audit", (req, res) => {
+  try {
+    const limit = Math.min(
+      500,
+      Math.max(1, Number(req.query.limit) || 100)
+    );
+
+    const db = readDb();
+    const audit = db.auditLog || [];
+
+    return res.json(
+      audit
+        .slice()
+        .reverse()
+        .slice(0, limit)
+    );
+  } catch {
+    return res.json([]);
+  }
+});
+
+/* =========================================================
+   MANAGER ROOM — NOTIFICATIONS (ADMIN VIEW)
+   Frontend: api.managerNotifications()
+========================================================= */
+
+router.get("/manager/notifications", (req, res) => {
+  try {
+    const db = readDb();
+    return res.json(db.notifications || []);
+  } catch {
+    return res.json([]);
+  }
+});
+
+module.exports = router;
