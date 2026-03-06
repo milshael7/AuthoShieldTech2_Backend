@@ -1,11 +1,12 @@
 // backend/src/services/tradeBrain.js
-// Phase 16 — Behavioral Core + Microstructure Intelligence (Stable Merge)
+// Phase 17 — Behavioral Core + Microstructure + Liquidity Intelligence
 
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
 const { buildDecision } = require("./strategyEngine");
 const capitalProtection = require("./capitalProtection");
 const orderFlowEngine = require("./orderFlowEngine");
+const liquidityEngine = require("./liquidityEngine");
 
 /* ================= SAFETY CONSTANTS ================= */
 
@@ -44,11 +45,11 @@ const ALLOWED_ACTIONS = new Set([
 
 const BRAIN_STATE = new Map();
 
-function getBrainState(tenantId) {
+function getBrainState(tenantId){
 
   const key = tenantId || "__default__";
 
-  if (!BRAIN_STATE.has(key)) {
+  if(!BRAIN_STATE.has(key)){
 
     BRAIN_STATE.set(key,{
       smoothedConfidence:0,
@@ -69,12 +70,16 @@ function getBrainState(tenantId) {
 /* ================= UTIL ================= */
 
 function safeNum(x,fallback=0){
+
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
+
 }
 
 function clamp(n,min,max){
+
   return Math.max(min,Math.min(max,n));
+
 }
 
 /* ================= PERFORMANCE TRACKING ================= */
@@ -91,7 +96,6 @@ function updatePerformance(brain,paper){
     brain.lossStreak = 0;
 
   }
-
   else if(delta < 0){
 
     brain.lossStreak++;
@@ -174,13 +178,17 @@ function makeDecision(context={}){
   /* ================= NORMALIZE ================= */
 
   if(!hasPosition && action==="SELL"){
+
     action="WAIT";
     reason="No position to sell.";
+
   }
 
   if(hasPosition && action==="BUY"){
+
     action="WAIT";
     reason="Position already open.";
+
   }
 
   /* ================= AI OVERLAY ================= */
@@ -241,9 +249,30 @@ function makeDecision(context={}){
 
     }
 
-    if(flow.type==="volatility_shock"){
+  }catch{}
 
-      confidence *= 0.5;
+  /* ================= LIQUIDITY INTELLIGENCE ================= */
+
+  try{
+
+    const liquidity =
+      liquidityEngine.analyzeLiquidity({tenantId});
+
+    confidence *= liquidity.boost || 1;
+
+    if(
+      liquidity.type==="bull_trap" ||
+      liquidity.type==="bear_trap"
+    ){
+
+      action="WAIT";
+      reason="Liquidity trap";
+
+    }
+
+    if(liquidity.type==="liquidity_vacuum"){
+
+      confidence *= 1.2;
 
     }
 
