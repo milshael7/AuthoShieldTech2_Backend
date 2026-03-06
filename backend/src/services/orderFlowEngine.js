@@ -1,8 +1,9 @@
 // backend/src/services/orderFlowEngine.js
 // ======================================================
-// Phase 2 — Institutional Order Flow Engine
+// Phase 3 — Institutional Order Flow Engine
 // Detects liquidity sweeps, fake breakouts,
-// trend acceleration, and market compression
+// trend acceleration, compression, exhaustion
+// and volatility shocks
 // ======================================================
 
 const FLOW = new Map();
@@ -20,7 +21,8 @@ function getState(tenantId){
   if(!FLOW.has(key)){
     FLOW.set(key,{
       prices:[],
-      velocity:0
+      velocity:0,
+      lastFlow:"neutral"
     });
   }
 
@@ -105,11 +107,28 @@ function analyzeFlow({ tenantId }){
 
   state.velocity = velocity;
 
+  const absMove = Math.abs(move);
+  const absVel = Math.abs(velocity);
+
+  /* ===================================================
+  VOLATILITY SHOCK
+  ==================================================== */
+
+  if(absMove > 0.02){
+
+    return {
+      type:"volatility_shock",
+      boost:0.4,
+      velocity
+    };
+
+  }
+
   /* ===================================================
   LIQUIDITY SWEEP
   ==================================================== */
 
-  if(range > 0.01 && Math.abs(move) < 0.002){
+  if(range > 0.01 && absMove < 0.002){
 
     return {
       type:"liquidity_sweep",
@@ -123,7 +142,7 @@ function analyzeFlow({ tenantId }){
   AGGRESSIVE TREND
   ==================================================== */
 
-  if(Math.abs(move) > 0.007 && Math.abs(velocity) > 0.0005){
+  if(absMove > 0.007 && absVel > 0.0005){
 
     return {
       type:"aggressive_trend",
@@ -137,7 +156,7 @@ function analyzeFlow({ tenantId }){
   TREND ACCELERATION
   ==================================================== */
 
-  if(Math.abs(velocity) > 0.001){
+  if(absVel > 0.001){
 
     return {
       type:"trend_acceleration",
@@ -148,10 +167,24 @@ function analyzeFlow({ tenantId }){
   }
 
   /* ===================================================
+  TREND EXHAUSTION
+  ==================================================== */
+
+  if(absMove > 0.008 && absVel < 0.0002){
+
+    return {
+      type:"trend_exhaustion",
+      boost:0.7,
+      velocity
+    };
+
+  }
+
+  /* ===================================================
   FAKE BREAKOUT
   ==================================================== */
 
-  if(range > 0.008 && Math.abs(move) < 0.001){
+  if(range > 0.008 && absMove < 0.001){
 
     return {
       type:"fake_breakout",
