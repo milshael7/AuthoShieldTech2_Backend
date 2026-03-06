@@ -1,4 +1,3 @@
-// backend/src/services/liquidityEngine.js
 // ======================================================
 // Institutional Liquidity Intelligence Engine
 // Detects stop hunts, traps, absorption, liquidity zones,
@@ -23,7 +22,6 @@ function getState(tenantId){
     LIQUIDITY.set(key,{
       prices:[],
       levels:[],
-      absorptionLevels:[],
       pressure:"neutral"
     });
 
@@ -79,6 +77,8 @@ function recordPrice({
 
   const p = safeNum(price);
 
+  if(!p) return;
+
   state.prices.push({
     price:p,
     ts:Date.now()
@@ -112,11 +112,12 @@ function detectLiquiditySweep(prices){
 
   const last = prices[prices.length-1].price;
 
-  const highs =
-    prices.slice(-10).map(p=>p.price);
+  const highs = prices.slice(-10).map(p=>p.price);
 
   const max = Math.max(...highs);
   const min = Math.min(...highs);
+
+  if(!max || !min) return null;
 
   if(last > max * 1.001)
     return "liquidity_sweep_up";
@@ -137,11 +138,12 @@ function detectAbsorption(prices){
   if(prices.length < 12)
     return null;
 
-  const lastPrices =
-    prices.slice(-6).map(p=>p.price);
+  const lastPrices = prices.slice(-6).map(p=>p.price);
 
   const max = Math.max(...lastPrices);
   const min = Math.min(...lastPrices);
+
+  if(!max) return null;
 
   const range = (max-min)/max;
 
@@ -174,6 +176,8 @@ function detectTrap(prices){
 
   const first = prices[0].price;
   const last = prices[prices.length-1].price;
+
+  if(!first) return null;
 
   const move = (last-first)/first;
 
@@ -211,12 +215,11 @@ function detectVacuum(prices){
   const first = prices[0].price;
   const last = prices[prices.length-1].price;
 
+  if(!first) return false;
+
   const move = Math.abs((last-first)/first);
 
-  if(move > 0.012)
-    return true;
-
-  return false;
+  return move > 0.012;
 
 }
 
@@ -231,6 +234,8 @@ function detectPressure(prices){
 
   const first = prices[0].price;
   const last = prices[prices.length-1].price;
+
+  if(!first) return "neutral";
 
   const diff = (last-first)/first;
 
@@ -268,24 +273,15 @@ function analyzeLiquidity({
 
   state.pressure = pressure;
 
-  /* ===================================================
-  LIQUIDITY SWEEP
-  ==================================================== */
-
   if(sweep){
 
     return{
       type:sweep,
       pressure,
-      trap,
       boost:0.75
     };
 
   }
-
-  /* ===================================================
-  TRAP
-  ==================================================== */
 
   if(trap){
 
@@ -297,10 +293,6 @@ function analyzeLiquidity({
 
   }
 
-  /* ===================================================
-  ABSORPTION
-  ==================================================== */
-
   if(absorption){
 
     return{
@@ -310,10 +302,6 @@ function analyzeLiquidity({
     };
 
   }
-
-  /* ===================================================
-  VACUUM
-  ==================================================== */
 
   if(vacuum){
 
