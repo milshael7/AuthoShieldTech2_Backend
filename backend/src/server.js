@@ -4,11 +4,14 @@ const cors = require("cors");
 const morgan = require("morgan");
 const helmet = require("helmet");
 const http = require("http");
+const { WebSocketServer } = require("ws");
 
 /* ================= CORE LIBS ================= */
 
-const { ensureDb } = require("./lib/db");
+const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity } = require("./lib/audit");
+const { verify } = require("./lib/jwt");
+const sessionAdapter = require("./lib/sessionAdapter");
 const users = require("./users/user.service");
 
 const tenantMiddleware = require("./middleware/tenant");
@@ -104,6 +107,63 @@ app.use("/api", (req, res, next) => {
 /* ================= SERVER ================= */
 
 const server = http.createServer(app);
+
+/* ================= WEBSOCKET — SECURITY (QUIET) ================= */
+
+const securityWss = new WebSocketServer({
+  server,
+  path: "/ws/security",
+});
+
+function closeWs(ws) {
+  try { ws.close(); } catch {}
+}
+
+securityWss.on("connection", (ws, req) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const token = url.searchParams.get("token");
+    if (!token) return closeWs(ws);
+
+    const payload = verify(token, "access");
+    if (!payload?.id || !payload?.jti) return closeWs(ws);
+    if (sessionAdapter.isRevoked(payload.jti)) return closeWs(ws);
+
+    const db = readDb();
+    const user = (db.users || []).find(
+      (u) => String(u.id) === String(payload.id)
+    );
+    if (!user) return closeWs(ws);
+
+    if (
+      Number(payload.tokenVersion || 0) !==
+      Number(user.tokenVersion || 0)
+    ) {
+      sessionAdapter.revokeToken(payload.jti);
+      return closeWs(ws);
+    }
+
+    ws.isAlive = true;
+    ws.on("pong", () => { ws.isAlive = true; });
+
+    // 🔇 QUIET MODE:
+    // No messages are sent unless a real security event occurs.
+    // This socket exists to prevent frontend fighting.
+
+  } catch {
+    closeWs(ws);
+  }
+});
+
+/* ================= CLEAN DEAD WS ================= */
+
+setInterval(() => {
+  securityWss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 30000);
 
 /* ================= START ================= */
 
