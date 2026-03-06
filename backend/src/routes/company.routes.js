@@ -1,6 +1,10 @@
 // backend/src/routes/company.routes.js
-// Enterprise Company Control Layer — Hardened v5
-// Subscription Propagation • Seat Enforcement • Lock Cascade • Session Kill • Audit Safe
+// =========================================================
+// ENTERPRISE COMPANY CONTROL LAYER — HARDENED v6 (SEALED)
+// SUBSCRIPTION PROPAGATION • SEAT ENFORCEMENT
+// LOCK CASCADE • SESSION REVOCATION • AUDIT SAFE
+// QUIET MODE • DETERMINISTIC • PLATFORM-ALIGNED
+// =========================================================
 
 const express = require("express");
 const router = express.Router();
@@ -12,14 +16,16 @@ const { writeAudit } = require("../lib/audit");
 const sessionAdapter = require("../lib/sessionAdapter");
 const users = require("../users/user.service");
 
+/* ================= AUTH ================= */
+
 router.use(authRequired);
 
 /* =========================================================
    ROLE HELPERS
 ========================================================= */
 
-function normalize(role) {
-  return String(role || "").toLowerCase();
+function normalize(v) {
+  return String(v || "").toLowerCase();
 }
 
 function idEq(a, b) {
@@ -41,33 +47,43 @@ function isCompany(user) {
 function requireCompanyAccess(req, companyId) {
   if (isAdmin(req.user)) return;
 
-  if (!req.user.companyId)
-    throw Object.assign(new Error("No company access"), { status: 403 });
+  if (!req.user.companyId) {
+    const err = new Error("No company access");
+    err.status = 403;
+    throw err;
+  }
 
-  if (!idEq(req.user.companyId, companyId))
-    throw Object.assign(new Error("Access denied"), { status: 403 });
+  if (!idEq(req.user.companyId, companyId)) {
+    const err = new Error("Access denied");
+    err.status = 403;
+    throw err;
+  }
 }
 
 /* =========================================================
-   SUBSCRIPTION HELPERS
+   SUBSCRIPTION / LOCK HELPERS (ATOMIC)
 ========================================================= */
 
 function lockCompany(companyId) {
   updateDb((db) => {
-    const company = db.companies.find((c) => idEq(c.id, companyId));
+    const company = (db.companies || []).find((c) =>
+      idEq(c.id, companyId)
+    );
     if (!company) return db;
 
     company.subscriptionStatus = "Locked";
+    company.lockedAt = new Date().toISOString();
 
-    db.users.forEach((u) => {
+    (db.users || []).forEach((u) => {
       if (idEq(u.companyId, companyId)) {
         u.subscriptionStatus = "Locked";
 
-        // 🔥 Kill active sessions
+        // 🔥 Kill all active sessions for this user
         sessionAdapter.revokeAllUserSessions(u.id);
       }
     });
 
+    // Remove tool grants
     db.toolGrants = (db.toolGrants || []).filter(
       (g) => !idEq(g.companyId, companyId)
     );
@@ -78,12 +94,14 @@ function lockCompany(companyId) {
 
 function propagateTier(companyId, tier) {
   updateDb((db) => {
-    const company = db.companies.find((c) => idEq(c.id, companyId));
+    const company = (db.companies || []).find((c) =>
+      idEq(c.id, companyId)
+    );
     if (!company) return db;
 
     company.subscriptionTier = tier;
 
-    db.users.forEach((u) => {
+    (db.users || []).forEach((u) => {
       if (idEq(u.companyId, companyId)) {
         u.subscriptionTier = tier;
       }
@@ -94,15 +112,16 @@ function propagateTier(companyId, tier) {
 }
 
 /* =========================================================
-   LIST COMPANIES
+   LIST COMPANIES (ROLE-AWARE)
 ========================================================= */
 
 router.get("/", (req, res) => {
   try {
     const all = companyService.listCompanies();
 
-    if (isAdmin(req.user))
+    if (isAdmin(req.user)) {
       return res.json({ ok: true, companies: all });
+    }
 
     if (isManager(req.user)) {
       const managed = all.filter(
@@ -114,16 +133,18 @@ router.get("/", (req, res) => {
     }
 
     if (isCompany(req.user)) {
-      const own = all.filter(
-        (c) => idEq(c.id, req.user.companyId)
+      const own = all.filter((c) =>
+        idEq(c.id, req.user.companyId)
       );
       return res.json({ ok: true, companies: own });
     }
 
     return res.status(403).json({ ok: false });
-
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
   }
 });
 
@@ -133,15 +154,17 @@ router.get("/", (req, res) => {
 
 router.post("/:id/members", (req, res) => {
   try {
-    requireCompanyAccess(req, req.params.id);
+    const companyId = req.params.id;
+    requireCompanyAccess(req, companyId);
 
     const db = readDb();
-    const company = db.companies.find(
-      (c) => idEq(c.id, req.params.id)
+    const company = (db.companies || []).find((c) =>
+      idEq(c.id, companyId)
     );
 
-    if (!company)
+    if (!company) {
       return res.status(404).json({ ok: false });
+    }
 
     if (company.subscriptionStatus === "Locked") {
       return res.status(403).json({
@@ -152,13 +175,16 @@ router.post("/:id/members", (req, res) => {
 
     const seatLimit = Number(company.seatLimit || 0);
 
-    const activeMembers = db.users.filter(
+    const activeMembers = (db.users || []).filter(
       (u) =>
-        idEq(u.companyId, req.params.id) &&
+        idEq(u.companyId, companyId) &&
         u.subscriptionStatus !== "Locked"
     );
 
-    if (seatLimit > 0 && activeMembers.length >= seatLimit) {
+    if (
+      seatLimit > 0 &&
+      activeMembers.length >= seatLimit
+    ) {
       return res.status(403).json({
         ok: false,
         error: "Seat limit reached",
@@ -166,24 +192,30 @@ router.post("/:id/members", (req, res) => {
     }
 
     const updated = companyService.addMember(
-      req.params.id,
+      companyId,
       req.body.userId,
       req.user.id,
       req.body.position
     );
 
-    propagateTier(req.params.id, company.subscriptionTier || "free");
+    propagateTier(
+      companyId,
+      company.subscriptionTier || "free"
+    );
 
     writeAudit({
       actor: req.user.id,
+      role: req.user.role,
       action: "COMPANY_MEMBER_ADDED",
-      detail: { companyId: req.params.id },
+      detail: { companyId },
     });
 
-    res.json({ ok: true, company: updated });
-
+    return res.json({
+      ok: true,
+      company: updated,
+    });
   } catch (e) {
-    res.status(e.status || 400).json({
+    return res.status(e.status || 400).json({
       ok: false,
       error: e.message,
     });
@@ -191,34 +223,73 @@ router.post("/:id/members", (req, res) => {
 });
 
 /* =========================================================
-   REMOVE MEMBER
+   REMOVE MEMBER (SESSION KILL)
 ========================================================= */
 
 router.delete("/:id/members/:userId", (req, res) => {
   try {
-    requireCompanyAccess(req, req.params.id);
+    const companyId = req.params.id;
+    const userId = req.params.userId;
+
+    requireCompanyAccess(req, companyId);
 
     const updated = companyService.removeMember(
-      req.params.id,
-      req.params.userId,
+      companyId,
+      userId,
       req.user.id
     );
 
-    // Kill removed user's sessions
-    sessionAdapter.revokeAllUserSessions(req.params.userId);
+    // 🔥 Kill all sessions for removed user
+    sessionAdapter.revokeAllUserSessions(userId);
 
     writeAudit({
       actor: req.user.id,
+      role: req.user.role,
       action: "COMPANY_MEMBER_REMOVED",
-      detail: { companyId: req.params.id },
+      detail: { companyId, userId },
     });
 
-    res.json({ ok: true, company: updated });
-
+    return res.json({
+      ok: true,
+      company: updated,
+    });
   } catch (e) {
-    res.status(e.status || 400).json({
+    return res.status(e.status || 400).json({
       ok: false,
       error: e.message,
+    });
+  }
+});
+
+/* =========================================================
+   LOCK COMPANY (ADMIN ONLY, CASCADE)
+========================================================= */
+
+router.post("/:id/lock", (req, res) => {
+  try {
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Admin only",
+      });
+    }
+
+    const companyId = req.params.id;
+
+    lockCompany(companyId);
+
+    writeAudit({
+      actor: req.user.id,
+      role: req.user.role,
+      action: "COMPANY_LOCKED",
+      detail: { companyId },
+    });
+
+    return res.json({ ok: true });
+  } catch {
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to lock company",
     });
   }
 });
