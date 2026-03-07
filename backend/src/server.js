@@ -19,11 +19,13 @@ const rateLimiter = require("./middleware/rateLimiter");
 const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
+const marketEngine = require("./services/marketEngine");
+
 /* ================= ROUTES ================= */
 
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
-const tradingRoutes = require("./routes/trading.routes"); // ← NEW
+const tradingRoutes = require("./routes/trading.routes");
 
 /* ================= SAFE BOOT ================= */
 
@@ -75,14 +77,9 @@ app.use("/api", (req, res, next) => {
 
 app.use("/api", tenantMiddleware);
 
-/* =========================================================
-ADMIN COMPATIBILITY LAYER
-========================================================= */
+/* ================= ADMIN COMPAT ================= */
 
-app.use(
-  "/api/admin",
-  require("./routes/admin.compat.routes")
-);
+app.use("/api/admin", require("./routes/admin.compat.routes"));
 
 /* ================= CORE API ================= */
 
@@ -100,13 +97,9 @@ app.use("/api/soc", require("./routes/soc.routes"));
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
-
-/* NEW — unified trading control */
 app.use("/api/trading", tradingRoutes);
 
-/* =========================================================
-ZERO TRUST
-========================================================= */
+/* ================= ZERO TRUST ================= */
 
 app.use("/api", (req, res, next) => {
 
@@ -114,7 +107,7 @@ app.use("/api", (req, res, next) => {
     req.path.startsWith("/auth") ||
     req.path.startsWith("/market") ||
     req.path.startsWith("/paper") ||
-    req.path.startsWith("/trading") ||   // ← added
+    req.path.startsWith("/trading") ||
     req.path.startsWith("/admin")
   ) {
     return next();
@@ -129,26 +122,30 @@ app.use("/api", (req, res, next) => {
 const server = http.createServer(app);
 
 /* =================================================
-WEBSOCKET — SECURITY CHANNEL
+UNIFIED WEBSOCKET HUB
+Path: /ws
+Channels: security | market
 ================================================= */
 
-const securityWss = new WebSocketServer({
+const wss = new WebSocketServer({
   server,
-  path: "/ws/security",
+  path: "/ws",
 });
 
 function closeWs(ws) {
-  try {
-    ws.close();
-  } catch {}
+  try { ws.close(); } catch {}
 }
 
-securityWss.on("connection", (ws, req) => {
+/* ================= CONNECTION ================= */
+
+wss.on("connection", (ws, req) => {
 
   try {
 
     const url = new URL(req.url, `http://${req.headers.host}`);
+
     const token = url.searchParams.get("token");
+    const channel = url.searchParams.get("channel") || "security";
 
     if (!token) return closeWs(ws);
 
@@ -176,7 +173,15 @@ securityWss.on("connection", (ws, req) => {
       return closeWs(ws);
     }
 
+    const tenantId = user.companyId || user.id;
+
+    ws.channel = channel;
+    ws.tenantId = tenantId;
     ws.isAlive = true;
+
+    if (channel === "market") {
+      marketEngine.registerTenant(tenantId);
+    }
 
     ws.on("pong", () => {
       ws.isAlive = true;
@@ -188,28 +193,53 @@ securityWss.on("connection", (ws, req) => {
 
 });
 
-/* ================= WS HEARTBEAT ================= */
+/* ================= HEARTBEAT ================= */
 
 setInterval(() => {
 
-  securityWss.clients.forEach((ws) => {
+  wss.clients.forEach((ws) => {
 
     if (ws.isAlive === false) {
-      try {
-        ws.terminate();
-      } catch {}
+      try { ws.terminate(); } catch {}
       return;
     }
 
     ws.isAlive = false;
 
-    try {
-      ws.ping();
-    } catch {}
+    try { ws.ping(); } catch {}
 
   });
 
 }, 30000);
+
+/* ================= MARKET STREAM ================= */
+
+setInterval(() => {
+
+  wss.clients.forEach((ws) => {
+
+    if (ws.channel !== "market") return;
+
+    try {
+
+      const price =
+        marketEngine.getPrice(ws.tenantId, "BTCUSDT");
+
+      if (!price) return;
+
+      ws.send(JSON.stringify({
+        channel: "market",
+        type: "tick",
+        symbol: "BTCUSDT",
+        price,
+        ts: Date.now()
+      }));
+
+    } catch {}
+
+  });
+
+}, 1000);
 
 /* ================= START ================= */
 
