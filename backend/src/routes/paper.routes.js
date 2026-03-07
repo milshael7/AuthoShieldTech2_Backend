@@ -27,6 +27,79 @@ function resetAllowed(req) {
 }
 
 /* =========================================================
+   EXECUTE PAPER ORDER
+   NEW — used by OrderPanel
+========================================================= */
+
+router.post("/order", (req, res) => {
+  try {
+
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
+    const {
+      symbol,
+      side,
+      qty,
+      price,
+      type,
+      stopLoss,
+      takeProfit,
+      risk
+    } = req.body || {};
+
+    if (!symbol || !side || !qty) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid order payload",
+      });
+    }
+
+    const result =
+      paperTrader.executeOrder?.(tenantId,{
+        symbol:String(symbol).toUpperCase(),
+        side:String(side).toUpperCase(),
+        qty:Number(qty),
+        price:Number(price) || 0,
+        type:String(type || "MARKET").toUpperCase(),
+        stopLoss: stopLoss ? Number(stopLoss) : null,
+        takeProfit: takeProfit ? Number(takeProfit) : null,
+        risk: risk ? Number(risk) : null
+      });
+
+    if (!result || result.ok === false) {
+
+      return res.status(400).json({
+        ok:false,
+        error:"Order rejected"
+      });
+
+    }
+
+    return res.json({
+      ok:true,
+      order:result,
+      snapshot: paperTrader.snapshot(tenantId),
+      time:new Date().toISOString()
+    });
+
+  } catch {
+
+    return res.status(500).json({
+      ok:false,
+      error:"Paper order execution failed"
+    });
+
+  }
+});
+
+/* =========================================================
    STATUS
 ========================================================= */
 
@@ -66,7 +139,6 @@ router.get("/status", (req, res) => {
 
 /* =========================================================
    AI DECISION STREAM
-   NEW ENDPOINT
 ========================================================= */
 
 router.get("/decisions", (req, res) => {
