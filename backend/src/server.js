@@ -50,6 +50,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 /* Stripe webhook BEFORE json parser */
+
 app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 
 app.use(
@@ -124,7 +125,9 @@ const server = http.createServer(app);
 /* =================================================
 UNIFIED WEBSOCKET HUB
 Path: /ws
-Channels: security | market
+Channels:
+  security
+  market
 ================================================= */
 
 const wss = new WebSocketServer({
@@ -212,9 +215,14 @@ setInterval(() => {
 
 }, 30000);
 
-/* ================= MARKET STREAM ================= */
+/* =================================================
+MARKET STREAM
+Broadcast full market snapshot per tenant
+================================================= */
 
 setInterval(() => {
+
+  const cache = new Map();
 
   wss.clients.forEach((ws) => {
 
@@ -222,16 +230,20 @@ setInterval(() => {
 
     try {
 
-      const price =
-        marketEngine.getPrice(ws.tenantId, "BTCUSDT");
+      let snapshot = cache.get(ws.tenantId);
 
-      if (!price) return;
+      if (!snapshot) {
+
+        snapshot =
+          marketEngine.getMarketSnapshot(ws.tenantId);
+
+        cache.set(ws.tenantId, snapshot);
+      }
 
       ws.send(JSON.stringify({
         channel: "market",
-        type: "tick",
-        symbol: "BTCUSDT",
-        price,
+        type: "snapshot",
+        data: snapshot,
         ts: Date.now()
       }));
 
