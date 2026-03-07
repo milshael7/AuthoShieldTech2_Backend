@@ -1,30 +1,26 @@
 // backend/src/services/adapters/krakenAdapter.js
-// Phase 16 — Kraken Smart Institutional Adapter
-// Router Compatible • Risk-Based Qty • Liquidation Aware
-// Partial Fills • Slippage Model • Sandbox Safe
+// Phase 17 — Kraken Smart Institutional Adapter
+// Router Compatible • Real Execution + Simulation
 
-const crypto = require("crypto");
+const kraken = require("../krakenConnector");
 
 /* =========================================================
-   CONFIG
+CONFIG
 ========================================================= */
 
 const CONFIG = Object.freeze({
   name: "kraken",
-  sandbox: true,
+
+  // controlled by env if you ever want simulation again
+  sandbox:
+    String(process.env.KRAKEN_SANDBOX || "false")
+      .toLowerCase() === "true",
 
   baseSlippagePct: 0.0007,
-  liquidationSlippagePct: 0.0018,
-
-  partialFillProbability: 0.32,
-  minPartialFillPct: 0.35,
-
-  simulatedLatencyMin: 25,
-  simulatedLatencyMax: 70,
 });
 
 /* =========================================================
-   HELPERS
+UTIL
 ========================================================= */
 
 function safeNum(x, fallback = 0) {
@@ -36,36 +32,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function randomBetween(min, max) {
-  return Math.random() * (max - min) + min;
-}
-
-function simulateLatency() {
-  return randomBetween(
-    CONFIG.simulatedLatencyMin,
-    CONFIG.simulatedLatencyMax
-  );
-}
-
-function simulateSlippage(price, side, forceClose) {
-  const slip = forceClose
-    ? CONFIG.liquidationSlippagePct
-    : CONFIG.baseSlippagePct;
-
-  if (side === "BUY") return price * (1 + slip);
-  return price * (1 - slip);
-}
-
-function simulatePartialFill(qty, forceClose) {
-  if (forceClose) return qty;
-
-  if (Math.random() > CONFIG.partialFillProbability)
-    return qty;
-
-  const pct = randomBetween(CONFIG.minPartialFillPct, 0.9);
-  return qty * pct;
-}
-
 function buildOrderId() {
   return `kraken_${Date.now()}_${Math.random()
     .toString(16)
@@ -73,125 +39,161 @@ function buildOrderId() {
 }
 
 /* =========================================================
-   NORMALIZATION
+NORMALIZATION
 ========================================================= */
 
 function normalizeParams(params = {}) {
   return {
-    symbol: String(params.symbol || "").toUpperCase(),
+    symbol: String(params.symbol || "BTCUSD").toUpperCase(),
     side: String(params.side || "").toUpperCase(),
     qty: safeNum(params.qty, 0),
     price: safeNum(params.price, 0),
     riskPct: safeNum(params.riskPct, 0),
-    forceClose: !!params.forceClose,
     clientOrderId: params.clientOrderId || buildOrderId(),
   };
 }
 
 /* =========================================================
-   QTY DERIVATION
+QTY DERIVATION
 ========================================================= */
 
 function deriveQty(order) {
+
   if (order.qty > 0) return order.qty;
 
   if (order.riskPct > 0 && order.price > 0) {
+
     const notional = 10_000 * order.riskPct;
+
     return notional / order.price;
+
   }
 
   return 0;
+
 }
 
 /* =========================================================
-   EXECUTION
+EXECUTION
 ========================================================= */
 
 async function executeLiveOrder(params = {}) {
-  const startedAt = Date.now();
+
   const order = normalizeParams(params);
 
-  const requestedQty = deriveQty(order);
+  const qty = deriveQty(order);
 
-  if (!order.symbol || !order.side || !requestedQty) {
+  if (!order.symbol || !order.side || !qty) {
+
     return {
       ok: false,
       exchange: CONFIG.name,
       error: "Invalid order parameters",
     };
+
   }
 
   /* =====================================================
-     SANDBOX EXECUTION
+  SANDBOX MODE
   ===================================================== */
 
   if (CONFIG.sandbox) {
-    const latency = simulateLatency();
-
-    const slippedPrice = simulateSlippage(
-      order.price,
-      order.side,
-      order.forceClose
-    );
-
-    const filledQty = simulatePartialFill(
-      requestedQty,
-      order.forceClose
-    );
 
     return {
       ok: true,
       exchange: CONFIG.name,
-      latencyMs: latency,
-
       result: {
         symbol: order.symbol,
         side: order.side,
-        requestedQty,
-        filledQty,
-        avgPrice: slippedPrice,
-        status: order.forceClose
-          ? "LIQUIDATION_FILL"
-          : "SIMULATED_FILL",
-        clientOrderId: order.clientOrderId,
+        qty,
+        avgPrice: order.price,
+        status: "SIMULATED_FILL",
         timestamp: nowIso(),
       },
     };
+
   }
 
   /* =====================================================
-     PRODUCTION FLOW (future wiring)
+  REAL KRAKEN EXECUTION
   ===================================================== */
 
   try {
-    throw new Error("Live Kraken execution not implemented.");
-  } catch (err) {
+
+    const result = await kraken.executeLiveOrder({
+
+      symbol: order.symbol,
+
+      action: order.side,
+
+      qty,
+
+    });
+
+    if (!result || !result.ok) {
+
+      return {
+
+        ok: false,
+
+        exchange: CONFIG.name,
+
+        error: "Kraken order failed",
+
+      };
+
+    }
+
     return {
-      ok: false,
+
+      ok: true,
+
       exchange: CONFIG.name,
-      error: err.message || "Execution failure",
+
+      result: result.order,
+
     };
+
+  } catch (err) {
+
+    return {
+
+      ok: false,
+
+      exchange: CONFIG.name,
+
+      error: err?.message || "Execution error",
+
+    };
+
   }
+
 }
 
 /* =========================================================
-   HEALTH
+HEALTH
 ========================================================= */
 
 function health() {
+
   return {
+
     ok: true,
+
     exchange: CONFIG.name,
+
     sandbox: CONFIG.sandbox,
+
     time: nowIso(),
+
   };
+
 }
 
-/* =========================================================
-   EXPORTS
-========================================================= */
-
 module.exports = {
+
   executeLiveOrder,
+
   health,
+
 };
