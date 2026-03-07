@@ -162,6 +162,52 @@ function scheduleSave(tenantId,state){
 
 }
 
+/* ================= MANUAL ORDER EXECUTION ================= */
+
+function executeOrder(tenantId,order){
+
+  const state = load(tenantId);
+
+  const {
+    symbol,
+    side,
+    qty,
+    price
+  } = order;
+
+  if(!symbol || !side || !qty)
+    return { ok:false };
+
+  const action =
+    String(side).toUpperCase()==="BUY"
+      ? "BUY"
+      : "SELL";
+
+  const result =
+    executionEngine.executePaperOrder({
+
+      tenantId,
+      symbol,
+      action,
+      price: price || state.lastPrice,
+      riskPct:0,
+      state,
+      ts:Date.now(),
+      qty:Number(qty)
+
+    });
+
+  state._dirty = true;
+
+  scheduleSave(tenantId,state);
+
+  return {
+    ok:true,
+    result
+  };
+
+}
+
 /* ================= CANDLE ENGINE ================= */
 
 function updateCandle(state,price){
@@ -226,8 +272,6 @@ function tick(
 
     state.executionStats.ticks++;
 
-    /* MARKET INTELLIGENCE */
-
     orderFlowEngine.recordPrice({tenantId,price});
     counterfactualEngine.recordPrice({tenantId,price});
     correlationEngine.recordPrice({tenantId,symbol,price});
@@ -248,8 +292,6 @@ function tick(
 
     updateCandle(state,price);
 
-    /* EQUITY */
-
     if(state.position){
 
       state.equity =
@@ -266,8 +308,6 @@ function tick(
     state.peakEquity =
       Math.max(state.peakEquity,state.equity);
 
-    /* RISK ENGINE */
-
     const risk =
       riskManager.evaluate({
 
@@ -279,8 +319,6 @@ function tick(
         mode:"paper"
 
       });
-
-    /* AI DECISION */
 
     const plan =
       makeDecision({
@@ -294,8 +332,6 @@ function tick(
       });
 
     state.executionStats.decisions++;
-
-    /* DECISION STREAM */
 
     state.decisions.push({
 
@@ -311,104 +347,6 @@ function tick(
 
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
-
-    }
-
-    /* BUY */
-
-    if(plan.action==="BUY" && !state.position){
-
-      const portfolioCheck =
-        portfolioManager.evaluate({
-
-          tenantId,
-          symbol,
-          equity:state.equity,
-
-          proposedRiskPct:
-            plan.riskPct * risk.riskMultiplier,
-
-          paperState:state
-
-        });
-
-      if(portfolioCheck.allow){
-
-        executionEngine.executePaperOrder({
-
-          tenantId,
-          symbol,
-          action:"BUY",
-          price,
-
-          riskPct:
-            portfolioCheck.adjustedRiskPct,
-
-          state,
-          ts
-
-        });
-
-        state.executionStats.trades++;
-
-        state._dirty = true;
-
-      }
-
-      /* MISSED TRADE LEARNING */
-
-      else{
-
-        counterfactualEngine.recordSignal({
-
-          tenantId,
-          action:"BUY",
-          price,
-          edge:plan.edge,
-          confidence:plan.confidence
-
-        });
-
-      }
-
-    }
-
-    /* SELL */
-
-    if(
-      (plan.action==="SELL" ||
-       plan.action==="CLOSE") &&
-      state.position
-    ){
-
-      const result =
-        executionEngine.executePaperOrder({
-
-          tenantId,
-          symbol,
-          action:"SELL",
-          price,
-          riskPct:0,
-          state,
-          ts
-
-        });
-
-      if(result?.result?.pnl !== undefined){
-
-        aiBrain.recordTradeOutcome({
-
-          tenantId,
-          pnl:result.result.pnl
-
-        });
-
-      }
-
-      state.trades =
-        state.trades.slice(-MAX_TRADES_MEMORY);
-
-      state._dirty = true;
 
     }
 
@@ -466,6 +404,7 @@ module.exports = {
 
   tick,
   snapshot,
+  executeOrder,
 
   getCandles:(tenantId,limit=200)=>
 
