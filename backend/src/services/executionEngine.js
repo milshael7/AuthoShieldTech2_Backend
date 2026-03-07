@@ -1,13 +1,12 @@
 // ==========================================================
-// Institutional Execution Engine — FINAL VERSION
+// Institutional Execution Engine — DASHBOARD CONTROLLED
 // Paper Trading + Live Trading Auto Router
-// Slippage Guard • Spread Guard • Volatility Guard
-// Deterministic Accounting • Capital Protection
+// Single Dashboard Switch Authority
 // ==========================================================
 
 const exchangeRouter = require("./exchangeRouter");
 const krakenConnector = require("./krakenConnector");
-const liveTradingGuard = require("./liveTradingGuard");
+const { readDb } = require("../lib/db");
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
@@ -48,6 +47,46 @@ const CONFIG = Object.freeze({
     Number(process.env.EXEC_MAX_VOLATILITY || 0.015)
 
 });
+
+/* =========================================================
+AI CONFIG FROM DASHBOARD
+========================================================= */
+
+function getAIConfig(){
+
+  try{
+
+    const db = readDb();
+
+    const cfg =
+      db.aiConfig ||
+      db.tradingConfig ||
+      {};
+
+    return {
+
+      tradingMode:
+        String(cfg.tradingMode || "paper").toLowerCase(),
+
+      maxTrades:
+        Number(cfg.maxTrades || CONFIG.maxDailyTrades),
+
+      riskPercent:
+        Number(cfg.riskPercent || 1)
+
+    };
+
+  }catch{
+
+    return {
+      tradingMode:"paper",
+      maxTrades:CONFIG.maxDailyTrades,
+      riskPercent:1
+    };
+
+  }
+
+}
 
 /* =========================================================
 SAFE STATE
@@ -201,8 +240,6 @@ function executePaperOrder({
 
   const executionId = buildExecutionId();
 
-  /* ENTRY */
-
   if(action==="BUY" && !state.position){
 
     if(state.limits.tradesToday >= CONFIG.maxDailyTrades)
@@ -264,8 +301,6 @@ function executePaperOrder({
     };
 
   }
-
-  /* EXIT */
 
   if((action==="SELL" || action==="CLOSE") && state.position){
 
@@ -381,18 +416,25 @@ AUTO ROUTER
 
 async function executeOrder(params){
 
-  const canTrade =
-    await liveTradingGuard.canTradeLive();
+  const ai = getAIConfig();
 
-  if(!canTrade){
+  /* ================= DASHBOARD SWITCH ================= */
+
+  if(ai.tradingMode !== "live"){
+
     return executePaperOrder(params);
+
   }
+
+  /* ================= LIVE MODE ================= */
 
   const guard =
     await capitalGuard(params);
 
   if(!guard.ok){
+
     return executePaperOrder(params);
+
   }
 
   return executeLiveOrder(params);
