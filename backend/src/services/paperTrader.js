@@ -1,14 +1,13 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — INSTITUTIONAL FINAL
-// FIXED: AI decisions now execute trades
-// Non-blocking • Reentrant-safe • Deterministic state
+// FIXED: AI decisions reliably execute trades
+// Deterministic • Crash-safe • Multi-tenant
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
-const riskManager = require("./riskManager");
 const executionEngine = require("./executionEngine");
 
 const orderFlowEngine = require("./orderFlowEngine");
@@ -65,6 +64,17 @@ function defaultState(){
     lastPrice:65000,
 
     candles:[],
+
+    realized:{
+      wins:0,
+      losses:0,
+      net:0
+    },
+
+    limits:{
+      tradesToday:0,
+      lossesToday:0
+    },
 
     executionStats:{
       ticks:0,
@@ -148,62 +158,6 @@ function scheduleSave(tenantId,state){
     }catch{}
 
   });
-
-}
-
-/* ================= MANUAL ORDER ================= */
-
-function executeOrder(tenantId,order){
-
-  const state = load(tenantId);
-
-  const {symbol,side,qty,price} = order;
-
-  if(!symbol || !side || !qty)
-    return {ok:false};
-
-  const action =
-    String(side).toUpperCase()==="BUY"
-      ? "BUY"
-      : "SELL";
-
-  const result =
-    executionEngine.executePaperOrder({
-
-      tenantId,
-      symbol,
-      action,
-      price: price || state.lastPrice,
-      riskPct:0,
-      state,
-      ts:Date.now(),
-      qty:Number(qty)
-
-    });
-
-  if(result?.result){
-
-    state.trades.push({
-
-      time:Date.now(),
-      side:action,
-      price,
-      qty:result.result.qty || 0,
-      profit:result.result.pnl || 0
-
-    });
-
-    if(state.trades.length>MAX_TRADES_MEMORY)
-      state.trades =
-        state.trades.slice(-MAX_TRADES_MEMORY);
-
-  }
-
-  state._dirty = true;
-
-  scheduleSave(tenantId,state);
-
-  return {ok:true,result};
 
 }
 
@@ -312,8 +266,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         tenantId,
         symbol,
         last:price,
-        paper:state,
-        mode:"paper"
+        paper:state
 
       });
 
@@ -323,6 +276,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
       time:ts,
       action:plan?.action,
+      confidence:plan?.confidence,
       price,
       riskPct:plan?.riskPct
 
@@ -337,7 +291,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     /* ================= EXECUTE AI TRADE ================= */
 
-    if(plan && plan.action && plan.action!=="HOLD"){
+    if(plan && ["BUY","SELL","CLOSE"].includes(plan.action)){
 
       const exec =
         executionEngine.executePaperOrder({
@@ -356,22 +310,28 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.executionStats.trades++;
 
+        const pnl = exec.result.pnl || 0;
+
         state.trades.push({
 
           time:ts,
           side:plan.action,
           price,
           qty:exec.result.qty || 0,
-          profit:exec.result.pnl || 0
+          profit:pnl
 
         });
 
-        if(state.trades.length>MAX_TRADES_MEMORY){
+        if(pnl>0)
+          state.realized.wins++;
+        else if(pnl<0)
+          state.realized.losses++;
 
+        state.realized.net += pnl;
+
+        if(state.trades.length>MAX_TRADES_MEMORY)
           state.trades =
             state.trades.slice(-MAX_TRADES_MEMORY);
-
-        }
 
       }
 
@@ -405,7 +365,6 @@ function snapshot(tenantId){
     position:s.position,
 
     trades:s.trades,
-
     decisions:s.decisions,
 
     lastPrice:s.lastPrice,
@@ -419,7 +378,8 @@ function snapshot(tenantId){
 
     executionStats:s.executionStats,
 
-    limits:{}
+    realized:s.realized,
+    limits:s.limits
 
   }));
 
@@ -431,7 +391,6 @@ module.exports = {
 
   tick,
   snapshot,
-  executeOrder,
 
   getCandles:(tenantId,limit=200)=>
     load(tenantId).candles
@@ -439,7 +398,6 @@ module.exports = {
       .map(c=>({
 
         time:Math.floor(c.t/1000),
-
         open:c.o,
         high:c.h,
         low:c.l,
