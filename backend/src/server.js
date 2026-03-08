@@ -20,6 +20,7 @@ const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
 const marketEngine = require("./services/marketEngine");
+const paperTrader = require("./services/paperTrader");
 
 /* ================= ROUTES ================= */
 
@@ -48,8 +49,6 @@ verifyAuditIntegrity();
 
 const app = express();
 app.set("trust proxy", 1);
-
-/* Stripe webhook BEFORE json parser */
 
 app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 
@@ -122,13 +121,7 @@ app.use("/api", (req, res, next) => {
 
 const server = http.createServer(app);
 
-/* =================================================
-UNIFIED WEBSOCKET HUB
-Path: /ws
-Channels:
-  security
-  market
-================================================= */
+/* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
   server,
@@ -215,10 +208,7 @@ setInterval(() => {
 
 }, 30000);
 
-/* =================================================
-MARKET STREAM
-Broadcast full market snapshot per tenant
-================================================= */
+/* ================= MARKET STREAM ================= */
 
 setInterval(() => {
 
@@ -238,6 +228,22 @@ setInterval(() => {
           marketEngine.getMarketSnapshot(ws.tenantId);
 
         cache.set(ws.tenantId, snapshot);
+      }
+
+      /* ================= FEED AI ================= */
+
+      if (snapshot?.BTCUSDT?.price) {
+
+        try {
+
+          paperTrader.tick(
+            ws.tenantId,
+            "BTCUSDT",
+            Number(snapshot.BTCUSDT.price)
+          );
+
+        } catch {}
+
       }
 
       ws.send(JSON.stringify({
