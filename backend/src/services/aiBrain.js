@@ -1,7 +1,7 @@
-// backend/src/services/aiBrain.js
 // ==========================================================
 // Adaptive Reinforcement AI Core (Tenant Safe)
 // Multi-Signal Fusion + Persistent Learning Engine
+// WITH ENGINE TELEMETRY
 // ==========================================================
 
 const fs = require("fs");
@@ -30,6 +30,20 @@ const PERFORMANCE_WEIGHT =
   Number(process.env.AI_WEIGHT_PERF || 0.30);
 
 /* =========================================================
+ENGINE TELEMETRY
+========================================================= */
+
+const ENGINE_BOOT_TIME = Date.now();
+
+let DECISION_COUNTER = 0;
+let LAST_DECISION_TS = Date.now();
+
+function recordDecisionTick(){
+  DECISION_COUNTER++;
+  LAST_DECISION_TS = Date.now();
+}
+
+/* =========================================================
 UTIL
 ========================================================= */
 
@@ -54,7 +68,7 @@ const BRAINS = new Map();
 
 function defaultBrain() {
   return {
-    version: 15,
+    version: 16,
     createdAt: nowIso(),
     updatedAt: nowIso(),
 
@@ -296,6 +310,8 @@ DECISION OVERLAY
 
 function decide(context = {}) {
 
+  recordDecisionTick();
+
   const {
     tenantId,
     last,
@@ -320,8 +336,6 @@ function decide(context = {}) {
 
   }
 
-  /* SIGNAL FUSION */
-
   const fusedEdge =
     fuseSignals({
       trendEdge: baseEdge,
@@ -336,8 +350,6 @@ function decide(context = {}) {
     baseConfidence * brain.adaptive.confidenceBoost;
 
   confidence = clamp(confidence,0,1);
-
-  /* DECISION */
 
   if (confidence > 0.7 && Math.abs(edge) > 0.001) {
 
@@ -368,19 +380,39 @@ function decide(context = {}) {
 }
 
 /* =========================================================
-SNAPSHOT
+SNAPSHOT + TELEMETRY
 ========================================================= */
 
 function getSnapshot(tenantId) {
 
   const brain = getBrain(tenantId);
 
+  const uptime =
+    Math.floor((Date.now() - ENGINE_BOOT_TIME) / 1000);
+
+  const decisionsPerMinute =
+    DECISION_COUNTER
+      ? (DECISION_COUNTER / (uptime / 60 || 1))
+      : 0;
+
   return {
+
     ok:true,
+
     stats:brain.stats,
+
     adaptive:brain.adaptive,
+
     signalMemory:brain.signalMemory.length,
-    tradeMemory:brain.tradeOutcomes.length
+    tradeMemory:brain.tradeOutcomes.length,
+
+    telemetry:{
+      uptime,
+      decisionsPerMinute:Number(decisionsPerMinute.toFixed(2)),
+      lastDecision:LAST_DECISION_TS,
+      memoryUsage:process.memoryUsage().rss
+    }
+
   };
 
 }
