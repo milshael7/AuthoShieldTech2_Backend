@@ -1,7 +1,7 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — INSTITUTIONAL FINAL
-// Non-blocking • Reentrant-safe • AI Learning Enabled
-// Deterministic State • Crash Safe
+// FIXED: AI decisions now execute trades
+// Non-blocking • Reentrant-safe • Deterministic state
 // ==========================================================
 
 const fs = require("fs");
@@ -9,9 +9,7 @@ const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const riskManager = require("./riskManager");
-const portfolioManager = require("./portfolioManager");
 const executionEngine = require("./executionEngine");
-const aiBrain = require("./aiBrain");
 
 const orderFlowEngine = require("./orderFlowEngine");
 const counterfactualEngine = require("./counterfactualEngine");
@@ -68,15 +66,6 @@ function defaultState(){
 
     candles:[],
 
-    learnStats:{
-      trendEdge:0,
-      confidence:0
-    },
-
-    adaptive:{
-      riskBoost:1
-    },
-
     executionStats:{
       ticks:0,
       decisions:0,
@@ -123,7 +112,7 @@ function load(tenantId){
 
 }
 
-/* ================= SAFE SAVE ================= */
+/* ================= SAVE ================= */
 
 function scheduleSave(tenantId,state){
 
@@ -162,21 +151,16 @@ function scheduleSave(tenantId,state){
 
 }
 
-/* ================= MANUAL ORDER EXECUTION ================= */
+/* ================= MANUAL ORDER ================= */
 
 function executeOrder(tenantId,order){
 
   const state = load(tenantId);
 
-  const {
-    symbol,
-    side,
-    qty,
-    price
-  } = order;
+  const {symbol,side,qty,price} = order;
 
   if(!symbol || !side || !qty)
-    return { ok:false };
+    return {ok:false};
 
   const action =
     String(side).toUpperCase()==="BUY"
@@ -197,14 +181,29 @@ function executeOrder(tenantId,order){
 
     });
 
+  if(result?.result){
+
+    state.trades.push({
+
+      time:Date.now(),
+      side:action,
+      price,
+      qty:result.result.qty || 0,
+      profit:result.result.pnl || 0
+
+    });
+
+    if(state.trades.length>MAX_TRADES_MEMORY)
+      state.trades =
+        state.trades.slice(-MAX_TRADES_MEMORY);
+
+  }
+
   state._dirty = true;
 
   scheduleSave(tenantId,state);
 
-  return {
-    ok:true,
-    result
-  };
+  return {ok:true,result};
 
 }
 
@@ -227,7 +226,7 @@ function updateCandle(state,price){
   const last =
     state.candles[state.candles.length-1];
 
-  if(now - last.t >= CANDLE_MS){
+  if(now-last.t>=CANDLE_MS){
 
     state.candles.push({
       t:now,
@@ -237,8 +236,8 @@ function updateCandle(state,price){
       c:last.c
     });
 
-    if(state.candles.length > MAX_CANDLES)
-      state.candles =
+    if(state.candles.length>MAX_CANDLES)
+      state.candles=
         state.candles.slice(-MAX_CANDLES);
 
   }
@@ -246,20 +245,15 @@ function updateCandle(state,price){
   const cur =
     state.candles[state.candles.length-1];
 
-  cur.h = Math.max(cur.h,price);
-  cur.l = Math.min(cur.l,price);
-  cur.c = price;
+  cur.h=Math.max(cur.h,price);
+  cur.l=Math.min(cur.l,price);
+  cur.c=price;
 
 }
 
-/* ================= TICK ================= */
+/* ================= AI TICK ================= */
 
-function tick(
-  tenantId,
-  symbol,
-  price,
-  ts = Date.now()
-){
+function tick(tenantId,symbol,price,ts=Date.now()){
 
   const state = load(tenantId);
 
@@ -292,6 +286,8 @@ function tick(
 
     updateCandle(state,price);
 
+    /* ================= EQUITY ================= */
+
     if(state.position){
 
       state.equity =
@@ -308,17 +304,7 @@ function tick(
     state.peakEquity =
       Math.max(state.peakEquity,state.equity);
 
-    const risk =
-      riskManager.evaluate({
-
-        tenantId,
-        equity:state.equity,
-        volatility:state.volatility,
-        trades:state.trades,
-        ts,
-        mode:"paper"
-
-      });
+    /* ================= AI DECISION ================= */
 
     const plan =
       makeDecision({
@@ -336,26 +322,69 @@ function tick(
     state.decisions.push({
 
       time:ts,
-      action:plan.action,
+      action:plan?.action,
       price,
-      riskPct:plan.riskPct
+      riskPct:plan?.riskPct
 
     });
 
-    if(state.decisions.length >
-       MAX_DECISIONS_MEMORY){
+    if(state.decisions.length>MAX_DECISIONS_MEMORY){
 
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
 
     }
 
+    /* ================= EXECUTE AI TRADE ================= */
+
+    if(plan && plan.action && plan.action!=="HOLD"){
+
+      const exec =
+        executionEngine.executePaperOrder({
+
+          tenantId,
+          symbol,
+          action:plan.action,
+          price,
+          riskPct:plan.riskPct || 0.01,
+          state,
+          ts
+
+        });
+
+      if(exec?.result){
+
+        state.executionStats.trades++;
+
+        state.trades.push({
+
+          time:ts,
+          side:plan.action,
+          price,
+          qty:exec.result.qty || 0,
+          profit:exec.result.pnl || 0
+
+        });
+
+        if(state.trades.length>MAX_TRADES_MEMORY){
+
+          state.trades =
+            state.trades.slice(-MAX_TRADES_MEMORY);
+
+        }
+
+      }
+
+    }
+
+    state._dirty=true;
+
     scheduleSave(tenantId,state);
 
   }
   finally{
 
-    state._locked = false;
+    state._locked=false;
 
   }
 
@@ -367,34 +396,32 @@ function snapshot(tenantId){
 
   const s = load(tenantId);
 
-  return JSON.parse(
-    JSON.stringify({
+  return JSON.parse(JSON.stringify({
 
-      cashBalance:s.cashBalance,
-      equity:s.equity,
-      peakEquity:s.peakEquity,
+    cashBalance:s.cashBalance,
+    equity:s.equity,
+    peakEquity:s.peakEquity,
 
-      position:s.position,
+    position:s.position,
 
-      trades:s.trades,
+    trades:s.trades,
 
-      decisions:s.decisions,
+    decisions:s.decisions,
 
-      lastPrice:s.lastPrice,
-      volatility:s.volatility,
+    lastPrice:s.lastPrice,
+    volatility:s.volatility,
 
-      unrealizedPnL:
-        s.position
-          ? (s.lastPrice-s.position.entry)
-            * s.position.qty
-          : 0,
+    unrealizedPnL:
+      s.position
+        ? (s.lastPrice-s.position.entry)
+          * s.position.qty
+        : 0,
 
-      executionStats:s.executionStats,
+    executionStats:s.executionStats,
 
-      limits:{}
+    limits:{}
 
-    })
-  );
+  }));
 
 }
 
@@ -407,7 +434,6 @@ module.exports = {
   executeOrder,
 
   getCandles:(tenantId,limit=200)=>
-
     load(tenantId).candles
       .slice(-limit)
       .map(c=>({
