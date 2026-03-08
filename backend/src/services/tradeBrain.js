@@ -1,5 +1,8 @@
-// backend/src/services/tradeBrain.js
-// Phase 17 — Behavioral Core + Microstructure + Liquidity Intelligence
+// -----------------------------------------------------------
+// AutoShield — Institutional Trade Brain (Upgraded)
+// Behavioral AI • Strategy Engine • Order Flow • Liquidity
+// Multi-Layer Risk Governance
+// -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
 const memoryBrain = require("./memoryBrain");
@@ -8,7 +11,7 @@ const capitalProtection = require("./capitalProtection");
 const orderFlowEngine = require("./orderFlowEngine");
 const liquidityEngine = require("./liquidityEngine");
 
-/* ================= SAFETY CONSTANTS ================= */
+/* ================= CONFIG ================= */
 
 const MAX_TRADES_PER_DAY =
   Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
@@ -34,12 +37,7 @@ const STRONG_CONFIDENCE =
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
 
-const ALLOWED_ACTIONS = new Set([
-  "WAIT",
-  "BUY",
-  "SELL",
-  "CLOSE",
-]);
+const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
 /* ================= MEMORY ================= */
 
@@ -55,6 +53,7 @@ function getBrainState(tenantId){
       smoothedConfidence:0,
       edgeMomentum:0,
       lastAction:"WAIT",
+      lastDecisionTime:0,
       winStreak:0,
       lossStreak:0,
       lastRealizedNet:0,
@@ -67,28 +66,26 @@ function getBrainState(tenantId){
 
 }
 
-/* ================= UTIL ================= */
+/* ================= UTILS ================= */
 
-function safeNum(x,fallback=0){
-
-  const n = Number(x);
+function safeNum(v,fallback=0){
+  const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
-
 }
 
 function clamp(n,min,max){
-
   return Math.max(min,Math.min(max,n));
-
 }
 
-/* ================= PERFORMANCE TRACKING ================= */
+/* ================= PERFORMANCE ================= */
 
 function updatePerformance(brain,paper){
 
-  const realizedNet = safeNum(paper?.realized?.net,0);
+  const realizedNet =
+    safeNum(paper?.realized?.net,0);
 
-  const delta = realizedNet - brain.lastRealizedNet;
+  const delta =
+    realizedNet - brain.lastRealizedNet;
 
   if(delta > 0){
 
@@ -121,7 +118,7 @@ function updatePerformance(brain,paper){
 
 }
 
-/* ================= CORE ================= */
+/* ================= DECISION ================= */
 
 function makeDecision(context={}){
 
@@ -153,11 +150,12 @@ function makeDecision(context={}){
 
   /* ================= STRATEGY ================= */
 
-  let strategyView = {};
+  let strategy = {};
 
   try{
 
-    strategyView = buildDecision({
+    strategy = buildDecision({
+
       tenantId,
       symbol,
       price,
@@ -166,56 +164,54 @@ function makeDecision(context={}){
       ticksSeen:learn.ticksSeen,
       limits,
       paperState:paper
+
     }) || {};
 
   }catch{}
 
-  let action = strategyView.action || "WAIT";
-  let confidence = safeNum(strategyView.confidence,0);
-  let edge = safeNum(strategyView.edge,0);
-  let reason = strategyView.reason || "strategy";
+  let action = strategy.action || "WAIT";
+  let confidence = safeNum(strategy.confidence,0);
+  let edge = safeNum(strategy.edge,0);
+  let reason = strategy.reason || "strategy";
 
-  /* ================= NORMALIZE ================= */
-
-  if(!hasPosition && action==="SELL"){
-
+  if(!ACTIONS.has(action))
     action="WAIT";
-    reason="No position to sell.";
 
-  }
+  /* ================= POSITION NORMALIZATION ================= */
 
-  if(hasPosition && action==="BUY"){
-
+  if(!hasPosition && action==="SELL")
     action="WAIT";
-    reason="Position already open.";
 
-  }
+  if(hasPosition && action==="BUY")
+    action="WAIT";
 
   /* ================= AI OVERLAY ================= */
 
   try{
 
-    const aiView = aiBrain.decide({
+    const ai = aiBrain.decide({
       tenantId,
       symbol,
       last,
       paper
     }) || {};
 
-    if(
-      aiView.action &&
-      ALLOWED_ACTIONS.has(
-        String(aiView.action).toUpperCase()
-      )
-    ){
+    const aiConf = safeNum(ai.confidence,0);
+    const aiEdge = safeNum(ai.edge,0);
 
-      confidence =
-        Math.max(confidence,safeNum(aiView.confidence,0));
+    confidence =
+      clamp(
+        (confidence*0.6)+(aiConf*0.4),
+        0,
+        1
+      );
 
-      edge =
-        Math.max(edge,safeNum(aiView.edge,0));
-
-    }
+    edge =
+      clamp(
+        (edge*0.6)+(aiEdge*0.4),
+        -1,
+        1
+      );
 
   }catch{}
 
@@ -236,22 +232,9 @@ function makeDecision(context={}){
 
     }
 
-    if(flow.type==="compression"){
-
-      action="WAIT";
-      reason="Market compression";
-
-    }
-
-    if(flow.type==="liquidity_sweep"){
-
-      confidence *= 0.7;
-
-    }
-
   }catch{}
 
-  /* ================= LIQUIDITY INTELLIGENCE ================= */
+  /* ================= LIQUIDITY ================= */
 
   try{
 
@@ -260,37 +243,31 @@ function makeDecision(context={}){
 
     confidence *= liquidity.boost || 1;
 
-    if(
-      liquidity.type==="bull_trap" ||
-      liquidity.type==="bear_trap"
-    ){
+    if(liquidity.type==="bull_trap" ||
+       liquidity.type==="bear_trap"){
 
       action="WAIT";
       reason="Liquidity trap";
 
     }
 
-    if(liquidity.type==="liquidity_vacuum"){
-
-      confidence *= 1.2;
-
-    }
-
   }catch{}
 
-  /* ================= SMOOTHING ================= */
+  /* ================= CONFIDENCE SMOOTHING ================= */
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * CONFIDENCE_DECAY +
     confidence * (1 - CONFIDENCE_DECAY);
 
-  confidence = clamp(brain.smoothedConfidence,0,1);
+  confidence =
+    clamp(brain.smoothedConfidence,0,1);
 
   brain.edgeMomentum =
     brain.edgeMomentum * EDGE_MEMORY_DECAY +
     edge * (1 - EDGE_MEMORY_DECAY);
 
-  edge = clamp(brain.edgeMomentum,-1,1);
+  edge =
+    clamp(brain.edgeMomentum,-1,1);
 
   /* ================= CONFIDENCE GATE ================= */
 
@@ -301,7 +278,7 @@ function makeDecision(context={}){
 
   }
 
-  /* ================= VOLATILITY ================= */
+  /* ================= VOLATILITY CONTROL ================= */
 
   if(volatility >= VOL_HIGH){
 
@@ -313,39 +290,24 @@ function makeDecision(context={}){
 
   if(!isPaper){
 
-    if(!Number.isFinite(price)){
-
+    if(!Number.isFinite(price))
       action="WAIT";
-      reason="Missing price.";
 
-    }
-
-    else if(limits.halted){
-
+    if(limits.halted)
       action="WAIT";
-      reason="System halted.";
 
-    }
-
-    else if(tradesToday >= MAX_TRADES_PER_DAY){
-
+    if(tradesToday >= MAX_TRADES_PER_DAY)
       action="WAIT";
-      reason="Daily trade limit reached.";
 
-    }
-
-    else if(lossesToday >= MAX_LOSS_STREAK){
-
+    if(lossesToday >= MAX_LOSS_STREAK)
       action="WAIT";
-      reason="Loss streak protection.";
-
-    }
 
   }
 
   /* ================= RISK ================= */
 
-  let riskPct = safeNum(strategyView.riskPct,0);
+  let riskPct =
+    safeNum(strategy.riskPct,0.01);
 
   riskPct *= brain.aggressionFactor;
 
@@ -355,7 +317,8 @@ function makeDecision(context={}){
   if(confidence > STRONG_CONFIDENCE)
     riskPct *= isPaper ? 1.5 : 1.25;
 
-  riskPct = clamp(riskPct,MIN_RISK,MAX_RISK);
+  riskPct =
+    clamp(riskPct,MIN_RISK,MAX_RISK);
 
   /* ================= CAPITAL PROTECTION ================= */
 
@@ -368,9 +331,11 @@ function makeDecision(context={}){
 
     const protection =
       capitalProtection.validateOrder({
+
         balanceUsd,
         price,
         riskPct
+
       });
 
     if(!protection.allow){
@@ -390,7 +355,7 @@ function makeDecision(context={}){
 
   }catch{}
 
-  /* ================= FINAL ================= */
+  /* ================= FINAL NORMALIZATION ================= */
 
   if(action==="WAIT"){
 
@@ -400,12 +365,14 @@ function makeDecision(context={}){
   }
 
   brain.lastAction = action;
+  brain.lastDecisionTime = Date.now();
 
   /* ================= MEMORY ================= */
 
   try{
 
     memoryBrain.recordSignal({
+
       tenantId,
       symbol,
       action,
@@ -413,13 +380,16 @@ function makeDecision(context={}){
       edge,
       price,
       volatility
+
     });
 
     memoryBrain.recordMarketState({
+
       tenantId,
       symbol,
       price,
       volatility
+
     });
 
   }catch{}
@@ -442,7 +412,7 @@ function makeDecision(context={}){
         : "live-capital"
     },
 
-    learning:strategyView.learning,
+    learning:strategy.learning,
 
     ts:Date.now()
 
@@ -458,7 +428,9 @@ function resetTenant(tenantId){
 
 }
 
-module.exports={
+module.exports = {
+
   makeDecision,
   resetTenant
+
 };
