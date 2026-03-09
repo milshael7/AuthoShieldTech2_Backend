@@ -66,7 +66,7 @@ app.use(rateLimiter);
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* ================= AUTH + TENANT ================= */
+/* ================= AUTH ================= */
 
 app.use("/api",(req,res,next)=>{
   if(req.path.startsWith("/auth")) return next();
@@ -191,9 +191,10 @@ setInterval(()=>{
 
   });
 
-},30000);
+},20000);
 
-/* ================= MARKET STREAM ================= */
+/* ================= MARKET + AI LOOP ================= */
+/* FAST ENGINE LOOP */
 
 setInterval(()=>{
 
@@ -215,16 +216,18 @@ setInterval(()=>{
         cache.set(ws.tenantId,snapshot);
       }
 
-      /* ===== FEED AI ===== */
+      /* ===== AI TICK ===== */
 
-      if(snapshot?.BTCUSDT?.price){
+      const btc = snapshot?.BTCUSDT?.price;
+
+      if(btc){
 
         try{
 
           paperTrader.tick(
             ws.tenantId,
             "BTCUSDT",
-            Number(snapshot.BTCUSDT.price)
+            Number(btc)
           );
 
         }catch{}
@@ -242,7 +245,7 @@ setInterval(()=>{
 
   });
 
-},1000);
+},250);  // ⚡ 4 updates per second
 
 /* ================= PAPER ENGINE STREAM ================= */
 
@@ -264,10 +267,8 @@ setInterval(()=>{
 
         channel:"paper",
         type:"engine",
-
         snapshot,
         decisions,
-
         ts:Date.now()
 
       }));
@@ -276,7 +277,7 @@ setInterval(()=>{
 
   });
 
-},1200);
+},800); // faster updates
 
 /* ================= START ================= */
 
