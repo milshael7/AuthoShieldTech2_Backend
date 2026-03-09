@@ -24,6 +24,31 @@ const ADMIN = "Admin";
 const MANAGER = "Manager";
 
 /* =========================================================
+AI CONFIG STORAGE
+========================================================= */
+
+const AI_CONFIG = new Map();
+
+function getAIConfig(tenantId){
+
+  if(!AI_CONFIG.has(tenantId)){
+
+    AI_CONFIG.set(tenantId,{
+      enabled:true,
+      tradingMode:"paper",
+      maxTrades:5,
+      riskPercent:1.5,
+      positionMultiplier:1,
+      strategyMode:"Balanced"
+    });
+
+  }
+
+  return AI_CONFIG.get(tenantId);
+
+}
+
+/* =========================================================
 PUBLIC
 ========================================================= */
 
@@ -259,9 +284,6 @@ requireRole(ADMIN,MANAGER),
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  const paper =
-    paperTrader.snapshot(tenantId);
-
   const portfolio =
     portfolioManager.snapshot?.(tenantId) || {};
 
@@ -274,7 +296,7 @@ requireRole(ADMIN,MANAGER),
 });
 
 /* =========================================================
-AI
+AI SNAPSHOT
 ========================================================= */
 
 router.get("/ai/snapshot",
@@ -287,6 +309,63 @@ requireRole(ADMIN,MANAGER),
   return res.json({
     ok:true,
     snapshot
+  });
+
+});
+
+/* =========================================================
+AI CONFIG
+========================================================= */
+
+router.get("/ai/config",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = req.tenant?.id;
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const config = getAIConfig(tenantId);
+
+  return res.json({
+    ok:true,
+    config,
+    engine:"RUNNING"
+  });
+
+});
+
+router.post("/ai/config",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = req.tenant?.id;
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const cfg = getAIConfig(tenantId);
+
+  const {
+    enabled,
+    tradingMode,
+    maxTrades,
+    riskPercent,
+    positionMultiplier,
+    strategyMode
+  } = req.body || {};
+
+  cfg.enabled = Boolean(enabled);
+  cfg.tradingMode = tradingMode || "paper";
+  cfg.maxTrades = Number(maxTrades || 5);
+  cfg.riskPercent = Number(riskPercent || 1.5);
+  cfg.positionMultiplier = Number(positionMultiplier || 1);
+  cfg.strategyMode = strategyMode || "Balanced";
+
+  return res.json({
+    ok:true,
+    config:cfg
   });
 
 });
