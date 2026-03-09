@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v2
-// FIXED: ticksSeen pass-through + safe AI config gating
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v3
+// FIXED: No route dependency + ticksSeen + safe AI gating
 // ==========================================================
 
 const fs = require("fs");
@@ -8,7 +8,7 @@ const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
-const { getAIConfig } = require("../routes/control.routes");
+const { getAIConfig } = require("./aiConfigService");
 
 const orderFlowEngine = require("./orderFlowEngine");
 const counterfactualEngine = require("./counterfactualEngine");
@@ -25,7 +25,6 @@ const BASE_PATH =
 
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
-
 const SAVE_INTERVAL_MS = 5000;
 
 /* ================= FS ================= */
@@ -148,39 +147,26 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     /* ================= AI CONFIG ================= */
 
-    const cfg = getAIConfig?.(tenantId);
+    const cfg = getAIConfig(tenantId);
 
-    if(!cfg || !cfg.enabled){
-      state._dirty=true;
-      scheduleSave(tenantId,state);
-      return;
-    }
+    if(!cfg.enabled) return;
+    if(cfg.tradingMode !== "paper") return;
 
-    if(cfg.tradingMode !== "paper"){
-      state._dirty=true;
-      scheduleSave(tenantId,state);
+    if(state.executionStats.trades >= cfg.maxTrades)
       return;
-    }
-
-    if(state.executionStats.trades >= cfg.maxTrades){
-      state._dirty=true;
-      scheduleSave(tenantId,state);
-      return;
-    }
 
     /* ================= AI DECISION ================= */
 
-    let plan =
+    const plan =
       makeDecision({
         tenantId,
         symbol,
         last:price,
         paper:state,
-        ticksSeen: state.executionStats.ticks   // 🔥 CRITICAL FIX
+        ticksSeen: state.executionStats.ticks
       }) || { action:"WAIT", confidence:0, riskPct:0 };
 
-    /* ===== Risk override from control panel ===== */
-
+    // Override risk from control panel
     plan.riskPct =
       Number(cfg.riskPercent || 1.5) / 100;
 
@@ -194,7 +180,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       riskPct:plan.riskPct
     });
 
-    if(state.decisions.length>MAX_DECISIONS_MEMORY){
+    if(state.decisions.length > MAX_DECISIONS_MEMORY){
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
     }
@@ -239,7 +225,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.realized.net += pnl;
 
-        if(state.trades.length>MAX_TRADES_MEMORY){
+        if(state.trades.length > MAX_TRADES_MEMORY){
           state.trades =
             state.trades.slice(-MAX_TRADES_MEMORY);
         }
