@@ -1,5 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v2
+// FIXED: ticksSeen pass-through + safe AI config gating
 // ==========================================================
 
 const fs = require("fs");
@@ -114,7 +115,6 @@ function scheduleSave(tenantId,state){
       fs.renameSync(tmp,file);
     }catch{}
   });
-
 }
 
 /* ================= AI TICK ================= */
@@ -148,13 +148,25 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     /* ================= AI CONFIG ================= */
 
-    const cfg = getAIConfig(tenantId);
+    const cfg = getAIConfig?.(tenantId);
 
-    if(!cfg?.enabled) return;
-    if(cfg.tradingMode !== "paper") return;
-
-    if(state.executionStats.trades >= cfg.maxTrades)
+    if(!cfg || !cfg.enabled){
+      state._dirty=true;
+      scheduleSave(tenantId,state);
       return;
+    }
+
+    if(cfg.tradingMode !== "paper"){
+      state._dirty=true;
+      scheduleSave(tenantId,state);
+      return;
+    }
+
+    if(state.executionStats.trades >= cfg.maxTrades){
+      state._dirty=true;
+      scheduleSave(tenantId,state);
+      return;
+    }
 
     /* ================= AI DECISION ================= */
 
@@ -163,10 +175,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         tenantId,
         symbol,
         last:price,
-        paper:state
+        paper:state,
+        ticksSeen: state.executionStats.ticks   // 🔥 CRITICAL FIX
       }) || { action:"WAIT", confidence:0, riskPct:0 };
 
-    /* ===== Apply risk override ===== */
+    /* ===== Risk override from control panel ===== */
 
     plan.riskPct =
       Number(cfg.riskPercent || 1.5) / 100;
@@ -186,7 +199,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
     }
 
-    /* ================= EXECUTE ================= */
+    /* ================= EXECUTION ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
@@ -269,8 +282,6 @@ function snapshot(tenantId){
   }));
 
 }
-
-/* ================= EXPORT ================= */
 
 module.exports = {
   tick,
