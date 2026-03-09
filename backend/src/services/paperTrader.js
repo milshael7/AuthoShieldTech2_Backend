@@ -1,5 +1,5 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — STABLE AI EXECUTION
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE
 // ==========================================================
 
 const fs = require("fs");
@@ -7,6 +7,7 @@ const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
+const { getAIConfig } = require("../routes/control.routes");
 
 const orderFlowEngine = require("./orderFlowEngine");
 const counterfactualEngine = require("./counterfactualEngine");
@@ -41,48 +42,23 @@ function statePath(tenantId){
 /* ================= STATE ================= */
 
 function defaultState(){
-
   return{
-
     running:true,
-
     cashBalance:START_BAL,
     equity:START_BAL,
     peakEquity:START_BAL,
-
     position:null,
-
     trades:[],
     decisions:[],
-
     volatility:0.002,
     lastPrice:65000,
-
-    candles:[],
-
-    realized:{
-      wins:0,
-      losses:0,
-      net:0
-    },
-
-    limits:{
-      tradesToday:0,
-      lossesToday:0
-    },
-
-    executionStats:{
-      ticks:0,
-      decisions:0,
-      trades:0
-    },
-
+    realized:{ wins:0, losses:0, net:0 },
+    limits:{ tradesToday:0, lossesToday:0 },
+    executionStats:{ ticks:0, decisions:0, trades:0 },
     _dirty:false,
     _lastSave:0,
     _locked:false
-
   };
-
 }
 
 const STATES = new Map();
@@ -95,26 +71,18 @@ function load(tenantId){
     return STATES.get(tenantId);
 
   let state = defaultState();
-
   const file = statePath(tenantId);
 
   try{
-
     if(fs.existsSync(file)){
-
       const raw =
         JSON.parse(fs.readFileSync(file,"utf-8"));
-
       state = {...state,...raw};
-
     }
-
   }catch{}
 
   STATES.set(tenantId,state);
-
   return state;
-
 }
 
 /* ================= SAVE ================= */
@@ -124,12 +92,11 @@ function scheduleSave(tenantId,state){
   const now = Date.now();
 
   if(!state._dirty) return;
-
   if(now - state._lastSave < SAVE_INTERVAL_MS)
     return;
 
-  state._dirty = false;
-  state._lastSave = now;
+  state._dirty=false;
+  state._lastSave=now;
 
   const file = statePath(tenantId);
 
@@ -141,17 +108,11 @@ function scheduleSave(tenantId,state){
     );
 
   setImmediate(()=>{
-
     try{
-
       const tmp = `${file}.tmp`;
-
       fs.writeFileSync(tmp,snapshot);
-
       fs.renameSync(tmp,file);
-
     }catch{}
-
   });
 
 }
@@ -176,18 +137,24 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     correlationEngine.recordPrice({tenantId,symbol,price});
 
     const prev = state.lastPrice;
-
     state.lastPrice = price;
 
     if(prev){
-
       const change =
         Math.abs(price-prev)/prev;
-
       state.volatility =
         state.volatility*0.9 + change*0.1;
-
     }
+
+    /* ================= AI CONFIG ================= */
+
+    const cfg = getAIConfig(tenantId);
+
+    if(!cfg?.enabled) return;
+    if(cfg.tradingMode !== "paper") return;
+
+    if(state.executionStats.trades >= cfg.maxTrades)
+      return;
 
     /* ================= AI DECISION ================= */
 
@@ -197,96 +164,81 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         symbol,
         last:price,
         paper:state
-      });
+      }) || { action:"WAIT", confidence:0, riskPct:0 };
 
-    /* ===== DEFAULT PLAN FIX ===== */
+    /* ===== Apply risk override ===== */
 
-    if(!plan){
-
-      plan = {
-        action:"WAIT",
-        confidence:0,
-        riskPct:0
-      };
-
-    }
+    plan.riskPct =
+      Number(cfg.riskPercent || 1.5) / 100;
 
     state.executionStats.decisions++;
 
     state.decisions.push({
-
       time:ts,
-      action:plan.action || "WAIT",
-      confidence:plan.confidence || 0,
+      action:plan.action,
+      confidence:plan.confidence,
       price,
-      riskPct:plan.riskPct || 0
-
+      riskPct:plan.riskPct
     });
 
     if(state.decisions.length>MAX_DECISIONS_MEMORY){
-
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
-
     }
 
-    /* ================= EXECUTE AI TRADE ================= */
+    /* ================= EXECUTE ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
       const exec =
         executionEngine.executePaperOrder({
-
           tenantId,
           symbol,
           action:plan.action,
           price,
-          riskPct:plan.riskPct || 0.01,
+          riskPct:plan.riskPct,
           state,
           ts
-
         });
 
       if(exec?.result){
 
         state.executionStats.trades++;
+        state.limits.tradesToday++;
 
         const pnl = exec.result.pnl || 0;
 
         state.trades.push({
-
           time:ts,
           side:plan.action,
           price,
           qty:exec.result.qty || 0,
           profit:pnl
-
         });
 
-        if(pnl>0)
+        if(pnl>0){
           state.realized.wins++;
-        else if(pnl<0)
+        }
+        else if(pnl<0){
           state.realized.losses++;
+          state.limits.lossesToday++;
+        }
 
         state.realized.net += pnl;
 
-        if(state.trades.length>MAX_TRADES_MEMORY)
+        if(state.trades.length>MAX_TRADES_MEMORY){
           state.trades =
             state.trades.slice(-MAX_TRADES_MEMORY);
-
+        }
       }
-
     }
 
     state._dirty=true;
-
     scheduleSave(tenantId,state);
 
   }
   finally{
-
     state._locked=false;
-
   }
 
 }
@@ -298,30 +250,22 @@ function snapshot(tenantId){
   const s = load(tenantId);
 
   return JSON.parse(JSON.stringify({
-
     cashBalance:s.cashBalance,
     equity:s.equity,
     peakEquity:s.peakEquity,
-
     position:s.position,
-
     trades:s.trades,
     decisions:s.decisions,
-
     lastPrice:s.lastPrice,
     volatility:s.volatility,
-
     unrealizedPnL:
       s.position
         ? (s.lastPrice-s.position.entry)
           * s.position.qty
         : 0,
-
     executionStats:s.executionStats,
-
     realized:s.realized,
     limits:s.limits
-
   }));
 
 }
@@ -329,18 +273,14 @@ function snapshot(tenantId){
 /* ================= EXPORT ================= */
 
 module.exports = {
-
   tick,
   snapshot,
-
   getDecisions:
     tenantId=>load(tenantId)
       .decisions.slice(-50),
-
   hardReset:
     tenantId=>STATES.set(
       tenantId,
       defaultState()
     )
-
 };
