@@ -1,7 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Upgraded)
-// Behavioral AI • Strategy Engine • Order Flow • Liquidity
-// Multi-Layer Risk Governance
+// AutoShield — Institutional Trade Brain (Adaptive Balanced)
+// Active Paper Mode • Strict Live Mode
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
@@ -88,33 +87,23 @@ function updatePerformance(brain,paper){
     realizedNet - brain.lastRealizedNet;
 
   if(delta > 0){
-
     brain.winStreak++;
     brain.lossStreak = 0;
-
   }
   else if(delta < 0){
-
     brain.lossStreak++;
     brain.winStreak = 0;
-
   }
 
   brain.lastRealizedNet = realizedNet;
 
-  if(brain.winStreak >= 2){
-
+  if(brain.winStreak >= 2)
     brain.aggressionFactor =
       clamp(brain.aggressionFactor + 0.1,1,1.8);
 
-  }
-
-  if(brain.lossStreak >= 2){
-
+  if(brain.lossStreak >= 2)
     brain.aggressionFactor =
       clamp(brain.aggressionFactor * 0.8,0.6,1);
-
-  }
 
 }
 
@@ -153,9 +142,7 @@ function makeDecision(context={}){
   let strategy = {};
 
   try{
-
     strategy = buildDecision({
-
       tenantId,
       symbol,
       price,
@@ -164,9 +151,7 @@ function makeDecision(context={}){
       ticksSeen:learn.ticksSeen,
       limits,
       paperState:paper
-
     }) || {};
-
   }catch{}
 
   let action = strategy.action || "WAIT";
@@ -200,22 +185,14 @@ function makeDecision(context={}){
     const aiEdge = safeNum(ai.edge,0);
 
     confidence =
-      clamp(
-        (confidence*0.6)+(aiConf*0.4),
-        0,
-        1
-      );
+      clamp((confidence*0.6)+(aiConf*0.4),0,1);
 
     edge =
-      clamp(
-        (edge*0.6)+(aiEdge*0.4),
-        -1,
-        1
-      );
+      clamp((edge*0.6)+(aiEdge*0.4),-1,1);
 
   }catch{}
 
-  /* ================= ORDER FLOW ================= */
+  /* ================= ORDER FLOW (Paper Relaxed) ================= */
 
   try{
 
@@ -224,17 +201,16 @@ function makeDecision(context={}){
 
     confidence *= flow.boost || 1;
 
-    if(flow.type==="fake_breakout" ||
-       flow.type==="trend_exhaustion"){
-
+    if(!isPaper &&
+      (flow.type==="fake_breakout" ||
+       flow.type==="trend_exhaustion")){
       action="WAIT";
       reason="Order flow risk";
-
     }
 
   }catch{}
 
-  /* ================= LIQUIDITY ================= */
+  /* ================= LIQUIDITY (Paper Relaxed) ================= */
 
   try{
 
@@ -243,21 +219,23 @@ function makeDecision(context={}){
 
     confidence *= liquidity.boost || 1;
 
-    if(liquidity.type==="bull_trap" ||
-       liquidity.type==="bear_trap"){
-
+    if(!isPaper &&
+      (liquidity.type==="bull_trap" ||
+       liquidity.type==="bear_trap")){
       action="WAIT";
       reason="Liquidity trap";
-
     }
 
   }catch{}
 
   /* ================= CONFIDENCE SMOOTHING ================= */
 
+  const decay =
+    isPaper ? 0.6 : CONFIDENCE_DECAY;
+
   brain.smoothedConfidence =
-    brain.smoothedConfidence * CONFIDENCE_DECAY +
-    confidence * (1 - CONFIDENCE_DECAY);
+    brain.smoothedConfidence * decay +
+    confidence * (1 - decay);
 
   confidence =
     clamp(brain.smoothedConfidence,0,1);
@@ -271,22 +249,15 @@ function makeDecision(context={}){
 
   /* ================= CONFIDENCE GATE ================= */
 
-  if(confidence < MIN_CONFIDENCE_TO_TRADE){
+  const dynamicThreshold =
+    isPaper ? 0.35 : MIN_CONFIDENCE_TO_TRADE;
 
+  if(confidence < dynamicThreshold){
     action="WAIT";
     reason="Confidence below threshold";
-
   }
 
-  /* ================= VOLATILITY CONTROL ================= */
-
-  if(volatility >= VOL_HIGH){
-
-    confidence *= isPaper ? 0.9 : 0.75;
-
-  }
-
-  /* ================= HARD SAFETY ================= */
+  /* ================= HARD SAFETY (Live Only Strict) ================= */
 
   if(!isPaper){
 
@@ -301,7 +272,6 @@ function makeDecision(context={}){
 
     if(lossesToday >= MAX_LOSS_STREAK)
       action="WAIT";
-
   }
 
   /* ================= RISK ================= */
@@ -331,48 +301,35 @@ function makeDecision(context={}){
 
     const protection =
       capitalProtection.validateOrder({
-
         balanceUsd,
         price,
         riskPct
-
       });
 
     if(!protection.allow){
-
       action="WAIT";
       confidence=0;
       edge=0;
       reason=protection.reason;
-
     }
     else{
-
       riskPct =
         protection.usd / balanceUsd;
-
     }
 
   }catch{}
 
-  /* ================= FINAL NORMALIZATION ================= */
-
   if(action==="WAIT"){
-
     confidence=0;
     edge=0;
-
   }
 
   brain.lastAction = action;
   brain.lastDecisionTime = Date.now();
 
-  /* ================= MEMORY ================= */
-
   try{
 
     memoryBrain.recordSignal({
-
       tenantId,
       symbol,
       action,
@@ -380,29 +337,24 @@ function makeDecision(context={}){
       edge,
       price,
       volatility
-
     });
 
     memoryBrain.recordMarketState({
-
       tenantId,
       symbol,
       price,
       volatility
-
     });
 
   }catch{}
 
   return{
-
     symbol,
     action,
     confidence,
     edge,
     riskPct,
     reason,
-
     behavioral:{
       winStreak:brain.winStreak,
       lossStreak:brain.lossStreak,
@@ -411,26 +363,17 @@ function makeDecision(context={}){
         ? "paper-learning"
         : "live-capital"
     },
-
     learning:strategy.learning,
-
     ts:Date.now()
-
   };
 
 }
 
-/* ================= RESET ================= */
-
 function resetTenant(tenantId){
-
   BRAIN_STATE.delete(tenantId);
-
 }
 
 module.exports = {
-
   makeDecision,
   resetTenant
-
 };
