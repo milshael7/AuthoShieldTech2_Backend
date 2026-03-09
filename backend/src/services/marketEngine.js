@@ -1,5 +1,5 @@
 // --------------------------------------------------
-// AutoShield — Market Engine (Institutional Upgrade)
+// AutoShield — Market Engine (Institutional Stable)
 // Real Exchange Feed + Deterministic Fallback
 // Multi-Tenant • AI Feed • Candle Generator
 // --------------------------------------------------
@@ -12,16 +12,12 @@ const liveTrader = require("./liveTrader");
 /* ================= CONFIG ================= */
 
 const CONFIG = {
-
   tickMs: 1000,
   candleMs: 60 * 1000,
   maxCandles: 2000,
-
   defaultSymbols: ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"],
-
   regimeTrendThreshold: 0.004,
   regimeVolatilityHigh: 0.015,
-
 };
 
 /* ================= STATE ================= */
@@ -30,8 +26,8 @@ const TENANTS = new Map();
 let exchangeConnected = false;
 
 const GLOBAL_PRICE = {
-  BTCUSDT:65000,
-  ETHUSDT:3500,
+  BTCUSDT: 65000,
+  ETHUSDT: 3500,
 };
 
 /* ================= HELPERS ================= */
@@ -41,114 +37,68 @@ function clamp(n,min,max){
 }
 
 function seedFrom(tenantId,symbol){
-
   const s = `${tenantId}:${symbol}`;
-
   let h = 2166136261;
-
   for(let i=0;i<s.length;i++){
     h ^= s.charCodeAt(i);
     h = Math.imul(h,16777619);
   }
-
   return h>>>0;
 }
 
 function xorshift32(seed){
-
   let x = seed|0;
-
   return ()=>{
-
     x ^= x<<13;
     x ^= x>>>17;
     x ^= x<<5;
-
     return (x>>>0)/4294967296;
-
   };
-
 }
 
 function basePrice(symbol){
-
   switch(symbol){
-
     case "BTCUSDT": return GLOBAL_PRICE.BTCUSDT;
     case "ETHUSDT": return GLOBAL_PRICE.ETHUSDT;
     case "SOLUSDT": return 150;
     case "XRPUSDT": return 0.6;
-
     default: return 100;
-
   }
-
 }
 
 /* ================= EXCHANGE FEED ================= */
 
 function startKrakenFeed(){
-
   try{
-
     const ws = new WebSocket("wss://ws.kraken.com");
 
     ws.on("open",()=>{
-
       exchangeConnected = true;
-
       ws.send(JSON.stringify({
-
         event:"subscribe",
-
         pair:["XBT/USD","ETH/USD"],
-
-        subscription:{
-          name:"ticker"
-        }
-
+        subscription:{ name:"ticker" }
       }));
-
     });
 
     ws.on("message",(msg)=>{
-
       try{
-
         const data = JSON.parse(msg);
-
         if(Array.isArray(data) && data[1]){
-
-          const price =
-            Number(data[1].c?.[0]);
-
-          const pair =
-            data[3];
-
-          if(pair==="XBT/USD"){
-            GLOBAL_PRICE.BTCUSDT = price;
-          }
-
-          if(pair==="ETH/USD"){
-            GLOBAL_PRICE.ETHUSDT = price;
-          }
-
+          const price = Number(data[1].c?.[0]);
+          const pair = data[3];
+          if(pair==="XBT/USD") GLOBAL_PRICE.BTCUSDT = price;
+          if(pair==="ETH/USD") GLOBAL_PRICE.ETHUSDT = price;
         }
-
       }catch{}
-
     });
 
     ws.on("close",()=>{
-
       exchangeConnected = false;
-
       setTimeout(startKrakenFeed,5000);
-
     });
 
   }catch{}
-
 }
 
 startKrakenFeed();
@@ -160,97 +110,73 @@ function getTenant(tenantId){
   if(!TENANTS.has(tenantId)){
 
     const market = {
-
       prices:{},
       candles:{},
       volatility:{},
       regime:{},
-
     };
 
     for(const sym of CONFIG.defaultSymbols){
 
-      const rnd =
-        xorshift32(seedFrom(tenantId,sym));
+      const rnd = xorshift32(seedFrom(tenantId,sym));
+      const price = basePrice(sym);
 
-      const price =
-        basePrice(sym);
-
-      market.prices[sym] = {price,rnd};
+      market.prices[sym] = { price, rnd };
 
       market.candles[sym] = [{
-        t:Date.now(),
-        o:price,
-        h:price,
-        l:price,
-        c:price
+        t: Date.now(),
+        o: price,
+        h: price,
+        l: price,
+        c: price
       }];
 
       market.volatility[sym] = 0.002;
       market.regime[sym] = "neutral";
-
     }
 
     TENANTS.set(tenantId,market);
-
   }
 
   return TENANTS.get(tenantId);
-
 }
 
-/* ================= CANDLES ================= */
+/* ================= CANDLE ENGINE ================= */
 
 function updateCandle(arr,price){
-
   const c = arr[arr.length-1];
-
   c.h = Math.max(c.h,price);
   c.l = Math.min(c.l,price);
   c.c = price;
-
 }
 
 function maybeRollCandle(arr){
 
   const now = Date.now();
-
   const last = arr[arr.length-1];
 
   if(now-last.t >= CONFIG.candleMs){
 
     arr.push({
-
-      t:now,
-      o:last.c,
-      h:last.c,
-      l:last.c,
-      c:last.c
-
+      t: now,
+      o: last.c,
+      h: last.c,
+      l: last.c,
+      c: last.c
     });
 
     if(arr.length > CONFIG.maxCandles){
-
       arr.splice(0,arr.length-CONFIG.maxCandles);
-
     }
-
   }
-
 }
 
 /* ================= REGIME ================= */
 
 function detectRegime(volatility,move){
-
-  if(volatility > CONFIG.regimeVolatilityHigh)
-    return "volatile";
-
-  if(Math.abs(move) > CONFIG.regimeTrendThreshold)
-    return "trend";
-
+  if(volatility > CONFIG.regimeVolatilityHigh) return "volatile";
+  if(Math.abs(move) > CONFIG.regimeTrendThreshold) return "trend";
   return "range";
-
 }
 
 /* ================= MARKET TICK ================= */
@@ -262,22 +188,12 @@ function marketTick(tenantId){
   for(const sym of Object.keys(market.prices)){
 
     const node = market.prices[sym];
-
     let nextPrice;
 
-    /* ===== REAL EXCHANGE PRICE ===== */
-
     if(exchangeConnected && GLOBAL_PRICE[sym]){
-
       nextPrice = GLOBAL_PRICE[sym];
-
-    }
-    else{
-
-      /* ===== SIMULATION FALLBACK ===== */
-
+    } else {
       const rnd = node.rnd();
-
       const volatilityBase =
         sym==="BTCUSDT"?0.0025:
         sym==="ETHUSDT"?0.0035:
@@ -285,125 +201,90 @@ function marketTick(tenantId){
         sym==="XRPUSDT"?0.01:0.004;
 
       const drift = (rnd-0.5)*2*volatilityBase;
-
-      nextPrice =
-        clamp(node.price*(1+drift),0.0001,999999999);
-
+      nextPrice = clamp(node.price*(1+drift),0.0001,999999999);
     }
 
     const prev = node.price;
-
     node.price = Number(nextPrice.toFixed(8));
-
     const move = (node.price-prev)/prev;
 
-    /* ===== volatility ===== */
-
     market.volatility[sym] =
-      market.volatility[sym]*0.9 +
-      Math.abs(move)*0.1;
+      market.volatility[sym]*0.9 + Math.abs(move)*0.1;
 
     market.regime[sym] =
       detectRegime(market.volatility[sym],move);
 
-    /* ===== candles ===== */
-
     const candles = market.candles[sym];
-
     maybeRollCandle(candles);
     updateCandle(candles,node.price);
 
-    /* ===== feed engines ===== */
-
-    try{
-      paperTrader.tick(tenantId,sym,node.price);
-    }catch{}
-
-    try{
-      liveTrader.tick(tenantId,sym,node.price);
-    }catch{}
-
+    try{ paperTrader.tick(tenantId,sym,node.price); }catch{}
+    try{ liveTrader.tick(tenantId,sym,node.price); }catch{}
   }
-
 }
 
-/* ================= LOOP ================= */
-
 setInterval(()=>{
-
   for(const tenantId of TENANTS.keys()){
-
-    try{
-      marketTick(tenantId);
-    }catch{}
-
+    try{ marketTick(tenantId); }catch{}
   }
-
 },CONFIG.tickMs);
 
-/* ================= API ================= */
+/* ================= SAFE API ================= */
 
 function registerTenant(tenantId){
-
   getTenant(tenantId);
-
 }
 
 function getPrice(tenantId,symbol){
-
   const market = getTenant(tenantId);
-
   return market.prices[symbol]?.price || null;
-
 }
 
 function getCandles(tenantId,symbol,limit=200){
 
   const market = getTenant(tenantId);
-
   const arr = market.candles[symbol] || [];
 
-  return arr.slice(-limit).map(c=>({
-
-    time:c.t,
-    open:c.o,
-    high:c.h,
-    low:c.l,
-    close:c.c
-
-  }));
-
+  return arr
+    .slice(-limit)
+    .map(c=>{
+      const time = Math.floor(c.t / 1000); // 🔥 FIX: ms → seconds
+      return {
+        time,
+        open: Number(c.o),
+        high: Number(c.h),
+        low: Number(c.l),
+        close: Number(c.c)
+      };
+    })
+    .filter(c =>
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    );
 }
 
 function getMarketSnapshot(tenantId){
 
   const market = getTenant(tenantId);
-
   const snapshot = {};
 
   for(const sym of Object.keys(market.prices)){
-
     snapshot[sym] = {
-
-      price:market.prices[sym].price,
-      volatility:market.volatility[sym],
-      regime:market.regime[sym],
-
+      price: market.prices[sym].price,
+      volatility: market.volatility[sym],
+      regime: market.regime[sym],
     };
-
   }
 
   return snapshot;
-
 }
 
-/* ================= EXPORT ================= */
-
 module.exports = {
-
   registerTenant,
   getPrice,
   getCandles,
   getMarketSnapshot
-
 };
