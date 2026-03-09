@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v3
-// FIXED: No route dependency + ticksSeen + safe AI gating
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v4
+// FIXED: Reads config directly from DB (Control Panel Linked)
 // ==========================================================
 
 const fs = require("fs");
@@ -8,7 +8,7 @@ const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
-const { getAIConfig } = require("./aiConfigService");
+const { readDb } = require("../lib/db");
 
 const orderFlowEngine = require("./orderFlowEngine");
 const counterfactualEngine = require("./counterfactualEngine");
@@ -116,14 +116,43 @@ function scheduleSave(tenantId,state){
   });
 }
 
+/* ================= AI CONFIG FROM DB ================= */
+
+function getTradingConfig(){
+
+  try{
+    const db = readDb();
+    return db.tradingConfig || {
+      enabled:true,
+      tradingMode:"paper",
+      maxTrades:5,
+      riskPercent:1.5,
+      positionMultiplier:1,
+      strategyMode:"Balanced"
+    };
+  }catch{
+    return {
+      enabled:true,
+      tradingMode:"paper",
+      maxTrades:5,
+      riskPercent:1.5,
+      positionMultiplier:1,
+      strategyMode:"Balanced"
+    };
+  }
+
+}
+
 /* ================= AI TICK ================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
 
   const state = load(tenantId);
+  const cfg = getTradingConfig();
 
-  if(!state.running || state._locked)
-    return;
+  if(!state.running || state._locked) return;
+  if(!cfg.enabled) return;
+  if(cfg.tradingMode !== "paper") return;
 
   state._locked = true;
 
@@ -145,17 +174,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         state.volatility*0.9 + change*0.1;
     }
 
-    /* ================= AI CONFIG ================= */
-
-    const cfg = getAIConfig(tenantId);
-
-    if(!cfg.enabled) return;
-    if(cfg.tradingMode !== "paper") return;
-
-    if(state.executionStats.trades >= cfg.maxTrades)
+    if(state.limits.tradesToday >= cfg.maxTrades)
       return;
-
-    /* ================= AI DECISION ================= */
 
     const plan =
       makeDecision({
@@ -166,9 +186,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         ticksSeen: state.executionStats.ticks
       }) || { action:"WAIT", confidence:0, riskPct:0 };
 
-    // Override risk from control panel
     plan.riskPct =
-      Number(cfg.riskPercent || 1.5) / 100;
+      (Number(cfg.riskPercent || 1.5)/100)
+      * Number(cfg.positionMultiplier || 1);
 
     state.executionStats.decisions++;
 
@@ -184,8 +204,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
     }
-
-    /* ================= EXECUTION ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
