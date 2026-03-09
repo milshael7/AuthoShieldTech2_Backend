@@ -1,448 +1,278 @@
 // ==========================================================
-// Institutional Execution Engine — DASHBOARD CONTROLLED
-// Paper Trading + Live Trading Auto Router
-// Single Dashboard Switch Authority
+// Institutional Trading Control API — FINAL
+// Dashboard + Market + Paper + Live + Risk + AI
+// Tenant Safe • Role Protected • Snapshot Accurate
 // ==========================================================
 
-const exchangeRouter = require("./exchangeRouter");
-const krakenConnector = require("./krakenConnector");
-const { readDb } = require("../lib/db");
+const express = require("express");
+const router = express.Router();
 
-const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
+const { authRequired, requireRole } = require("../middleware/auth");
+const { audit } = require("../lib/audit");
+
+const paperTrader = require("../services/paperTrader");
+const liveTrader = require("../services/liveTrader");
+const riskManager = require("../services/riskManager");
+const portfolioManager = require("../services/portfolioManager");
+const aiBrain = require("../services/aiBrain");
+const executionEngine = require("../services/executionEngine");
+const exchangeRouter = require("../services/exchangeRouter");
+const marketEngine = require("../services/marketEngine");
+
+// ---------------- ROLES ----------------
+
+const ADMIN = "Admin";
+const MANAGER = "Manager";
 
 /* =========================================================
-CONFIG
+AI CONFIG STORAGE
 ========================================================= */
 
-const CONFIG = Object.freeze({
+const AI_CONFIG = new Map();
 
-  feeRate:
-    Number(process.env.PAPER_FEE_RATE || 0.0026),
+function getAIConfig(tenantId){
 
-  baseSlippagePct:
-    Number(process.env.PAPER_SLIPPAGE_PCT || 0.0004),
+  if(!AI_CONFIG.has(tenantId)){
 
-  maxSlippagePct:
-    Number(process.env.PAPER_MAX_SLIPPAGE || 0.0015),
+    AI_CONFIG.set(tenantId,{
+      enabled:true,
+      tradingMode:"paper",
+      maxTrades:5,
+      riskPercent:1.5,
+      positionMultiplier:1,
+      strategyMode:"Balanced"
+    });
 
-  minOrderUsd:
-    Number(process.env.PAPER_MIN_ORDER_USD || 50),
+  }
 
-  maxCapitalFraction:
-    Number(process.env.PAPER_MAX_CAPITAL_FRACTION || 0.5),
+  return AI_CONFIG.get(tenantId);
 
-  maxDailyTrades:
-    Number(process.env.LIVE_MAX_TRADES_PER_DAY || 12),
+}
 
-  maxNotionalUsd:
-    Number(process.env.LIVE_MAX_NOTIONAL_USD || 25000),
+/* =========================================================
+PUBLIC
+========================================================= */
 
-  minAccountBalance:
-    Number(process.env.LIVE_MIN_ACCOUNT_BALANCE || 50),
+router.get("/symbols",(req,res)=>{
 
-  maxSpreadPct:
-    Number(process.env.EXEC_MAX_SPREAD || 0.004),
-
-  maxVolatilityPct:
-    Number(process.env.EXEC_MAX_VOLATILITY || 0.015)
+  return res.json({
+    ok:true,
+    symbols:["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
+  });
 
 });
 
 /* =========================================================
-AI CONFIG FROM DASHBOARD
+AUTH
 ========================================================= */
 
-function getAIConfig(){
-
-  try{
-
-    const db = readDb();
-
-    const cfg =
-      db.aiConfig ||
-      db.tradingConfig ||
-      {};
-
-    return {
-
-      tradingMode:
-        String(cfg.tradingMode || "paper").toLowerCase(),
-
-      maxTrades:
-        Number(cfg.maxTrades || CONFIG.maxDailyTrades),
-
-      riskPercent:
-        Number(cfg.riskPercent || 1)
-
-    };
-
-  }catch{
-
-    return {
-      tradingMode:"paper",
-      maxTrades:CONFIG.maxDailyTrades,
-      riskPercent:1
-    };
-
-  }
-
-}
+router.use(authRequired);
 
 /* =========================================================
-SAFE STATE
+MARKET
 ========================================================= */
 
-function ensureStateSafety(state){
+router.get("/market/price/:symbol",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  state.cashBalance ??= 0;
-  state.equity ??= state.cashBalance;
-  state.peakEquity ??= state.cashBalance;
+  const tenantId = req.tenant?.id;
+  const symbol = String(req.params.symbol || "").toUpperCase();
 
-  state.lastPrice ??= null;
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  state.costs ??= { feePaid:0 };
+  marketEngine.registerTenant(tenantId);
 
-  state.executionStats ??= {
-    orders:0,
-    fills:0
-  };
+  const price =
+    marketEngine.getPrice(tenantId,symbol);
 
-  state.realized ??={
-    wins:0,
-    losses:0,
-    net:0,
-    grossProfit:0,
-    grossLoss:0
-  };
+  return res.json({
+    ok:true,
+    tenantId,
+    symbol,
+    price
+  });
 
-  state.limits ??={
-    tradesToday:0,
-    lossesToday:0,
-    lastResetDay:new Date().toISOString().slice(0,10)
-  };
+});
 
-  state.trades ??=[];
+router.get("/market/candles/:symbol",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-}
+  const tenantId = req.tenant?.id;
+  const symbol = String(req.params.symbol || "").toUpperCase();
+  const limit = Number(req.query.limit || 200);
 
-/* =========================================================
-HELPERS
-========================================================= */
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
-function resetDailyLimitsIfNeeded(state,ts){
+  marketEngine.registerTenant(tenantId);
 
-  const day = new Date(ts).toISOString().slice(0,10);
-
-  if(state.limits.lastResetDay !== day){
-
-    state.limits.tradesToday = 0;
-    state.limits.lossesToday = 0;
-    state.limits.lastResetDay = day;
-
-  }
-
-}
-
-function deterministicSlippage(price,side){
-
-  const slipPct =
-    (CONFIG.baseSlippagePct + CONFIG.maxSlippagePct)/2;
-
-  return side==="BUY"
-    ? price*(1+slipPct)
-    : price*(1-slipPct);
-
-}
-
-function recalcEquity(state){
-
-  if(state.position && state.lastPrice){
-
-    state.equity =
-      state.cashBalance +
-      (state.lastPrice - state.position.entry)
-        * state.position.qty;
-
-  }
-  else{
-
-    state.equity = state.cashBalance;
-
-  }
-
-  state.peakEquity =
-    Math.max(state.peakEquity || 0,state.equity);
-
-}
-
-function buildExecutionId(){
-
-  return `${Date.now()}_${Math.random()
-    .toString(16)
-    .slice(2)}`;
-
-}
-
-/* =========================================================
-EXECUTION PROTECTION
-========================================================= */
-
-function checkSpreadProtection(price,bid,ask){
-
-  if(!bid || !ask) return true;
-
-  const spread = (ask-bid)/price;
-
-  return spread <= CONFIG.maxSpreadPct;
-
-}
-
-function checkVolatility(price,lastPrice){
-
-  if(!lastPrice) return true;
-
-  const move =
-    Math.abs((price-lastPrice)/lastPrice);
-
-  return move <= CONFIG.maxVolatilityPct;
-
-}
-
-/* =========================================================
-PAPER EXECUTION
-========================================================= */
-
-function executePaperOrder({
-  tenantId,
-  symbol,
-  action,
-  price,
-  riskPct,
-  bid,
-  ask,
-  state,
-  ts = Date.now()
-}){
-
-  if(!state) return null;
-  if(!Number.isFinite(price) || price<=0) return null;
-
-  ensureStateSafety(state);
-  resetDailyLimitsIfNeeded(state,ts);
-
-  if(!checkSpreadProtection(price,bid,ask))
-    return null;
-
-  if(!checkVolatility(price,state.lastPrice))
-    return null;
-
-  state.lastPrice = price;
-
-  const executionId = buildExecutionId();
-
-  if(action==="BUY" && !state.position){
-
-    if(state.limits.tradesToday >= CONFIG.maxDailyTrades)
-      return null;
-
-    const safeRisk =
-      clamp(Number(riskPct)||0,0,CONFIG.maxCapitalFraction);
-
-    const maxUsd =
-      state.cashBalance * CONFIG.maxCapitalFraction;
-
-    const usd = clamp(
-      state.cashBalance * safeRisk,
-      CONFIG.minOrderUsd,
-      maxUsd
+  const candles =
+    marketEngine.getCandles(
+      tenantId,
+      symbol,
+      limit
     );
 
-    if(usd<=0 || usd>state.cashBalance)
-      return null;
+  return res.json({
+    ok:true,
+    tenantId,
+    symbol,
+    candles
+  });
 
-    const fillPrice =
-      deterministicSlippage(price,"BUY");
-
-    const qty = usd / fillPrice;
-    const notional = qty * fillPrice;
-
-    const fee = notional * CONFIG.feeRate;
-
-    if(state.cashBalance - notional - fee < 0)
-      return null;
-
-    state.cashBalance -= notional + fee;
-
-    state.costs.feePaid += fee;
-
-    state.position = {
-      symbol,
-      entry:fillPrice,
-      qty,
-      ts,
-      executionId,
-      riskPct:safeRisk
-    };
-
-    state.limits.tradesToday++;
-    state.executionStats.orders++;
-
-    recalcEquity(state);
-
-    return{
-      result:{
-        type:"ENTRY",
-        side:"BUY",
-        symbol,
-        price:fillPrice,
-        qty,
-        executionId
-      }
-    };
-
-  }
-
-  if((action==="SELL" || action==="CLOSE") && state.position){
-
-    const pos = state.position;
-
-    const fillPrice =
-      deterministicSlippage(price,"SELL");
-
-    const qty = pos.qty;
-    const notional = qty * fillPrice;
-
-    const gross = (fillPrice-pos.entry)*qty;
-    const fee = notional * CONFIG.feeRate;
-
-    const pnl = gross - fee;
-
-    state.cashBalance += notional - fee;
-
-    state.costs.feePaid += fee;
-    state.realized.net += pnl;
-
-    state.trades.push({
-      time:ts,
-      side:"SELL",
-      symbol:pos.symbol,
-      qty,
-      price:fillPrice,
-      entry:pos.entry,
-      profit:pnl,
-      executionId
-    });
-
-    state.position = null;
-
-    state.executionStats.fills++;
-
-    recalcEquity(state);
-
-    return{
-      result:{
-        type:"EXIT",
-        side:"SELL",
-        symbol,
-        pnl,
-        executionId
-      }
-    };
-
-  }
-
-  return null;
-
-}
+});
 
 /* =========================================================
-LIVE EXECUTION
+MANUAL ORDER ROUTE  (THIS IS THE IMPORTANT PART)
 ========================================================= */
 
-async function executeLiveOrder(params={}){
+router.post("/paper/order",
+requireRole(ADMIN,MANAGER),
+async (req,res)=>{
 
-  const executionId = buildExecutionId();
+  const tenantId = req.tenant?.id;
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const {
+    symbol,
+    side,
+    type,
+    qty,
+    price,
+    risk
+  } = req.body || {};
+
+  if(!symbol || !side)
+    return res.status(400).json({
+      ok:false,
+      error:"Invalid order request"
+    });
 
   try{
 
-    const routed =
-      await exchangeRouter.routeLiveOrder({
-        ...params,
-        executionId
+    const state =
+      paperTrader.snapshot(tenantId);
+
+    const result =
+      await executionEngine.executeOrder({
+
+        tenantId,
+        symbol:String(symbol).toUpperCase(),
+        action:side.toUpperCase(),
+        price:Number(price),
+        riskPct:Number(risk || 0.01),
+        state
+
       });
 
-    return routed.ok
-      ? { ok:true,executionId,result:routed.result }
-      : { ok:false,executionId,error:routed.error };
+    if(!result){
+
+      return res.json({
+        ok:false,
+        error:"Order rejected"
+      });
+
+    }
+
+    return res.json({
+      ok:true,
+      result
+    });
 
   }
   catch(err){
 
-    return{
+    return res.json({
       ok:false,
-      executionId,
       error:String(err?.message || err)
-    };
+    });
 
   }
 
-}
+});
 
 /* =========================================================
-CAPITAL GUARD
+PAPER SNAPSHOT
 ========================================================= */
 
-async function capitalGuard(params={}){
+router.get("/paper/snapshot",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  const balance =
-    await krakenConnector.getBalance();
+  const tenantId = req.tenant?.id;
 
-  const usd =
-    Number(balance?.USD || balance?.ZUSD || 0);
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  if(usd < CONFIG.minAccountBalance)
-    return { ok:false };
+  marketEngine.registerTenant(tenantId);
 
-  if(params?.notionalUsd > CONFIG.maxNotionalUsd)
-    return { ok:false };
+  const snapshot =
+    paperTrader.snapshot(tenantId);
 
-  return { ok:true };
+  return res.json({
+    ok:true,
+    tenantId,
+    snapshot
+  });
 
-}
+});
 
 /* =========================================================
-AUTO ROUTER
+AI CONFIG
 ========================================================= */
 
-async function executeOrder(params){
+router.get("/ai/config",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  const ai = getAIConfig();
+  const tenantId = req.tenant?.id;
 
-  /* ================= DASHBOARD SWITCH ================= */
+  const config = getAIConfig(tenantId);
 
-  if(ai.tradingMode !== "live"){
+  return res.json({
+    ok:true,
+    config,
+    engine:"RUNNING"
+  });
 
-    return executePaperOrder(params);
+});
 
-  }
+router.post("/ai/config",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
 
-  /* ================= LIVE MODE ================= */
+  const tenantId = req.tenant?.id;
 
-  const guard =
-    await capitalGuard(params);
+  const cfg = getAIConfig(tenantId);
 
-  if(!guard.ok){
+  const {
+    enabled,
+    tradingMode,
+    maxTrades,
+    riskPercent,
+    positionMultiplier,
+    strategyMode
+  } = req.body || {};
 
-    return executePaperOrder(params);
+  cfg.enabled = Boolean(enabled);
+  cfg.tradingMode = tradingMode || "paper";
+  cfg.maxTrades = Number(maxTrades || 5);
+  cfg.riskPercent = Number(riskPercent || 1.5);
+  cfg.positionMultiplier = Number(positionMultiplier || 1);
+  cfg.strategyMode = strategyMode || "Balanced";
 
-  }
+  return res.json({
+    ok:true,
+    config:cfg
+  });
 
-  return executeLiveOrder(params);
+});
 
-}
+/* ========================================================= */
 
-module.exports={
-  executePaperOrder,
-  executeLiveOrder,
-  executeOrder
-};
+module.exports = router;
