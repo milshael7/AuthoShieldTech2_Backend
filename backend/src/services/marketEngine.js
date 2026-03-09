@@ -1,6 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — REALTIME SIMULATED EXCHANGE
 // Multi-Tenant • High Frequency • Deterministic
+// UPGRADED: Tenant Registry Exposure for AI Engine
 // ==========================================================
 
 const TENANTS = new Map();
@@ -28,14 +29,9 @@ function clamp(n,min,max){
 }
 
 function randomWalk(price,vol){
-
-  const drift =
-    (Math.random() - 0.5) * 2 * vol;
-
+  const drift = (Math.random() - 0.5) * 2 * vol;
   const next = price * (1 + drift);
-
   return Number(clamp(next,0.0000001,1e12).toFixed(8));
-
 }
 
 /* ================= TENANT INIT ================= */
@@ -45,11 +41,9 @@ function registerTenant(tenantId){
   if(TENANTS.has(tenantId)) return;
 
   const state = {
-
     prices:{},
     candles:{},
     lastCandleTime:{}
-
   };
 
   for(const sym of Object.keys(SYMBOLS)){
@@ -67,11 +61,15 @@ function registerTenant(tenantId){
     }];
 
     state.lastCandleTime[sym] = Date.now();
-
   }
 
   TENANTS.set(tenantId,state);
+}
 
+/* ================= TENANT LIST ================= */
+
+function getRegisteredTenants(){
+  return Array.from(TENANTS.keys());
 }
 
 /* ================= MARKET TICK ================= */
@@ -84,16 +82,13 @@ function tickTenant(tenantId){
   for(const sym of Object.keys(SYMBOLS)){
 
     const config = SYMBOLS[sym];
-
     const prev = state.prices[sym];
     const next = randomWalk(prev,config.vol);
 
     state.prices[sym] = next;
 
     updateCandle(state,sym,next);
-
   }
-
 }
 
 /* ================= CANDLE ENGINE ================= */
@@ -101,7 +96,6 @@ function tickTenant(tenantId){
 function updateCandle(state,symbol,price){
 
   const now = Date.now();
-
   const arr = state.candles[symbol];
   const last = arr[arr.length - 1];
 
@@ -120,7 +114,6 @@ function updateCandle(state,symbol,price){
     if(arr.length > MAX_CANDLES){
       arr.splice(0,arr.length - MAX_CANDLES);
     }
-
   }
 
   const cur = arr[arr.length - 1];
@@ -128,7 +121,6 @@ function updateCandle(state,symbol,price){
   cur.h = Math.max(cur.h,price);
   cur.l = Math.min(cur.l,price);
   cur.c = price;
-
 }
 
 /* ================= SNAPSHOT ================= */
@@ -136,21 +128,15 @@ function updateCandle(state,symbol,price){
 function getMarketSnapshot(tenantId){
 
   const state = TENANTS.get(tenantId);
-
   if(!state) return {};
 
   const out = {};
 
   for(const sym of Object.keys(state.prices)){
-
-    out[sym] = {
-      price:state.prices[sym]
-    };
-
+    out[sym] = { price:state.prices[sym] };
   }
 
   return out;
-
 }
 
 /* ================= CANDLES ================= */
@@ -158,21 +144,17 @@ function getMarketSnapshot(tenantId){
 function getCandles(tenantId,symbol,limit=200){
 
   const state = TENANTS.get(tenantId);
-
   if(!state) return [];
 
   const arr = state.candles[symbol] || [];
 
-  return arr
-    .slice(-limit)
-    .map(c => ({
-      time: Math.floor(c.t/1000),
-      open:c.o,
-      high:c.h,
-      low:c.l,
-      close:c.c
-    }));
-
+  return arr.slice(-limit).map(c => ({
+    time: Math.floor(c.t/1000),
+    open:c.o,
+    high:c.h,
+    low:c.l,
+    close:c.c
+  }));
 }
 
 /* ================= PRICE ================= */
@@ -180,11 +162,9 @@ function getCandles(tenantId,symbol,limit=200){
 function getPrice(tenantId,symbol){
 
   const state = TENANTS.get(tenantId);
-
   if(!state) return null;
 
   return state.prices[symbol] || null;
-
 }
 
 /* ================= GLOBAL MARKET LOOP ================= */
@@ -192,22 +172,19 @@ function getPrice(tenantId,symbol){
 setInterval(()=>{
 
   for(const tenantId of TENANTS.keys()){
-
     try{
       tickTenant(tenantId);
     }catch{}
-
   }
 
-},200); // ⚡ 5 market updates per second
+},200);
 
 /* ================= EXPORT ================= */
 
 module.exports = {
-
   registerTenant,
+  getRegisteredTenants,
   getMarketSnapshot,
   getCandles,
   getPrice
-
 };
