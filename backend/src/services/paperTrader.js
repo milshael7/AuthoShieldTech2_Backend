@@ -1,7 +1,5 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — INSTITUTIONAL FINAL
-// FIXED: AI decisions reliably execute trades
-// Deterministic • Crash-safe • Multi-tenant
+// Autonomous Paper Trading Engine — STABLE AI EXECUTION
 // ==========================================================
 
 const fs = require("fs");
@@ -22,9 +20,6 @@ const START_BAL =
 const BASE_PATH =
   process.env.PAPER_STATE_DIR ||
   path.join("/tmp", "paper_trader");
-
-const CANDLE_MS = 60000;
-const MAX_CANDLES = 2000;
 
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
@@ -161,50 +156,6 @@ function scheduleSave(tenantId,state){
 
 }
 
-/* ================= CANDLE ENGINE ================= */
-
-function updateCandle(state,price){
-
-  const now = Date.now();
-
-  if(!state.candles.length){
-
-    state.candles.push({
-      t:now,o:price,h:price,l:price,c:price
-    });
-
-    return;
-
-  }
-
-  const last =
-    state.candles[state.candles.length-1];
-
-  if(now-last.t>=CANDLE_MS){
-
-    state.candles.push({
-      t:now,
-      o:last.c,
-      h:last.c,
-      l:last.c,
-      c:last.c
-    });
-
-    if(state.candles.length>MAX_CANDLES)
-      state.candles=
-        state.candles.slice(-MAX_CANDLES);
-
-  }
-
-  const cur =
-    state.candles[state.candles.length-1];
-
-  cur.h=Math.max(cur.h,price);
-  cur.l=Math.min(cur.l,price);
-  cur.c=price;
-
-}
-
 /* ================= AI TICK ================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
@@ -238,47 +189,37 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }
 
-    updateCandle(state,price);
-
-    /* ================= EQUITY ================= */
-
-    if(state.position){
-
-      state.equity =
-        state.cashBalance +
-        (price-state.position.entry)
-          * state.position.qty;
-
-    }else{
-
-      state.equity = state.cashBalance;
-
-    }
-
-    state.peakEquity =
-      Math.max(state.peakEquity,state.equity);
-
     /* ================= AI DECISION ================= */
 
-    const plan =
+    let plan =
       makeDecision({
-
         tenantId,
         symbol,
         last:price,
         paper:state
-
       });
+
+    /* ===== DEFAULT PLAN FIX ===== */
+
+    if(!plan){
+
+      plan = {
+        action:"WAIT",
+        confidence:0,
+        riskPct:0
+      };
+
+    }
 
     state.executionStats.decisions++;
 
     state.decisions.push({
 
       time:ts,
-      action:plan?.action,
-      confidence:plan?.confidence,
+      action:plan.action || "WAIT",
+      confidence:plan.confidence || 0,
       price,
-      riskPct:plan?.riskPct
+      riskPct:plan.riskPct || 0
 
     });
 
@@ -291,7 +232,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     /* ================= EXECUTE AI TRADE ================= */
 
-    if(plan && ["BUY","SELL","CLOSE"].includes(plan.action)){
+    if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
       const exec =
         executionEngine.executePaperOrder({
@@ -391,22 +332,6 @@ module.exports = {
 
   tick,
   snapshot,
-
-  getCandles:(tenantId,limit=200)=>
-    load(tenantId).candles
-      .slice(-limit)
-      .map(c=>({
-
-        time:Math.floor(c.t/1000),
-        open:c.o,
-        high:c.h,
-        low:c.l,
-        close:c.c
-
-      })),
-
-  getMarketPrice:
-    tenantId=>load(tenantId).lastPrice,
 
   getDecisions:
     tenantId=>load(tenantId)
