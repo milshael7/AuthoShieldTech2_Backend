@@ -1,8 +1,10 @@
 // ==========================================================
 // MARKET ENGINE — REALTIME SIMULATED EXCHANGE
 // Multi-Tenant • High Frequency • Deterministic
-// UPGRADED: Tenant Registry Exposure for AI Engine
+// UPGRADED: AI Scheduler + Stable Engine
 // ==========================================================
+
+const paperTrader = require("./paperTrader");
 
 const TENANTS = new Map();
 
@@ -21,6 +23,9 @@ const SYMBOLS = {
 
 const CANDLE_MS = 60000;
 const MAX_CANDLES = 2000;
+
+const MARKET_TICK_MS = 200;
+const AI_TICK_MS = 2000;
 
 /* ================= UTIL ================= */
 
@@ -89,6 +94,30 @@ function tickTenant(tenantId){
 
     updateCandle(state,sym,next);
   }
+}
+
+/* ================= AI DECISION LOOP ================= */
+
+function runAiForTenant(tenantId){
+
+  const state = TENANTS.get(tenantId);
+  if(!state) return;
+
+  try{
+
+    const btc = state.prices["BTCUSDT"];
+
+    if(btc){
+
+      paperTrader.tick(
+        tenantId,
+        "BTCUSDT",
+        Number(btc)
+      );
+
+    }
+
+  }catch{}
 }
 
 /* ================= CANDLE ENGINE ================= */
@@ -177,7 +206,19 @@ setInterval(()=>{
     }catch{}
   }
 
-},200);
+},MARKET_TICK_MS);
+
+/* ================= GLOBAL AI LOOP ================= */
+
+setInterval(()=>{
+
+  for(const tenantId of TENANTS.keys()){
+    try{
+      runAiForTenant(tenantId);
+    }catch{}
+  }
+
+},AI_TICK_MS);
 
 /* ================= EXPORT ================= */
 
