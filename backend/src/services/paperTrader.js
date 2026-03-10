@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v4
-// FIXED: Reads config directly from DB (Control Panel Linked)
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v5
+// FIXED: Tenant Config + Daily Reset + Safe Execution
 // ==========================================================
 
 const fs = require("fs");
@@ -51,10 +51,11 @@ function defaultState(){
     trades:[],
     decisions:[],
     volatility:0.002,
-    lastPrice:65000,
+    lastPrice:null,
     realized:{ wins:0, losses:0, net:0 },
     limits:{ tradesToday:0, lossesToday:0 },
     executionStats:{ ticks:0, decisions:0, trades:0 },
+    lastResetDay:null,
     _dirty:false,
     _lastSave:0,
     _locked:false
@@ -83,6 +84,23 @@ function load(tenantId){
 
   STATES.set(tenantId,state);
   return state;
+}
+
+/* ================= DAILY RESET ================= */
+
+function resetDailyLimits(state){
+
+  const today = new Date().toISOString().slice(0,10);
+
+  if(state.lastResetDay !== today){
+
+    state.limits.tradesToday = 0;
+    state.limits.lossesToday = 0;
+
+    state.lastResetDay = today;
+
+  }
+
 }
 
 /* ================= SAVE ================= */
@@ -116,21 +134,31 @@ function scheduleSave(tenantId,state){
   });
 }
 
-/* ================= AI CONFIG FROM DB ================= */
+/* ================= CONFIG FROM DB ================= */
 
-function getTradingConfig(){
+function getTradingConfig(tenantId){
 
   try{
+
     const db = readDb();
-    return db.tradingConfig || {
-      enabled:true,
-      tradingMode:"paper",
-      maxTrades:5,
-      riskPercent:1.5,
-      positionMultiplier:1,
-      strategyMode:"Balanced"
+
+    const cfg =
+      db.tradingConfig?.[tenantId] ||
+      db.tradingConfig ||
+      {};
+
+    return {
+      enabled: cfg.enabled ?? true,
+      tradingMode: cfg.tradingMode || "paper",
+      maxTrades: Number(cfg.maxTrades || 5),
+      riskPercent: Number(cfg.riskPercent || 1.5),
+      positionMultiplier: Number(cfg.positionMultiplier || 1),
+      strategyMode: cfg.strategyMode || "Balanced"
     };
-  }catch{
+
+  }
+  catch{
+
     return {
       enabled:true,
       tradingMode:"paper",
@@ -139,6 +167,7 @@ function getTradingConfig(){
       positionMultiplier:1,
       strategyMode:"Balanced"
     };
+
   }
 
 }
@@ -148,15 +177,20 @@ function getTradingConfig(){
 function tick(tenantId,symbol,price,ts=Date.now()){
 
   const state = load(tenantId);
-  const cfg = getTradingConfig();
+  const cfg = getTradingConfig(tenantId);
 
-  if(!state.running || state._locked) return;
+  if(!state.running) return;
   if(!cfg.enabled) return;
   if(cfg.tradingMode !== "paper") return;
+  if(!Number.isFinite(price)) return;
+
+  if(state._locked) return;
 
   state._locked = true;
 
   try{
+
+    resetDailyLimits(state);
 
     state.executionStats.ticks++;
 
@@ -183,12 +217,13 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         symbol,
         last:price,
         paper:state,
-        ticksSeen: state.executionStats.ticks
+        ticksSeen: state.executionStats.ticks,
+        strategyMode: cfg.strategyMode
       }) || { action:"WAIT", confidence:0, riskPct:0 };
 
     plan.riskPct =
-      (Number(cfg.riskPercent || 1.5)/100)
-      * Number(cfg.positionMultiplier || 1);
+      (cfg.riskPercent/100)
+      * cfg.positionMultiplier;
 
     state.executionStats.decisions++;
 
@@ -200,10 +235,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       riskPct:plan.riskPct
     });
 
-    if(state.decisions.length > MAX_DECISIONS_MEMORY){
+    if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
-    }
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
@@ -233,9 +267,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
           profit:pnl
         });
 
-        if(pnl>0){
-          state.realized.wins++;
-        }
+        if(pnl>0) state.realized.wins++;
         else if(pnl<0){
           state.realized.losses++;
           state.limits.lossesToday++;
@@ -243,11 +275,12 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.realized.net += pnl;
 
-        if(state.trades.length > MAX_TRADES_MEMORY){
+        if(state.trades.length > MAX_TRADES_MEMORY)
           state.trades =
             state.trades.slice(-MAX_TRADES_MEMORY);
-        }
+
       }
+
     }
 
     state._dirty=true;
