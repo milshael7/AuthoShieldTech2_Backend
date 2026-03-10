@@ -1,106 +1,25 @@
 // backend/src/routes/paper.routes.js
 // ==========================================================
-// Paper Engine API — STABLE + WS-ALIGNED
-// Single-auth • Tenant-safe • Snapshot-guarded
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE
+// FIXED: Engine stats + AI brain state + config wiring
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
 const paperTrader = require("../services/paperTrader");
+const { readDb } = require("../lib/db");
 
 /* =========================================================
-   TENANT RESOLUTION (MUST MATCH WS + AI LOOP)
+   TENANT RESOLUTION
 ========================================================= */
 
 function resolveTenant(req) {
   return req.user?.companyId || req.user?.id || null;
 }
 
-function resetAllowed(req) {
-  const key = String(process.env.PAPER_RESET_KEY || "").trim();
-
-  if (!key) return true;
-
-  const sent = String(req.headers["x-reset-key"] || "").trim();
-  return !!sent && sent === key;
-}
-
 /* =========================================================
-   EXECUTE PAPER ORDER
-   NEW — used by OrderPanel
-========================================================= */
-
-router.post("/order", (req, res) => {
-  try {
-
-    const tenantId = resolveTenant(req);
-
-    if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
-      });
-    }
-
-    const {
-      symbol,
-      side,
-      qty,
-      price,
-      type,
-      stopLoss,
-      takeProfit,
-      risk
-    } = req.body || {};
-
-    if (!symbol || !side || !qty) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid order payload",
-      });
-    }
-
-    const result =
-      paperTrader.executeOrder?.(tenantId,{
-        symbol:String(symbol).toUpperCase(),
-        side:String(side).toUpperCase(),
-        qty:Number(qty),
-        price:Number(price) || 0,
-        type:String(type || "MARKET").toUpperCase(),
-        stopLoss: stopLoss ? Number(stopLoss) : null,
-        takeProfit: takeProfit ? Number(takeProfit) : null,
-        risk: risk ? Number(risk) : null
-      });
-
-    if (!result || result.ok === false) {
-
-      return res.status(400).json({
-        ok:false,
-        error:"Order rejected"
-      });
-
-    }
-
-    return res.json({
-      ok:true,
-      order:result,
-      snapshot: paperTrader.snapshot(tenantId),
-      time:new Date().toISOString()
-    });
-
-  } catch {
-
-    return res.status(500).json({
-      ok:false,
-      error:"Paper order execution failed"
-    });
-
-  }
-});
-
-/* =========================================================
-   STATUS
+   STATUS — FULL ENGINE STATE
 ========================================================= */
 
 router.get("/status", (req, res) => {
@@ -115,30 +34,72 @@ router.get("/status", (req, res) => {
       });
     }
 
-    const snapshot = paperTrader.snapshot(tenantId) || {
-      equity: 0,
-      cashBalance: 0,
-      position: null,
-      trades: [],
-      limits: {},
+    const snapshot = paperTrader.snapshot(tenantId);
+
+    if (!snapshot) {
+      return res.json({
+        ok: true,
+        engine: "IDLE",
+        snapshot: null
+      });
+    }
+
+    const db = readDb();
+    const tradingConfig = db.tradingConfig || {};
+
+    const decisions =
+      paperTrader.getDecisions?.(tenantId) || [];
+
+    const lastDecision =
+      decisions.length
+        ? decisions[decisions.length - 1]
+        : null;
+
+    const engineState = {
+      mode: tradingConfig.tradingMode || "paper",
+      enabled: tradingConfig.enabled ?? true,
+      riskPercent: tradingConfig.riskPercent ?? 1.5,
+      maxTrades: tradingConfig.maxTrades ?? 5,
+      positionMultiplier: tradingConfig.positionMultiplier ?? 1,
+      strategyMode: tradingConfig.strategyMode ?? "Balanced"
+    };
+
+    const brainState = {
+      lastAction: lastDecision?.action || "WAIT",
+      smoothedConfidence:
+        Number(lastDecision?.confidence || 0).toFixed(3),
+      edgeMomentum:
+        Number(lastDecision?.edge || 0).toFixed(4),
+      winStreak:
+        snapshot.realized?.wins || 0,
+      lossStreak:
+        snapshot.realized?.losses || 0
     };
 
     return res.json({
       ok: true,
+      engine: snapshot.executionStats?.ticks > 0
+        ? "RUNNING"
+        : "IDLE",
+      engineState,
+      brainState,
+      executionStats: snapshot.executionStats || {},
       snapshot,
       time: new Date().toISOString(),
     });
 
   } catch {
+
     return res.status(500).json({
       ok: false,
       error: "Paper engine unavailable",
     });
+
   }
 });
 
 /* =========================================================
-   AI DECISION STREAM
+   DECISION STREAM
 ========================================================= */
 
 router.get("/decisions", (req, res) => {
@@ -159,6 +120,7 @@ router.get("/decisions", (req, res) => {
     return res.json({
       ok: true,
       decisions,
+      count: decisions.length,
       time: new Date().toISOString(),
     });
 
@@ -188,27 +150,10 @@ router.post("/reset", (req, res) => {
       });
     }
 
-    const role = String(req.user?.role || "").toLowerCase();
-
-    if (role !== "admin" && role !== "manager") {
-      return res.status(403).json({
-        ok: false,
-        error: "Reset not permitted for this role",
-      });
-    }
-
-    if (!resetAllowed(req)) {
-      return res.status(403).json({
-        ok: false,
-        error: "Reset blocked. Invalid or missing x-reset-key.",
-      });
-    }
-
     paperTrader.hardReset(tenantId);
 
     return res.json({
       ok: true,
-      message: "Paper trader reset complete",
       snapshot: paperTrader.snapshot(tenantId),
       time: new Date().toISOString(),
     });
@@ -221,66 +166,6 @@ router.post("/reset", (req, res) => {
     });
 
   }
-});
-
-/* =========================================================
-   CONFIG
-========================================================= */
-
-router.get("/config", (req, res) => {
-  try {
-
-    const tenantId = resolveTenant(req);
-
-    if (!tenantId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
-      });
-    }
-
-    const snap = paperTrader.snapshot(tenantId) || {};
-
-    const config = {
-      startBalance: Number(process.env.PAPER_START_BALANCE || 100000),
-      warmupTicks: Number(process.env.PAPER_WARMUP_TICKS || 250),
-
-      feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
-      slippageBp: Number(process.env.PAPER_SLIPPAGE_BP || 8),
-      spreadBp: Number(process.env.PAPER_SPREAD_BP || 6),
-
-      cooldownMs: Number(process.env.PAPER_COOLDOWN_MS || 12000),
-      maxTradesPerDay: Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40),
-      maxDrawdownPct: Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25),
-    };
-
-    return res.json({
-      ok: true,
-      config,
-      limits: snap.limits || {},
-      time: new Date().toISOString(),
-    });
-
-  } catch {
-
-    return res.status(500).json({
-      ok: false,
-      error: "Paper config unavailable",
-    });
-
-  }
-});
-
-/* =========================================================
-   CONFIG UPDATE BLOCK
-========================================================= */
-
-router.post("/config", (_req, res) => {
-  return res.status(409).json({
-    ok: false,
-    error:
-      "Runtime config updates are not supported. Set PAPER_* env variables and restart.",
-  });
 });
 
 module.exports = router;
