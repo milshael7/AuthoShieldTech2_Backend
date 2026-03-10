@@ -1,7 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — REALTIME SIMULATED EXCHANGE
 // Multi-Tenant • High Frequency • Deterministic
-// UPGRADED: AI Scheduler + Stable Engine
+// UPGRADED: Multi-Symbol AI + Stable Engine
 // ==========================================================
 
 const paperTrader = require("./paperTrader");
@@ -25,7 +25,7 @@ const CANDLE_MS = 60000;
 const MAX_CANDLES = 2000;
 
 const MARKET_TICK_MS = 200;
-const AI_TICK_MS = 2000;
+const AI_TICK_MS = 1000;
 
 /* ================= UTIL ================= */
 
@@ -34,9 +34,15 @@ function clamp(n,min,max){
 }
 
 function randomWalk(price,vol){
+
   const drift = (Math.random() - 0.5) * 2 * vol;
+
   const next = price * (1 + drift);
-  return Number(clamp(next,0.0000001,1e12).toFixed(8));
+
+  return Number(
+    clamp(next,0.0000001,1e12).toFixed(8)
+  );
+
 }
 
 /* ================= TENANT INIT ================= */
@@ -47,8 +53,7 @@ function registerTenant(tenantId){
 
   const state = {
     prices:{},
-    candles:{},
-    lastCandleTime:{}
+    candles:{}
   };
 
   for(const sym of Object.keys(SYMBOLS)){
@@ -65,16 +70,9 @@ function registerTenant(tenantId){
       c:start
     }];
 
-    state.lastCandleTime[sym] = Date.now();
   }
 
   TENANTS.set(tenantId,state);
-}
-
-/* ================= TENANT LIST ================= */
-
-function getRegisteredTenants(){
-  return Array.from(TENANTS.keys());
 }
 
 /* ================= MARKET TICK ================= */
@@ -87,16 +85,20 @@ function tickTenant(tenantId){
   for(const sym of Object.keys(SYMBOLS)){
 
     const config = SYMBOLS[sym];
+
     const prev = state.prices[sym];
+
     const next = randomWalk(prev,config.vol);
 
     state.prices[sym] = next;
 
     updateCandle(state,sym,next);
+
   }
+
 }
 
-/* ================= AI DECISION LOOP ================= */
+/* ================= AI LOOP ================= */
 
 function runAiForTenant(tenantId){
 
@@ -105,19 +107,22 @@ function runAiForTenant(tenantId){
 
   try{
 
-    const btc = state.prices["BTCUSDT"];
+    for(const sym of Object.keys(state.prices)){
 
-    if(btc){
+      const price = state.prices[sym];
+
+      if(!price) continue;
 
       paperTrader.tick(
         tenantId,
-        "BTCUSDT",
-        Number(btc)
+        sym,
+        Number(price)
       );
 
     }
 
   }catch{}
+
 }
 
 /* ================= CANDLE ENGINE ================= */
@@ -125,17 +130,19 @@ function runAiForTenant(tenantId){
 function updateCandle(state,symbol,price){
 
   const now = Date.now();
+
   const arr = state.candles[symbol];
+
   const last = arr[arr.length - 1];
 
   if(now - last.t >= CANDLE_MS){
 
     const newCandle = {
       t:now,
-      o:last.c,
-      h:last.c,
-      l:last.c,
-      c:last.c
+      o:price,
+      h:price,
+      l:price,
+      c:price
     };
 
     arr.push(newCandle);
@@ -143,6 +150,7 @@ function updateCandle(state,symbol,price){
     if(arr.length > MAX_CANDLES){
       arr.splice(0,arr.length - MAX_CANDLES);
     }
+
   }
 
   const cur = arr[arr.length - 1];
@@ -150,6 +158,7 @@ function updateCandle(state,symbol,price){
   cur.h = Math.max(cur.h,price);
   cur.l = Math.min(cur.l,price);
   cur.c = price;
+
 }
 
 /* ================= SNAPSHOT ================= */
@@ -162,10 +171,15 @@ function getMarketSnapshot(tenantId){
   const out = {};
 
   for(const sym of Object.keys(state.prices)){
-    out[sym] = { price:state.prices[sym] };
+
+    out[sym] = {
+      price: state.prices[sym]
+    };
+
   }
 
   return out;
+
 }
 
 /* ================= CANDLES ================= */
@@ -184,6 +198,7 @@ function getCandles(tenantId,symbol,limit=200){
     low:c.l,
     close:c.c
   }));
+
 }
 
 /* ================= PRICE ================= */
@@ -194,6 +209,7 @@ function getPrice(tenantId,symbol){
   if(!state) return null;
 
   return state.prices[symbol] || null;
+
 }
 
 /* ================= GLOBAL MARKET LOOP ================= */
@@ -201,9 +217,11 @@ function getPrice(tenantId,symbol){
 setInterval(()=>{
 
   for(const tenantId of TENANTS.keys()){
+
     try{
       tickTenant(tenantId);
     }catch{}
+
   }
 
 },MARKET_TICK_MS);
@@ -213,9 +231,11 @@ setInterval(()=>{
 setInterval(()=>{
 
   for(const tenantId of TENANTS.keys()){
+
     try{
       runAiForTenant(tenantId);
     }catch{}
+
   }
 
 },AI_TICK_MS);
@@ -224,7 +244,6 @@ setInterval(()=>{
 
 module.exports = {
   registerTenant,
-  getRegisteredTenants,
   getMarketSnapshot,
   getCandles,
   getPrice
