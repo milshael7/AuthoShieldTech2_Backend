@@ -122,6 +122,8 @@ const wss = new WebSocketServer({
   path:"/ws"
 });
 
+/* ================= SAFE CLOSE ================= */
+
 function closeWs(ws){
   try{ws.close()}catch{}
 }
@@ -161,10 +163,15 @@ wss.on("connection",(ws,req)=>{
     ws.tenantId = tenantId;
     ws.isAlive = true;
 
-    /* ensure market engine exists for tenant */
+    /* ensure tenant engine exists */
+
     marketEngine.registerTenant(tenantId);
 
     ws.on("pong",()=>{ws.isAlive=true});
+
+    ws.on("error",()=>{
+      try{ws.terminate()}catch{}
+    });
 
   }
   catch{
@@ -180,8 +187,11 @@ setInterval(()=>{
   wss.clients.forEach(ws=>{
 
     if(ws.isAlive===false){
+
       try{ws.terminate()}catch{}
+
       return;
+
     }
 
     ws.isAlive=false;
@@ -193,7 +203,7 @@ setInterval(()=>{
 },20000);
 
 /* ================= MARKET STREAM ================= */
-/* BROADCAST ONLY — ENGINE RUNS IN marketEngine */
+/* MARKET ENGINE RUNS SEPARATELY */
 
 setInterval(()=>{
 
@@ -216,19 +226,22 @@ setInterval(()=>{
       }
 
       ws.send(JSON.stringify({
+
         channel:"market",
         type:"snapshot",
         data:snapshot,
         ts:Date.now()
+
       }));
 
-    }catch{}
+    }
+    catch{}
 
   });
 
 },250);
 
-/* ================= PAPER ENGINE STREAM ================= */
+/* ================= PAPER TRADER STREAM ================= */
 
 setInterval(()=>{
 
@@ -254,7 +267,8 @@ setInterval(()=>{
 
       }));
 
-    }catch{}
+    }
+    catch{}
 
   });
 
