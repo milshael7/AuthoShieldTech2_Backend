@@ -161,9 +161,8 @@ wss.on("connection",(ws,req)=>{
     ws.tenantId = tenantId;
     ws.isAlive = true;
 
-    if(channel==="market"){
-      marketEngine.registerTenant(tenantId);
-    }
+    /* ensure market engine exists for tenant */
+    marketEngine.registerTenant(tenantId);
 
     ws.on("pong",()=>{ws.isAlive=true});
 
@@ -193,8 +192,8 @@ setInterval(()=>{
 
 },20000);
 
-/* ================= MARKET + AI LOOP ================= */
-/* FAST ENGINE LOOP */
+/* ================= MARKET STREAM ================= */
+/* BROADCAST ONLY — ENGINE RUNS IN marketEngine */
 
 setInterval(()=>{
 
@@ -216,24 +215,6 @@ setInterval(()=>{
         cache.set(ws.tenantId,snapshot);
       }
 
-      /* ===== AI TICK ===== */
-
-      const btc = snapshot?.BTCUSDT?.price;
-
-      if(btc){
-
-        try{
-
-          paperTrader.tick(
-            ws.tenantId,
-            "BTCUSDT",
-            Number(btc)
-          );
-
-        }catch{}
-
-      }
-
       ws.send(JSON.stringify({
         channel:"market",
         type:"snapshot",
@@ -245,7 +226,7 @@ setInterval(()=>{
 
   });
 
-},250);  // ⚡ 4 updates per second
+},250);
 
 /* ================= PAPER ENGINE STREAM ================= */
 
@@ -277,7 +258,7 @@ setInterval(()=>{
 
   });
 
-},800); // faster updates
+},800);
 
 /* ================= START ================= */
 
