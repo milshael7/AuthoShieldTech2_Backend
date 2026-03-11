@@ -1,14 +1,10 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v3)
-// FIXED: Paper mode trading unlock + stable confidence gating
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v4)
+// STABLE: Paper trading unlocked + stable confidence model
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
-const memoryBrain = require("./memoryBrain");
 const { buildDecision } = require("./strategyEngine");
-const capitalProtection = require("./capitalProtection");
-const orderFlowEngine = require("./orderFlowEngine");
-const liquidityEngine = require("./liquidityEngine");
 
 /* ================= CONFIG ================= */
 
@@ -24,14 +20,8 @@ const CONFIDENCE_DECAY =
 const EDGE_MEMORY_DECAY =
   Number(process.env.TRADE_EDGE_MEMORY_DECAY || 0.88);
 
-const VOL_HIGH =
-  Number(process.env.TRADE_VOL_HIGH || 0.02);
-
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
-
-const STRONG_CONFIDENCE =
-  Number(process.env.TRADE_STRONG_CONFIDENCE || 0.82);
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
@@ -47,22 +37,21 @@ function getBrainState(tenantId){
   const key = tenantId || "__default__";
 
   if(!BRAIN_STATE.has(key)){
+
     BRAIN_STATE.set(key,{
       smoothedConfidence:0,
       edgeMomentum:0,
       lastAction:"WAIT",
-      lastDecisionTime:0,
-      winStreak:0,
-      lossStreak:0,
-      lastRealizedNet:0,
-      aggressionFactor:1
+      lastDecisionTime:0
     });
+
   }
 
   return BRAIN_STATE.get(key);
+
 }
 
-/* ================= UTILS ================= */
+/* ================= UTIL ================= */
 
 function safeNum(v,fallback=0){
   const n = Number(v);
@@ -126,13 +115,15 @@ function makeDecision(context={}){
   if(!ACTIONS.has(action))
     action="WAIT";
 
-  /* ================= POSITION NORMALIZATION ================= */
+  /* ================= POSITION RULES ================= */
 
-  // allow shorts in paper mode
-  if(!hasPosition && action==="SELL" && !isPaper)
+  if(!hasPosition && action==="CLOSE")
     action="WAIT";
 
   if(hasPosition && action==="BUY")
+    action="WAIT";
+
+  if(!hasPosition && action==="SELL" && !isPaper)
     action="WAIT";
 
   /* ================= AI OVERLAY ================= */
@@ -150,17 +141,17 @@ function makeDecision(context={}){
     const aiEdge = safeNum(ai.edge,0);
 
     confidence =
-      clamp((confidence*0.6)+(aiConf*0.4),0,1);
+      clamp((confidence*0.65)+(aiConf*0.35),0,1);
 
     edge =
-      clamp((edge*0.6)+(aiEdge*0.4),-1,1);
+      clamp((edge*0.65)+(aiEdge*0.35),-1,1);
 
   }catch{}
 
   /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
-    isPaper ? 0.25 : CONFIDENCE_DECAY;
+    isPaper ? 0.30 : CONFIDENCE_DECAY;
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * decay +
@@ -179,7 +170,7 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.18 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.20 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
@@ -226,7 +217,10 @@ function makeDecision(context={}){
     riskPct,
     ts:Date.now()
   };
+
 }
+
+/* ================= RESET ================= */
 
 function resetTenant(tenantId){
   BRAIN_STATE.delete(tenantId);
