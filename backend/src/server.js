@@ -141,6 +141,45 @@ function computeMetrics(snapshot){
   };
 }
 
+/* ================= START ALL TENANTS ================= */
+
+function bootTenants(){
+
+  try{
+
+    const db = readDb();
+
+    const usersList = db.users || [];
+
+    const tenants = new Set();
+
+    for(const u of usersList){
+
+      const tenantId = u.companyId || u.id;
+
+      if(tenantId)
+        tenants.add(tenantId);
+
+    }
+
+    for(const id of tenants){
+
+      marketEngine.registerTenant(id);
+
+      console.log("[AI] tenant initialized:",id);
+
+    }
+
+  }catch(err){
+
+    console.error("Tenant boot error:",err.message);
+
+  }
+
+}
+
+bootTenants();
+
 /* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
@@ -148,13 +187,9 @@ const wss = new WebSocketServer({
   path:"/ws"
 });
 
-/* ================= SAFE CLOSE ================= */
-
 function closeWs(ws){
   try{ws.close()}catch{}
 }
-
-/* ================= CONNECTION ================= */
 
 wss.on("connection",(ws,req)=>{
 
@@ -192,10 +227,6 @@ wss.on("connection",(ws,req)=>{
     marketEngine.registerTenant(tenantId);
 
     ws.on("pong",()=>{ws.isAlive=true});
-
-    ws.on("error",()=>{
-      try{ws.terminate()}catch{}
-    });
 
   }
   catch{
