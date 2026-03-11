@@ -92,10 +92,10 @@ app.use("/api/soc", require("./routes/soc.routes"));
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* FIXED: allow frontend AI control panel to work */
+/* AI control panel route */
 app.use("/api/ai", tradingRoutes);
 
-/* existing trading routes */
+/* normal trading routes */
 app.use("/api/trading", tradingRoutes);
 
 /* ================= ZERO TRUST ================= */
@@ -130,6 +130,7 @@ function computeMetrics(snapshot){
   const stats = snapshot?.executionStats || {};
 
   const decisions = Number(stats.decisions || 0);
+
   const uptimeMinutes =
     (Date.now() - ENGINE_START_TIME) / 60000;
 
@@ -147,7 +148,7 @@ function computeMetrics(snapshot){
   };
 }
 
-/* ================= START ALL TENANTS ================= */
+/* ================= START TENANTS ================= */
 
 function bootTenants(){
 
@@ -155,6 +156,7 @@ function bootTenants(){
 
     const db = readDb();
     const usersList = db.users || [];
+
     const tenants = new Set();
 
     for(const u of usersList){
@@ -183,6 +185,48 @@ function bootTenants(){
 }
 
 bootTenants();
+
+/* ================= ENGINE SAFETY LOOP ================= */
+/* ensures AI keeps running even if no websocket clients */
+
+setInterval(()=>{
+
+  try{
+
+    const db = readDb();
+    const usersList = db.users || [];
+
+    for(const u of usersList){
+
+      const tenantId = u.companyId || u.id;
+
+      if(!tenantId) continue;
+
+      const snapshot =
+        marketEngine.getMarketSnapshot(tenantId);
+
+      if(!snapshot) continue;
+
+      for(const sym of Object.keys(snapshot)){
+
+        const price = snapshot[sym]?.price;
+
+        if(!price) continue;
+
+        paperTrader.tick(
+          tenantId,
+          sym,
+          price,
+          Date.now()
+        );
+
+      }
+
+    }
+
+  }catch{}
+
+},1000);
 
 /* ================= WEBSOCKET ================= */
 
@@ -278,6 +322,7 @@ setInterval(()=>{
           marketEngine.getMarketSnapshot(ws.tenantId);
 
         cache.set(ws.tenantId,snapshot);
+
       }
 
       ws.send(JSON.stringify({
@@ -319,10 +364,13 @@ setInterval(()=>{
 
         channel:"paper",
         type:"engine",
+
         snapshot,
         decisions,
         metrics,
+
         engineStart:ENGINE_START_TIME,
+
         ts:Date.now()
 
       }));
