@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v5)
-// STABLE: Paper trading unlocked + stable confidence model
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v6)
+// FIXED: correct position flipping + stable confidence model
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
@@ -79,7 +79,7 @@ function makeDecision(context={}){
   const price = safeNum(last,NaN);
 
   const limits = paper.limits || {};
-  const hasPosition = !!paper.position;
+  const pos = paper.position || null;
 
   const tradesToday = safeNum(limits.tradesToday,0);
   const lossesToday = safeNum(limits.lossesToday,0);
@@ -117,13 +117,20 @@ function makeDecision(context={}){
 
   /* ================= POSITION RULES ================= */
 
-  if(!hasPosition && action==="CLOSE")
+  if(!pos && action==="CLOSE")
     action="WAIT";
 
-  if(hasPosition && action==="BUY")
-    action="WAIT";
+  if(pos){
 
-  if(!hasPosition && action==="SELL" && !isPaper)
+    if(pos.side==="LONG" && action==="BUY")
+      action="WAIT";
+
+    if(pos.side==="SHORT" && action==="SELL")
+      action="WAIT";
+
+  }
+
+  if(!pos && action==="SELL" && !isPaper)
     action="WAIT";
 
   /* ================= AI OVERLAY ================= */
