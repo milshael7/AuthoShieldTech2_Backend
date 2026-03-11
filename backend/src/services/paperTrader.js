@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v6
-// FIXED: Warmup + Stable Volatility + Safe Execution
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v7
+// FIXED: Execution stability + correct equity + warmup logging
 // ==========================================================
 
 const fs = require("fs");
@@ -21,11 +21,13 @@ const START_BAL =
 
 const BASE_PATH =
   process.env.PAPER_STATE_DIR ||
-  path.join("/tmp", "paper_trader");
+  path.join("/tmp","paper_trader");
 
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
+
 const SAVE_INTERVAL_MS = 5000;
+
 const WARMUP_TICKS =
   Number(process.env.PAPER_WARMUP_TICKS || 25);
 
@@ -54,9 +56,9 @@ function defaultState(){
     decisions:[],
     volatility:0.003,
     lastPrice:null,
-    realized:{ wins:0, losses:0, net:0 },
-    limits:{ tradesToday:0, lossesToday:0 },
-    executionStats:{ ticks:0, decisions:0, trades:0 },
+    realized:{wins:0,losses:0,net:0},
+    limits:{tradesToday:0,lossesToday:0},
+    executionStats:{ticks:0,decisions:0,trades:0},
     lastResetDay:null,
     _dirty:false,
     _lastSave:0,
@@ -92,14 +94,16 @@ function load(tenantId){
 
 function resetDailyLimits(state){
 
-  const today = new Date().toISOString().slice(0,10);
+  const today =
+    new Date().toISOString().slice(0,10);
 
   if(state.lastResetDay !== today){
+
     state.limits.tradesToday = 0;
     state.limits.lossesToday = 0;
+
     state.lastResetDay = today;
   }
-
 }
 
 /* ================= SAVE ================= */
@@ -109,11 +113,12 @@ function scheduleSave(tenantId,state){
   const now = Date.now();
 
   if(!state._dirty) return;
+
   if(now - state._lastSave < SAVE_INTERVAL_MS)
     return;
 
-  state._dirty = false;
-  state._lastSave = now;
+  state._dirty=false;
+  state._lastSave=now;
 
   const file = statePath(tenantId);
 
@@ -131,9 +136,10 @@ function scheduleSave(tenantId,state){
       fs.renameSync(tmp,file);
     }catch{}
   });
+
 }
 
-/* ================= CONFIG FROM DB ================= */
+/* ================= CONFIG ================= */
 
 function getTradingConfig(tenantId){
 
@@ -180,10 +186,10 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(!state.running) return;
   if(!cfg.enabled) return;
   if(cfg.tradingMode !== "paper") return;
-  if(!Number.isFinite(price) || price <= 0) return;
+  if(!Number.isFinite(price) || price<=0) return;
   if(state._locked) return;
 
-  state._locked = true;
+  state._locked=true;
 
   try{
 
@@ -198,13 +204,17 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     const prev = state.lastPrice;
 
     if(prev){
+
       const change =
-        Math.abs(price - prev) / prev;
+        Math.abs(price-prev)/prev;
 
       state.volatility =
-        state.volatility * 0.9 + change * 0.1;
-    }else{
-      state.volatility = 0.003;
+        Math.max(
+          0.0005,
+          state.volatility*0.9 +
+          change*0.1
+        );
+
     }
 
     state.lastPrice = price;
@@ -212,16 +222,28 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     /* ============== WARMUP ============== */
 
     if(state.executionStats.ticks < WARMUP_TICKS){
-      state._dirty = true;
+
+      state.decisions.push({
+        time:ts,
+        symbol,
+        action:"WAIT",
+        confidence:0,
+        price
+      });
+
+      state._dirty=true;
       scheduleSave(tenantId,state);
       return;
     }
 
     if(state.limits.tradesToday >= cfg.maxTrades){
-      state._dirty = true;
+
+      state._dirty=true;
       scheduleSave(tenantId,state);
       return;
     }
+
+    /* ============== DECISION ============== */
 
     const plan =
       makeDecision({
@@ -229,18 +251,16 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         symbol,
         last:price,
         paper:state,
-        ticksSeen: state.executionStats.ticks,
-        strategyMode: cfg.strategyMode
+        ticksSeen:state.executionStats.ticks
       }) || {
         action:"WAIT",
         confidence:0,
-        edge:0,
         riskPct:0
       };
 
     plan.riskPct =
-      (Number(cfg.riskPercent || 1.5) / 100) *
-      Number(cfg.positionMultiplier || 1);
+      (Number(cfg.riskPercent)/100) *
+      Number(cfg.positionMultiplier);
 
     state.executionStats.decisions++;
 
@@ -248,73 +268,101 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       time:ts,
       symbol,
       action:plan.action,
-      confidence:Number(plan.confidence || 0),
+      confidence:Number(plan.confidence||0),
       price,
-      riskPct:Number(plan.riskPct || 0),
-      volatility:Number(state.volatility || 0)
+      riskPct:Number(plan.riskPct||0),
+      volatility:Number(state.volatility||0)
     });
 
-    if(state.decisions.length > MAX_DECISIONS_MEMORY){
+    if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
-    }
+
+    /* ============== EXECUTION ============== */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
-      const exec =
-        executionEngine.executePaperOrder({
-          tenantId,
-          symbol,
-          action:plan.action,
-          price,
-          riskPct:plan.riskPct,
-          state,
-          ts
-        });
+      let exec=null;
+
+      try{
+
+        exec =
+          executionEngine.executePaperOrder({
+            tenantId,
+            symbol,
+            action:plan.action,
+            price,
+            riskPct:plan.riskPct,
+            state,
+            ts
+          });
+
+      }catch{}
 
       if(exec?.result){
 
         state.executionStats.trades++;
         state.limits.tradesToday++;
 
-        const pnl = Number(exec.result.pnl || 0);
+        const pnl =
+          Number(exec.result.pnl||0);
 
         state.trades.push({
           time:ts,
           symbol,
           side:plan.action,
           price,
-          qty:Number(exec.result.qty || 0),
+          qty:Number(exec.result.qty||0),
           profit:pnl
         });
 
-        if(pnl > 0){
+        if(pnl>0){
           state.realized.wins++;
-        }else if(pnl < 0){
+        }
+        else if(pnl<0){
           state.realized.losses++;
           state.limits.lossesToday++;
         }
 
-        state.realized.net += pnl;
-        state.equity = Number(state.cashBalance || state.equity || 0);
+        state.realized.net+=pnl;
 
-        if(state.equity > state.peakEquity){
-          state.peakEquity = state.equity;
-        }
-
-        if(state.trades.length > MAX_TRADES_MEMORY){
+        if(state.trades.length > MAX_TRADES_MEMORY)
           state.trades =
             state.trades.slice(-MAX_TRADES_MEMORY);
-        }
       }
+
     }
 
-    state._dirty = true;
+    /* ============== EQUITY ============== */
+
+    if(state.position){
+
+      const unrealized =
+        (state.lastPrice - state.position.entry)
+        * state.position.qty;
+
+      state.equity =
+        state.cashBalance + unrealized;
+
+    }
+    else{
+
+      state.equity =
+        state.cashBalance;
+
+    }
+
+    if(state.equity > state.peakEquity)
+      state.peakEquity = state.equity;
+
+    state._dirty=true;
     scheduleSave(tenantId,state);
 
   }
   finally{
-    state._locked = false;
+
+    state._locked=false;
+
   }
 
 }
@@ -326,34 +374,47 @@ function snapshot(tenantId){
   const s = load(tenantId);
 
   return JSON.parse(JSON.stringify({
+
     cashBalance:s.cashBalance,
     equity:s.equity,
     peakEquity:s.peakEquity,
+
     position:s.position,
     trades:s.trades,
     decisions:s.decisions,
+
     lastPrice:s.lastPrice,
     volatility:s.volatility,
+
     unrealizedPnL:
       s.position
-        ? (
-            s.position.side === "SHORT"
-              ? (s.position.entry - s.lastPrice) * s.position.qty
-              : (s.lastPrice - s.position.entry) * s.position.qty
-          )
+        ? (s.lastPrice - s.position.entry)
+          * s.position.qty
         : 0,
+
     executionStats:s.executionStats,
     realized:s.realized,
     limits:s.limits
+
   }));
 
 }
 
 module.exports = {
+
   tick,
   snapshot,
+
   getDecisions:
-    tenantId=>load(tenantId).decisions.slice(-50),
+    tenantId =>
+      load(tenantId)
+        .decisions.slice(-50),
+
   hardReset:
-    tenantId=>STATES.set(tenantId, defaultState())
+    tenantId =>
+      STATES.set(
+        tenantId,
+        defaultState()
+      )
+
 };
