@@ -1,13 +1,11 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE v2
-// Supports LONG + SHORT positions
+// EXECUTION ENGINE — PAPER TRADING CORE v3
+// FIXED: position flipping + stability improvements
 // ==========================================================
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
-
-/* ========================================================= */
 
 function safeNum(v,fallback=0){
   const n = Number(v);
@@ -23,9 +21,10 @@ function calculatePositionSize(state, price, riskPct){
   const equity =
     safeNum(state.equity, safeNum(state.cashBalance,0));
 
-  const riskCapital = equity * riskPct;
+  if(equity <= 0 || price <= 0)
+    return 0;
 
-  if(price <= 0) return 0;
+  const riskCapital = equity * riskPct;
 
   const qty = riskCapital / price;
 
@@ -139,11 +138,30 @@ function executePaperOrder({
 
     if(pos){
 
-      if(pos.side === "SHORT"){
-        return closePosition({state,price,ts});
+      if(pos.side === "LONG"){
+        return null;
       }
 
-      return null;
+      if(pos.side === "SHORT"){
+
+        closePosition({state,price,ts});
+
+        const qty =
+          calculatePositionSize(state,price,riskPct);
+
+        if(qty <= 0) return null;
+
+        return openPosition({
+          state,
+          symbol,
+          price,
+          qty,
+          side:"LONG",
+          ts
+        });
+
+      }
+
     }
 
     const qty =
@@ -168,11 +186,30 @@ function executePaperOrder({
 
     if(pos){
 
-      if(pos.side === "LONG"){
-        return closePosition({state,price,ts});
+      if(pos.side === "SHORT"){
+        return null;
       }
 
-      return null;
+      if(pos.side === "LONG"){
+
+        closePosition({state,price,ts});
+
+        const qty =
+          calculatePositionSize(state,price,riskPct);
+
+        if(qty <= 0) return null;
+
+        return openPosition({
+          state,
+          symbol,
+          price,
+          qty,
+          side:"SHORT",
+          ts
+        });
+
+      }
+
     }
 
     const qty =
@@ -208,8 +245,6 @@ function executePaperOrder({
   return null;
 
 }
-
-/* ========================================================= */
 
 module.exports = {
   executePaperOrder
