@@ -1,5 +1,5 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v4)
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v5)
 // STABLE: Paper trading unlocked + stable confidence model
 // -----------------------------------------------------------
 
@@ -170,7 +170,7 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.20 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.12 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
@@ -201,9 +201,10 @@ function makeDecision(context={}){
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
 
+  /* ================= WAIT HANDLING ================= */
+
   if(action==="WAIT"){
-    confidence=0;
-    edge=0;
+    edge = edge * 0.5;
   }
 
   brain.lastAction = action;
