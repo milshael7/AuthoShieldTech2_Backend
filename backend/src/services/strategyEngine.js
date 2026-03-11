@@ -1,6 +1,6 @@
 // ==========================================================
 // STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
-// FIXED: AI inactivity + dashboard metrics
+// STABLE VERSION — Regime Fix + Signal Stability
 // ==========================================================
 
 const fs = require("fs");
@@ -20,7 +20,6 @@ BASE CONFIG (PAPER FRIENDLY)
 
 const BASE_CONFIG = Object.freeze({
 
-  // lowered thresholds so AI actually trades
   minConfidence:Number(process.env.TRADE_MIN_CONF || 0.15),
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
 
@@ -126,12 +125,11 @@ function computeEdge({price,lastPrice,volatility,regime}){
 }
 
 /* =========================================================
-CONFIDENCE MODEL (FASTER)
+CONFIDENCE MODEL
 ========================================================= */
 
 function computeConfidence({edge,ticksSeen,regime}){
 
-  // warmup phase
   if(ticksSeen < 10)
     return 0.35;
 
@@ -144,6 +142,19 @@ function computeConfidence({edge,ticksSeen,regime}){
     base *= 0.9;
 
   return clamp(base,0,1);
+}
+
+/* =========================================================
+REGIME NORMALIZER
+========================================================= */
+
+function normalizeRegime(regime){
+
+  if(regime === "volatility_expansion")
+    return "expansion";
+
+  return regime;
+
 }
 
 /* =========================================================
@@ -163,12 +174,14 @@ function buildDecision(context={}){
 
   const learning = loadLearning(tenantId);
 
-  const regime =
+  let regime =
     regimeMemory.detectRegime({
       price,
       lastPrice,
       volatility
     });
+
+  regime = normalizeRegime(regime);
 
   let edge =
     computeEdge({
