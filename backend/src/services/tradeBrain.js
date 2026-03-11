@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v2)
-// FIXED: Proper ticksSeen propagation + paper confidence unlock
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v3)
+// FIXED: Paper mode trading unlock + stable confidence gating
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
@@ -82,7 +82,7 @@ function makeDecision(context={}){
     symbol="BTCUSDT",
     last,
     paper={},
-    ticksSeen = 0   // 🔥 FIXED: accept ticksSeen directly
+    ticksSeen = 0
   } = context;
 
   const brain = getBrainState(tenantId);
@@ -105,16 +105,18 @@ function makeDecision(context={}){
   let strategy = {};
 
   try{
+
     strategy = buildDecision({
       tenantId,
       symbol,
       price,
       lastPrice:paper.lastPrice,
       volatility,
-      ticksSeen,   // 🔥 now correct
+      ticksSeen,
       limits,
       paperState:paper
     }) || {};
+
   }catch{}
 
   let action = strategy.action || "WAIT";
@@ -126,7 +128,8 @@ function makeDecision(context={}){
 
   /* ================= POSITION NORMALIZATION ================= */
 
-  if(!hasPosition && action==="SELL")
+  // allow shorts in paper mode
+  if(!hasPosition && action==="SELL" && !isPaper)
     action="WAIT";
 
   if(hasPosition && action==="BUY")
@@ -135,6 +138,7 @@ function makeDecision(context={}){
   /* ================= AI OVERLAY ================= */
 
   try{
+
     const ai = aiBrain.decide({
       tenantId,
       symbol,
@@ -156,7 +160,7 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
-    isPaper ? 0.6 : CONFIDENCE_DECAY;
+    isPaper ? 0.25 : CONFIDENCE_DECAY;
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * decay +
@@ -175,13 +179,12 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.35 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.18 : MIN_CONFIDENCE_TO_TRADE;
 
-  if(confidence < dynamicThreshold){
+  if(confidence < dynamicThreshold)
     action="WAIT";
-  }
 
-  /* ================= HARD SAFETY (Live Strict) ================= */
+  /* ================= HARD SAFETY ================= */
 
   if(!isPaper){
 
@@ -196,6 +199,7 @@ function makeDecision(context={}){
 
     if(lossesToday >= MAX_LOSS_STREAK)
       action="WAIT";
+
   }
 
   /* ================= RISK ================= */
