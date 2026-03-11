@@ -1,6 +1,6 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// Enterprise Style: Persistent State + Regime Driven Markets
+// FIXED: AI loop + guaranteed paperTrader ticks
 // ==========================================================
 
 const fs = require("fs");
@@ -45,78 +45,19 @@ const MAX_CANDLES = 2000;
 
 const TENANTS = new Map();
 
-/* ================= REGIME STATE ================= */
-
-const REGIMES = new Map();
-
 /* ================= UTIL ================= */
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
-function nextRegime(){
+function simulate(price,baseVol){
 
-  const r = Math.random();
+  const drift = (Math.random()-0.5)*2*baseVol;
 
-  if(r < 0.15) return "trend_up";
-  if(r < 0.30) return "trend_down";
-  if(r < 0.40) return "spike";
+  const next = price*(1+drift);
 
-  return "sideways";
-}
-
-/* ================= SIMULATION ================= */
-
-function simulate(symbol,price,baseVol){
-
-  let regime = REGIMES.get(symbol);
-
-  if(!regime || Date.now() > regime.until){
-
-    regime = {
-      type: nextRegime(),
-      until: Date.now() + (30000 + Math.random()*90000)
-    };
-
-    REGIMES.set(symbol,regime);
-  }
-
-  let vol = baseVol;
-  let drift = 0;
-
-  switch(regime.type){
-
-    case "trend_up":
-      drift = baseVol * 0.8;
-      vol *= 2;
-      break;
-
-    case "trend_down":
-      drift = -baseVol * 0.8;
-      vol *= 2;
-      break;
-
-    case "spike":
-      vol *= 8;
-      break;
-
-    case "sideways":
-      vol *= 0.6;
-      break;
-
-  }
-
-  const random =
-    (Math.random()-0.5) * 2 * vol;
-
-  const next =
-    price * (1 + drift + random);
-
-  return Number(
-    clamp(next,0.0000001,1e12)
-      .toFixed(8)
-  );
+  return Number(clamp(next,0.0000001,1e12).toFixed(8));
 }
 
 /* ================= LOAD / SAVE ================= */
@@ -166,11 +107,11 @@ function registerTenant(tenantId){
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const start = SYMBOLS[sym].start;
+    const start=SYMBOLS[sym].start;
 
-    state.prices[sym] = start;
+    state.prices[sym]=start;
 
-    state.candles[sym] = [{
+    state.candles[sym]=[{
       t:Date.now(),
       o:start,
       h:start,
@@ -187,11 +128,11 @@ function registerTenant(tenantId){
 
 function updateCandle(state,symbol,price){
 
-  const arr = state.candles[symbol];
-  const last = arr[arr.length-1];
-  const now = Date.now();
+  const arr=state.candles[symbol];
+  const last=arr[arr.length-1];
+  const now=Date.now();
 
-  if(now-last.t >= CANDLE_MS){
+  if(now-last.t>=CANDLE_MS){
 
     arr.push({
       t:now,
@@ -201,17 +142,17 @@ function updateCandle(state,symbol,price){
       c:price
     });
 
-    if(arr.length > MAX_CANDLES){
+    if(arr.length>MAX_CANDLES){
       arr.splice(0,arr.length-MAX_CANDLES);
     }
 
   }
 
-  const cur = arr[arr.length-1];
+  const cur=arr[arr.length-1];
 
-  cur.h = Math.max(cur.h,price);
-  cur.l = Math.min(cur.l,price);
-  cur.c = price;
+  cur.h=Math.max(cur.h,price);
+  cur.l=Math.min(cur.l,price);
+  cur.c=price;
 
 }
 
@@ -219,17 +160,18 @@ function updateCandle(state,symbol,price){
 
 function tickTenant(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return;
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const base = SYMBOLS[sym].vol;
-    const prev = state.prices[sym];
+    const base=SYMBOLS[sym].vol;
 
-    const next = simulate(sym,prev,base);
+    const prev=state.prices[sym];
 
-    state.prices[sym] = next;
+    const next=simulate(prev,base);
+
+    state.prices[sym]=next;
 
     updateCandle(state,sym,next);
 
@@ -241,16 +183,28 @@ function tickTenant(tenantId){
 
 function runAI(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return;
 
   for(const sym of Object.keys(state.prices)){
 
-    const price = state.prices[sym];
+    const price=state.prices[sym];
 
     try{
-      paperTrader.tick(tenantId,sym,price);
-    }catch{}
+
+      // 🔥 THIS IS THE CRITICAL CALL
+      paperTrader.tick(
+        tenantId,
+        sym,
+        price,
+        Date.now()
+      );
+
+    }catch(e){
+
+      console.error("AI tick error:",e.message);
+
+    }
 
   }
 
@@ -260,7 +214,7 @@ function runAI(tenantId){
 
 function getMarketSnapshot(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return {};
 
   const out={};
@@ -279,10 +233,10 @@ function getMarketSnapshot(tenantId){
 
 function getCandles(tenantId,symbol,limit=200){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return [];
 
-  const arr = state.candles[symbol] || [];
+  const arr=state.candles[symbol]||[];
 
   return arr.slice(-limit).map(c=>({
     time:Math.floor(c.t/1000),
