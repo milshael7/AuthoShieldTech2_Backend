@@ -1,6 +1,6 @@
 // ==========================================================
 // STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
-// FIXED: Trade frequency + realistic paper trading
+// FIXED: AI inactivity + dashboard metrics
 // ==========================================================
 
 const fs = require("fs");
@@ -20,7 +20,8 @@ BASE CONFIG (PAPER FRIENDLY)
 
 const BASE_CONFIG = Object.freeze({
 
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.18),
+  // lowered thresholds so AI actually trades
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.15),
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
@@ -125,11 +126,12 @@ function computeEdge({price,lastPrice,volatility,regime}){
 }
 
 /* =========================================================
-CONFIDENCE MODEL (FAST FOR PAPER)
+CONFIDENCE MODEL (FASTER)
 ========================================================= */
 
 function computeConfidence({edge,ticksSeen,regime}){
 
+  // warmup phase
   if(ticksSeen < 10)
     return 0.35;
 
