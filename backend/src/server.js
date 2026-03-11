@@ -89,9 +89,14 @@ app.use("/api/soc", require("./routes/soc.routes"));
 
 /* ================= TRADING ================= */
 
-app.use("/api/paper",paperRoutes);
-app.use("/api/market",marketRoutes);
-app.use("/api/trading",tradingRoutes);
+app.use("/api/paper", paperRoutes);
+app.use("/api/market", marketRoutes);
+
+/* FIXED: allow frontend AI control panel to work */
+app.use("/api/ai", tradingRoutes);
+
+/* existing trading routes */
+app.use("/api/trading", tradingRoutes);
 
 /* ================= ZERO TRUST ================= */
 
@@ -102,6 +107,7 @@ app.use("/api",(req,res,next)=>{
     req.path.startsWith("/market") ||
     req.path.startsWith("/paper") ||
     req.path.startsWith("/trading") ||
+    req.path.startsWith("/ai") ||
     req.path.startsWith("/admin")
   ){
     return next();
@@ -148,9 +154,7 @@ function bootTenants(){
   try{
 
     const db = readDb();
-
     const usersList = db.users || [];
-
     const tenants = new Set();
 
     for(const u of usersList){
@@ -315,14 +319,10 @@ setInterval(()=>{
 
         channel:"paper",
         type:"engine",
-
         snapshot,
         decisions,
-
         metrics,
-
         engineStart:ENGINE_START_TIME,
-
         ts:Date.now()
 
       }));
