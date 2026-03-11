@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v7
-// FIXED: Execution stability + correct equity + warmup logging
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v8
+// FIXED: Faster warmup + optional unlimited paper trades
 // ==========================================================
 
 const fs = require("fs");
@@ -28,8 +28,10 @@ const MAX_DECISIONS_MEMORY = 200;
 
 const SAVE_INTERVAL_MS = 5000;
 
+/* FIXED: faster AI warmup */
+
 const WARMUP_TICKS =
-  Number(process.env.PAPER_WARMUP_TICKS || 25);
+  Number(process.env.PAPER_WARMUP_TICKS || 8);
 
 /* ================= FS ================= */
 
@@ -236,8 +238,12 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       return;
     }
 
-    if(state.limits.tradesToday >= cfg.maxTrades){
+    /* FIXED: unlimited trades allowed if maxTrades = 0 */
 
+    if(
+      cfg.maxTrades > 0 &&
+      state.limits.tradesToday >= cfg.maxTrades
+    ){
       state._dirty=true;
       scheduleSave(tenantId,state);
       return;
