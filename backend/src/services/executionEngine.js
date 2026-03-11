@@ -1,278 +1,210 @@
 // ==========================================================
-// Institutional Trading Control API — FINAL
-// Dashboard + Market + Paper + Live + Risk + AI
-// Tenant Safe • Role Protected • Snapshot Accurate
+// EXECUTION ENGINE — PAPER TRADING CORE
+// Handles order execution, PnL, and position management
 // ==========================================================
 
-const express = require("express");
-const router = express.Router();
-
-const { authRequired, requireRole } = require("../middleware/auth");
-const { audit } = require("../lib/audit");
-
-const paperTrader = require("../services/paperTrader");
-const liveTrader = require("../services/liveTrader");
-const riskManager = require("../services/riskManager");
-const portfolioManager = require("../services/portfolioManager");
-const aiBrain = require("../services/aiBrain");
-const executionEngine = require("../services/executionEngine");
-const exchangeRouter = require("../services/exchangeRouter");
-const marketEngine = require("../services/marketEngine");
-
-// ---------------- ROLES ----------------
-
-const ADMIN = "Admin";
-const MANAGER = "Manager";
+function clamp(n,min,max){
+  return Math.max(min,Math.min(max,n));
+}
 
 /* =========================================================
-AI CONFIG STORAGE
+UTILS
 ========================================================= */
 
-const AI_CONFIG = new Map();
+function safeNum(v,fallback=0){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-function getAIConfig(tenantId){
+/* =========================================================
+POSITION SIZE
+========================================================= */
 
-  if(!AI_CONFIG.has(tenantId)){
+function calculatePositionSize(state, price, riskPct){
 
-    AI_CONFIG.set(tenantId,{
-      enabled:true,
-      tradingMode:"paper",
-      maxTrades:5,
-      riskPercent:1.5,
-      positionMultiplier:1,
-      strategyMode:"Balanced"
-    });
+  const equity =
+    safeNum(state.equity, safeNum(state.cashBalance,0));
 
-  }
+  const riskCapital = equity * riskPct;
 
-  return AI_CONFIG.get(tenantId);
+  if(price <= 0) return 0;
+
+  const qty = riskCapital / price;
+
+  return clamp(qty,0,1e12);
+}
+
+/* =========================================================
+OPEN POSITION
+========================================================= */
+
+function openPosition({
+  state,
+  symbol,
+  price,
+  qty,
+  side,
+  ts
+}){
+
+  state.position = {
+    symbol,
+    side,
+    entry: price,
+    qty,
+    time: ts
+  };
+
+  return {
+    result:{
+      side,
+      price,
+      qty,
+      pnl:0
+    }
+  };
 
 }
 
 /* =========================================================
-PUBLIC
+CLOSE POSITION
 ========================================================= */
 
-router.get("/symbols",(req,res)=>{
+function closePosition({
+  state,
+  price,
+  ts
+}){
 
-  return res.json({
-    ok:true,
-    symbols:["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
-  });
+  const pos = state.position;
 
-});
+  if(!pos) return null;
 
-/* =========================================================
-AUTH
-========================================================= */
+  let pnl = 0;
 
-router.use(authRequired);
+  if(pos.side === "LONG"){
 
-/* =========================================================
-MARKET
-========================================================= */
+    pnl =
+      (price - pos.entry) *
+      pos.qty;
 
-router.get("/market/price/:symbol",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
+  }
 
-  const tenantId = req.tenant?.id;
-  const symbol = String(req.params.symbol || "").toUpperCase();
+  if(pos.side === "SHORT"){
 
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
+    pnl =
+      (pos.entry - price) *
+      pos.qty;
 
-  marketEngine.registerTenant(tenantId);
+  }
 
-  const price =
-    marketEngine.getPrice(tenantId,symbol);
+  state.cashBalance =
+    safeNum(state.cashBalance) + pnl;
 
-  return res.json({
-    ok:true,
-    tenantId,
-    symbol,
-    price
-  });
+  state.equity = state.cashBalance;
 
-});
-
-router.get("/market/candles/:symbol",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
-
-  const tenantId = req.tenant?.id;
-  const symbol = String(req.params.symbol || "").toUpperCase();
-  const limit = Number(req.query.limit || 200);
-
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
-  marketEngine.registerTenant(tenantId);
-
-  const candles =
-    marketEngine.getCandles(
-      tenantId,
-      symbol,
-      limit
-    );
-
-  return res.json({
-    ok:true,
-    tenantId,
-    symbol,
-    candles
-  });
-
-});
-
-/* =========================================================
-MANUAL ORDER ROUTE  (THIS IS THE IMPORTANT PART)
-========================================================= */
-
-router.post("/paper/order",
-requireRole(ADMIN,MANAGER),
-async (req,res)=>{
-
-  const tenantId = req.tenant?.id;
-
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
-  const {
-    symbol,
-    side,
-    type,
-    qty,
+  const trade = {
+    side:"CLOSE",
     price,
-    risk
-  } = req.body || {};
+    qty:pos.qty,
+    pnl,
+    time:ts
+  };
 
-  if(!symbol || !side)
-    return res.status(400).json({
-      ok:false,
-      error:"Invalid order request"
-    });
+  state.position = null;
 
-  try{
+  return { result:trade };
 
-    const state =
-      paperTrader.snapshot(tenantId);
+}
 
-    const result =
-      await executionEngine.executeOrder({
+/* =========================================================
+MAIN EXECUTION
+========================================================= */
 
-        tenantId,
-        symbol:String(symbol).toUpperCase(),
-        action:side.toUpperCase(),
-        price:Number(price),
-        riskPct:Number(risk || 0.01),
-        state
+function executePaperOrder({
 
-      });
+  tenantId,
+  symbol,
+  action,
+  price,
+  riskPct,
+  state,
+  ts = Date.now()
 
-    if(!result){
+}){
 
-      return res.json({
-        ok:false,
-        error:"Order rejected"
-      });
+  if(!state) return null;
+  if(!symbol) return null;
+  if(!Number.isFinite(price)) return null;
 
-    }
+  riskPct = clamp(
+    safeNum(riskPct,0.01),
+    0.001,
+    0.1
+  );
 
-    return res.json({
-      ok:true,
-      result
+  const pos = state.position;
+
+  /* ================= BUY ================= */
+
+  if(action === "BUY"){
+
+    if(pos) return null;
+
+    const qty =
+      calculatePositionSize(
+        state,
+        price,
+        riskPct
+      );
+
+    if(qty <= 0) return null;
+
+    return openPosition({
+      state,
+      symbol,
+      price,
+      qty,
+      side:"LONG",
+      ts
     });
 
   }
-  catch(err){
 
-    return res.json({
-      ok:false,
-      error:String(err?.message || err)
+  /* ================= SELL ================= */
+
+  if(action === "SELL"){
+
+    if(!pos) return null;
+
+    return closePosition({
+      state,
+      price,
+      ts
     });
 
   }
 
-});
+  /* ================= CLOSE ================= */
 
-/* =========================================================
-PAPER SNAPSHOT
-========================================================= */
+  if(action === "CLOSE"){
 
-router.get("/paper/snapshot",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
+    if(!pos) return null;
 
-  const tenantId = req.tenant?.id;
+    return closePosition({
+      state,
+      price,
+      ts
+    });
 
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
+  }
 
-  marketEngine.registerTenant(tenantId);
+  return null;
 
-  const snapshot =
-    paperTrader.snapshot(tenantId);
-
-  return res.json({
-    ok:true,
-    tenantId,
-    snapshot
-  });
-
-});
-
-/* =========================================================
-AI CONFIG
-========================================================= */
-
-router.get("/ai/config",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
-
-  const tenantId = req.tenant?.id;
-
-  const config = getAIConfig(tenantId);
-
-  return res.json({
-    ok:true,
-    config,
-    engine:"RUNNING"
-  });
-
-});
-
-router.post("/ai/config",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
-
-  const tenantId = req.tenant?.id;
-
-  const cfg = getAIConfig(tenantId);
-
-  const {
-    enabled,
-    tradingMode,
-    maxTrades,
-    riskPercent,
-    positionMultiplier,
-    strategyMode
-  } = req.body || {};
-
-  cfg.enabled = Boolean(enabled);
-  cfg.tradingMode = tradingMode || "paper";
-  cfg.maxTrades = Number(maxTrades || 5);
-  cfg.riskPercent = Number(riskPercent || 1.5);
-  cfg.positionMultiplier = Number(positionMultiplier || 1);
-  cfg.strategyMode = strategyMode || "Balanced";
-
-  return res.json({
-    ok:true,
-    config:cfg
-  });
-
-});
+}
 
 /* ========================================================= */
 
-module.exports = router;
+module.exports = {
+  executePaperOrder
+};
