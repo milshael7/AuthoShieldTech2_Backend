@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v3
-// FIXED: AI config wiring + engine health
+// Institutional Trading Control API — STABLE ENTERPRISE v4
+// FIXED: AI config wiring + engine health detection
 // ==========================================================
 
 const express = require("express");
@@ -18,6 +18,21 @@ const { readDb, writeDb } = require("../lib/db");
 
 const ADMIN = "Admin";
 const MANAGER = "Manager";
+
+/* =========================================================
+TENANT SAFE ACCESS
+========================================================= */
+
+function getTenantId(req){
+
+  return (
+    req.tenant?.id ||
+    req.user?.companyId ||
+    req.user?.id ||
+    null
+  );
+
+}
 
 /* =========================================================
 AI CONFIG (ENGINE CONNECTED)
@@ -73,7 +88,7 @@ router.get("/market/price/:symbol",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
   const symbol = String(req.params.symbol || "").toUpperCase();
 
   if(!tenantId)
@@ -97,7 +112,7 @@ router.get("/market/candles/:symbol",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
   const symbol = String(req.params.symbol || "").toUpperCase();
   const limit = Number(req.query.limit || 200);
 
@@ -130,7 +145,7 @@ router.post("/paper/order",
 requireRole(ADMIN,MANAGER),
 async (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
 
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
@@ -202,7 +217,7 @@ router.get("/paper/snapshot",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
 
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
@@ -221,6 +236,33 @@ requireRole(ADMIN,MANAGER),
 });
 
 /* =========================================================
+ENGINE HEALTH DETECTOR
+========================================================= */
+
+function getEngineHealth(tenantId){
+
+  try{
+
+    const snap =
+      paperTrader.snapshot(tenantId);
+
+    const ticks =
+      snap?.executionStats?.ticks || 0;
+
+    if(ticks > 0)
+      return "RUNNING";
+
+    return "STARTING";
+
+  }catch{
+
+    return "UNKNOWN";
+
+  }
+
+}
+
+/* =========================================================
 AI CONFIG
 ========================================================= */
 
@@ -228,14 +270,20 @@ router.get("/ai/config",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   const config = getAIConfig(tenantId);
+
+  const engine =
+    getEngineHealth(tenantId);
 
   return res.json({
     ok:true,
     config,
-    engine:"RUNNING"
+    engine
   });
 
 });
@@ -244,7 +292,7 @@ router.post("/ai/config",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
-  const tenantId = req.tenant?.id;
+  const tenantId = getTenantId(req);
 
   const db = readDb();
   db.tradingConfig = db.tradingConfig || {};
@@ -271,10 +319,13 @@ requireRole(ADMIN,MANAGER),
 
   writeDb(db);
 
+  const engine =
+    getEngineHealth(tenantId);
+
   return res.json({
     ok:true,
     config:cfg,
-    engine:"RUNNING"
+    engine
   });
 
 });
