@@ -1,31 +1,49 @@
 // ==========================================================
-// MARKET ENGINE — REALTIME SIMULATED EXCHANGE
-// Multi-Tenant • High Frequency • Deterministic
-// UPGRADED: Multi-Symbol AI + Stable Engine
+// MARKET ENGINE — Persistent Real-Time Exchange Simulator
+// Enterprise Style: Persistent State + Volatility Regimes
 // ==========================================================
 
+const fs = require("fs");
+const path = require("path");
 const paperTrader = require("./paperTrader");
 
-const TENANTS = new Map();
+/* ================= STORAGE ================= */
+
+const STATE_DIR =
+  process.env.MARKET_STATE_DIR ||
+  path.join("/tmp","market_engine");
+
+function ensureDir(){
+  if(!fs.existsSync(STATE_DIR))
+    fs.mkdirSync(STATE_DIR,{recursive:true});
+}
+
+function stateFile(tenantId){
+  ensureDir();
+  return path.join(STATE_DIR,`market_${tenantId}.json`);
+}
 
 /* ================= CONFIG ================= */
 
 const SYMBOLS = {
-  BTCUSDT: { start: 65000, vol: 0.0025 },
-  ETHUSDT: { start: 3500, vol: 0.003 },
-  SOLUSDT: { start: 150, vol: 0.004 },
-  EURUSD: { start: 1.08, vol: 0.0004 },
-  GBPUSD: { start: 1.27, vol: 0.0004 },
-  SPX: { start: 5100, vol: 0.0007 },
-  NASDAQ: { start: 17800, vol: 0.0008 },
-  GOLD: { start: 2050, vol: 0.0006 }
+  BTCUSDT:{start:65000,vol:0.0025},
+  ETHUSDT:{start:3500,vol:0.003},
+  SOLUSDT:{start:150,vol:0.004},
+  EURUSD:{start:1.08,vol:0.0004},
+  GBPUSD:{start:1.27,vol:0.0004},
+  SPX:{start:5100,vol:0.0007},
+  NASDAQ:{start:17800,vol:0.0008},
+  GOLD:{start:2050,vol:0.0006}
 };
-
-const CANDLE_MS = 60000;
-const MAX_CANDLES = 2000;
 
 const MARKET_TICK_MS = 200;
 const AI_TICK_MS = 1000;
+const CANDLE_MS = 60000;
+const MAX_CANDLES = 2000;
+
+/* ================= TENANTS ================= */
+
+const TENANTS = new Map();
 
 /* ================= UTIL ================= */
 
@@ -33,36 +51,84 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
-function randomWalk(price,vol){
+function randomRegime(){
 
-  const drift = (Math.random() - 0.5) * 2 * vol;
+  const r = Math.random();
 
-  const next = price * (1 + drift);
+  if(r < 0.02) return "spike";
+  if(r < 0.12) return "trend";
 
-  return Number(
-    clamp(next,0.0000001,1e12).toFixed(8)
-  );
+  return "normal";
+}
+
+function simulate(price,baseVol){
+
+  const regime = randomRegime();
+
+  let vol = baseVol;
+
+  if(regime==="spike") vol*=6;
+  if(regime==="trend") vol*=3;
+
+  const drift = (Math.random()-0.5)*2*vol;
+
+  const next = price*(1+drift);
+
+  return Number(clamp(next,0.0000001,1e12).toFixed(8));
+}
+
+/* ================= LOAD / SAVE ================= */
+
+function loadState(tenantId){
+
+  const file = stateFile(tenantId);
+
+  if(!fs.existsSync(file)) return null;
+
+  try{
+    return JSON.parse(fs.readFileSync(file,"utf-8"));
+  }catch{
+    return null;
+  }
 
 }
 
-/* ================= TENANT INIT ================= */
+function saveState(tenantId,state){
+
+  try{
+    fs.writeFileSync(
+      stateFile(tenantId),
+      JSON.stringify(state)
+    );
+  }catch{}
+
+}
+
+/* ================= REGISTER ================= */
 
 function registerTenant(tenantId){
 
   if(TENANTS.has(tenantId)) return;
 
-  const state = {
+  const persisted = loadState(tenantId);
+
+  if(persisted){
+    TENANTS.set(tenantId,persisted);
+    return;
+  }
+
+  const state={
     prices:{},
     candles:{}
   };
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const start = SYMBOLS[sym].start;
+    const start=SYMBOLS[sym].start;
 
-    state.prices[sym] = start;
+    state.prices[sym]=start;
 
-    state.candles[sym] = [{
+    state.candles[sym]=[{
       t:Date.now(),
       o:start,
       h:start,
@@ -75,22 +141,54 @@ function registerTenant(tenantId){
   TENANTS.set(tenantId,state);
 }
 
+/* ================= CANDLES ================= */
+
+function updateCandle(state,symbol,price){
+
+  const arr=state.candles[symbol];
+  const last=arr[arr.length-1];
+  const now=Date.now();
+
+  if(now-last.t>=CANDLE_MS){
+
+    arr.push({
+      t:now,
+      o:price,
+      h:price,
+      l:price,
+      c:price
+    });
+
+    if(arr.length>MAX_CANDLES){
+      arr.splice(0,arr.length-MAX_CANDLES);
+    }
+
+  }
+
+  const cur=arr[arr.length-1];
+
+  cur.h=Math.max(cur.h,price);
+  cur.l=Math.min(cur.l,price);
+  cur.c=price;
+
+}
+
 /* ================= MARKET TICK ================= */
 
 function tickTenant(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return;
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const config = SYMBOLS[sym];
+    const base=SYMBOLS[sym].vol;
 
-    const prev = state.prices[sym];
+    const prev=state.prices[sym];
 
-    const next = randomWalk(prev,config.vol);
+    const next=simulate(prev,base);
 
-    state.prices[sym] = next;
+    state.prices[sym]=next;
 
     updateCandle(state,sym,next);
 
@@ -100,64 +198,20 @@ function tickTenant(tenantId){
 
 /* ================= AI LOOP ================= */
 
-function runAiForTenant(tenantId){
+function runAI(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return;
 
-  try{
+  for(const sym of Object.keys(state.prices)){
 
-    for(const sym of Object.keys(state.prices)){
+    const price=state.prices[sym];
 
-      const price = state.prices[sym];
-
-      if(!price) continue;
-
-      paperTrader.tick(
-        tenantId,
-        sym,
-        Number(price)
-      );
-
-    }
-
-  }catch{}
-
-}
-
-/* ================= CANDLE ENGINE ================= */
-
-function updateCandle(state,symbol,price){
-
-  const now = Date.now();
-
-  const arr = state.candles[symbol];
-
-  const last = arr[arr.length - 1];
-
-  if(now - last.t >= CANDLE_MS){
-
-    const newCandle = {
-      t:now,
-      o:price,
-      h:price,
-      l:price,
-      c:price
-    };
-
-    arr.push(newCandle);
-
-    if(arr.length > MAX_CANDLES){
-      arr.splice(0,arr.length - MAX_CANDLES);
-    }
+    try{
+      paperTrader.tick(tenantId,sym,price);
+    }catch{}
 
   }
-
-  const cur = arr[arr.length - 1];
-
-  cur.h = Math.max(cur.h,price);
-  cur.l = Math.min(cur.l,price);
-  cur.c = price;
 
 }
 
@@ -165,16 +219,14 @@ function updateCandle(state,symbol,price){
 
 function getMarketSnapshot(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return {};
 
-  const out = {};
+  const out={};
 
   for(const sym of Object.keys(state.prices)){
 
-    out[sym] = {
-      price: state.prices[sym]
-    };
+    out[sym]={price:state.prices[sym]};
 
   }
 
@@ -182,17 +234,17 @@ function getMarketSnapshot(tenantId){
 
 }
 
-/* ================= CANDLES ================= */
+/* ================= CANDLES API ================= */
 
 function getCandles(tenantId,symbol,limit=200){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
   if(!state) return [];
 
-  const arr = state.candles[symbol] || [];
+  const arr=state.candles[symbol]||[];
 
-  return arr.slice(-limit).map(c => ({
-    time: Math.floor(c.t/1000),
+  return arr.slice(-limit).map(c=>({
+    time:Math.floor(c.t/1000),
     open:c.o,
     high:c.h,
     low:c.l,
@@ -201,39 +253,27 @@ function getCandles(tenantId,symbol,limit=200){
 
 }
 
-/* ================= PRICE ================= */
-
-function getPrice(tenantId,symbol){
-
-  const state = TENANTS.get(tenantId);
-  if(!state) return null;
-
-  return state.prices[symbol] || null;
-
-}
-
-/* ================= GLOBAL MARKET LOOP ================= */
+/* ================= LOOPS ================= */
 
 setInterval(()=>{
 
-  for(const tenantId of TENANTS.keys()){
+  for(const id of TENANTS.keys()){
 
     try{
-      tickTenant(tenantId);
+      tickTenant(id);
+      saveState(id,TENANTS.get(id));
     }catch{}
 
   }
 
 },MARKET_TICK_MS);
 
-/* ================= GLOBAL AI LOOP ================= */
-
 setInterval(()=>{
 
-  for(const tenantId of TENANTS.keys()){
+  for(const id of TENANTS.keys()){
 
     try{
-      runAiForTenant(tenantId);
+      runAI(id);
     }catch{}
 
   }
@@ -242,9 +282,8 @@ setInterval(()=>{
 
 /* ================= EXPORT ================= */
 
-module.exports = {
+module.exports={
   registerTenant,
   getMarketSnapshot,
-  getCandles,
-  getPrice
+  getCandles
 };
