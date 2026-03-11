@@ -115,6 +115,32 @@ app.use("/api",(req,res,next)=>{
 
 const server = http.createServer(app);
 
+/* ================= ENGINE METRICS ================= */
+
+const ENGINE_START_TIME = Date.now();
+
+function computeMetrics(snapshot){
+
+  const stats = snapshot?.executionStats || {};
+
+  const decisions = Number(stats.decisions || 0);
+  const uptimeMinutes =
+    (Date.now() - ENGINE_START_TIME) / 60000;
+
+  const aiPerMin =
+    uptimeMinutes > 0
+      ? decisions / uptimeMinutes
+      : 0;
+
+  const memMb =
+    process.memoryUsage().rss / 1024 / 1024;
+
+  return {
+    aiPerMin:Number(aiPerMin.toFixed(2)),
+    memMb:Number(memMb.toFixed(1))
+  };
+}
+
 /* ================= WEBSOCKET ================= */
 
 const wss = new WebSocketServer({
@@ -163,8 +189,6 @@ wss.on("connection",(ws,req)=>{
     ws.tenantId = tenantId;
     ws.isAlive = true;
 
-    /* ensure tenant engine exists */
-
     marketEngine.registerTenant(tenantId);
 
     ws.on("pong",()=>{ws.isAlive=true});
@@ -187,11 +211,8 @@ setInterval(()=>{
   wss.clients.forEach(ws=>{
 
     if(ws.isAlive===false){
-
       try{ws.terminate()}catch{}
-
       return;
-
     }
 
     ws.isAlive=false;
@@ -203,7 +224,6 @@ setInterval(()=>{
 },20000);
 
 /* ================= MARKET STREAM ================= */
-/* MARKET ENGINE RUNS SEPARATELY */
 
 setInterval(()=>{
 
@@ -241,7 +261,7 @@ setInterval(()=>{
 
 },250);
 
-/* ================= PAPER TRADER STREAM ================= */
+/* ================= PAPER ENGINE STREAM ================= */
 
 setInterval(()=>{
 
@@ -257,12 +277,21 @@ setInterval(()=>{
       const decisions =
         paperTrader.getDecisions(ws.tenantId);
 
+      const metrics =
+        computeMetrics(snapshot);
+
       ws.send(JSON.stringify({
 
         channel:"paper",
         type:"engine",
+
         snapshot,
         decisions,
+
+        metrics,
+
+        engineStart:ENGINE_START_TIME,
+
         ts:Date.now()
 
       }));
