@@ -1,5 +1,7 @@
-// backend/src/services/strategyEngine.js
-// Phase 15 — Adaptive Strategy Core (Paper Optimized)
+// ==========================================================
+// STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
+// FIXED: Trade frequency + realistic paper trading
+// ==========================================================
 
 const fs = require("fs");
 const path = require("path");
@@ -13,28 +15,28 @@ const counterfactualEngine = require("./counterfactualEngine");
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 /* =========================================================
-BASE CONFIG (Balanced For Paper)
+BASE CONFIG (PAPER FRIENDLY)
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
 
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.52),
-  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.0004),
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.18),
+  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
-  maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.02),
+  maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
 
   regimeTrendEdgeBoost:1.25,
-  regimeRangeEdgeCut:0.75,
+  regimeRangeEdgeCut:0.8,
   regimeExpansionBoost:1.35
 
 });
 
 /* =========================================================
-LEARNING
+LEARNING SYSTEM
 ========================================================= */
 
-const LEARNING_VERSION = 6;
+const LEARNING_VERSION = 7;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
@@ -82,6 +84,7 @@ function loadLearning(tenantId){
       const raw =
         JSON.parse(fs.readFileSync(file,"utf-8"));
       state = {...state,...raw};
+
       if(state.version !== LEARNING_VERSION)
         state = defaultLearning();
     }
@@ -102,6 +105,7 @@ function computeEdge({price,lastPrice,volatility,regime}){
     return 0;
 
   const vol = volatility || 0.002;
+
   const momentum =
     (price-lastPrice)/lastPrice;
 
@@ -117,26 +121,25 @@ function computeEdge({price,lastPrice,volatility,regime}){
   if(regime==="expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
-  return clamp(normalized,-0.03,0.03);
+  return clamp(normalized,-0.05,0.05);
 }
 
 /* =========================================================
-CONFIDENCE MODEL (FASTER RAMP)
+CONFIDENCE MODEL (FAST FOR PAPER)
 ========================================================= */
 
 function computeConfidence({edge,ticksSeen,regime}){
 
-  // 🔥 Reduced ramp time
-  if(ticksSeen < 20)
-    return 0.45;
+  if(ticksSeen < 10)
+    return 0.35;
 
-  let base = Math.abs(edge)*6;
+  let base = Math.abs(edge) * 5;
 
   if(regime==="expansion")
     base *= 1.2;
 
   if(regime==="range")
-    base *= 0.85;
+    base *= 0.9;
 
   return clamp(base,0,1);
 }
@@ -213,11 +216,13 @@ function buildDecision(context={}){
   edge *= learning.edgeMultiplier;
   confidence *= learning.confidenceMultiplier;
 
-  edge = clamp(edge,-0.05,0.05);
+  edge = clamp(edge,-0.06,0.06);
   confidence = clamp(confidence,0,1);
 
   if(!Number.isFinite(price))
     return {action:"WAIT",confidence:0,edge:0};
+
+  /* ================= DECISION GATES ================= */
 
   if(confidence < BASE_CONFIG.minConfidence)
     return {action:"WAIT",confidence,edge};
@@ -234,7 +239,7 @@ function buildDecision(context={}){
 
   return{
     symbol,
-    action:edge>0 ? "BUY":"SELL",
+    action:edge > 0 ? "BUY":"SELL",
     confidence,
     edge,
     riskPct,
