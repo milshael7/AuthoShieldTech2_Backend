@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v4
-// FIXED: AI config wiring + engine health detection
+// Institutional Trading Control API — STABLE ENTERPRISE v5
+// FIXED: /api/ai/config route alignment + engine health detection
 // ==========================================================
 
 const express = require("express");
@@ -24,14 +24,12 @@ TENANT SAFE ACCESS
 ========================================================= */
 
 function getTenantId(req){
-
   return (
     req.tenant?.id ||
     req.user?.companyId ||
     req.user?.id ||
     null
   );
-
 }
 
 /* =========================================================
@@ -150,12 +148,7 @@ async (req,res)=>{
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  const {
-    symbol,
-    side,
-    price,
-    risk
-  } = req.body || {};
+  const { symbol, side, price, risk } = req.body || {};
 
   if(!symbol || !side)
     return res.status(400).json({
@@ -264,9 +257,10 @@ function getEngineHealth(tenantId){
 
 /* =========================================================
 AI CONFIG
+FINAL ROUTE → /api/ai/config
 ========================================================= */
 
-router.get("/ai/config",
+router.get("/config",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
@@ -276,9 +270,7 @@ requireRole(ADMIN,MANAGER),
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
   const config = getAIConfig(tenantId);
-
-  const engine =
-    getEngineHealth(tenantId);
+  const engine = getEngineHealth(tenantId);
 
   return res.json({
     ok:true,
@@ -288,7 +280,7 @@ requireRole(ADMIN,MANAGER),
 
 });
 
-router.post("/ai/config",
+router.post("/config",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
@@ -319,8 +311,7 @@ requireRole(ADMIN,MANAGER),
 
   writeDb(db);
 
-  const engine =
-    getEngineHealth(tenantId);
+  const engine = getEngineHealth(tenantId);
 
   return res.json({
     ok:true,
@@ -329,7 +320,5 @@ requireRole(ADMIN,MANAGER),
   });
 
 });
-
-/* ========================================================= */
 
 module.exports = router;
