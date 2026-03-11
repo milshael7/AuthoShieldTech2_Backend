@@ -92,10 +92,10 @@ app.use("/api/soc", require("./routes/soc.routes"));
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* AI control panel route */
+/* AI control panel */
 app.use("/api/ai", tradingRoutes);
 
-/* normal trading routes */
+/* trading API */
 app.use("/api/trading", tradingRoutes);
 
 /* ================= ZERO TRUST ================= */
@@ -148,7 +148,7 @@ function computeMetrics(snapshot){
   };
 }
 
-/* ================= START TENANTS ================= */
+/* ================= TENANT BOOT ================= */
 
 function bootTenants(){
 
@@ -185,48 +185,6 @@ function bootTenants(){
 }
 
 bootTenants();
-
-/* ================= ENGINE SAFETY LOOP ================= */
-/* ensures AI keeps running even if no websocket clients */
-
-setInterval(()=>{
-
-  try{
-
-    const db = readDb();
-    const usersList = db.users || [];
-
-    for(const u of usersList){
-
-      const tenantId = u.companyId || u.id;
-
-      if(!tenantId) continue;
-
-      const snapshot =
-        marketEngine.getMarketSnapshot(tenantId);
-
-      if(!snapshot) continue;
-
-      for(const sym of Object.keys(snapshot)){
-
-        const price = snapshot[sym]?.price;
-
-        if(!price) continue;
-
-        paperTrader.tick(
-          tenantId,
-          sym,
-          price,
-          Date.now()
-        );
-
-      }
-
-    }
-
-  }catch{}
-
-},1000);
 
 /* ================= WEBSOCKET ================= */
 
@@ -275,6 +233,10 @@ wss.on("connection",(ws,req)=>{
     marketEngine.registerTenant(tenantId);
 
     ws.on("pong",()=>{ws.isAlive=true});
+
+    ws.on("error",()=>{
+      try{ws.terminate()}catch{}
+    });
 
   }
   catch{
@@ -364,13 +326,10 @@ setInterval(()=>{
 
         channel:"paper",
         type:"engine",
-
         snapshot,
         decisions,
         metrics,
-
         engineStart:ENGINE_START_TIME,
-
         ts:Date.now()
 
       }));
