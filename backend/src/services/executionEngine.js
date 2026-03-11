@@ -1,15 +1,13 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE
-// Handles order execution, PnL, and position management
+// EXECUTION ENGINE — PAPER TRADING CORE v2
+// Supports LONG + SHORT positions
 // ==========================================================
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
-/* =========================================================
-UTILS
-========================================================= */
+/* ========================================================= */
 
 function safeNum(v,fallback=0){
   const n = Number(v);
@@ -83,25 +81,15 @@ function closePosition({
   let pnl = 0;
 
   if(pos.side === "LONG"){
-
-    pnl =
-      (price - pos.entry) *
-      pos.qty;
-
+    pnl = (price - pos.entry) * pos.qty;
   }
 
   if(pos.side === "SHORT"){
-
-    pnl =
-      (pos.entry - price) *
-      pos.qty;
-
+    pnl = (pos.entry - price) * pos.qty;
   }
 
   state.cashBalance =
     safeNum(state.cashBalance) + pnl;
-
-  state.equity = state.cashBalance;
 
   const trade = {
     side:"CLOSE",
@@ -149,14 +137,17 @@ function executePaperOrder({
 
   if(action === "BUY"){
 
-    if(pos) return null;
+    if(pos){
+
+      if(pos.side === "SHORT"){
+        return closePosition({state,price,ts});
+      }
+
+      return null;
+    }
 
     const qty =
-      calculatePositionSize(
-        state,
-        price,
-        riskPct
-      );
+      calculatePositionSize(state,price,riskPct);
 
     if(qty <= 0) return null;
 
@@ -175,11 +166,26 @@ function executePaperOrder({
 
   if(action === "SELL"){
 
-    if(!pos) return null;
+    if(pos){
 
-    return closePosition({
+      if(pos.side === "LONG"){
+        return closePosition({state,price,ts});
+      }
+
+      return null;
+    }
+
+    const qty =
+      calculatePositionSize(state,price,riskPct);
+
+    if(qty <= 0) return null;
+
+    return openPosition({
       state,
+      symbol,
       price,
+      qty,
+      side:"SHORT",
       ts
     });
 
