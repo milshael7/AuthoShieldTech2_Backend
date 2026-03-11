@@ -1,6 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// FIXED: AI loop + getPrice + stable tenant initialization
+// STABLE ENGINE VERSION
+// Guarantees AI ticks + tenant safety
 // ==========================================================
 
 const fs = require("fs");
@@ -51,11 +52,11 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
-function simulate(price,baseVol){
+function simulate(price,vol){
 
-  const drift = (Math.random()-0.5)*2*baseVol;
+  const drift=(Math.random()-0.5)*2*vol;
 
-  const next = price*(1+drift);
+  const next=price*(1+drift);
 
   return Number(clamp(next,0.0000001,1e12).toFixed(8));
 }
@@ -64,7 +65,7 @@ function simulate(price,baseVol){
 
 function loadState(tenantId){
 
-  const file = stateFile(tenantId);
+  const file=stateFile(tenantId);
 
   if(!fs.existsSync(file)) return null;
 
@@ -91,9 +92,12 @@ function saveState(tenantId,state){
 
 function registerTenant(tenantId){
 
-  if(TENANTS.has(tenantId)) return;
+  if(!tenantId) return;
 
-  const persisted = loadState(tenantId);
+  if(TENANTS.has(tenantId))
+    return;
+
+  const persisted=loadState(tenantId);
 
   if(persisted){
     TENANTS.set(tenantId,persisted);
@@ -122,19 +126,22 @@ function registerTenant(tenantId){
   }
 
   TENANTS.set(tenantId,state);
+
 }
 
 /* ================= GET PRICE ================= */
 
 function getPrice(tenantId,symbol){
 
-  const state = TENANTS.get(tenantId);
+  const state=TENANTS.get(tenantId);
+
   if(!state) return null;
 
   return state.prices?.[symbol] ?? null;
+
 }
 
-/* ================= CANDLES ================= */
+/* ================= CANDLE UPDATE ================= */
 
 function updateCandle(state,symbol,price){
 
@@ -152,9 +159,8 @@ function updateCandle(state,symbol,price){
       c:price
     });
 
-    if(arr.length>MAX_CANDLES){
+    if(arr.length>MAX_CANDLES)
       arr.splice(0,arr.length-MAX_CANDLES);
-    }
 
   }
 
@@ -171,15 +177,16 @@ function updateCandle(state,symbol,price){
 function tickTenant(tenantId){
 
   const state=TENANTS.get(tenantId);
+
   if(!state) return;
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const base=SYMBOLS[sym].vol;
+    const vol=SYMBOLS[sym].vol;
 
     const prev=state.prices[sym];
 
-    const next=simulate(prev,base);
+    const next=simulate(prev,vol);
 
     state.prices[sym]=next;
 
@@ -194,11 +201,14 @@ function tickTenant(tenantId){
 function runAI(tenantId){
 
   const state=TENANTS.get(tenantId);
+
   if(!state) return;
 
   for(const sym of Object.keys(state.prices)){
 
     const price=state.prices[sym];
+
+    if(!price) continue;
 
     try{
 
@@ -209,9 +219,9 @@ function runAI(tenantId){
         Date.now()
       );
 
-    }catch(e){
+    }catch(err){
 
-      console.error("AI tick error:",e.message);
+      console.error("AI tick error:",err.message);
 
     }
 
@@ -224,25 +234,24 @@ function runAI(tenantId){
 function getMarketSnapshot(tenantId){
 
   const state=TENANTS.get(tenantId);
+
   if(!state) return {};
 
   const out={};
 
-  for(const sym of Object.keys(state.prices)){
-
+  for(const sym of Object.keys(state.prices))
     out[sym]={price:state.prices[sym]};
-
-  }
 
   return out;
 
 }
 
-/* ================= CANDLES API ================= */
+/* ================= CANDLES ================= */
 
 function getCandles(tenantId,symbol,limit=200){
 
   const state=TENANTS.get(tenantId);
+
   if(!state) return [];
 
   const arr=state.candles[symbol]||[];
@@ -257,15 +266,18 @@ function getCandles(tenantId,symbol,limit=200){
 
 }
 
-/* ================= LOOPS ================= */
+/* ================= ENGINE LOOPS ================= */
 
 setInterval(()=>{
 
-  for(const id of TENANTS.keys()){
+  for(const tenantId of TENANTS.keys()){
 
     try{
-      tickTenant(id);
-      saveState(id,TENANTS.get(id));
+
+      tickTenant(tenantId);
+
+      saveState(tenantId,TENANTS.get(tenantId));
+
     }catch{}
 
   }
@@ -274,10 +286,12 @@ setInterval(()=>{
 
 setInterval(()=>{
 
-  for(const id of TENANTS.keys()){
+  for(const tenantId of TENANTS.keys()){
 
     try{
-      runAI(id);
+
+      runAI(tenantId);
+
     }catch{}
 
   }
