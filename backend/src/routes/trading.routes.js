@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v2
-// Dashboard + Market + Paper + Live + Risk + AI
+// Institutional Trading Control API — STABLE ENTERPRISE v3
+// FIXED: AI config wiring + engine health
 // ==========================================================
 
 const express = require("express");
@@ -14,24 +14,24 @@ const marketEngine = require("../services/marketEngine");
 
 const { readDb, writeDb } = require("../lib/db");
 
-// ---------------- ROLES ----------------
+/* ================= ROLES ================= */
 
 const ADMIN = "Admin";
 const MANAGER = "Manager";
 
 /* =========================================================
-AI CONFIG STORAGE (PERSISTENT)
+AI CONFIG (ENGINE CONNECTED)
 ========================================================= */
 
 function getAIConfig(tenantId){
 
   const db = readDb();
 
-  db.aiConfig = db.aiConfig || {};
+  db.tradingConfig = db.tradingConfig || {};
 
-  if(!db.aiConfig[tenantId]){
+  if(!db.tradingConfig[tenantId]){
 
-    db.aiConfig[tenantId] = {
+    db.tradingConfig[tenantId] = {
       enabled:true,
       tradingMode:"paper",
       maxTrades:5,
@@ -43,8 +43,7 @@ function getAIConfig(tenantId){
     writeDb(db);
   }
 
-  return db.aiConfig[tenantId];
-
+  return db.tradingConfig[tenantId];
 }
 
 /* =========================================================
@@ -248,7 +247,7 @@ requireRole(ADMIN,MANAGER),
   const tenantId = req.tenant?.id;
 
   const db = readDb();
-  db.aiConfig = db.aiConfig || {};
+  db.tradingConfig = db.tradingConfig || {};
 
   const cfg = getAIConfig(tenantId);
 
@@ -268,13 +267,14 @@ requireRole(ADMIN,MANAGER),
   cfg.positionMultiplier = Number(positionMultiplier || 1);
   cfg.strategyMode = strategyMode || "Balanced";
 
-  db.aiConfig[tenantId] = cfg;
+  db.tradingConfig[tenantId] = cfg;
 
   writeDb(db);
 
   return res.json({
     ok:true,
-    config:cfg
+    config:cfg,
+    engine:"RUNNING"
   });
 
 });
