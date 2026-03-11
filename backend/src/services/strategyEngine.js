@@ -20,7 +20,9 @@ BASE CONFIG (PAPER FRIENDLY)
 
 const BASE_CONFIG = Object.freeze({
 
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.15),
+  // FIXED: lower confidence gate so paper AI trades more often
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.08),
+
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
