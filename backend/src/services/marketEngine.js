@@ -1,6 +1,6 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// FIXED: AI loop + guaranteed paperTrader ticks
+// FIXED: AI loop + getPrice + stable tenant initialization
 // ==========================================================
 
 const fs = require("fs");
@@ -124,6 +124,16 @@ function registerTenant(tenantId){
   TENANTS.set(tenantId,state);
 }
 
+/* ================= GET PRICE ================= */
+
+function getPrice(tenantId,symbol){
+
+  const state = TENANTS.get(tenantId);
+  if(!state) return null;
+
+  return state.prices?.[symbol] ?? null;
+}
+
 /* ================= CANDLES ================= */
 
 function updateCandle(state,symbol,price){
@@ -192,7 +202,6 @@ function runAI(tenantId){
 
     try{
 
-      // 🔥 THIS IS THE CRITICAL CALL
       paperTrader.tick(
         tenantId,
         sym,
@@ -280,5 +289,6 @@ setInterval(()=>{
 module.exports={
   registerTenant,
   getMarketSnapshot,
-  getCandles
+  getCandles,
+  getPrice
 };
