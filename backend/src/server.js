@@ -92,10 +92,7 @@ app.use("/api/soc", require("./routes/soc.routes"));
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 
-/* AI control panel */
 app.use("/api/ai", tradingRoutes);
-
-/* trading API */
 app.use("/api/trading", tradingRoutes);
 
 /* ================= ZERO TRUST ================= */
@@ -121,32 +118,9 @@ app.use("/api",(req,res,next)=>{
 
 const server = http.createServer(app);
 
-/* ================= ENGINE METRICS ================= */
+/* ================= ENGINE START ================= */
 
 const ENGINE_START_TIME = Date.now();
-
-function computeMetrics(snapshot){
-
-  const stats = snapshot?.executionStats || {};
-
-  const decisions = Number(stats.decisions || 0);
-
-  const uptimeMinutes =
-    (Date.now() - ENGINE_START_TIME) / 60000;
-
-  const aiPerMin =
-    uptimeMinutes > 0
-      ? decisions / uptimeMinutes
-      : 0;
-
-  const memMb =
-    process.memoryUsage().rss / 1024 / 1024;
-
-  return {
-    aiPerMin:Number(aiPerMin.toFixed(2)),
-    memMb:Number(memMb.toFixed(1))
-  };
-}
 
 /* ================= TENANT BOOT ================= */
 
@@ -185,6 +159,55 @@ function bootTenants(){
 }
 
 bootTenants();
+
+/* ================= AI TRADING LOOP ================= */
+
+setInterval(()=>{
+
+  try{
+
+    const db = readDb();
+    const usersList = db.users || [];
+
+    const tenants = new Set();
+
+    for(const u of usersList){
+
+      const tenantId = u.companyId || u.id;
+
+      if(tenantId)
+        tenants.add(tenantId);
+
+    }
+
+    for(const tenantId of tenants){
+
+      const market =
+        marketEngine.getMarketSnapshot(tenantId);
+
+      const price =
+        market?.BTCUSDT?.price;
+
+      if(price){
+
+        paperTrader.tick(
+          tenantId,
+          "BTCUSDT",
+          Number(price)
+        );
+
+      }
+
+    }
+
+  }
+  catch(err){
+
+    console.error("AI tick error:",err.message);
+
+  }
+
+},1000);
 
 /* ================= WEBSOCKET ================= */
 
@@ -234,35 +257,12 @@ wss.on("connection",(ws,req)=>{
 
     ws.on("pong",()=>{ws.isAlive=true});
 
-    ws.on("error",()=>{
-      try{ws.terminate()}catch{}
-    });
-
   }
   catch{
     closeWs(ws);
   }
 
 });
-
-/* ================= HEARTBEAT ================= */
-
-setInterval(()=>{
-
-  wss.clients.forEach(ws=>{
-
-    if(ws.isAlive===false){
-      try{ws.terminate()}catch{}
-      return;
-    }
-
-    ws.isAlive=false;
-
-    try{ws.ping()}catch{}
-
-  });
-
-},20000);
 
 /* ================= MARKET STREAM ================= */
 
@@ -303,7 +303,7 @@ setInterval(()=>{
 
 },250);
 
-/* ================= PAPER ENGINE STREAM ================= */
+/* ================= PAPER STREAM ================= */
 
 setInterval(()=>{
 
@@ -319,16 +319,12 @@ setInterval(()=>{
       const decisions =
         paperTrader.getDecisions(ws.tenantId);
 
-      const metrics =
-        computeMetrics(snapshot);
-
       ws.send(JSON.stringify({
 
         channel:"paper",
         type:"engine",
         snapshot,
         decisions,
-        metrics,
         engineStart:ENGINE_START_TIME,
         ts:Date.now()
 
