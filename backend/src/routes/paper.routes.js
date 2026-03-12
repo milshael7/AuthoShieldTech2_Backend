@@ -2,6 +2,7 @@
 // ==========================================================
 // Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE
 // FIXED: Engine stats + AI brain state + config wiring
+// ADDED: Manual paper trade execution endpoint
 // ==========================================================
 
 const express = require("express");
@@ -163,6 +164,64 @@ router.post("/reset", (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Paper reset failed",
+    });
+
+  }
+});
+
+/* =========================================================
+   EXECUTE PAPER ORDER
+   (Manual trade support)
+========================================================= */
+
+router.post("/order", (req, res) => {
+  try {
+
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
+    const {
+      symbol,
+      side,
+      size,
+      stopLoss,
+      takeProfit
+    } = req.body || {};
+
+    if (!symbol || !side || !size) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid order payload",
+      });
+    }
+
+    const result = paperTrader.executeOrder({
+      tenantId,
+      symbol,
+      side,
+      size,
+      stopLoss,
+      takeProfit
+    });
+
+    return res.json({
+      ok: true,
+      result,
+      snapshot: paperTrader.snapshot(tenantId),
+      time: new Date().toISOString(),
+    });
+
+  } catch (err) {
+
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Paper order failed",
     });
 
   }
