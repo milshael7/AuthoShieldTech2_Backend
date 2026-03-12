@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v9
-// FIXED: getTradingConfig missing
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v10
+// FIXED: price sync + equity update + decision history
 // ==========================================================
 
 const fs = require("fs");
@@ -9,10 +9,6 @@ const path = require("path");
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
 const { readDb } = require("../lib/db");
-
-const orderFlowEngine = require("./orderFlowEngine");
-const counterfactualEngine = require("./counterfactualEngine");
-const correlationEngine = require("./correlationEngine");
 
 /* ================= CONFIG ================= */
 
@@ -25,23 +21,6 @@ const BASE_PATH =
 
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
-
-const SAVE_INTERVAL_MS = 5000;
-
-const WARMUP_TICKS =
-  Number(process.env.PAPER_WARMUP_TICKS || 8);
-
-/* ================= FS ================= */
-
-function ensureDir(p){
-  if(!fs.existsSync(p))
-    fs.mkdirSync(p,{recursive:true});
-}
-
-function statePath(tenantId){
-  ensureDir(BASE_PATH);
-  return path.join(BASE_PATH,`paper_${tenantId}.json`);
-}
 
 /* ================= STATE ================= */
 
@@ -59,9 +38,6 @@ function defaultState(){
     realized:{wins:0,losses:0,net:0},
     limits:{tradesToday:0,lossesToday:0},
     executionStats:{ticks:0,decisions:0,trades:0},
-    lastResetDay:null,
-    _dirty:false,
-    _lastSave:0,
     _locked:false
   };
 }
@@ -75,22 +51,15 @@ function load(tenantId){
   if(STATES.has(tenantId))
     return STATES.get(tenantId);
 
-  let state = defaultState();
-  const file = statePath(tenantId);
-
-  try{
-    if(fs.existsSync(file)){
-      const raw =
-        JSON.parse(fs.readFileSync(file,"utf-8"));
-      state = {...state,...raw};
-    }
-  }catch{}
+  const state = defaultState();
 
   STATES.set(tenantId,state);
+
   return state;
+
 }
 
-/* ================= TRADING CONFIG ================= */
+/* ================= CONFIG ================= */
 
 function getTradingConfig(tenantId){
 
@@ -108,8 +77,7 @@ function getTradingConfig(tenantId){
       tradingMode: cfg.tradingMode || "paper",
       maxTrades: Number(cfg.maxTrades || 5),
       riskPercent: Number(cfg.riskPercent || 1.5),
-      positionMultiplier: Number(cfg.positionMultiplier || 1),
-      strategyMode: cfg.strategyMode || "Balanced"
+      positionMultiplier: Number(cfg.positionMultiplier || 1)
     };
 
   }catch{
@@ -119,8 +87,7 @@ function getTradingConfig(tenantId){
       tradingMode:"paper",
       maxTrades:5,
       riskPercent:1.5,
-      positionMultiplier:1,
-      strategyMode:"Balanced"
+      positionMultiplier:1
     };
 
   }
@@ -133,37 +100,29 @@ function executeOrder({
   tenantId,
   symbol,
   side,
-  size,
-  stopLoss,
-  takeProfit
+  size
 }){
 
   const state = load(tenantId);
 
-  const price =
-    state.lastPrice || 0;
+  const price = state.lastPrice;
 
   if(!price)
     throw new Error("Market price unavailable");
 
   const exec =
     executionEngine.executePaperOrder({
-
       tenantId,
       symbol,
       action:side,
       price,
-      riskPct:0,
-      state,
-      ts:Date.now(),
-      qty:Number(size)
-
+      qty:Number(size),
+      state
     });
 
   if(exec?.result){
 
-    const pnl =
-      Number(exec.result.pnl||0);
+    const pnl = Number(exec.result.pnl || 0);
 
     state.executionStats.trades++;
 
@@ -172,16 +131,16 @@ function executeOrder({
       symbol,
       side,
       price,
-      qty:Number(exec.result.qty||0),
+      qty:Number(exec.result.qty || 0),
       profit:pnl
     });
 
     state.realized.net += pnl;
 
-    state._dirty=true;
   }
 
   return exec;
+
 }
 
 /* ================= AI TICK ================= */
@@ -197,11 +156,33 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(!Number.isFinite(price) || price<=0) return;
   if(state._locked) return;
 
-  state._locked=true;
+  state._locked = true;
 
   try{
 
+    /* ===== update price ===== */
+
+    const prev = state.lastPrice;
+
+    state.lastPrice = price;
+
+    if(prev){
+
+      const change =
+        Math.abs(price-prev)/prev;
+
+      state.volatility =
+        Math.max(
+          0.0005,
+          state.volatility*0.9 +
+          change*0.1
+        );
+
+    }
+
     state.executionStats.ticks++;
+
+    /* ===== AI decision ===== */
 
     const plan =
       makeDecision({
@@ -218,25 +199,81 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.decisions++;
 
+    state.decisions.push({
+      time:ts,
+      symbol,
+      action:plan.action,
+      confidence:plan.confidence,
+      price
+    });
+
+    if(state.decisions.length > MAX_DECISIONS_MEMORY)
+      state.decisions =
+        state.decisions.slice(-MAX_DECISIONS_MEMORY);
+
+    /* ===== execution ===== */
+
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
-      executionEngine.executePaperOrder({
-        tenantId,
-        symbol,
-        action:plan.action,
-        price,
-        riskPct:plan.riskPct,
-        state,
-        ts
-      });
+      const exec =
+        executionEngine.executePaperOrder({
+          tenantId,
+          symbol,
+          action:plan.action,
+          price,
+          riskPct:plan.riskPct,
+          state,
+          ts
+        });
 
-      state.executionStats.trades++;
+      if(exec?.result){
+
+        state.executionStats.trades++;
+
+        state.trades.push({
+          time:ts,
+          symbol,
+          side:plan.action,
+          price,
+          qty:Number(exec.result.qty||0),
+          profit:Number(exec.result.pnl||0)
+        });
+
+        if(state.trades.length > MAX_TRADES_MEMORY)
+          state.trades =
+            state.trades.slice(-MAX_TRADES_MEMORY);
+
+      }
 
     }
 
+    /* ===== equity ===== */
+
+    if(state.position){
+
+      const unrealized =
+        (price - state.position.entry)
+        * state.position.qty;
+
+      state.equity =
+        state.cashBalance + unrealized;
+
+    }
+    else{
+
+      state.equity =
+        state.cashBalance;
+
+    }
+
+    if(state.equity > state.peakEquity)
+      state.peakEquity = state.equity;
+
   }
   finally{
-    state._locked=false;
+
+    state._locked = false;
+
   }
 
 }
