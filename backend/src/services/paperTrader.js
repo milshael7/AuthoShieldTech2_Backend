@@ -1,11 +1,15 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v13
-// FIXED: correct decision context + momentum sync
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v14
+// FIXED: telemetry + stable AI tick loop
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
 const { readDb } = require("../lib/db");
+
+/* ================= ENGINE START ================= */
+
+const ENGINE_START = Date.now();
 
 /* ================= CONFIG ================= */
 
@@ -106,9 +110,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     const prev = state.lastPrice;
 
-    /* ===== update price ===== */
-
     state.lastPrice = price;
+
+    /* ===== volatility ===== */
 
     if(prev){
 
@@ -148,7 +152,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       time:ts,
       symbol,
       action:plan.action,
-      confidence:plan.confidence,
+      confidence:plan.confidence || 0,
       price
     });
 
@@ -223,27 +227,61 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
 }
 
+/* ================= TELEMETRY ================= */
+
+function getTelemetry(state){
+
+  const uptime =
+    Math.floor((Date.now() - ENGINE_START) / 1000);
+
+  const decisions =
+    state.executionStats.decisions || 0;
+
+  const decisionsPerMinute =
+    uptime > 0
+      ? (decisions / uptime) * 60
+      : 0;
+
+  return {
+
+    uptime,
+
+    decisionsPerMinute,
+
+    memoryUsage:
+      process.memoryUsage().rss
+
+  };
+
+}
+
 /* ================= SNAPSHOT ================= */
 
 function snapshot(tenantId){
 
   const s = load(tenantId);
 
-  return JSON.parse(JSON.stringify({
+  return {
 
-    cashBalance:s.cashBalance,
-    equity:s.equity,
-    peakEquity:s.peakEquity,
-    position:s.position,
-    trades:s.trades,
-    decisions:s.decisions,
-    lastPrice:s.lastPrice,
-    volatility:s.volatility,
-    executionStats:s.executionStats,
-    realized:s.realized,
-    limits:s.limits
+    snapshot:{
 
-  }));
+      cashBalance:s.cashBalance,
+      equity:s.equity,
+      peakEquity:s.peakEquity,
+      position:s.position,
+      trades:s.trades,
+      decisions:s.decisions,
+      lastPrice:s.lastPrice,
+      volatility:s.volatility,
+      executionStats:s.executionStats,
+      realized:s.realized,
+      limits:s.limits,
+
+      telemetry:getTelemetry(s)
+
+    }
+
+  };
 
 }
 
