@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
 // AutoShield — Institutional Trade Brain (Adaptive Balanced v7)
-// FIXED: confidence warm start + stable smoothing
+// STABLE ENGINE VERSION — Memory Safe
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
@@ -32,14 +32,22 @@ const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
 const BRAIN_STATE = new Map();
 
+/* Prevent runaway tenant memory */
+const MAX_BRAIN_TENANTS = 500;
+const IDLE_RESET_MS = 1000 * 60 * 60 * 12; // 12h
+
 function getBrainState(tenantId){
 
   const key = tenantId || "__default__";
 
   if(!BRAIN_STATE.has(key)){
 
+    if(BRAIN_STATE.size > MAX_BRAIN_TENANTS){
+      BRAIN_STATE.clear();
+    }
+
     BRAIN_STATE.set(key,{
-      smoothedConfidence:0.25,   // warm start
+      smoothedConfidence:0.25,
       edgeMomentum:0,
       lastAction:"WAIT",
       lastDecisionTime:0
@@ -109,7 +117,7 @@ function makeDecision(context={}){
   }catch{}
 
   let action = strategy.action || "WAIT";
-  let confidence = safeNum(strategy.confidence,0.25); // warm fallback
+  let confidence = safeNum(strategy.confidence,0.25);
   let edge = safeNum(strategy.edge,0);
 
   if(!ACTIONS.has(action))
