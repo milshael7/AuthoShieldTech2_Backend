@@ -4,7 +4,7 @@
 // directly controls the strategy brain.
 // ==========================================================
 
-const { buildDecision } = require("../ai/strategyEngine");
+const { buildDecision } = require("./strategyEngine");
 const learningStore = require("../brain/learningStore");
 
 function runStrategy(context = {}){
