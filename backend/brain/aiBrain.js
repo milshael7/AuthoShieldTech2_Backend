@@ -4,7 +4,7 @@
 // Lives outside the body and survives body upgrades
 // ==========================================================
 
-const { readDb, writeDb } = require("../lib/db");
+const { readDb, writeDb } = require("../src/lib/db");
 
 /* =========================================================
 CONFIG
@@ -90,19 +90,6 @@ function defaultBrain() {
       degradation: 0,
     },
   };
-}
-
-function getDbBrainRoot(){
-
-  const db = readDb();
-
-  if(!db.brain) db.brain = {};
-  if(!db.brain.ai) db.brain.ai = {};
-
-  writeDb(db);
-
-  return db.brain.ai;
-
 }
 
 function getBrain(tenantId) {
