@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v6)
-// FIXED: correct position flipping + stable confidence model
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v7)
+// FIXED: confidence warm start + stable smoothing
 // -----------------------------------------------------------
 
 const aiBrain = require("./aiBrain");
@@ -39,7 +39,7 @@ function getBrainState(tenantId){
   if(!BRAIN_STATE.has(key)){
 
     BRAIN_STATE.set(key,{
-      smoothedConfidence:0,
+      smoothedConfidence:0.25,   // warm start
       edgeMomentum:0,
       lastAction:"WAIT",
       lastDecisionTime:0
@@ -109,7 +109,7 @@ function makeDecision(context={}){
   }catch{}
 
   let action = strategy.action || "WAIT";
-  let confidence = safeNum(strategy.confidence,0);
+  let confidence = safeNum(strategy.confidence,0.25); // warm fallback
   let edge = safeNum(strategy.edge,0);
 
   if(!ACTIONS.has(action))
@@ -158,7 +158,7 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
-    isPaper ? 0.30 : CONFIDENCE_DECAY;
+    isPaper ? 0.25 : CONFIDENCE_DECAY;
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * decay +
@@ -177,7 +177,7 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.12 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.10 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
