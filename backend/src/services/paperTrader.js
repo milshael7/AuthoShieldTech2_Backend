@@ -1,10 +1,7 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v12
-// FIXED: correct decision call + equity sync + history
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v13
+// FIXED: correct decision context + momentum sync
 // ==========================================================
-
-const fs = require("fs");
-const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
@@ -108,6 +105,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   try{
 
     const prev = state.lastPrice;
+
+    /* ===== update price ===== */
+
     state.lastPrice = price;
 
     if(prev){
@@ -132,9 +132,10 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       makeDecision({
         tenantId,
         symbol,
-        last:price,
-        paper:state,
-        ticksSeen:state.executionStats.ticks
+        price,
+        lastPrice: prev,
+        volatility: state.volatility,
+        ticksSeen: state.executionStats.ticks
       }) || {
         action:"WAIT",
         confidence:0,
