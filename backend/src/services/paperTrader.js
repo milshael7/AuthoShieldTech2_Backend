@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v15
-// FIXED: correct AI context + stable tick pipeline
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v16
+// FIXED: snapshot format + UI compatibility + telemetry
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -109,7 +109,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   try{
 
     const prev = state.lastPrice;
-
     state.lastPrice = price;
 
     /* ===== VOLATILITY ===== */
@@ -244,11 +243,8 @@ function getTelemetry(state){
   return {
 
     uptime,
-
     decisionsPerMinute,
-
-    memoryUsage:
-      process.memoryUsage().rss
+    memoryUsage:process.memoryUsage().rss
 
   };
 
@@ -262,27 +258,25 @@ function snapshot(tenantId){
 
   return {
 
-    snapshot:{
+    cashBalance:s.cashBalance,
+    equity:s.equity,
+    peakEquity:s.peakEquity,
+    position:s.position,
+    trades:s.trades,
+    decisions:s.decisions,
+    lastPrice:s.lastPrice,
+    volatility:s.volatility,
+    executionStats:s.executionStats,
+    realized:s.realized,
+    limits:s.limits,
 
-      cashBalance:s.cashBalance,
-      equity:s.equity,
-      peakEquity:s.peakEquity,
-      position:s.position,
-      trades:s.trades,
-      decisions:s.decisions,
-      lastPrice:s.lastPrice,
-      volatility:s.volatility,
-      executionStats:s.executionStats,
-      realized:s.realized,
-      limits:s.limits,
-
-      telemetry:getTelemetry(s)
-
-    }
+    telemetry:getTelemetry(s)
 
   };
 
 }
+
+/* ================= EXPORT ================= */
 
 module.exports = {
 
