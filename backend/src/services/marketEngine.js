@@ -1,7 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
 // STABLE ENGINE VERSION
-// Guarantees AI ticks + tenant safety
+// FIXED: sync prices with paperTrader
 // ==========================================================
 
 const fs = require("fs");
@@ -212,6 +212,7 @@ function runAI(tenantId){
 
     try{
 
+      // feed price to paper engine
       paperTrader.tick(
         tenantId,
         sym,
