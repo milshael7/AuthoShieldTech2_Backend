@@ -1,6 +1,7 @@
 // ==========================================================
 // STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
 // STABLE VERSION — Regime Fix + Signal Stability
+// FIXED: confidence scaling so AI dashboard moves
 // ==========================================================
 
 const fs = require("fs");
@@ -20,8 +21,8 @@ BASE CONFIG (PAPER FRIENDLY)
 
 const BASE_CONFIG = Object.freeze({
 
-  // FIXED: lower confidence gate so paper AI trades more often
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.08),
+  // Lower threshold so paper AI actually trades
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.05),
 
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
 
@@ -123,7 +124,7 @@ function computeEdge({price,lastPrice,volatility,regime}){
   if(regime==="expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
-  return clamp(normalized,-0.05,0.05);
+  return clamp(normalized,-0.06,0.06);
 }
 
 /* =========================================================
@@ -132,10 +133,12 @@ CONFIDENCE MODEL
 
 function computeConfidence({edge,ticksSeen,regime}){
 
+  // warmup confidence
   if(ticksSeen < 10)
     return 0.35;
 
-  let base = Math.abs(edge) * 5;
+  // FIXED: scaled so dashboard shows movement
+  let base = Math.abs(edge) * 25;
 
   if(regime==="expansion")
     base *= 1.2;
