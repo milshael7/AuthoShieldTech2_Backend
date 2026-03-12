@@ -1,19 +1,14 @@
 // ==========================================================
 // MARKET WEBSOCKET ENGINE
 // Feeds price ticks to frontend + AI trading engine
-// FIXED: multi-tenant AI feed
+// FIXED: correct payload format + tenant feed
 // ==========================================================
 
 const paperTrader = require("../services/paperTrader");
-const marketEngine = require("../services/marketEngine");
 
 const SYMBOL = "BTCUSDT";
 
 let price = 65000;
-
-/* =========================================================
-   PRICE SIMULATION ENGINE
-========================================================= */
 
 function nextPrice(){
 
@@ -26,10 +21,6 @@ function nextPrice(){
 
 }
 
-/* =========================================================
-   START MARKET STREAM
-========================================================= */
-
 function startMarketStream(wss){
 
   setInterval(()=>{
@@ -38,7 +29,8 @@ function startMarketStream(wss){
 
     const payload = {
 
-      type:"market",
+      channel:"market",
+      type:"snapshot",
 
       data:{
         [SYMBOL]:{
@@ -48,7 +40,7 @@ function startMarketStream(wss){
 
     };
 
-    /* ================= BROADCAST ================= */
+    /* BROADCAST TO CLIENTS */
 
     wss.clients.forEach(client=>{
 
@@ -62,34 +54,27 @@ function startMarketStream(wss){
 
     });
 
-    /* ================= FEED AI ================= */
+    /* FEED AI */
 
-    try{
+    const tenants = new Set();
 
-      // send tick to every tenant connected
-      const tenants = new Set();
+    wss.clients.forEach(ws=>{
+      if(ws.tenantId){
+        tenants.add(ws.tenantId);
+      }
+    });
 
-      wss.clients.forEach(ws=>{
-        if(ws.tenantId){
-          tenants.add(ws.tenantId);
-        }
-      });
+    tenants.forEach(tenantId=>{
 
-      tenants.forEach(tenantId=>{
+      try{
+        paperTrader.tick(
+          tenantId,
+          SYMBOL,
+          newPrice
+        );
+      }catch{}
 
-        try{
-
-          paperTrader.tick(
-            tenantId,
-            SYMBOL,
-            newPrice
-          );
-
-        }catch{}
-
-      });
-
-    }catch{}
+    });
 
   },1000);
 
