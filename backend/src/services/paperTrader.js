@@ -1,6 +1,6 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — AI GOVERNED STABLE v15
-// FIXED: snapshot format + telemetry + AI tick stability
+// FIXED: correct AI context + stable tick pipeline
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -112,6 +112,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.lastPrice = price;
 
+    /* ===== VOLATILITY ===== */
+
     if(prev){
 
       const change =
@@ -128,13 +130,14 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
+    /* ===== AI DECISION ===== */
+
     const plan =
       makeDecision({
         tenantId,
         symbol,
-        price,
-        lastPrice: prev,
-        volatility: state.volatility,
+        last: price,
+        paper: state,
         ticksSeen: state.executionStats.ticks
       }) || {
         action:"WAIT",
@@ -155,6 +158,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
+
+    /* ===== EXECUTION ===== */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
@@ -190,6 +195,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }
 
+    /* ===== EQUITY ===== */
+
     if(state.position){
 
       const unrealized =
@@ -199,9 +206,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       state.equity =
         state.cashBalance + unrealized;
 
-    }else{
+    }
+    else{
 
-      state.equity = state.cashBalance;
+      state.equity =
+        state.cashBalance;
 
     }
 
@@ -235,8 +244,11 @@ function getTelemetry(state){
   return {
 
     uptime,
+
     decisionsPerMinute,
-    memoryUsage: process.memoryUsage().rss
+
+    memoryUsage:
+      process.memoryUsage().rss
 
   };
 
@@ -248,23 +260,25 @@ function snapshot(tenantId){
 
   const s = load(tenantId);
 
-  const telemetry = getTelemetry(s);
-
   return {
 
-    cashBalance:s.cashBalance,
-    equity:s.equity,
-    peakEquity:s.peakEquity,
-    position:s.position,
-    trades:s.trades,
-    decisions:s.decisions,
-    lastPrice:s.lastPrice,
-    volatility:s.volatility,
-    executionStats:s.executionStats,
-    realized:s.realized,
-    limits:s.limits,
+    snapshot:{
 
-    telemetry
+      cashBalance:s.cashBalance,
+      equity:s.equity,
+      peakEquity:s.peakEquity,
+      position:s.position,
+      trades:s.trades,
+      decisions:s.decisions,
+      lastPrice:s.lastPrice,
+      volatility:s.volatility,
+      executionStats:s.executionStats,
+      realized:s.realized,
+      limits:s.limits,
+
+      telemetry:getTelemetry(s)
+
+    }
 
   };
 
