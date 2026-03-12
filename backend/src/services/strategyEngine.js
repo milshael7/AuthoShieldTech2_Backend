@@ -1,7 +1,7 @@
 // ==========================================================
 // STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
 // STABLE VERSION — Regime Fix + Signal Stability
-// FIXED: confidence scaling so AI dashboard moves
+// FIXED: confidence scaling + makeDecision export
 // ==========================================================
 
 const fs = require("fs");
@@ -21,10 +21,8 @@ BASE CONFIG (PAPER FRIENDLY)
 
 const BASE_CONFIG = Object.freeze({
 
-  // Lower threshold so paper AI actually trades
   minConfidence:Number(process.env.TRADE_MIN_CONF || 0.05),
-
-  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00005),
+  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00001),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
   maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
@@ -133,12 +131,10 @@ CONFIDENCE MODEL
 
 function computeConfidence({edge,ticksSeen,regime}){
 
-  // warmup confidence
   if(ticksSeen < 10)
     return 0.35;
 
-  // FIXED: scaled so dashboard shows movement
-  let base = Math.abs(edge) * 25;
+  let base = Math.abs(edge) * 20;
 
   if(regime==="expansion")
     base *= 1.2;
@@ -146,7 +142,7 @@ function computeConfidence({edge,ticksSeen,regime}){
   if(regime==="range")
     base *= 0.9;
 
-  return clamp(base,0,1);
+  return clamp(base,0.02,1); // small floor so UI moves
 }
 
 /* =========================================================
@@ -163,7 +159,7 @@ function normalizeRegime(regime){
 }
 
 /* =========================================================
-FINAL DECISION
+CORE DECISION
 ========================================================= */
 
 function buildDecision(context={}){
@@ -237,12 +233,10 @@ function buildDecision(context={}){
   confidence *= learning.confidenceMultiplier;
 
   edge = clamp(edge,-0.06,0.06);
-  confidence = clamp(confidence,0,1);
+  confidence = clamp(confidence,0.02,1);
 
   if(!Number.isFinite(price))
     return {action:"WAIT",confidence:0,edge:0};
-
-  /* ================= DECISION GATES ================= */
 
   if(confidence < BASE_CONFIG.minConfidence)
     return {action:"WAIT",confidence,edge};
@@ -250,7 +244,7 @@ function buildDecision(context={}){
   if(Math.abs(edge) < BASE_CONFIG.minEdge)
     return {action:"WAIT",confidence,edge};
 
-  let riskPct =
+  const riskPct =
     clamp(
       BASE_CONFIG.baseRiskPct * confidence,
       BASE_CONFIG.baseRiskPct,
@@ -268,6 +262,15 @@ function buildDecision(context={}){
   };
 }
 
+/* =========================================================
+COMPATIBILITY EXPORT
+========================================================= */
+
+function makeDecision(context){
+  return buildDecision(context);
+}
+
 module.exports = {
-  buildDecision
+  buildDecision,
+  makeDecision
 };
