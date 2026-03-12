@@ -1,10 +1,12 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — AI GOVERNED STABLE v16
 // FIXED: snapshot format + UI compatibility + telemetry
+// MEMORY ENABLED
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
+const memoryBrain = require("../../brainMemory/memoryBrain");
 const { readDb } = require("../lib/db");
 
 /* ================= ENGINE START ================= */
@@ -129,6 +131,15 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
+    /* ===== RECORD MARKET STATE ===== */
+
+    memoryBrain.recordMarketState({
+      tenantId,
+      symbol,
+      price,
+      volatility:state.volatility
+    });
+
     /* ===== AI DECISION ===== */
 
     const plan =
@@ -154,6 +165,18 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       price
     });
 
+    /* ===== MEMORY: SIGNAL ===== */
+
+    memoryBrain.recordSignal({
+      tenantId,
+      symbol,
+      action:plan.action,
+      confidence:plan.confidence || 0,
+      edge:plan.edge || 0,
+      price,
+      volatility:state.volatility
+    });
+
     if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
@@ -177,13 +200,30 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.executionStats.trades++;
 
-        state.trades.push({
+        const trade = {
           time:ts,
           symbol,
           side:plan.action,
           price,
           qty:Number(exec.result.qty||0),
           profit:Number(exec.result.pnl||0)
+        };
+
+        state.trades.push(trade);
+
+        /* ===== MEMORY: TRADE ===== */
+
+        memoryBrain.recordTrade({
+          tenantId,
+          symbol,
+          entry:price,
+          exit:price,
+          qty:trade.qty,
+          pnl:trade.profit,
+          risk:plan.riskPct,
+          confidence:plan.confidence || 0,
+          edge:plan.edge || 0,
+          volatility:state.volatility
         });
 
         if(state.trades.length > MAX_TRADES_MEMORY)
