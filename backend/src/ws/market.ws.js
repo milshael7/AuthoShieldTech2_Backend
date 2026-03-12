@@ -1,9 +1,11 @@
 // ==========================================================
 // MARKET WEBSOCKET ENGINE
 // Feeds price ticks to frontend + AI trading engine
+// FIXED: multi-tenant AI feed
 // ==========================================================
 
 const paperTrader = require("../services/paperTrader");
+const marketEngine = require("../services/marketEngine");
 
 const SYMBOL = "BTCUSDT";
 
@@ -53,9 +55,7 @@ function startMarketStream(wss){
       if(client.readyState === 1){
 
         try{
-
           client.send(JSON.stringify(payload));
-
         }catch{}
 
       }
@@ -66,13 +66,28 @@ function startMarketStream(wss){
 
     try{
 
-      const tenantId = "global";
+      // send tick to every tenant connected
+      const tenants = new Set();
 
-      paperTrader.tick(
-        tenantId,
-        SYMBOL,
-        newPrice
-      );
+      wss.clients.forEach(ws=>{
+        if(ws.tenantId){
+          tenants.add(ws.tenantId);
+        }
+      });
+
+      tenants.forEach(tenantId=>{
+
+        try{
+
+          paperTrader.tick(
+            tenantId,
+            SYMBOL,
+            newPrice
+          );
+
+        }catch{}
+
+      });
 
     }catch{}
 
