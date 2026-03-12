@@ -3,12 +3,14 @@
 // Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE
 // FIXED: Engine stats + AI brain state + config wiring
 // ADDED: Manual paper trade execution endpoint
+// FIXED: Manual orders use marketEngine live price
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
 const paperTrader = require("../services/paperTrader");
+const marketEngine = require("../services/marketEngine");
 const { readDb } = require("../lib/db");
 
 /* =========================================================
@@ -25,7 +27,6 @@ function resolveTenant(req) {
 
 router.get("/status", (req, res) => {
   try {
-
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -41,20 +42,18 @@ router.get("/status", (req, res) => {
       return res.json({
         ok: true,
         engine: "IDLE",
-        snapshot: null
+        snapshot: null,
       });
     }
 
     const db = readDb();
     const tradingConfig = db.tradingConfig || {};
 
-    const decisions =
-      paperTrader.getDecisions?.(tenantId) || [];
+    const decisions = paperTrader.getDecisions?.(tenantId) || [];
 
-    const lastDecision =
-      decisions.length
-        ? decisions[decisions.length - 1]
-        : null;
+    const lastDecision = decisions.length
+      ? decisions[decisions.length - 1]
+      : null;
 
     const engineState = {
       mode: tradingConfig.tradingMode || "paper",
@@ -62,40 +61,31 @@ router.get("/status", (req, res) => {
       riskPercent: tradingConfig.riskPercent ?? 1.5,
       maxTrades: tradingConfig.maxTrades ?? 5,
       positionMultiplier: tradingConfig.positionMultiplier ?? 1,
-      strategyMode: tradingConfig.strategyMode ?? "Balanced"
+      strategyMode: tradingConfig.strategyMode ?? "Balanced",
     };
 
     const brainState = {
       lastAction: lastDecision?.action || "WAIT",
-      smoothedConfidence:
-        Number(lastDecision?.confidence || 0).toFixed(3),
-      edgeMomentum:
-        Number(lastDecision?.edge || 0).toFixed(4),
-      winStreak:
-        snapshot.realized?.wins || 0,
-      lossStreak:
-        snapshot.realized?.losses || 0
+      smoothedConfidence: Number(lastDecision?.confidence || 0).toFixed(3),
+      edgeMomentum: Number(lastDecision?.edge || 0).toFixed(4),
+      winStreak: snapshot.realized?.wins || 0,
+      lossStreak: snapshot.realized?.losses || 0,
     };
 
     return res.json({
       ok: true,
-      engine: snapshot.executionStats?.ticks > 0
-        ? "RUNNING"
-        : "IDLE",
+      engine: snapshot.executionStats?.ticks > 0 ? "RUNNING" : "IDLE",
       engineState,
       brainState,
       executionStats: snapshot.executionStats || {},
       snapshot,
       time: new Date().toISOString(),
     });
-
   } catch {
-
     return res.status(500).json({
       ok: false,
       error: "Paper engine unavailable",
     });
-
   }
 });
 
@@ -105,7 +95,6 @@ router.get("/status", (req, res) => {
 
 router.get("/decisions", (req, res) => {
   try {
-
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -115,8 +104,7 @@ router.get("/decisions", (req, res) => {
       });
     }
 
-    const decisions =
-      paperTrader.getDecisions?.(tenantId) || [];
+    const decisions = paperTrader.getDecisions?.(tenantId) || [];
 
     return res.json({
       ok: true,
@@ -124,14 +112,11 @@ router.get("/decisions", (req, res) => {
       count: decisions.length,
       time: new Date().toISOString(),
     });
-
   } catch {
-
     return res.status(500).json({
       ok: false,
       error: "Decision stream unavailable",
     });
-
   }
 });
 
@@ -141,7 +126,6 @@ router.get("/decisions", (req, res) => {
 
 router.post("/reset", (req, res) => {
   try {
-
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -158,25 +142,20 @@ router.post("/reset", (req, res) => {
       snapshot: paperTrader.snapshot(tenantId),
       time: new Date().toISOString(),
     });
-
   } catch {
-
     return res.status(500).json({
       ok: false,
       error: "Paper reset failed",
     });
-
   }
 });
 
 /* =========================================================
    EXECUTE PAPER ORDER
-   (Manual trade support)
 ========================================================= */
 
 router.post("/order", (req, res) => {
   try {
-
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
@@ -186,13 +165,7 @@ router.post("/order", (req, res) => {
       });
     }
 
-    const {
-      symbol,
-      side,
-      size,
-      stopLoss,
-      takeProfit
-    } = req.body || {};
+    const { symbol, side, size, stopLoss, takeProfit, price } = req.body || {};
 
     if (!symbol || !side || !size) {
       return res.status(400).json({
@@ -201,13 +174,24 @@ router.post("/order", (req, res) => {
       });
     }
 
+    const livePrice =
+      marketEngine.getPrice(tenantId, symbol) || Number(price) || 0;
+
+    if (!livePrice || !Number.isFinite(livePrice) || livePrice <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Market price unavailable",
+      });
+    }
+
     const result = paperTrader.executeOrder({
       tenantId,
       symbol,
       side,
-      size,
-      stopLoss,
-      takeProfit
+      size: Number(size),
+      stopLoss: stopLoss != null ? Number(stopLoss) : null,
+      takeProfit: takeProfit != null ? Number(takeProfit) : null,
+      price: livePrice,
     });
 
     return res.json({
@@ -216,14 +200,11 @@ router.post("/order", (req, res) => {
       snapshot: paperTrader.snapshot(tenantId),
       time: new Date().toISOString(),
     });
-
   } catch (err) {
-
     return res.status(500).json({
       ok: false,
       error: err?.message || "Paper order failed",
     });
-
   }
 });
 
