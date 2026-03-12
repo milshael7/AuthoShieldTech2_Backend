@@ -1,16 +1,14 @@
 // backend/src/routes/paper.routes.js
 // ==========================================================
 // Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE
-// FIXED: Engine stats + AI brain state + config wiring
-// ADDED: Manual paper trade execution endpoint
-// FIXED: Manual orders use marketEngine live price
-// ENGINE MIGRATION: Uses engine/paperTrader instead of services
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
-const paperTrader = require("../engine/paperTrader");
+/* FIXED IMPORT PATH */
+const paperTrader = require("../services/paperTrader");
+
 const marketEngine = require("../services/marketEngine");
 const { readDb } = require("../lib/db");
 
