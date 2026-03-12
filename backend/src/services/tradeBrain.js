@@ -3,7 +3,7 @@
 // STABLE ENGINE VERSION — Memory Safe
 // -----------------------------------------------------------
 
-const aiBrain = require("./aiBrain");
+const aiBrain = require("../../brain/aiBrain");
 const { buildDecision } = require("./strategyEngine");
 
 /* ================= CONFIG ================= */
