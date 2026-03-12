@@ -1,7 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v8
-// FIXED: Faster warmup + optional unlimited paper trades
-// ADDED: manual executeOrder() support
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v9
+// FIXED: getTradingConfig missing
 // ==========================================================
 
 const fs = require("fs");
@@ -89,6 +88,43 @@ function load(tenantId){
 
   STATES.set(tenantId,state);
   return state;
+}
+
+/* ================= TRADING CONFIG ================= */
+
+function getTradingConfig(tenantId){
+
+  try{
+
+    const db = readDb();
+
+    const cfg =
+      db.tradingConfig?.[tenantId] ||
+      db.tradingConfig ||
+      {};
+
+    return {
+      enabled: cfg.enabled ?? true,
+      tradingMode: cfg.tradingMode || "paper",
+      maxTrades: Number(cfg.maxTrades || 5),
+      riskPercent: Number(cfg.riskPercent || 1.5),
+      positionMultiplier: Number(cfg.positionMultiplier || 1),
+      strategyMode: cfg.strategyMode || "Balanced"
+    };
+
+  }catch{
+
+    return {
+      enabled:true,
+      tradingMode:"paper",
+      maxTrades:5,
+      riskPercent:1.5,
+      positionMultiplier:1,
+      strategyMode:"Balanced"
+    };
+
+  }
+
 }
 
 /* ================= MANUAL ORDER ================= */
