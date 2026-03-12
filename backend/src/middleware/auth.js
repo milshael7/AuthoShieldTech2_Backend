@@ -1,7 +1,6 @@
 // backend/src/middleware/auth.js
-// AutoShield Tech — Zero Trust Identity Firewall v10
-// Token Versioned • Replay Safe • Device Risk Scored • Subscription Guard
-// Company Guard • Privilege Auto-Downgrade • Dev Override Safe • Role Guard Restored
+// AutoShield Tech — Zero Trust Identity Firewall v11
+// FIXED: device check no longer blocks legitimate sessions
 
 const { verify } = require("../lib/jwt");
 const { readDb } = require("../lib/db");
@@ -102,7 +101,7 @@ function authRequired(req, res, next) {
     return error(res, 403, "Account locked");
   }
 
-  /* ===== DEV BYPASS (ONLY IF ENABLED) ===== */
+  /* ===== DEV BYPASS ===== */
 
   if (!DEV_AUTH_BYPASS) {
 
@@ -132,30 +131,33 @@ function authRequired(req, res, next) {
     }
   }
 
-  /* ===== DEVICE CHECK ===== */
+  /* ===== DEVICE CHECK (FIXED) ===== */
 
-  const deviceCheck = classifyDeviceRisk(
-    user.activeDeviceFingerprint,
-    req
-  );
+  if (user.activeDeviceFingerprint) {
 
-  if (!deviceCheck.match) {
+    const deviceCheck = classifyDeviceRisk(
+      user.activeDeviceFingerprint,
+      req
+    );
 
-    if (DEVICE_STRICT || deviceCheck.score >= DEVICE_RISK_BLOCK_THRESHOLD) {
+    if (!deviceCheck.match) {
 
-      sessionAdapter.revokeAllUserSessions(user.id);
+      if (DEVICE_STRICT || deviceCheck.score >= DEVICE_RISK_BLOCK_THRESHOLD) {
 
-      writeAudit({
-        actor: user.id,
-        role: user.role,
-        action: "DEVICE_VERIFICATION_FAILED",
-        detail: {
-          riskScore: deviceCheck.score,
-          riskLevel: deviceCheck.risk
-        }
-      });
+        sessionAdapter.revokeAllUserSessions(user.id);
 
-      return error(res, 401, "Device verification failed");
+        writeAudit({
+          actor: user.id,
+          role: user.role,
+          action: "DEVICE_VERIFICATION_FAILED",
+          detail: {
+            riskScore: deviceCheck.score,
+            riskLevel: deviceCheck.risk
+          }
+        });
+
+        return error(res, 401, "Device verification failed");
+      }
     }
   }
 
@@ -218,7 +220,7 @@ function authRequired(req, res, next) {
 }
 
 /* ======================================================
-   ROLE GUARD (RESTORED)
+   ROLE GUARD
 ====================================================== */
 
 function requireRole(...roles) {
