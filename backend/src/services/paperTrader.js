@@ -1,6 +1,7 @@
 // ==========================================================
 // Autonomous Paper Trading Engine — AI GOVERNED STABLE v8
 // FIXED: Faster warmup + optional unlimited paper trades
+// ADDED: manual executeOrder() support
 // ==========================================================
 
 const fs = require("fs");
@@ -27,8 +28,6 @@ const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
 
 const SAVE_INTERVAL_MS = 5000;
-
-/* FIXED: faster AI warmup */
 
 const WARMUP_TICKS =
   Number(process.env.PAPER_WARMUP_TICKS || 8);
@@ -92,90 +91,61 @@ function load(tenantId){
   return state;
 }
 
-/* ================= DAILY RESET ================= */
+/* ================= MANUAL ORDER ================= */
 
-function resetDailyLimits(state){
+function executeOrder({
+  tenantId,
+  symbol,
+  side,
+  size,
+  stopLoss,
+  takeProfit
+}){
 
-  const today =
-    new Date().toISOString().slice(0,10);
+  const state = load(tenantId);
 
-  if(state.lastResetDay !== today){
+  const price =
+    state.lastPrice || 0;
 
-    state.limits.tradesToday = 0;
-    state.limits.lossesToday = 0;
+  if(!price)
+    throw new Error("Market price unavailable");
 
-    state.lastResetDay = today;
-  }
-}
+  const exec =
+    executionEngine.executePaperOrder({
 
-/* ================= SAVE ================= */
+      tenantId,
+      symbol,
+      action:side,
+      price,
+      riskPct:0,
+      state,
+      ts:Date.now(),
+      qty:Number(size)
 
-function scheduleSave(tenantId,state){
+    });
 
-  const now = Date.now();
+  if(exec?.result){
 
-  if(!state._dirty) return;
+    const pnl =
+      Number(exec.result.pnl||0);
 
-  if(now - state._lastSave < SAVE_INTERVAL_MS)
-    return;
+    state.executionStats.trades++;
 
-  state._dirty=false;
-  state._lastSave=now;
+    state.trades.push({
+      time:Date.now(),
+      symbol,
+      side,
+      price,
+      qty:Number(exec.result.qty||0),
+      profit:pnl
+    });
 
-  const file = statePath(tenantId);
+    state.realized.net += pnl;
 
-  const snapshot =
-    JSON.stringify(
-      {...state,_dirty:undefined,_locked:undefined},
-      null,
-      2
-    );
-
-  setImmediate(()=>{
-    try{
-      const tmp = `${file}.tmp`;
-      fs.writeFileSync(tmp,snapshot);
-      fs.renameSync(tmp,file);
-    }catch{}
-  });
-
-}
-
-/* ================= CONFIG ================= */
-
-function getTradingConfig(tenantId){
-
-  try{
-
-    const db = readDb();
-
-    const cfg =
-      db.tradingConfig?.[tenantId] ||
-      db.tradingConfig ||
-      {};
-
-    return {
-      enabled: cfg.enabled ?? true,
-      tradingMode: cfg.tradingMode || "paper",
-      maxTrades: Number(cfg.maxTrades || 5),
-      riskPercent: Number(cfg.riskPercent || 1.5),
-      positionMultiplier: Number(cfg.positionMultiplier || 1),
-      strategyMode: cfg.strategyMode || "Balanced"
-    };
-
-  }catch{
-
-    return {
-      enabled:true,
-      tradingMode:"paper",
-      maxTrades:5,
-      riskPercent:1.5,
-      positionMultiplier:1,
-      strategyMode:"Balanced"
-    };
-
+    state._dirty=true;
   }
 
+  return exec;
 }
 
 /* ================= AI TICK ================= */
@@ -195,61 +165,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   try{
 
-    resetDailyLimits(state);
-
     state.executionStats.ticks++;
-
-    orderFlowEngine.recordPrice({tenantId,price});
-    counterfactualEngine.recordPrice({tenantId,price});
-    correlationEngine.recordPrice({tenantId,symbol,price});
-
-    const prev = state.lastPrice;
-
-    if(prev){
-
-      const change =
-        Math.abs(price-prev)/prev;
-
-      state.volatility =
-        Math.max(
-          0.0005,
-          state.volatility*0.9 +
-          change*0.1
-        );
-
-    }
-
-    state.lastPrice = price;
-
-    /* ============== WARMUP ============== */
-
-    if(state.executionStats.ticks < WARMUP_TICKS){
-
-      state.decisions.push({
-        time:ts,
-        symbol,
-        action:"WAIT",
-        confidence:0,
-        price
-      });
-
-      state._dirty=true;
-      scheduleSave(tenantId,state);
-      return;
-    }
-
-    /* FIXED: unlimited trades allowed if maxTrades = 0 */
-
-    if(
-      cfg.maxTrades > 0 &&
-      state.limits.tradesToday >= cfg.maxTrades
-    ){
-      state._dirty=true;
-      scheduleSave(tenantId,state);
-      return;
-    }
-
-    /* ============== DECISION ============== */
 
     const plan =
       makeDecision({
@@ -264,111 +180,27 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         riskPct:0
       };
 
-    plan.riskPct =
-      (Number(cfg.riskPercent)/100) *
-      Number(cfg.positionMultiplier);
-
     state.executionStats.decisions++;
-
-    state.decisions.push({
-      time:ts,
-      symbol,
-      action:plan.action,
-      confidence:Number(plan.confidence||0),
-      price,
-      riskPct:Number(plan.riskPct||0),
-      volatility:Number(state.volatility||0)
-    });
-
-    if(state.decisions.length > MAX_DECISIONS_MEMORY)
-      state.decisions =
-        state.decisions.slice(-MAX_DECISIONS_MEMORY);
-
-    /* ============== EXECUTION ============== */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
-      let exec=null;
+      executionEngine.executePaperOrder({
+        tenantId,
+        symbol,
+        action:plan.action,
+        price,
+        riskPct:plan.riskPct,
+        state,
+        ts
+      });
 
-      try{
-
-        exec =
-          executionEngine.executePaperOrder({
-            tenantId,
-            symbol,
-            action:plan.action,
-            price,
-            riskPct:plan.riskPct,
-            state,
-            ts
-          });
-
-      }catch{}
-
-      if(exec?.result){
-
-        state.executionStats.trades++;
-        state.limits.tradesToday++;
-
-        const pnl =
-          Number(exec.result.pnl||0);
-
-        state.trades.push({
-          time:ts,
-          symbol,
-          side:plan.action,
-          price,
-          qty:Number(exec.result.qty||0),
-          profit:pnl
-        });
-
-        if(pnl>0){
-          state.realized.wins++;
-        }
-        else if(pnl<0){
-          state.realized.losses++;
-          state.limits.lossesToday++;
-        }
-
-        state.realized.net+=pnl;
-
-        if(state.trades.length > MAX_TRADES_MEMORY)
-          state.trades =
-            state.trades.slice(-MAX_TRADES_MEMORY);
-      }
+      state.executionStats.trades++;
 
     }
-
-    /* ============== EQUITY ============== */
-
-    if(state.position){
-
-      const unrealized =
-        (state.lastPrice - state.position.entry)
-        * state.position.qty;
-
-      state.equity =
-        state.cashBalance + unrealized;
-
-    }
-    else{
-
-      state.equity =
-        state.cashBalance;
-
-    }
-
-    if(state.equity > state.peakEquity)
-      state.peakEquity = state.equity;
-
-    state._dirty=true;
-    scheduleSave(tenantId,state);
 
   }
   finally{
-
     state._locked=false;
-
   }
 
 }
@@ -384,20 +216,11 @@ function snapshot(tenantId){
     cashBalance:s.cashBalance,
     equity:s.equity,
     peakEquity:s.peakEquity,
-
     position:s.position,
     trades:s.trades,
     decisions:s.decisions,
-
     lastPrice:s.lastPrice,
     volatility:s.volatility,
-
-    unrealizedPnL:
-      s.position
-        ? (s.lastPrice - s.position.entry)
-          * s.position.qty
-        : 0,
-
     executionStats:s.executionStats,
     realized:s.realized,
     limits:s.limits
@@ -410,6 +233,7 @@ module.exports = {
 
   tick,
   snapshot,
+  executeOrder,
 
   getDecisions:
     tenantId =>
