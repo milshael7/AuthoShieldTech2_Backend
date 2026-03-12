@@ -1,6 +1,6 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE v3
-// FIXED: position flipping + stability improvements
+// EXECUTION ENGINE — PAPER TRADING CORE v4
+// FIXED: manual qty support + stability improvements
 // ==========================================================
 
 function clamp(n,min,max){
@@ -115,6 +115,7 @@ function executePaperOrder({
   action,
   price,
   riskPct,
+  qty,
   state,
   ts = Date.now()
 
@@ -132,6 +133,17 @@ function executePaperOrder({
 
   const pos = state.position;
 
+  /* ================= POSITION SIZE ================= */
+
+  let positionSize = safeNum(qty,0);
+
+  if(positionSize <= 0){
+    positionSize =
+      calculatePositionSize(state,price,riskPct);
+  }
+
+  if(positionSize <= 0) return null;
+
   /* ================= BUY ================= */
 
   if(action === "BUY"){
@@ -146,16 +158,11 @@ function executePaperOrder({
 
         closePosition({state,price,ts});
 
-        const qty =
-          calculatePositionSize(state,price,riskPct);
-
-        if(qty <= 0) return null;
-
         return openPosition({
           state,
           symbol,
           price,
-          qty,
+          qty:positionSize,
           side:"LONG",
           ts
         });
@@ -164,16 +171,11 @@ function executePaperOrder({
 
     }
 
-    const qty =
-      calculatePositionSize(state,price,riskPct);
-
-    if(qty <= 0) return null;
-
     return openPosition({
       state,
       symbol,
       price,
-      qty,
+      qty:positionSize,
       side:"LONG",
       ts
     });
@@ -194,16 +196,11 @@ function executePaperOrder({
 
         closePosition({state,price,ts});
 
-        const qty =
-          calculatePositionSize(state,price,riskPct);
-
-        if(qty <= 0) return null;
-
         return openPosition({
           state,
           symbol,
           price,
-          qty,
+          qty:positionSize,
           side:"SHORT",
           ts
         });
@@ -212,16 +209,11 @@ function executePaperOrder({
 
     }
 
-    const qty =
-      calculatePositionSize(state,price,riskPct);
-
-    if(qty <= 0) return null;
-
     return openPosition({
       state,
       symbol,
       price,
-      qty,
+      qty:positionSize,
       side:"SHORT",
       ts
     });
