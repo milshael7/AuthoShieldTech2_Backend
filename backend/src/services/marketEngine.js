@@ -2,11 +2,12 @@
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
 // STABLE ENGINE VERSION
 // FIXED: sync prices with paperTrader
+// ENGINE MIGRATION: uses engine/paperTrader
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
-const paperTrader = require("./paperTrader");
+const paperTrader = require("../engine/paperTrader");
 
 /* ================= STORAGE ================= */
 
@@ -212,7 +213,6 @@ function runAI(tenantId){
 
     try{
 
-      // feed price to paper engine
       paperTrader.tick(
         tenantId,
         sym,
