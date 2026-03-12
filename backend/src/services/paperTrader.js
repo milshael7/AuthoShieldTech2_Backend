@@ -1,12 +1,12 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v11
-// FIXED: correct AI decision call + equity sync + history
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v12
+// FIXED: correct decision call + equity sync + history
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
 
-const { buildDecision } = require("./tradeBrain");
+const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
 const { readDb } = require("../lib/db");
 
@@ -14,10 +14,6 @@ const { readDb } = require("../lib/db");
 
 const START_BAL =
   Number(process.env.PAPER_START_BALANCE || 100000);
-
-const BASE_PATH =
-  process.env.PAPER_STATE_DIR ||
-  path.join("/tmp","paper_trader");
 
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
@@ -94,55 +90,6 @@ function getTradingConfig(tenantId){
 
 }
 
-/* ================= MANUAL ORDER ================= */
-
-function executeOrder({
-  tenantId,
-  symbol,
-  side,
-  size
-}){
-
-  const state = load(tenantId);
-
-  const price = state.lastPrice;
-
-  if(!price)
-    throw new Error("Market price unavailable");
-
-  const exec =
-    executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action:side,
-      price,
-      qty:Number(size),
-      state
-    });
-
-  if(exec?.result){
-
-    const pnl = Number(exec.result.pnl || 0);
-
-    state.executionStats.trades++;
-
-    state.trades.push({
-      time:Date.now(),
-      symbol,
-      side,
-      price,
-      qty:Number(exec.result.qty || 0),
-      profit:pnl
-    });
-
-    state.realized.net += pnl;
-
-  }
-
-  return exec;
-
-}
-
 /* ================= AI TICK ================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
@@ -160,10 +107,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   try{
 
-    /* ===== update price ===== */
-
     const prev = state.lastPrice;
-
     state.lastPrice = price;
 
     if(prev){
@@ -185,12 +129,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     /* ===== AI decision ===== */
 
     const plan =
-      buildDecision({
+      makeDecision({
         tenantId,
         symbol,
-        price,
-        lastPrice:prev,
-        volatility:state.volatility,
+        last:price,
+        paper:state,
         ticksSeen:state.executionStats.ticks
       }) || {
         action:"WAIT",
@@ -307,7 +250,6 @@ module.exports = {
 
   tick,
   snapshot,
-  executeOrder,
 
   getDecisions:
     tenantId =>
