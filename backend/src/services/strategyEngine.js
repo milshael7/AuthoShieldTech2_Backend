@@ -1,276 +1,484 @@
-// ==========================================================
-// STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
-// STABLE VERSION — Regime Fix + Signal Stability
-// FIXED: confidence scaling + makeDecision export
-// ==========================================================
+import React, { useEffect, useRef, useState, useMemo } from "react";
+import TerminalChart from "../components/TerminalChart";
+import OrderPanel from "../components/OrderPanel";
+import AIBehaviorPanel from "../components/AIBehaviorPanel";
+import { getToken } from "../lib/api.js";
 
-const fs = require("fs");
-const path = require("path");
+const API_BASE = import.meta.env.VITE_API_BASE?.replace(/\/+$/, "");
+const SYMBOL = "BTCUSDT";
 
-const patternEngine = require("./patternEngine");
-const regimeMemory = require("./regimeMemory");
-const orderFlowEngine = require("./orderFlowEngine");
-const correlationEngine = require("./correlationEngine");
-const counterfactualEngine = require("./counterfactualEngine");
+const CANDLE_SECONDS = 60;
+const MAX_CANDLES = 500;
 
-const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
+/* ================= GLOBAL CACHE ================= */
 
-/* =========================================================
-BASE CONFIG (PAPER FRIENDLY)
-========================================================= */
-
-const BASE_CONFIG = Object.freeze({
-
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.05),
-  minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00001),
-
-  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
-  maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
-
-  regimeTrendEdgeBoost:1.25,
-  regimeRangeEdgeCut:0.8,
-  regimeExpansionBoost:1.35
-
-});
-
-/* =========================================================
-LEARNING SYSTEM
-========================================================= */
-
-const LEARNING_VERSION = 7;
-
-const LEARNING_DIR =
-  process.env.STRATEGY_LEARNING_DIR ||
-  path.join("/tmp","strategy_learning");
-
-function ensureDir(p){
-  if(!fs.existsSync(p))
-    fs.mkdirSync(p,{recursive:true});
-}
-
-function learningPath(tenantId){
-  ensureDir(LEARNING_DIR);
-  const key = tenantId || "__default__";
-  return path.join(
-    LEARNING_DIR,
-    `learning_${key}.json`
-  );
-}
-
-function defaultLearning(){
-  return{
-    version:LEARNING_VERSION,
-    edgeMultiplier:1,
-    confidenceMultiplier:1,
-    lastWinRate:0.5,
-    lastEvaluatedTradeCount:0,
-    lastUpdated:Date.now()
+if (!window.__TRADING_CACHE__) {
+  window.__TRADING_CACHE__ = {
+    candles: [],
+    lastCandle: null
   };
 }
 
-const LEARNING_CACHE = new Map();
+function storageKey(){
+  return `trading_candles_${SYMBOL}`;
+}
 
-function loadLearning(tenantId){
-
-  const key = tenantId || "__default__";
-
-  if(LEARNING_CACHE.has(key))
-    return LEARNING_CACHE.get(key);
-
-  const file = learningPath(key);
-  let state = defaultLearning();
-
+function loadPersisted(){
   try{
-    if(fs.existsSync(file)){
-      const raw =
-        JSON.parse(fs.readFileSync(file,"utf-8"));
-      state = {...state,...raw};
+    const raw = localStorage.getItem(storageKey());
+    if(!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  }catch{
+    return [];
+  }
+}
 
-      if(state.version !== LEARNING_VERSION)
-        state = defaultLearning();
-    }
+function savePersisted(candles){
+  try{
+    localStorage.setItem(
+      storageKey(),
+      JSON.stringify(candles.slice(-MAX_CANDLES))
+    );
   }catch{}
-
-  LEARNING_CACHE.set(key,state);
-  return state;
 }
 
-/* =========================================================
-EDGE MODEL
-========================================================= */
+function mergeHistory(existing,incoming){
 
-function computeEdge({price,lastPrice,volatility,regime}){
+  if(!existing.length) return incoming;
 
-  if(!Number.isFinite(price) ||
-     !Number.isFinite(lastPrice))
-    return 0;
+  const map = new Map();
 
-  const vol = volatility || 0.002;
+  existing.forEach(c => map.set(c.time,c));
+  incoming.forEach(c => map.set(c.time,c));
 
-  const momentum =
-    (price-lastPrice)/lastPrice;
-
-  let normalized =
-    momentum/(vol || 0.001);
-
-  if(regime==="trend")
-    normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
-
-  if(regime==="range")
-    normalized *= BASE_CONFIG.regimeRangeEdgeCut;
-
-  if(regime==="expansion")
-    normalized *= BASE_CONFIG.regimeExpansionBoost;
-
-  return clamp(normalized,-0.06,0.06);
+  return Array.from(map.values())
+    .sort((a,b)=>a.time-b.time)
+    .slice(-MAX_CANDLES);
 }
 
-/* =========================================================
-CONFIDENCE MODEL
-========================================================= */
-
-function computeConfidence({edge,ticksSeen,regime}){
-
-  if(ticksSeen < 10)
-    return 0.35;
-
-  let base = Math.abs(edge) * 20;
-
-  if(regime==="expansion")
-    base *= 1.2;
-
-  if(regime==="range")
-    base *= 0.9;
-
-  return clamp(base,0.02,1); // small floor so UI moves
+function toNumber(v){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-/* =========================================================
-REGIME NORMALIZER
-========================================================= */
+export default function TradingRoom(){
 
-function normalizeRegime(regime){
+  const marketWsRef = useRef(null);
+  const paperWsRef = useRef(null);
 
-  if(regime === "volatility_expansion")
-    return "expansion";
+  const marketReconnectRef = useRef(null);
+  const paperReconnectRef = useRef(null);
 
-  return regime;
+  const lastCandleRef = useRef(null);
+  const engineStartRef = useRef(null);
 
-}
+  const [engineAlive,setEngineAlive] = useState(false);
 
-/* =========================================================
-CORE DECISION
-========================================================= */
+  const [candles,setCandles] = useState([]);
+  const [price,setPrice] = useState(null);
 
-function buildDecision(context={}){
+  const [equity,setEquity] = useState(0);
+  const [wallet,setWallet] = useState({usd:0,btc:0});
+  const [position,setPosition] = useState(null);
 
-  const {
-    tenantId,
-    symbol="BTCUSDT",
-    price,
-    lastPrice,
-    volatility,
-    ticksSeen=0
-  } = context;
+  const [trades,setTrades] = useState([]);
+  const [decisions,setDecisions] = useState([]);
 
-  const learning = loadLearning(tenantId);
+  const [memory,setMemory] = useState(null);
 
-  let regime =
-    regimeMemory.detectRegime({
-      price,
-      lastPrice,
-      volatility
-    });
+  const [engineUptime,setEngineUptime] = useState("0s");
 
-  regime = normalizeRegime(regime);
-
-  let edge =
-    computeEdge({
-      price,
-      lastPrice,
-      volatility,
-      regime
-    });
-
-  edge *= patternEngine.getPatternEdgeBoost({
-    tenantId,
-    symbol,
-    volatility
+  const [aiControl,setAiControl] = useState({
+    enabled:true,
+    tradingMode:"paper",
+    strategyMode:"Balanced"
   });
 
-  edge *= regimeMemory.getRegimeBoost({
-    tenantId,
-    regime
-  });
+/* ================= RESTORE CANDLES ================= */
 
-  edge *= correlationEngine.getCorrelationBoost({
-    tenantId,
-    symbol
-  });
+  useEffect(()=>{
 
-  let confidence =
-    computeConfidence({
-      edge,
-      ticksSeen,
-      regime
+    const cache = window.__TRADING_CACHE__;
+    const persisted = loadPersisted();
+
+    const next = cache.candles.length ? cache.candles : persisted;
+
+    const last = cache.lastCandle || next[next.length-1] || null;
+
+    lastCandleRef.current = last;
+
+    setCandles(next);
+
+  },[]);
+
+/* ================= LOAD MEMORY ================= */
+
+  async function loadMemory(){
+
+    const token=getToken();
+    if(!token || !API_BASE) return;
+
+    try{
+
+      const res=await fetch(
+        `${API_BASE}/api/brain/snapshot`,
+        {headers:{Authorization:`Bearer ${token}`}}
+      );
+
+      const data=await res.json();
+
+      if(data) setMemory(data);
+
+    }catch{}
+
+  }
+
+/* ================= LOAD CONFIG ================= */
+
+  useEffect(()=>{
+
+    async function loadConfig(){
+
+      const token=getToken();
+      if(!token || !API_BASE) return;
+
+      try{
+
+        const res=await fetch(
+          `${API_BASE}/api/ai/config`,
+          {headers:{Authorization:`Bearer ${token}`}}
+        );
+
+        const data=await res.json();
+
+        if(data?.config){
+          setAiControl(data.config);
+        }
+
+      }catch{}
+
+    }
+
+    loadConfig();
+    loadMemory();
+
+  },[]);
+
+/* ================= ENGINE UPTIME ================= */
+
+  useEffect(()=>{
+
+    const timer=setInterval(()=>{
+
+      if(!engineStartRef.current) return;
+
+      const diff=Date.now()-engineStartRef.current;
+
+      const sec=Math.floor(diff/1000)%60;
+      const min=Math.floor(diff/60000)%60;
+      const hr=Math.floor(diff/3600000);
+
+      setEngineUptime(`${hr}h ${min}m ${sec}s`);
+
+    },1000);
+
+    return ()=>clearInterval(timer);
+
+  },[]);
+
+/* ================= LOAD HISTORY ================= */
+
+  async function loadHistory(){
+
+    const token=getToken();
+    if(!token || !API_BASE) return;
+
+    try{
+
+      const res=await fetch(
+        `${API_BASE}/api/market/candles/${SYMBOL}?limit=${MAX_CANDLES}`,
+        {headers:{Authorization:`Bearer ${token}`}}
+      );
+
+      const data=await res.json();
+
+      if(!data?.ok || !Array.isArray(data.candles)) return;
+
+      const formatted=data.candles
+        .map(c=>({
+          time:Number(c.time),
+          open:Number(c.open),
+          high:Number(c.high),
+          low:Number(c.low),
+          close:Number(c.close)
+        }))
+        .filter(c=>Number.isFinite(c.time))
+        .slice(-MAX_CANDLES);
+
+      if(!formatted.length) return;
+
+      setCandles(prev => {
+
+        const merged = mergeHistory(prev, formatted);
+
+        const last = merged[merged.length-1];
+
+        lastCandleRef.current = last;
+
+        window.__TRADING_CACHE__.candles = merged;
+        window.__TRADING_CACHE__.lastCandle = last;
+
+        savePersisted(merged);
+
+        return merged;
+
+      });
+
+    }catch{}
+  }
+
+  useEffect(()=>{loadHistory()},[]);
+
+/* ================= CANDLE UPDATE ================= */
+
+  function updateCandles(priceNow){
+
+    if(!Number.isFinite(priceNow)) return;
+
+    const now=Math.floor(Date.now()/1000);
+    const candleTime=Math.floor(now/CANDLE_SECONDS)*CANDLE_SECONDS;
+
+    const last=lastCandleRef.current;
+
+    setCandles(prev=>{
+
+      let next;
+      let nextLast;
+
+      if(!last || last.time!==candleTime){
+
+        nextLast={
+          time:candleTime,
+          open:priceNow,
+          high:priceNow,
+          low:priceNow,
+          close:priceNow
+        };
+
+        next=[...prev.slice(-MAX_CANDLES),nextLast];
+
+      }else{
+
+        nextLast={
+          ...last,
+          high:Math.max(last.high,priceNow),
+          low:Math.min(last.low,priceNow),
+          close:priceNow
+        };
+
+        next=[...prev];
+        next[next.length-1]=nextLast;
+
+      }
+
+      lastCandleRef.current=nextLast;
+
+      window.__TRADING_CACHE__.candles = next;
+      window.__TRADING_CACHE__.lastCandle = nextLast;
+
+      savePersisted(next);
+
+      return next;
+
     });
 
-  const flow =
-    orderFlowEngine.analyzeFlow({tenantId});
+  }
 
-  confidence *= flow.boost || 1;
-  edge *= flow.boost || 1;
+/* ================= MARKET WS ================= */
 
-  const missedBoost =
-    counterfactualEngine.getLearningAdjustment?.({
-      tenantId
-    }) || 1;
+  function connectMarket(){
 
-  confidence *= missedBoost;
-  edge *= missedBoost;
+    const token=getToken();
+    if(!token || !API_BASE) return;
 
-  edge *= learning.edgeMultiplier;
-  confidence *= learning.confidenceMultiplier;
+    const url=new URL(API_BASE);
+    const protocol=url.protocol==="https:"?"wss:":"ws:";
 
-  edge = clamp(edge,-0.06,0.06);
-  confidence = clamp(confidence,0.02,1);
-
-  if(!Number.isFinite(price))
-    return {action:"WAIT",confidence:0,edge:0};
-
-  if(confidence < BASE_CONFIG.minConfidence)
-    return {action:"WAIT",confidence,edge};
-
-  if(Math.abs(edge) < BASE_CONFIG.minEdge)
-    return {action:"WAIT",confidence,edge};
-
-  const riskPct =
-    clamp(
-      BASE_CONFIG.baseRiskPct * confidence,
-      BASE_CONFIG.baseRiskPct,
-      BASE_CONFIG.maxRiskPct
+    const ws=new WebSocket(
+      `${protocol}//${url.host}/ws?channel=market&token=${encodeURIComponent(token)}`
     );
 
-  return{
-    symbol,
-    action:edge > 0 ? "BUY":"SELL",
-    confidence,
-    edge,
-    riskPct,
-    regime,
-    ts:Date.now()
-  };
+    marketWsRef.current=ws;
+
+    ws.onmessage=(msg)=>{
+
+      try{
+
+        const packet=JSON.parse(msg.data);
+
+        if(packet.channel!=="market") return;
+
+        const market=packet?.data?.[SYMBOL];
+        if(!market) return;
+
+        const p=toNumber(market.price);
+        if(p===null) return;
+
+        setPrice(p);
+
+        updateCandles(p);
+
+      }catch{}
+
+    };
+
+  }
+
+/* ================= PAPER WS ================= */
+
+  function connectPaper(){
+
+    const token=getToken();
+    if(!token || !API_BASE) return;
+
+    const url=new URL(API_BASE);
+    const protocol=url.protocol==="https:"?"wss:":"ws:";
+
+    const ws=new WebSocket(
+      `${protocol}//${url.host}/ws?channel=paper&token=${encodeURIComponent(token)}`
+    );
+
+    paperWsRef.current=ws;
+
+    ws.onmessage=(msg)=>{
+
+      try{
+
+        const data=JSON.parse(msg.data);
+
+        if(data.channel!=="paper") return;
+
+        if(!engineStartRef.current){
+          engineStartRef.current=data.engineStart||Date.now();
+        }
+
+        if(data.snapshot){
+          setEngineAlive(true);
+        }
+
+        const snap=data.snapshot||{};
+
+        setEquity(Number(snap.equity||0));
+
+        setWallet({
+          usd:Number(snap.cashBalance||0),
+          btc:Number(snap.position?.qty||0)
+        });
+
+        setPosition(snap.position||null);
+        setTrades(snap.trades||[]);
+        setDecisions(snap.decisions||[]);
+
+      }catch{}
+
+    };
+
+  }
+
+  useEffect(()=>{
+
+    connectMarket();
+    connectPaper();
+
+  },[]);
+
+/* ================= AI METRICS ================= */
+
+  const aiConfidence=useMemo(()=>{
+
+    if(!decisions.length) return 0.2;
+
+    const total=decisions.reduce(
+      (s,d)=>s+Number(d.confidence||0),0
+    );
+
+    return total/decisions.length;
+
+  },[decisions]);
+
+/* ================= ENGINE STATUS ================= */
+
+  const engineStatus =
+    engineAlive || engineStartRef.current
+      ? "RUNNING"
+      : "STARTING";
+
+/* ================= UI ================= */
+
+  return(
+
+    <div style={{display:"flex",flex:1,background:"#0a0f1c",color:"#fff"}}>
+
+      <div style={{flex:1,padding:20}}>
+
+        <div style={{fontWeight:700}}>{SYMBOL}</div>
+
+        <div style={{opacity:.7}}>
+          Live Price: {price ? price.toLocaleString() : "Loading"}
+        </div>
+
+        <TerminalChart
+          candles={candles}
+          trades={trades}
+          pnlSeries={trades}
+        />
+
+        <div style={{marginTop:20}}>
+          <AIBehaviorPanel
+            trades={trades}
+            decisions={decisions}
+            memory={memory}
+          />
+        </div>
+
+      </div>
+
+      <div style={{width:240}}>
+        <OrderPanel symbol={SYMBOL} price={price}/>
+      </div>
+
+      <div style={{
+        width:240,
+        padding:16,
+        background:"#111827",
+        overflowY:"auto"
+      }}>
+
+        <h3>AI Engine</h3>
+
+        <div>Status: {engineStatus}</div>
+
+        <div>Engine Uptime: {engineUptime}</div>
+
+        <div style={{marginTop:10}}>
+          Equity: ${equity.toFixed(2)}
+        </div>
+
+        <div>Cash: ${wallet.usd.toFixed(2)}</div>
+
+        <div style={{marginTop:10}}>
+          Trades: {trades.length}
+        </div>
+
+        <div>
+          AI Confidence: {(aiConfidence*100).toFixed(0)}%
+        </div>
+
+      </div>
+
+    </div>
+
+  );
+
 }
-
-/* =========================================================
-COMPATIBILITY EXPORT
-========================================================= */
-
-function makeDecision(context){
-  return buildDecision(context);
-}
-
-module.exports = {
-  buildDecision,
-  makeDecision
-};
