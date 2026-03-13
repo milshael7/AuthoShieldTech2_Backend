@@ -1,6 +1,6 @@
 // ==========================================================
-// AUTOSHIELD OUTSIDE BRAIN — STABLE PERSISTENT AI CORE v18
-// Reinforcement Learning + Fast Restore + Safe DB Writes
+// AUTOSHIELD OUTSIDE BRAIN — PERSISTENT AI CORE v19
+// Fast Restore • Reinforcement Learning • Safe Writes
 // ==========================================================
 
 const { readDb, writeDb } = require("../src/lib/db");
@@ -9,9 +9,9 @@ const { readDb, writeDb } = require("../src/lib/db");
 CONFIG
 ========================================================= */
 
-const SIGNAL_MEMORY_LIMIT = 100;
-const OUTCOME_MEMORY_LIMIT = 200;
-const SAVE_INTERVAL = 5000;
+const SIGNAL_MEMORY_LIMIT = 200;
+const OUTCOME_MEMORY_LIMIT = 400;
+const SAVE_INTERVAL = 4000;
 
 /* =========================================================
 ENGINE TELEMETRY
@@ -22,9 +22,24 @@ const ENGINE_BOOT_TIME = Date.now();
 let DECISION_COUNTER = 0;
 let LAST_DECISION_TS = Date.now();
 
-function recordDecisionTick(){
-  DECISION_COUNTER++;
-  LAST_DECISION_TS = Date.now();
+/* =========================================================
+WRITE LOCK
+========================================================= */
+
+let WRITE_LOCK = false;
+
+function safeWrite(db){
+
+  if(WRITE_LOCK) return;
+
+  WRITE_LOCK = true;
+
+  try{
+    writeDb(db);
+  }finally{
+    WRITE_LOCK = false;
+  }
+
 }
 
 /* =========================================================
@@ -48,7 +63,7 @@ function defaultBrain(){
 
   return{
 
-    version:18,
+    version:19,
 
     createdAt:Date.now(),
     updatedAt:Date.now(),
@@ -88,7 +103,7 @@ function getBrain(tenantId){
 
   if(!db.brain.ai[key]){
     db.brain.ai[key] = defaultBrain();
-    writeDb(db);
+    safeWrite(db);
   }
 
   return db.brain.ai[key];
@@ -105,9 +120,10 @@ function saveBrain(tenantId,brain){
   if(!db.brain.ai) db.brain.ai = {};
 
   brain.updatedAt = Date.now();
+
   db.brain.ai[key] = brain;
 
-  writeDb(db);
+  safeWrite(db);
 
 }
 
@@ -163,39 +179,38 @@ function recordTradeOutcome({tenantId,pnl}){
 }
 
 /* =========================================================
-ADAPTIVE BEHAVIOR
+ADAPTIVE LEARNING
 ========================================================= */
 
 function adaptBehavior(brain){
 
   const { winRate, expectancy } = brain.stats;
 
-  if(brain.stats.totalTrades < 10) return;
+  if(brain.stats.totalTrades < 8) return;
 
   if(expectancy > 0){
 
     brain.adaptive.biasBoost =
-      clamp(1 + winRate*0.5,1,1.6);
+      clamp(1 + winRate*0.6,1,1.8);
 
     brain.adaptive.edgeAmplifier =
-      clamp(1 + winRate*0.4,1,1.5);
+      clamp(1 + winRate*0.5,1,1.6);
 
     brain.adaptive.confidenceBoost =
-      clamp(1 + winRate*0.3,1,1.4);
+      clamp(1 + winRate*0.4,1,1.5);
 
     brain.adaptive.degradation = 0;
 
-  }
-  else{
+  }else{
 
     brain.adaptive.biasBoost =
-      clamp(0.9 - Math.abs(expectancy)*0.01,0.6,1);
+      clamp(0.9 - Math.abs(expectancy)*0.02,0.5,1);
 
     brain.adaptive.edgeAmplifier =
-      clamp(0.9 - Math.abs(expectancy)*0.01,0.6,1);
+      clamp(0.9 - Math.abs(expectancy)*0.02,0.5,1);
 
     brain.adaptive.confidenceBoost =
-      clamp(0.85 - Math.abs(expectancy)*0.01,0.6,1);
+      clamp(0.85 - Math.abs(expectancy)*0.02,0.5,1);
 
     brain.adaptive.degradation++;
 
@@ -231,13 +246,12 @@ DECISION OVERLAY
 
 function decide(context={}){
 
-  recordDecisionTick();
+  DECISION_COUNTER++;
+  LAST_DECISION_TS = Date.now();
 
   const { tenantId, last, paper={} } = context;
 
   const brain = getBrain(tenantId);
-
-  const volatility = safeNum(paper.volatility,0);
 
   if(!Number.isFinite(last)){
 
@@ -250,7 +264,7 @@ function decide(context={}){
   }
 
   const baseConfidence =
-    safeNum(paper?.learnStats?.confidence,0.2);
+    safeNum(paper?.learnStats?.confidence,0.25);
 
   const baseEdge =
     safeNum(paper?.learnStats?.trendEdge,0);
@@ -263,7 +277,7 @@ function decide(context={}){
 
   confidence = clamp(confidence,0,1);
 
-  if(confidence > 0.65 && Math.abs(edge) > 0.001){
+  if(confidence > 0.55 && Math.abs(edge) > 0.0005){
 
     const action =
       edge > 0 ? "BUY" : "SELL";
@@ -307,10 +321,10 @@ function restoreBrain(tenantId){
     adaptive:brain.adaptive,
 
     recentSignals:
-      brain.signalMemory.slice(-20),
+      brain.signalMemory.slice(-30),
 
     recentTrades:
-      brain.tradeOutcomes.slice(-50)
+      brain.tradeOutcomes.slice(-80)
 
   };
 
@@ -336,6 +350,9 @@ function getSnapshot(tenantId){
 
     stats:brain.stats,
     adaptive:brain.adaptive,
+
+    signalMemory:brain.signalMemory.length,
+    tradeMemory:brain.tradeOutcomes.length,
 
     telemetry:{
       uptime,
