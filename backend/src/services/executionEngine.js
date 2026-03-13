@@ -1,6 +1,6 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE v5
-// FIXED: outside brain learning + safer execution
+// EXECUTION ENGINE — PAPER TRADING CORE v6
+// FIXED: trade persistence + reverse trade recording
 // ==========================================================
 
 const outsideBrain =
@@ -13,6 +13,12 @@ function clamp(n,min,max){
 function safeNum(v,fallback=0){
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function ensureTradeLog(state){
+  if(!Array.isArray(state.trades)){
+    state.trades = [];
+  }
 }
 
 /* =========================================================
@@ -31,7 +37,7 @@ function calculatePositionSize(state,price,riskPct){
 
   const qty = riskCapital / price;
 
-  return clamp(qty,0,1000); // safety cap
+  return clamp(qty,0,1000);
 
 }
 
@@ -48,6 +54,8 @@ function openPosition({
   ts
 }){
 
+  ensureTradeLog(state);
+
   state.position = {
     symbol,
     side,
@@ -56,15 +64,17 @@ function openPosition({
     time:ts
   };
 
-  return{
-    result:{
-      side,
-      price,
-      qty,
-      pnl:0,
-      time:ts
-    }
+  const trade = {
+    side,
+    price,
+    qty,
+    pnl:0,
+    time:ts
   };
+
+  state.trades.push(trade);
+
+  return { result: trade };
 
 }
 
@@ -78,6 +88,8 @@ function closePosition({
   price,
   ts
 }){
+
+  ensureTradeLog(state);
 
   const pos = state.position;
 
@@ -104,6 +116,8 @@ function closePosition({
     time:ts
   };
 
+  state.trades.push(trade);
+
   state.position = null;
 
   /* ================= AI LEARNING ================= */
@@ -121,7 +135,7 @@ function closePosition({
 
   }
 
-  return{ result:trade };
+  return { result: trade };
 
 }
 
@@ -154,8 +168,6 @@ function executePaperOrder({
 
   const pos = state.position;
 
-  /* ================= POSITION SIZE ================= */
-
   let positionSize = safeNum(qty,0);
 
   if(positionSize <= 0){
@@ -177,25 +189,21 @@ function executePaperOrder({
 
       if(pos.side === "SHORT"){
 
-        const close =
-          closePosition({
-            tenantId,
-            state,
-            price,
-            ts
-          });
+        closePosition({
+          tenantId,
+          state,
+          price,
+          ts
+        });
 
-        const open =
-          openPosition({
-            state,
-            symbol,
-            price,
-            qty:positionSize,
-            side:"LONG",
-            ts
-          });
-
-        return open;
+        return openPosition({
+          state,
+          symbol,
+          price,
+          qty:positionSize,
+          side:"LONG",
+          ts
+        });
 
       }
 
@@ -224,25 +232,21 @@ function executePaperOrder({
 
       if(pos.side === "LONG"){
 
-        const close =
-          closePosition({
-            tenantId,
-            state,
-            price,
-            ts
-          });
+        closePosition({
+          tenantId,
+          state,
+          price,
+          ts
+        });
 
-        const open =
-          openPosition({
-            state,
-            symbol,
-            price,
-            qty:positionSize,
-            side:"SHORT",
-            ts
-          });
-
-        return open;
+        return openPosition({
+          state,
+          symbol,
+          price,
+          qty:positionSize,
+          side:"SHORT",
+          ts
+        });
 
       }
 
