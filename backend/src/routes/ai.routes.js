@@ -41,7 +41,18 @@ function cleanStr(v, max = MAX_MESSAGE_LEN) {
 
 function safeJsonParse(str) {
   if (typeof str !== "string") return null;
-  try { return JSON.parse(str); } catch { return null; }
+
+  try {
+    return JSON.parse(str);
+  } catch {
+    // sometimes OpenAI wraps JSON in ```json ```
+    try {
+      const cleaned = str.replace(/```json|```/gi, "").trim();
+      return JSON.parse(cleaned);
+    } catch {
+      return null;
+    }
+  }
 }
 
 function isCoolingDown() {
@@ -50,6 +61,7 @@ function isCoolingDown() {
 
 function registerFailure() {
   failureCount++;
+
   if (failureCount >= MAX_FAILURES_BEFORE_COOLDOWN) {
     failureCooldownUntil = Date.now() + FAILURE_COOLDOWN_MS;
     failureCount = 0;
@@ -62,6 +74,7 @@ function registerSuccess() {
 
 function detectPromptInjection(text) {
   const low = text.toLowerCase();
+
   return (
     low.includes("ignore previous instructions") ||
     low.includes("reveal system prompt") ||
@@ -100,9 +113,16 @@ async function openaiReply({ tenantId, message, context }) {
   if (isCoolingDown()) return null;
 
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
 
-  if (typeof fetch !== "function") return null;
+  if (!apiKey) {
+    console.warn("OpenAI key missing.");
+    return null;
+  }
+
+  if (typeof fetch !== "function") {
+    console.warn("Fetch not available in runtime.");
+    return null;
+  }
 
   const model =
     cleanStr(process.env.OPENAI_CHAT_MODEL, 60) || "gpt-4o-mini";
@@ -148,6 +168,7 @@ Respond ONLY with valid JSON:
 `;
 
   const controller = new AbortController();
+
   const timeout = setTimeout(
     () => controller.abort(),
     OPENAI_TIMEOUT_MS
@@ -176,15 +197,24 @@ Respond ONLY with valid JSON:
       }
     );
 
-    if (!r.ok) throw new Error("OpenAI error");
+    if (!r.ok) {
+      console.error("OpenAI error:", r.status);
+      throw new Error("OpenAI error");
+    }
 
     const data = await r.json();
 
     const raw = data?.choices?.[0]?.message?.content;
 
+    if (!raw) {
+      console.warn("OpenAI returned empty content.");
+      throw new Error("Empty AI reply");
+    }
+
     const parsed = safeJsonParse(raw);
 
     if (!parsed || typeof parsed.reply !== "string") {
+      console.warn("Invalid JSON reply:", raw);
       throw new Error("Invalid JSON reply");
     }
 
@@ -196,7 +226,9 @@ Respond ONLY with valid JSON:
       meta: { kind: "openai", model },
     };
 
-  } catch {
+  } catch (err) {
+
+    console.error("AI failure:", err.message);
 
     registerFailure();
     return null;
@@ -206,6 +238,7 @@ Respond ONLY with valid JSON:
     clearTimeout(timeout);
 
   }
+
 }
 
 /* =========================================================
@@ -267,7 +300,9 @@ router.post("/chat", authRequired, async (req, res) => {
 
     return res.json({ ok: true, ...out });
 
-  } catch {
+  } catch (err) {
+
+    console.error("AI route crash:", err);
 
     return res.json({
       ok: true,
