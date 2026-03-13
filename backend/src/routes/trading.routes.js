@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v6
-// FIXED: control room endpoints + telemetry + engine status
+// Institutional Trading Control API — STABLE ENTERPRISE v7
+// FIXED: control room status + telemetry + market sync
 // ==========================================================
 
 const express = require("express");
@@ -24,12 +24,14 @@ TENANT SAFE ACCESS
 ========================================================= */
 
 function getTenantId(req){
+
   return (
     req.tenant?.id ||
     req.user?.companyId ||
     req.user?.id ||
     null
   );
+
 }
 
 /* =========================================================
@@ -54,9 +56,11 @@ function getAIConfig(tenantId){
     };
 
     writeDb(db);
+
   }
 
   return db.tradingConfig[tenantId];
+
 }
 
 /* =========================================================
@@ -78,8 +82,10 @@ requireRole(ADMIN,MANAGER),
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
+  marketEngine.registerTenant(tenantId);
+
   const snapshot =
-    paperTrader.snapshot(tenantId);
+    paperTrader.snapshot(tenantId) || {};
 
   return res.json({
     ok:true,
@@ -102,7 +108,7 @@ requireRole(ADMIN,MANAGER),
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
   const decisions =
-    paperTrader.getDecisions(tenantId);
+    paperTrader.getDecisions(tenantId) || [];
 
   return res.json(decisions);
 
@@ -128,7 +134,7 @@ requireRole(ADMIN,MANAGER),
 
   return res.json({
     ok:true,
-    price
+    price: Number(price || 0)
   });
 
 });
@@ -161,6 +167,8 @@ requireRole(ADMIN,MANAGER),
 
   try{
 
+    marketEngine.registerTenant(tenantId);
+
     const state =
       paperTrader.snapshot(tenantId);
 
@@ -168,14 +176,23 @@ requireRole(ADMIN,MANAGER),
       executionEngine.executePaperOrder({
 
         tenantId,
-        symbol,
-        action:side.toUpperCase(),
+        symbol:String(symbol).toUpperCase(),
+        action:String(side).toUpperCase(),
         price:Number(price),
         riskPct:Number(risk || 0.01),
         state,
         ts:Date.now()
 
       });
+
+    if(!result){
+
+      return res.json({
+        ok:false,
+        error:"Order rejected"
+      });
+
+    }
 
     return res.json({
       ok:true,
@@ -208,7 +225,10 @@ function getEngineHealth(tenantId){
     const ticks =
       snap?.executionStats?.ticks || 0;
 
-    if(ticks > 0)
+    const decisions =
+      snap?.executionStats?.decisions || 0;
+
+    if(ticks > 0 || decisions > 0)
       return "RUNNING";
 
     return "STARTING";
@@ -217,6 +237,47 @@ function getEngineHealth(tenantId){
   catch{
 
     return "UNKNOWN";
+
+  }
+
+}
+
+/* =========================================================
+ENGINE TELEMETRY
+========================================================= */
+
+function getTelemetry(tenantId){
+
+  try{
+
+    const snap =
+      paperTrader.snapshot(tenantId);
+
+    const stats =
+      snap?.executionStats || {};
+
+    return {
+
+      ticks: stats.ticks || 0,
+      decisions: stats.decisions || 0,
+      trades: stats.trades || 0,
+
+      memoryMb:
+        Math.round(
+          process.memoryUsage().rss / 1024 / 1024
+        )
+
+    };
+
+  }
+  catch{
+
+    return {
+      ticks:0,
+      decisions:0,
+      trades:0,
+      memoryMb:0
+    };
 
   }
 
@@ -232,15 +293,20 @@ requireRole(ADMIN,MANAGER),
 
   const tenantId = getTenantId(req);
 
-  const config = getAIConfig(tenantId);
+  const config =
+    getAIConfig(tenantId);
 
   const engine =
     getEngineHealth(tenantId);
 
+  const telemetry =
+    getTelemetry(tenantId);
+
   return res.json({
     ok:true,
     config,
-    engine
+    engine,
+    telemetry
   });
 
 });
@@ -279,12 +345,18 @@ requireRole(ADMIN,MANAGER),
   const engine =
     getEngineHealth(tenantId);
 
+  const telemetry =
+    getTelemetry(tenantId);
+
   return res.json({
     ok:true,
     config:cfg,
-    engine
+    engine,
+    telemetry
   });
 
 });
+
+/* ========================================================= */
 
 module.exports = router;
