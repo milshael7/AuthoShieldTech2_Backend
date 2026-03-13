@@ -1,7 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// INSTITUTIONAL STABLE VERSION v3
-// FIXED: candle persistence + buffered saves + safe restore
+// INSTITUTIONAL STABLE VERSION v4
+// FIXED: tenant auto-init + AI safety + candle stability
 // ==========================================================
 
 const fs = require("fs");
@@ -161,15 +161,24 @@ function registerTenant(tenantId){
 
 }
 
+/* ================= SAFE ACCESS ================= */
+
+function ensureTenant(tenantId){
+
+  if(!TENANTS.has(tenantId))
+    registerTenant(tenantId);
+
+}
+
 /* ================= GET PRICE ================= */
 
 function getPrice(tenantId,symbol){
 
+  ensureTenant(tenantId);
+
   const state = TENANTS.get(tenantId);
 
-  if(!state) return null;
-
-  return state.prices?.[symbol] ?? null;
+  return state?.prices?.[symbol] ?? null;
 
 }
 
@@ -226,9 +235,9 @@ function updateCandle(state,symbol,price){
 
 function tickTenant(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  ensureTenant(tenantId);
 
-  if(!state) return;
+  const state = TENANTS.get(tenantId);
 
   for(const sym of Object.keys(SYMBOLS)){
 
@@ -251,9 +260,9 @@ function tickTenant(tenantId){
 
 function runAI(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  ensureTenant(tenantId);
 
-  if(!state) return;
+  const state = TENANTS.get(tenantId);
 
   for(const sym of Object.keys(state.prices)){
 
@@ -288,9 +297,9 @@ function runAI(tenantId){
 
 function getMarketSnapshot(tenantId){
 
-  const state = TENANTS.get(tenantId);
+  ensureTenant(tenantId);
 
-  if(!state) return {};
+  const state = TENANTS.get(tenantId);
 
   const out = {};
 
@@ -305,15 +314,11 @@ function getMarketSnapshot(tenantId){
 
 function getCandles(tenantId,symbol,limit=200){
 
+  ensureTenant(tenantId);
+
   const state = TENANTS.get(tenantId);
 
-  if(!state)
-    return [];
-
-  if(!state.candles[symbol])
-    return [];
-
-  const arr = state.candles[symbol];
+  const arr = state.candles?.[symbol] || [];
 
   return arr.slice(-limit).map(c=>({
 
