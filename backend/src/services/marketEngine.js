@@ -1,7 +1,12 @@
 // ==========================================================
+// FILE: backend/src/services/marketEngine.js
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// INSTITUTIONAL STABLE VERSION v4
-// FIXED: tenant auto-init + AI safety + candle stability
+// INSTITUTIONAL STABLE VERSION v5
+//
+// FIXES:
+// - Candle numeric safety
+// - Prevent NaN/undefined candle values
+// - Prevent corrupted state candle crash
 // ==========================================================
 
 const fs = require("fs");
@@ -53,6 +58,11 @@ const DIRTY = new Set();
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
+}
+
+function safeNum(v,fallback=0){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function simulate(price,vol){
@@ -225,9 +235,10 @@ function updateCandle(state,symbol,price){
 
   const cur = arr[arr.length-1];
 
-  cur.h = Math.max(cur.h,price);
-  cur.l = Math.min(cur.l,price);
-  cur.c = price;
+  cur.o = safeNum(cur.o,price);
+  cur.h = Math.max(safeNum(cur.h,price),price);
+  cur.l = Math.min(safeNum(cur.l,price),price);
+  cur.c = safeNum(price,cur.c);
 
 }
 
@@ -323,10 +334,10 @@ function getCandles(tenantId,symbol,limit=200){
   return arr.slice(-limit).map(c=>({
 
     time:Math.floor(c.t/1000),
-    open:c.o,
-    high:c.h,
-    low:c.l,
-    close:c.c
+    open:safeNum(c.o),
+    high:safeNum(c.h),
+    low:safeNum(c.l),
+    close:safeNum(c.c)
 
   }));
 
@@ -339,9 +350,7 @@ setInterval(()=>{
   for(const tenantId of TENANTS.keys()){
 
     try{
-
       tickTenant(tenantId);
-
     }catch{}
 
   }
@@ -368,9 +377,7 @@ setInterval(()=>{
   for(const tenantId of TENANTS.keys()){
 
     try{
-
       runAI(tenantId);
-
     }catch{}
 
   }
