@@ -1,7 +1,6 @@
 // ==========================================================
-// AUTOSHIELD OUTSIDE BRAIN — PERSISTENT AI CORE
-// Standalone learning brain for trading + platform memory
-// Lives outside the body and survives body upgrades
+// AUTOSHIELD OUTSIDE BRAIN — STABLE PERSISTENT AI CORE v18
+// Reinforcement Learning + Fast Restore + Safe DB Writes
 // ==========================================================
 
 const { readDb, writeDb } = require("../src/lib/db");
@@ -10,21 +9,9 @@ const { readDb, writeDb } = require("../src/lib/db");
 CONFIG
 ========================================================= */
 
-const MAX_HISTORY = Number(process.env.AI_BRAIN_MAX_HISTORY || 120);
-const MAX_NOTES = Number(process.env.AI_BRAIN_MAX_NOTES || 80);
 const SIGNAL_MEMORY_LIMIT = 100;
 const OUTCOME_MEMORY_LIMIT = 200;
-
-/* Fusion Weights */
-
-const TREND_WEIGHT =
-  Number(process.env.AI_WEIGHT_TREND || 0.45);
-
-const VOL_WEIGHT =
-  Number(process.env.AI_WEIGHT_VOL || 0.25);
-
-const PERFORMANCE_WEIGHT =
-  Number(process.env.AI_WEIGHT_PERF || 0.30);
+const SAVE_INTERVAL = 5000;
 
 /* =========================================================
 ENGINE TELEMETRY
@@ -44,57 +31,56 @@ function recordDecisionTick(){
 UTIL
 ========================================================= */
 
-function safeNum(v, fallback = 0) {
+function safeNum(v,fallback=0){
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function nowIso() {
-  return new Date().toISOString();
+function clamp(n,min,max){
+  return Math.max(min,Math.min(max,n));
 }
 
 /* =========================================================
 BRAIN STORAGE
 ========================================================= */
 
-function defaultBrain() {
-  return {
-    version: 17,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
+function defaultBrain(){
 
-    history: [],
-    notes: [],
+  return{
 
-    signalMemory: [],
-    tradeOutcomes: [],
+    version:18,
 
-    stats: {
-      totalTrades: 0,
-      wins: 0,
-      losses: 0,
-      winRate: 0,
-      expectancy: 0,
-      avgWin: 0,
-      avgLoss: 0,
+    createdAt:Date.now(),
+    updatedAt:Date.now(),
+
+    signalMemory:[],
+    tradeOutcomes:[],
+
+    stats:{
+      totalTrades:0,
+      wins:0,
+      losses:0,
+      winRate:0,
+      expectancy:0,
+      avgWin:0,
+      avgLoss:0
     },
 
-    adaptive: {
-      biasBoost: 1,
-      confidenceBoost: 1,
-      edgeAmplifier: 1,
-      degradation: 0,
-    },
+    adaptive:{
+      biasBoost:1,
+      confidenceBoost:1,
+      edgeAmplifier:1,
+      degradation:0
+    }
+
   };
+
 }
 
-function getBrain(tenantId) {
+function getBrain(tenantId){
 
   const key = tenantId || "__default__";
+
   const db = readDb();
 
   if(!db.brain) db.brain = {};
@@ -109,15 +95,16 @@ function getBrain(tenantId) {
 
 }
 
-function saveBrain(tenantId, brain) {
+function saveBrain(tenantId,brain){
 
   const key = tenantId || "__default__";
+
   const db = readDb();
 
   if(!db.brain) db.brain = {};
   if(!db.brain.ai) db.brain.ai = {};
 
-  brain.updatedAt = nowIso();
+  brain.updatedAt = Date.now();
   db.brain.ai[key] = brain;
 
   writeDb(db);
@@ -128,23 +115,23 @@ function saveBrain(tenantId, brain) {
 REINFORCEMENT LEARNING
 ========================================================= */
 
-function recordTradeOutcome({ tenantId, pnl }) {
+function recordTradeOutcome({tenantId,pnl}){
 
   const brain = getBrain(tenantId);
 
   const isWin = pnl > 0;
 
   brain.tradeOutcomes.push({
-    ts: Date.now(),
+    ts:Date.now(),
     pnl,
-    isWin,
+    isWin
   });
 
   brain.tradeOutcomes =
     brain.tradeOutcomes.slice(-OUTCOME_MEMORY_LIMIT);
 
-  const wins = brain.tradeOutcomes.filter(t => t.isWin);
-  const losses = brain.tradeOutcomes.filter(t => !t.isWin);
+  const wins = brain.tradeOutcomes.filter(t=>t.isWin);
+  const losses = brain.tradeOutcomes.filter(t=>!t.isWin);
 
   brain.stats.totalTrades = brain.tradeOutcomes.length;
   brain.stats.wins = wins.length;
@@ -152,7 +139,7 @@ function recordTradeOutcome({ tenantId, pnl }) {
 
   brain.stats.winRate =
     brain.stats.totalTrades
-      ? wins.length / brain.stats.totalTrades
+      ? wins.length/brain.stats.totalTrades
       : 0;
 
   brain.stats.avgWin =
@@ -167,11 +154,11 @@ function recordTradeOutcome({ tenantId, pnl }) {
 
   brain.stats.expectancy =
     brain.stats.winRate * brain.stats.avgWin -
-    (1 - brain.stats.winRate) * brain.stats.avgLoss;
+    (1-brain.stats.winRate) * brain.stats.avgLoss;
 
   adaptBehavior(brain);
 
-  saveBrain(tenantId, brain);
+  DIRTY.add(tenantId);
 
 }
 
@@ -183,22 +170,23 @@ function adaptBehavior(brain){
 
   const { winRate, expectancy } = brain.stats;
 
-  if (brain.stats.totalTrades < 10) return;
+  if(brain.stats.totalTrades < 10) return;
 
-  if (expectancy > 0) {
+  if(expectancy > 0){
 
     brain.adaptive.biasBoost =
-      clamp(1 + winRate * 0.5, 1, 1.6);
+      clamp(1 + winRate*0.5,1,1.6);
 
     brain.adaptive.edgeAmplifier =
-      clamp(1 + winRate * 0.4, 1, 1.5);
+      clamp(1 + winRate*0.4,1,1.5);
 
     brain.adaptive.confidenceBoost =
-      clamp(1 + winRate * 0.3, 1, 1.4);
+      clamp(1 + winRate*0.3,1,1.4);
 
     brain.adaptive.degradation = 0;
 
-  } else {
+  }
+  else{
 
     brain.adaptive.biasBoost =
       clamp(0.9 - Math.abs(expectancy)*0.01,0.6,1);
@@ -219,12 +207,12 @@ function adaptBehavior(brain){
 SIGNAL MEMORY
 ========================================================= */
 
-function recordSignal({ tenantId, action, confidence, edge }) {
+function recordSignal({tenantId,action,confidence,edge}){
 
   const brain = getBrain(tenantId);
 
   brain.signalMemory.push({
-    ts: Date.now(),
+    ts:Date.now(),
     action,
     confidence,
     edge
@@ -233,26 +221,7 @@ function recordSignal({ tenantId, action, confidence, edge }) {
   brain.signalMemory =
     brain.signalMemory.slice(-SIGNAL_MEMORY_LIMIT);
 
-  saveBrain(tenantId, brain);
-
-}
-
-/* =========================================================
-MULTI SIGNAL FUSION
-========================================================= */
-
-function fuseSignals({ trendEdge, volatility, expectancy }) {
-
-  const trendScore =
-    clamp(trendEdge * TREND_WEIGHT, -1, 1);
-
-  const volScore =
-    clamp((0.02 - volatility) * VOL_WEIGHT, -1, 1);
-
-  const perfScore =
-    clamp(expectancy * PERFORMANCE_WEIGHT, -1, 1);
-
-  return trendScore + volScore + perfScore;
+  DIRTY.add(tenantId);
 
 }
 
@@ -260,27 +229,19 @@ function fuseSignals({ trendEdge, volatility, expectancy }) {
 DECISION OVERLAY
 ========================================================= */
 
-function decide(context = {}) {
+function decide(context={}){
 
   recordDecisionTick();
 
-  const {
-    tenantId,
-    last,
-    paper = {}
-  } = context;
+  const { tenantId, last, paper={} } = context;
 
   const brain = getBrain(tenantId);
 
-  const learn = paper.learnStats || {};
+  const volatility = safeNum(paper.volatility,0);
 
-  const baseEdge = safeNum(learn.trendEdge, 0);
-  const baseConfidence = safeNum(learn.confidence, 0);
-  const volatility = safeNum(paper.volatility, 0);
+  if(!Number.isFinite(last)){
 
-  if (!Number.isFinite(last)) {
-
-    return {
+    return{
       action:"WAIT",
       confidence:0,
       edge:0
@@ -288,22 +249,21 @@ function decide(context = {}) {
 
   }
 
-  const fusedEdge =
-    fuseSignals({
-      trendEdge: baseEdge,
-      volatility,
-      expectancy: brain.stats.expectancy
-    });
+  const baseConfidence =
+    safeNum(paper?.learnStats?.confidence,0.2);
+
+  const baseEdge =
+    safeNum(paper?.learnStats?.trendEdge,0);
 
   let edge =
-    fusedEdge * brain.adaptive.edgeAmplifier;
+    baseEdge * brain.adaptive.edgeAmplifier;
 
   let confidence =
     baseConfidence * brain.adaptive.confidenceBoost;
 
   confidence = clamp(confidence,0,1);
 
-  if (confidence > 0.7 && Math.abs(edge) > 0.001) {
+  if(confidence > 0.65 && Math.abs(edge) > 0.001){
 
     const action =
       edge > 0 ? "BUY" : "SELL";
@@ -315,7 +275,7 @@ function decide(context = {}) {
       edge
     });
 
-    return {
+    return{
       action,
       confidence,
       edge
@@ -323,7 +283,7 @@ function decide(context = {}) {
 
   }
 
-  return {
+  return{
     action:"WAIT",
     confidence,
     edge
@@ -332,31 +292,50 @@ function decide(context = {}) {
 }
 
 /* =========================================================
-SNAPSHOT + TELEMETRY
+FAST RESTORE FOR INSIDE BRAIN
 ========================================================= */
 
-function getSnapshot(tenantId) {
+function restoreBrain(tenantId){
+
+  const brain = getBrain(tenantId);
+
+  return{
+
+    expectancy:brain.stats.expectancy,
+    winRate:brain.stats.winRate,
+
+    adaptive:brain.adaptive,
+
+    recentSignals:
+      brain.signalMemory.slice(-20),
+
+    recentTrades:
+      brain.tradeOutcomes.slice(-50)
+
+  };
+
+}
+
+/* =========================================================
+TELEMETRY
+========================================================= */
+
+function getSnapshot(tenantId){
 
   const brain = getBrain(tenantId);
 
   const uptime =
-    Math.floor((Date.now() - ENGINE_BOOT_TIME) / 1000);
+    Math.floor((Date.now()-ENGINE_BOOT_TIME)/1000);
 
   const decisionsPerMinute =
     DECISION_COUNTER
-      ? (DECISION_COUNTER / (uptime / 60 || 1))
+      ? (DECISION_COUNTER/(uptime/60||1))
       : 0;
 
-  return {
-
-    ok:true,
+  return{
 
     stats:brain.stats,
-
     adaptive:brain.adaptive,
-
-    signalMemory:brain.signalMemory.length,
-    tradeMemory:brain.tradeOutcomes.length,
 
     telemetry:{
       uptime,
@@ -370,28 +349,30 @@ function getSnapshot(tenantId) {
 }
 
 /* =========================================================
-RESET
+DIRTY SAVE LOOP
 ========================================================= */
 
-function resetBrain(tenantId) {
+const DIRTY = new Set();
 
-  const key = tenantId || "__default__";
-  const db = readDb();
+setInterval(()=>{
 
-  if(!db.brain) db.brain = {};
-  if(!db.brain.ai) db.brain.ai = {};
+  for(const tenantId of DIRTY){
 
-  db.brain.ai[key] = defaultBrain();
-  writeDb(db);
+    const brain = getBrain(tenantId);
+    saveBrain(tenantId,brain);
 
-}
+  }
+
+  DIRTY.clear();
+
+},SAVE_INTERVAL);
 
 /* ========================================================= */
 
-module.exports = {
+module.exports={
   decide,
-  recordTradeOutcome,
   recordSignal,
-  getSnapshot,
-  resetBrain
+  recordTradeOutcome,
+  restoreBrain,
+  getSnapshot
 };
