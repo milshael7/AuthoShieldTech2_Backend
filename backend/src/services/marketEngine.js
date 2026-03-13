@@ -1,13 +1,12 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// STABLE ENGINE VERSION
-// FIXED: sync prices with paperTrader
+// INSTITUTIONAL STABLE VERSION v2
+// FIXED: candle memory + atomic persistence + stability
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
 
-/* FIXED IMPORT PATH */
 const paperTrader = require("./paperTrader");
 
 /* ================= STORAGE ================= */
@@ -41,6 +40,7 @@ const SYMBOLS = {
 
 const MARKET_TICK_MS = 200;
 const AI_TICK_MS = 1000;
+
 const CANDLE_MS = 60000;
 const MAX_CANDLES = 2000;
 
@@ -54,38 +54,63 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
+/* smoother market simulation */
+
 function simulate(price,vol){
 
-  const drift=(Math.random()-0.5)*2*vol;
+  const drift =
+    (Math.random()-0.5) * vol;
 
-  const next=price*(1+drift);
+  const trend =
+    (Math.random()-0.5) * vol * 0.3;
 
-  return Number(clamp(next,0.0000001,1e12).toFixed(8));
+  const next =
+    price * (1 + drift + trend);
+
+  return Number(
+    clamp(next,0.0000001,1e12).toFixed(8)
+  );
 }
 
-/* ================= LOAD / SAVE ================= */
+/* ================= LOAD ================= */
 
 function loadState(tenantId){
 
-  const file=stateFile(tenantId);
+  const file = stateFile(tenantId);
 
-  if(!fs.existsSync(file)) return null;
+  if(!fs.existsSync(file))
+    return null;
 
   try{
-    return JSON.parse(fs.readFileSync(file,"utf-8"));
+
+    return JSON.parse(
+      fs.readFileSync(file,"utf-8")
+    );
+
   }catch{
+
+    console.warn(
+      "marketEngine: corrupted state reset",
+      tenantId
+    );
+
     return null;
   }
 
 }
 
+/* ================= SAFE SAVE ================= */
+
 function saveState(tenantId,state){
 
   try{
-    fs.writeFileSync(
-      stateFile(tenantId),
-      JSON.stringify(state)
-    );
+
+    const file = stateFile(tenantId);
+    const tmp = `${file}.tmp`;
+
+    fs.writeFileSync(tmp,JSON.stringify(state));
+    fs.renameSync(tmp,file);
+
   }catch{}
 
 }
@@ -99,25 +124,27 @@ function registerTenant(tenantId){
   if(TENANTS.has(tenantId))
     return;
 
-  const persisted=loadState(tenantId);
+  const persisted = loadState(tenantId);
 
   if(persisted){
+
     TENANTS.set(tenantId,persisted);
     return;
+
   }
 
-  const state={
+  const state = {
     prices:{},
     candles:{}
   };
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const start=SYMBOLS[sym].start;
+    const start = SYMBOLS[sym].start;
 
-    state.prices[sym]=start;
+    state.prices[sym] = start;
 
-    state.candles[sym]=[{
+    state.candles[sym] = [{
       t:Date.now(),
       o:start,
       h:start,
@@ -135,7 +162,7 @@ function registerTenant(tenantId){
 
 function getPrice(tenantId,symbol){
 
-  const state=TENANTS.get(tenantId);
+  const state = TENANTS.get(tenantId);
 
   if(!state) return null;
 
@@ -147,11 +174,28 @@ function getPrice(tenantId,symbol){
 
 function updateCandle(state,symbol,price){
 
-  const arr=state.candles[symbol];
-  const last=arr[arr.length-1];
-  const now=Date.now();
+  if(!state.candles[symbol])
+    state.candles[symbol] = [];
 
-  if(now-last.t>=CANDLE_MS){
+  const arr = state.candles[symbol];
+
+  if(arr.length===0){
+
+    arr.push({
+      t:Date.now(),
+      o:price,
+      h:price,
+      l:price,
+      c:price
+    });
+
+    return;
+  }
+
+  const last = arr[arr.length-1];
+  const now = Date.now();
+
+  if(now-last.t >= CANDLE_MS){
 
     arr.push({
       t:now,
@@ -161,16 +205,16 @@ function updateCandle(state,symbol,price){
       c:price
     });
 
-    if(arr.length>MAX_CANDLES)
+    if(arr.length > MAX_CANDLES)
       arr.splice(0,arr.length-MAX_CANDLES);
 
   }
 
-  const cur=arr[arr.length-1];
+  const cur = arr[arr.length-1];
 
-  cur.h=Math.max(cur.h,price);
-  cur.l=Math.min(cur.l,price);
-  cur.c=price;
+  cur.h = Math.max(cur.h,price);
+  cur.l = Math.min(cur.l,price);
+  cur.c = price;
 
 }
 
@@ -178,19 +222,22 @@ function updateCandle(state,symbol,price){
 
 function tickTenant(tenantId){
 
-  const state=TENANTS.get(tenantId);
+  const state = TENANTS.get(tenantId);
 
   if(!state) return;
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const vol=SYMBOLS[sym].vol;
+    const vol =
+      SYMBOLS[sym].vol;
 
-    const prev=state.prices[sym];
+    const prev =
+      state.prices[sym];
 
-    const next=simulate(prev,vol);
+    const next =
+      simulate(prev,vol);
 
-    state.prices[sym]=next;
+    state.prices[sym] = next;
 
     updateCandle(state,sym,next);
 
@@ -202,13 +249,13 @@ function tickTenant(tenantId){
 
 function runAI(tenantId){
 
-  const state=TENANTS.get(tenantId);
+  const state = TENANTS.get(tenantId);
 
   if(!state) return;
 
   for(const sym of Object.keys(state.prices)){
 
-    const price=state.prices[sym];
+    const price = state.prices[sym];
 
     if(!price) continue;
 
@@ -221,9 +268,13 @@ function runAI(tenantId){
         Date.now()
       );
 
-    }catch(err){
+    }
+    catch(err){
 
-      console.error("AI tick error:",err.message);
+      console.error(
+        "AI tick error:",
+        err.message
+      );
 
     }
 
@@ -235,14 +286,14 @@ function runAI(tenantId){
 
 function getMarketSnapshot(tenantId){
 
-  const state=TENANTS.get(tenantId);
+  const state = TENANTS.get(tenantId);
 
   if(!state) return {};
 
-  const out={};
+  const out = {};
 
   for(const sym of Object.keys(state.prices))
-    out[sym]={price:state.prices[sym]};
+    out[sym] = {price:state.prices[sym]};
 
   return out;
 
@@ -252,18 +303,21 @@ function getMarketSnapshot(tenantId){
 
 function getCandles(tenantId,symbol,limit=200){
 
-  const state=TENANTS.get(tenantId);
+  const state = TENANTS.get(tenantId);
 
   if(!state) return [];
 
-  const arr=state.candles[symbol]||[];
+  const arr =
+    state.candles?.[symbol] || [];
 
   return arr.slice(-limit).map(c=>({
+
     time:Math.floor(c.t/1000),
     open:c.o,
     high:c.h,
     low:c.l,
     close:c.c
+
   }));
 
 }
@@ -278,9 +332,13 @@ setInterval(()=>{
 
       tickTenant(tenantId);
 
-      saveState(tenantId,TENANTS.get(tenantId));
+      saveState(
+        tenantId,
+        TENANTS.get(tenantId)
+      );
 
-    }catch{}
+    }
+    catch{}
 
   }
 
@@ -294,7 +352,8 @@ setInterval(()=>{
 
       runAI(tenantId);
 
-    }catch{}
+    }
+    catch{}
 
   }
 
@@ -302,9 +361,11 @@ setInterval(()=>{
 
 /* ================= EXPORT ================= */
 
-module.exports={
+module.exports = {
+
   registerTenant,
   getMarketSnapshot,
   getCandles,
   getPrice
+
 };
