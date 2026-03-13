@@ -123,23 +123,31 @@ const ENGINE_START_TIME = Date.now();
 
 /* ================= TENANT BOOT ================= */
 
+function getTenants(){
+
+  const db = readDb();
+  const usersList = db.users || [];
+
+  const tenants = new Set();
+
+  for(const u of usersList){
+
+    const tenantId = u.companyId || u.id;
+
+    if(tenantId)
+      tenants.add(tenantId);
+
+  }
+
+  return tenants;
+
+}
+
 function bootTenants(){
 
   try{
 
-    const db = readDb();
-    const usersList = db.users || [];
-
-    const tenants = new Set();
-
-    for(const u of usersList){
-
-      const tenantId = u.companyId || u.id;
-
-      if(tenantId)
-        tenants.add(tenantId);
-
-    }
+    const tenants = getTenants();
 
     for(const id of tenants){
 
@@ -158,6 +166,45 @@ function bootTenants(){
 }
 
 bootTenants();
+
+/* ================= AUTONOMOUS AI ENGINE ================= */
+/* THIS RUNS EVEN WITH ZERO USERS CONNECTED */
+
+setInterval(()=>{
+
+  try{
+
+    const tenants = getTenants();
+
+    for(const tenantId of tenants){
+
+      const market =
+        marketEngine.getMarketSnapshot(tenantId);
+
+      const price =
+        market?.BTCUSDT?.price;
+
+      if(price){
+
+        paperTrader.tick(
+          tenantId,
+          "BTCUSDT",
+          Number(price),
+          Date.now()
+        );
+
+      }
+
+    }
+
+  }
+  catch(err){
+
+    console.error("AI engine error:",err.message);
+
+  }
+
+},1000);
 
 /* ================= WEBSOCKET ================= */
 
