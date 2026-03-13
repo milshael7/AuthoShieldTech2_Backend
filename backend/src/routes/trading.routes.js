@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v5
-// FIXED: /api/ai/config route alignment + engine health detection
+// Institutional Trading Control API — STABLE ENTERPRISE v6
+// FIXED: control room endpoints + telemetry + engine status
 // ==========================================================
 
 const express = require("express");
@@ -33,7 +33,7 @@ function getTenantId(req){
 }
 
 /* =========================================================
-AI CONFIG (ENGINE CONNECTED)
+AI CONFIG
 ========================================================= */
 
 function getAIConfig(tenantId){
@@ -60,34 +60,63 @@ function getAIConfig(tenantId){
 }
 
 /* =========================================================
-PUBLIC SYMBOLS
-========================================================= */
-
-router.get("/symbols",(req,res)=>{
-
-  return res.json({
-    ok:true,
-    symbols:["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
-  });
-
-});
-
-/* =========================================================
 AUTH
 ========================================================= */
 
 router.use(authRequired);
 
 /* =========================================================
-MARKET
+CONTROL ROOM SNAPSHOT
 ========================================================= */
 
-router.get("/market/price/:symbol",
+router.get("/snapshot",
 requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
   const tenantId = getTenantId(req);
-  const symbol = String(req.params.symbol || "").toUpperCase();
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const snapshot =
+    paperTrader.snapshot(tenantId);
+
+  return res.json({
+    ok:true,
+    snapshot
+  });
+
+});
+
+/* =========================================================
+AI DECISIONS
+========================================================= */
+
+router.get("/decisions",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = getTenantId(req);
+
+  if(!tenantId)
+    return res.status(400).json({ok:false,error:"Missing tenant"});
+
+  const decisions =
+    paperTrader.getDecisions(tenantId);
+
+  return res.json(decisions);
+
+});
+
+/* =========================================================
+CURRENT PRICE
+========================================================= */
+
+router.get("/price",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = getTenantId(req);
 
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
@@ -95,42 +124,11 @@ requireRole(ADMIN,MANAGER),
   marketEngine.registerTenant(tenantId);
 
   const price =
-    marketEngine.getPrice(tenantId,symbol);
+    marketEngine.getPrice(tenantId,"BTCUSDT");
 
   return res.json({
     ok:true,
-    tenantId,
-    symbol,
     price
-  });
-
-});
-
-router.get("/market/candles/:symbol",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
-
-  const tenantId = getTenantId(req);
-  const symbol = String(req.params.symbol || "").toUpperCase();
-  const limit = Number(req.query.limit || 200);
-
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
-  marketEngine.registerTenant(tenantId);
-
-  const candles =
-    marketEngine.getCandles(
-      tenantId,
-      symbol,
-      limit
-    );
-
-  return res.json({
-    ok:true,
-    tenantId,
-    symbol,
-    candles
   });
 
 });
@@ -139,26 +137,29 @@ requireRole(ADMIN,MANAGER),
 MANUAL PAPER ORDER
 ========================================================= */
 
-router.post("/paper/order",
+router.post("/order",
 requireRole(ADMIN,MANAGER),
-async (req,res)=>{
+(req,res)=>{
 
   const tenantId = getTenantId(req);
 
   if(!tenantId)
     return res.status(400).json({ok:false,error:"Missing tenant"});
 
-  const { symbol, side, price, risk } = req.body || {};
+  const {
+    symbol,
+    side,
+    price,
+    risk
+  } = req.body || {};
 
   if(!symbol || !side)
-    return res.status(400).json({
+    return res.json({
       ok:false,
-      error:"Invalid order request"
+      error:"Invalid order"
     });
 
   try{
-
-    marketEngine.registerTenant(tenantId);
 
     const state =
       paperTrader.snapshot(tenantId);
@@ -167,7 +168,7 @@ async (req,res)=>{
       executionEngine.executePaperOrder({
 
         tenantId,
-        symbol:String(symbol).toUpperCase(),
+        symbol,
         action:side.toUpperCase(),
         price:Number(price),
         riskPct:Number(risk || 0.01),
@@ -175,15 +176,6 @@ async (req,res)=>{
         ts:Date.now()
 
       });
-
-    if(!result){
-
-      return res.json({
-        ok:false,
-        error:"Order rejected"
-      });
-
-    }
 
     return res.json({
       ok:true,
@@ -195,7 +187,7 @@ async (req,res)=>{
 
     return res.json({
       ok:false,
-      error:String(err?.message || err)
+      error:String(err.message)
     });
 
   }
@@ -203,33 +195,7 @@ async (req,res)=>{
 });
 
 /* =========================================================
-PAPER SNAPSHOT
-========================================================= */
-
-router.get("/paper/snapshot",
-requireRole(ADMIN,MANAGER),
-(req,res)=>{
-
-  const tenantId = getTenantId(req);
-
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
-  marketEngine.registerTenant(tenantId);
-
-  const snapshot =
-    paperTrader.snapshot(tenantId);
-
-  return res.json({
-    ok:true,
-    tenantId,
-    snapshot
-  });
-
-});
-
-/* =========================================================
-ENGINE HEALTH DETECTOR
+ENGINE HEALTH
 ========================================================= */
 
 function getEngineHealth(tenantId){
@@ -247,7 +213,8 @@ function getEngineHealth(tenantId){
 
     return "STARTING";
 
-  }catch{
+  }
+  catch{
 
     return "UNKNOWN";
 
@@ -257,7 +224,6 @@ function getEngineHealth(tenantId){
 
 /* =========================================================
 AI CONFIG
-FINAL ROUTE → /api/ai/config
 ========================================================= */
 
 router.get("/config",
@@ -266,11 +232,10 @@ requireRole(ADMIN,MANAGER),
 
   const tenantId = getTenantId(req);
 
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
   const config = getAIConfig(tenantId);
-  const engine = getEngineHealth(tenantId);
+
+  const engine =
+    getEngineHealth(tenantId);
 
   return res.json({
     ok:true,
@@ -311,7 +276,8 @@ requireRole(ADMIN,MANAGER),
 
   writeDb(db);
 
-  const engine = getEngineHealth(tenantId);
+  const engine =
+    getEngineHealth(tenantId);
 
   return res.json({
     ok:true,
