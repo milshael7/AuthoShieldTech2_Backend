@@ -13,7 +13,7 @@ const executionEngine = require("../services/executionEngine");
 const marketEngine = require("../services/marketEngine");
 
 const aiBrain = require("../../brain/aiBrain");
-const memoryBrain = require("../../brain/memoryBrain");
+const memoryBrain = require("../../brainMemory/memoryBrain");
 
 const { readDb, writeDb } = require("../lib/db");
 
