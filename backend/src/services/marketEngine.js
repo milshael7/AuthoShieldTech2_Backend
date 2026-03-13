@@ -1,7 +1,7 @@
 // ==========================================================
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// INSTITUTIONAL STABLE VERSION v2
-// FIXED: candle memory + atomic persistence + stability
+// INSTITUTIONAL STABLE VERSION v3
+// FIXED: candle persistence + buffered saves + safe restore
 // ==========================================================
 
 const fs = require("fs");
@@ -47,6 +47,7 @@ const MAX_CANDLES = 2000;
 /* ================= TENANTS ================= */
 
 const TENANTS = new Map();
+const DIRTY = new Set();
 
 /* ================= UTIL ================= */
 
@@ -54,15 +55,10 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
-/* smoother market simulation */
-
 function simulate(price,vol){
 
-  const drift =
-    (Math.random()-0.5) * vol;
-
-  const trend =
-    (Math.random()-0.5) * vol * 0.3;
+  const drift = (Math.random()-0.5) * vol;
+  const trend = (Math.random()-0.5) * vol * 0.3;
 
   const next =
     price * (1 + drift + trend);
@@ -90,7 +86,7 @@ function loadState(tenantId){
   }catch{
 
     console.warn(
-      "marketEngine: corrupted state reset",
+      "marketEngine corrupted state reset:",
       tenantId
     );
 
@@ -99,7 +95,7 @@ function loadState(tenantId){
 
 }
 
-/* ================= SAFE SAVE ================= */
+/* ================= SAVE ================= */
 
 function saveState(tenantId,state){
 
@@ -111,7 +107,14 @@ function saveState(tenantId,state){
     fs.writeFileSync(tmp,JSON.stringify(state));
     fs.renameSync(tmp,file);
 
-  }catch{}
+  }catch(err){
+
+    console.warn(
+      "marketEngine save failed:",
+      err.message
+    );
+
+  }
 
 }
 
@@ -179,10 +182,12 @@ function updateCandle(state,symbol,price){
 
   const arr = state.candles[symbol];
 
+  const now = Date.now();
+
   if(arr.length===0){
 
     arr.push({
-      t:Date.now(),
+      t:now,
       o:price,
       h:price,
       l:price,
@@ -193,7 +198,6 @@ function updateCandle(state,symbol,price){
   }
 
   const last = arr[arr.length-1];
-  const now = Date.now();
 
   if(now-last.t >= CANDLE_MS){
 
@@ -228,20 +232,18 @@ function tickTenant(tenantId){
 
   for(const sym of Object.keys(SYMBOLS)){
 
-    const vol =
-      SYMBOLS[sym].vol;
-
-    const prev =
-      state.prices[sym];
+    const prev = state.prices[sym];
 
     const next =
-      simulate(prev,vol);
+      simulate(prev,SYMBOLS[sym].vol);
 
     state.prices[sym] = next;
 
     updateCandle(state,sym,next);
 
   }
+
+  DIRTY.add(tenantId);
 
 }
 
@@ -305,10 +307,13 @@ function getCandles(tenantId,symbol,limit=200){
 
   const state = TENANTS.get(tenantId);
 
-  if(!state) return [];
+  if(!state)
+    return [];
 
-  const arr =
-    state.candles?.[symbol] || [];
+  if(!state.candles[symbol])
+    return [];
+
+  const arr = state.candles[symbol];
 
   return arr.slice(-limit).map(c=>({
 
@@ -332,17 +337,26 @@ setInterval(()=>{
 
       tickTenant(tenantId);
 
-      saveState(
-        tenantId,
-        TENANTS.get(tenantId)
-      );
-
-    }
-    catch{}
+    }catch{}
 
   }
 
 },MARKET_TICK_MS);
+
+setInterval(()=>{
+
+  for(const tenantId of DIRTY){
+
+    const state = TENANTS.get(tenantId);
+
+    if(state)
+      saveState(tenantId,state);
+
+  }
+
+  DIRTY.clear();
+
+},3000);
 
 setInterval(()=>{
 
@@ -352,8 +366,7 @@ setInterval(()=>{
 
       runAI(tenantId);
 
-    }
-    catch{}
+    }catch{}
 
   }
 
