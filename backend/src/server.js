@@ -91,7 +91,6 @@ app.use("/api/soc", require("./routes/soc.routes"));
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
-
 app.use("/api/ai", tradingRoutes);
 app.use("/api/trading", tradingRoutes);
 
@@ -159,55 +158,6 @@ function bootTenants(){
 }
 
 bootTenants();
-
-/* ================= AI TRADING LOOP ================= */
-
-setInterval(()=>{
-
-  try{
-
-    const db = readDb();
-    const usersList = db.users || [];
-
-    const tenants = new Set();
-
-    for(const u of usersList){
-
-      const tenantId = u.companyId || u.id;
-
-      if(tenantId)
-        tenants.add(tenantId);
-
-    }
-
-    for(const tenantId of tenants){
-
-      const market =
-        marketEngine.getMarketSnapshot(tenantId);
-
-      const price =
-        market?.BTCUSDT?.price;
-
-      if(price){
-
-        paperTrader.tick(
-          tenantId,
-          "BTCUSDT",
-          Number(price)
-        );
-
-      }
-
-    }
-
-  }
-  catch(err){
-
-    console.error("AI tick error:",err.message);
-
-  }
-
-},1000);
 
 /* ================= WEBSOCKET ================= */
 
@@ -319,12 +269,20 @@ setInterval(()=>{
       const decisions =
         paperTrader.getDecisions(ws.tenantId);
 
+      const stats = snapshot?.executionStats || {};
+
+      const metrics = {
+        aiPerMin: stats.decisions || 0,
+        memMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
+      };
+
       ws.send(JSON.stringify({
 
         channel:"paper",
         type:"engine",
         snapshot,
         decisions,
+        metrics,
         engineStart:ENGINE_START_TIME,
         ts:Date.now()
 
