@@ -1,7 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v16
-// FIXED: snapshot format + UI compatibility + telemetry
-// MEMORY ENABLED
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v17
+// FIXED: UI trade display + risk config + stable equity
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -113,8 +112,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     const prev = state.lastPrice;
     state.lastPrice = price;
 
-    /* ===== VOLATILITY ===== */
-
     if(prev){
 
       const change =
@@ -131,8 +128,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    /* ===== RECORD MARKET STATE ===== */
-
     memoryBrain.recordMarketState({
       tenantId,
       symbol,
@@ -140,7 +135,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       volatility:state.volatility
     });
 
-    /* ===== AI DECISION ===== */
+    /* ================= AI DECISION ================= */
 
     const plan =
       makeDecision({
@@ -155,6 +150,12 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         riskPct:0
       };
 
+    /* APPLY UI RISK SETTINGS */
+
+    plan.riskPct =
+      (Number(cfg.riskPercent)/100) *
+      Number(cfg.positionMultiplier);
+
     state.executionStats.decisions++;
 
     state.decisions.push({
@@ -162,10 +163,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       symbol,
       action:plan.action,
       confidence:plan.confidence || 0,
-      price
+      price,
+      riskPct:plan.riskPct
     });
-
-    /* ===== MEMORY: SIGNAL ===== */
 
     memoryBrain.recordSignal({
       tenantId,
@@ -181,7 +181,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
 
-    /* ===== EXECUTION ===== */
+    /* ================= EXECUTION ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
@@ -206,12 +206,10 @@ function tick(tenantId,symbol,price,ts=Date.now()){
           side:plan.action,
           price,
           qty:Number(exec.result.qty||0),
-          profit:Number(exec.result.pnl||0)
+          pnl:Number(exec.result.pnl||0)
         };
 
         state.trades.push(trade);
-
-        /* ===== MEMORY: TRADE ===== */
 
         memoryBrain.recordTrade({
           tenantId,
@@ -219,7 +217,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
           entry:price,
           exit:price,
           qty:trade.qty,
-          pnl:trade.profit,
+          pnl:trade.pnl,
           risk:plan.riskPct,
           confidence:plan.confidence || 0,
           edge:plan.edge || 0,
@@ -234,13 +232,14 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }
 
-    /* ===== EQUITY ===== */
+    /* ================= EQUITY ================= */
 
     if(state.position){
 
       const unrealized =
-        (price - state.position.entry)
-        * state.position.qty;
+        state.position.side === "LONG"
+          ? (price - state.position.entry) * state.position.qty
+          : (state.position.entry - price) * state.position.qty;
 
       state.equity =
         state.cashBalance + unrealized;
@@ -309,7 +308,6 @@ function snapshot(tenantId){
     executionStats:s.executionStats,
     realized:s.realized,
     limits:s.limits,
-
     telemetry:getTelemetry(s)
 
   };
