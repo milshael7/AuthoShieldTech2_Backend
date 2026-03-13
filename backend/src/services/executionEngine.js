@@ -1,7 +1,10 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE v4
-// FIXED: manual qty support + stability improvements
+// EXECUTION ENGINE — PAPER TRADING CORE v5
+// FIXED: outside brain learning + safer execution
 // ==========================================================
+
+const outsideBrain =
+  require("../../brain/aiBrain");
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
@@ -16,10 +19,10 @@ function safeNum(v,fallback=0){
 POSITION SIZE
 ========================================================= */
 
-function calculatePositionSize(state, price, riskPct){
+function calculatePositionSize(state,price,riskPct){
 
   const equity =
-    safeNum(state.equity, safeNum(state.cashBalance,0));
+    safeNum(state.equity,safeNum(state.cashBalance,0));
 
   if(equity <= 0 || price <= 0)
     return 0;
@@ -28,7 +31,8 @@ function calculatePositionSize(state, price, riskPct){
 
   const qty = riskCapital / price;
 
-  return clamp(qty,0,1e12);
+  return clamp(qty,0,1000); // safety cap
+
 }
 
 /* =========================================================
@@ -47,17 +51,18 @@ function openPosition({
   state.position = {
     symbol,
     side,
-    entry: price,
+    entry:price,
     qty,
-    time: ts
+    time:ts
   };
 
-  return {
+  return{
     result:{
       side,
       price,
       qty,
-      pnl:0
+      pnl:0,
+      time:ts
     }
   };
 
@@ -68,6 +73,7 @@ CLOSE POSITION
 ========================================================= */
 
 function closePosition({
+  tenantId,
   state,
   price,
   ts
@@ -100,7 +106,22 @@ function closePosition({
 
   state.position = null;
 
-  return { result:trade };
+  /* ================= AI LEARNING ================= */
+
+  try{
+
+    outsideBrain.recordTradeOutcome({
+      tenantId,
+      pnl
+    });
+
+  }catch(err){
+
+    console.error("AI learning error:",err.message);
+
+  }
+
+  return{ result:trade };
 
 }
 
@@ -156,16 +177,25 @@ function executePaperOrder({
 
       if(pos.side === "SHORT"){
 
-        closePosition({state,price,ts});
+        const close =
+          closePosition({
+            tenantId,
+            state,
+            price,
+            ts
+          });
 
-        return openPosition({
-          state,
-          symbol,
-          price,
-          qty:positionSize,
-          side:"LONG",
-          ts
-        });
+        const open =
+          openPosition({
+            state,
+            symbol,
+            price,
+            qty:positionSize,
+            side:"LONG",
+            ts
+          });
+
+        return open;
 
       }
 
@@ -194,16 +224,25 @@ function executePaperOrder({
 
       if(pos.side === "LONG"){
 
-        closePosition({state,price,ts});
+        const close =
+          closePosition({
+            tenantId,
+            state,
+            price,
+            ts
+          });
 
-        return openPosition({
-          state,
-          symbol,
-          price,
-          qty:positionSize,
-          side:"SHORT",
-          ts
-        });
+        const open =
+          openPosition({
+            state,
+            symbol,
+            price,
+            qty:positionSize,
+            side:"SHORT",
+            ts
+          });
+
+        return open;
 
       }
 
@@ -227,6 +266,7 @@ function executePaperOrder({
     if(!pos) return null;
 
     return closePosition({
+      tenantId,
       state,
       price,
       ts
