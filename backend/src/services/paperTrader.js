@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v18
-// FIXED: crash protection + stable lock + telemetry safety
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v19
+// STABILIZED: telemetry safety + crash guard + stats integrity
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -35,7 +35,13 @@ function defaultState(){
     lastPrice:null,
     realized:{wins:0,losses:0,net:0},
     limits:{tradesToday:0,lossesToday:0},
-    executionStats:{ticks:0,decisions:0,trades:0},
+
+    executionStats:{
+      ticks:0,
+      decisions:0,
+      trades:0
+    },
+
     _locked:false
   };
 }
@@ -129,12 +135,14 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    memoryBrain.recordMarketState({
-      tenantId,
-      symbol,
-      price,
-      volatility:state.volatility
-    });
+    try{
+      memoryBrain.recordMarketState({
+        tenantId,
+        symbol,
+        price,
+        volatility:state.volatility
+      });
+    }catch{}
 
     /* ================= AI DECISION ================= */
 
@@ -166,15 +174,17 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       riskPct:plan.riskPct
     });
 
-    memoryBrain.recordSignal({
-      tenantId,
-      symbol,
-      action:plan.action,
-      confidence:plan.confidence || 0,
-      edge:plan.edge || 0,
-      price,
-      volatility:state.volatility
-    });
+    try{
+      memoryBrain.recordSignal({
+        tenantId,
+        symbol,
+        action:plan.action,
+        confidence:plan.confidence || 0,
+        edge:plan.edge || 0,
+        price,
+        volatility:state.volatility
+      });
+    }catch{}
 
     if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
@@ -210,18 +220,20 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.trades.push(trade);
 
-        memoryBrain.recordTrade({
-          tenantId,
-          symbol,
-          entry:price,
-          exit:price,
-          qty:trade.qty,
-          pnl:trade.pnl,
-          risk:plan.riskPct,
-          confidence:plan.confidence || 0,
-          edge:plan.edge || 0,
-          volatility:state.volatility
-        });
+        try{
+          memoryBrain.recordTrade({
+            tenantId,
+            symbol,
+            entry:price,
+            exit:price,
+            qty:trade.qty,
+            pnl:trade.pnl,
+            risk:plan.riskPct,
+            confidence:plan.confidence || 0,
+            edge:plan.edge || 0,
+            volatility:state.volatility
+          });
+        }catch{}
 
         if(state.trades.length > MAX_TRADES_MEMORY)
           state.trades =
@@ -272,24 +284,36 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
 function getTelemetry(state){
 
-  const uptime =
-    Math.floor((Date.now() - ENGINE_START) / 1000);
+  try{
 
-  const decisions =
-    state.executionStats.decisions || 0;
+    const uptime =
+      Math.floor((Date.now() - ENGINE_START) / 1000);
 
-  const decisionsPerMinute =
-    uptime > 0
-      ? (decisions / uptime) * 60
-      : 0;
+    const decisions =
+      state?.executionStats?.decisions || 0;
 
-  return {
+    const decisionsPerMinute =
+      uptime > 0
+        ? (decisions / uptime) * 60
+        : 0;
 
-    uptime,
-    decisionsPerMinute,
-    memoryUsage:process.memoryUsage().rss
+    return {
 
-  };
+      uptime,
+      decisionsPerMinute,
+      memoryUsage:process.memoryUsage().rss
+
+    };
+
+  }catch{
+
+    return {
+      uptime:0,
+      decisionsPerMinute:0,
+      memoryUsage:0
+    };
+
+  }
 
 }
 
@@ -301,17 +325,27 @@ function snapshot(tenantId){
 
   return {
 
-    cashBalance:s.cashBalance,
-    equity:s.equity,
-    peakEquity:s.peakEquity,
-    position:s.position,
-    trades:s.trades,
-    decisions:s.decisions,
+    cashBalance:Number(s.cashBalance||0),
+    equity:Number(s.equity||0),
+    peakEquity:Number(s.peakEquity||0),
+
+    position:s.position || null,
+
+    trades:s.trades || [],
+    decisions:s.decisions || [],
+
     lastPrice:s.lastPrice,
     volatility:s.volatility,
-    executionStats:s.executionStats,
+
+    executionStats:s.executionStats || {
+      ticks:0,
+      decisions:0,
+      trades:0
+    },
+
     realized:s.realized,
     limits:s.limits,
+
     telemetry:getTelemetry(s)
 
   };
