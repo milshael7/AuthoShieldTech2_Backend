@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v9)
-// IMPROVED: faster learning + visible AI activity
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v10)
+// STABILIZED: confidence smoothing + exploration stability
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -32,7 +32,6 @@ const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 /* ================= MEMORY ================= */
 
 const BRAIN_STATE = new Map();
-
 const MAX_BRAIN_TENANTS = 500;
 
 function getBrainState(tenantId){
@@ -165,7 +164,7 @@ function makeDecision(context={}){
 /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
-    isPaper ? 0.18 : CONFIDENCE_DECAY;
+    isPaper ? 0.25 : CONFIDENCE_DECAY;
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * decay +
@@ -184,7 +183,7 @@ function makeDecision(context={}){
 /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.03 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.05 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
@@ -193,7 +192,7 @@ function makeDecision(context={}){
 
   if(isPaper && action==="WAIT"){
 
-    const explorationChance = 0.12;
+    const explorationChance = 0.15;
 
     if(Math.random() < explorationChance){
 
@@ -202,7 +201,7 @@ function makeDecision(context={}){
           ? "BUY"
           : "SELL";
 
-      confidence = Math.max(confidence,0.08);
+      confidence = Math.max(confidence,0.1);
 
     }
 
