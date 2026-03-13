@@ -1,14 +1,17 @@
-// backend/src/routes/paper.routes.js
 // ==========================================================
-// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE
+// FILE: backend/src/routes/paper.routes.js
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v2
+//
+// FIXES:
+// - Tenant-safe config resolution
+// - Numeric brain state fields
+// - Clear maintenance header
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
-/* FIXED IMPORT PATH */
 const paperTrader = require("../services/paperTrader");
-
 const marketEngine = require("../services/marketEngine");
 const { readDb } = require("../lib/db");
 
@@ -26,12 +29,13 @@ function resolveTenant(req) {
 
 router.get("/status", (req, res) => {
   try {
+
     const tenantId = resolveTenant(req);
 
     if (!tenantId) {
       return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
+        ok:false,
+        error:"Missing tenant context"
       });
     }
 
@@ -39,52 +43,106 @@ router.get("/status", (req, res) => {
 
     if (!snapshot) {
       return res.json({
-        ok: true,
-        engine: "IDLE",
-        snapshot: null,
+        ok:true,
+        engine:"IDLE",
+        snapshot:null
       });
     }
 
     const db = readDb();
-    const tradingConfig = db.tradingConfig || {};
 
-    const decisions = paperTrader.getDecisions?.(tenantId) || [];
+    /* ================= CONFIG ================= */
 
-    const lastDecision = decisions.length
-      ? decisions[decisions.length - 1]
-      : null;
+    const rawConfig = db.tradingConfig || {};
+
+    const tradingConfig =
+      rawConfig[tenantId] || rawConfig || {};
+
+    /* ================= DECISIONS ================= */
+
+    const decisions =
+      paperTrader.getDecisions?.(tenantId) || [];
+
+    const lastDecision =
+      decisions.length
+        ? decisions[decisions.length - 1]
+        : null;
+
+    /* ================= ENGINE STATE ================= */
 
     const engineState = {
-      mode: tradingConfig.tradingMode || "paper",
-      enabled: tradingConfig.enabled ?? true,
-      riskPercent: tradingConfig.riskPercent ?? 1.5,
-      maxTrades: tradingConfig.maxTrades ?? 5,
-      positionMultiplier: tradingConfig.positionMultiplier ?? 1,
-      strategyMode: tradingConfig.strategyMode ?? "Balanced",
+
+      mode:
+        tradingConfig.tradingMode || "paper",
+
+      enabled:
+        tradingConfig.enabled ?? true,
+
+      riskPercent:
+        tradingConfig.riskPercent ?? 1.5,
+
+      maxTrades:
+        tradingConfig.maxTrades ?? 5,
+
+      positionMultiplier:
+        tradingConfig.positionMultiplier ?? 1,
+
+      strategyMode:
+        tradingConfig.strategyMode || "Balanced"
+
     };
 
+    /* ================= AI BRAIN STATE ================= */
+
     const brainState = {
-      lastAction: lastDecision?.action || "WAIT",
-      smoothedConfidence: Number(lastDecision?.confidence || 0).toFixed(3),
-      edgeMomentum: Number(lastDecision?.edge || 0).toFixed(4),
-      winStreak: snapshot.realized?.wins || 0,
-      lossStreak: snapshot.realized?.losses || 0,
+
+      lastAction:
+        lastDecision?.action || "WAIT",
+
+      smoothedConfidence:
+        Number(lastDecision?.confidence || 0),
+
+      edgeMomentum:
+        Number(lastDecision?.edge || 0),
+
+      winStreak:
+        snapshot.realized?.wins || 0,
+
+      lossStreak:
+        snapshot.realized?.losses || 0
+
     };
 
     return res.json({
-      ok: true,
-      engine: snapshot.executionStats?.ticks > 0 ? "RUNNING" : "IDLE",
+
+      ok:true,
+
+      engine:
+        snapshot.executionStats?.ticks > 0
+          ? "RUNNING"
+          : "IDLE",
+
       engineState,
+
       brainState,
-      executionStats: snapshot.executionStats || {},
+
+      executionStats:
+        snapshot.executionStats || {},
+
       snapshot,
-      time: new Date().toISOString(),
+
+      time:new Date().toISOString()
+
     });
-  } catch {
+
+  }
+  catch {
+
     return res.status(500).json({
-      ok: false,
-      error: "Paper engine unavailable",
+      ok:false,
+      error:"Paper engine unavailable"
     });
+
   }
 });
 
@@ -92,119 +150,168 @@ router.get("/status", (req, res) => {
    DECISION STREAM
 ========================================================= */
 
-router.get("/decisions", (req, res) => {
-  try {
+router.get("/decisions",(req,res)=>{
+
+  try{
+
     const tenantId = resolveTenant(req);
 
-    if (!tenantId) {
+    if(!tenantId){
       return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
+        ok:false,
+        error:"Missing tenant context"
       });
     }
 
-    const decisions = paperTrader.getDecisions?.(tenantId) || [];
+    const decisions =
+      paperTrader.getDecisions?.(tenantId) || [];
 
     return res.json({
-      ok: true,
+
+      ok:true,
       decisions,
-      count: decisions.length,
-      time: new Date().toISOString(),
+      count:decisions.length,
+      time:new Date().toISOString()
+
     });
-  } catch {
-    return res.status(500).json({
-      ok: false,
-      error: "Decision stream unavailable",
-    });
+
   }
+  catch{
+
+    return res.status(500).json({
+      ok:false,
+      error:"Decision stream unavailable"
+    });
+
+  }
+
 });
 
 /* =========================================================
    RESET
 ========================================================= */
 
-router.post("/reset", (req, res) => {
-  try {
+router.post("/reset",(req,res)=>{
+
+  try{
+
     const tenantId = resolveTenant(req);
 
-    if (!tenantId) {
+    if(!tenantId){
       return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
+        ok:false,
+        error:"Missing tenant context"
       });
     }
 
     paperTrader.hardReset(tenantId);
 
     return res.json({
-      ok: true,
-      snapshot: paperTrader.snapshot(tenantId),
-      time: new Date().toISOString(),
+
+      ok:true,
+      snapshot:paperTrader.snapshot(tenantId),
+      time:new Date().toISOString()
+
     });
-  } catch {
-    return res.status(500).json({
-      ok: false,
-      error: "Paper reset failed",
-    });
+
   }
+  catch{
+
+    return res.status(500).json({
+      ok:false,
+      error:"Paper reset failed"
+    });
+
+  }
+
 });
 
 /* =========================================================
    EXECUTE PAPER ORDER
 ========================================================= */
 
-router.post("/order", (req, res) => {
-  try {
+router.post("/order",(req,res)=>{
+
+  try{
+
     const tenantId = resolveTenant(req);
 
-    if (!tenantId) {
+    if(!tenantId){
       return res.status(400).json({
-        ok: false,
-        error: "Missing tenant context",
+        ok:false,
+        error:"Missing tenant context"
       });
     }
 
-    const { symbol, side, size, stopLoss, takeProfit, price } = req.body || {};
+    const {
+      symbol,
+      side,
+      size,
+      stopLoss,
+      takeProfit,
+      price
+    } = req.body || {};
 
-    if (!symbol || !side || !size) {
+    if(!symbol || !side || !size){
       return res.status(400).json({
-        ok: false,
-        error: "Invalid order payload",
+        ok:false,
+        error:"Invalid order payload"
       });
     }
 
     const livePrice =
-      marketEngine.getPrice(tenantId, symbol) || Number(price) || 0;
+      marketEngine.getPrice(tenantId,symbol)
+      || Number(price)
+      || 0;
 
-    if (!livePrice || !Number.isFinite(livePrice) || livePrice <= 0) {
+    if(!livePrice || !Number.isFinite(livePrice)){
       return res.status(400).json({
-        ok: false,
-        error: "Market price unavailable",
+        ok:false,
+        error:"Market price unavailable"
       });
     }
 
-    const result = paperTrader.executeOrder({
-      tenantId,
-      symbol,
-      side,
-      size: Number(size),
-      stopLoss: stopLoss != null ? Number(stopLoss) : null,
-      takeProfit: takeProfit != null ? Number(takeProfit) : null,
-      price: livePrice,
-    });
+    const result =
+      paperTrader.executeOrder({
+
+        tenantId,
+        symbol,
+        side,
+        size:Number(size),
+
+        stopLoss:
+          stopLoss!=null
+            ? Number(stopLoss)
+            : null,
+
+        takeProfit:
+          takeProfit!=null
+            ? Number(takeProfit)
+            : null,
+
+        price:livePrice
+
+      });
 
     return res.json({
-      ok: true,
+
+      ok:true,
       result,
-      snapshot: paperTrader.snapshot(tenantId),
-      time: new Date().toISOString(),
+      snapshot:paperTrader.snapshot(tenantId),
+      time:new Date().toISOString()
+
     });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err?.message || "Paper order failed",
-    });
+
   }
+  catch(err){
+
+    return res.status(500).json({
+      ok:false,
+      error:err?.message || "Paper order failed"
+    });
+
+  }
+
 });
 
 module.exports = router;
