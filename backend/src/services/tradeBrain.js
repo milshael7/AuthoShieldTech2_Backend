@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v8)
-// FIXED: paper trading exploration + visible AI activity
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v9)
+// IMPROVED: faster learning + visible AI activity
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -14,11 +14,12 @@ const MAX_TRADES_PER_DAY =
 const MAX_LOSS_STREAK =
   Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
 
+/* Faster learning feedback */
 const CONFIDENCE_DECAY =
-  Number(process.env.TRADE_CONFIDENCE_DECAY || 0.82);
+  Number(process.env.TRADE_CONFIDENCE_DECAY || 0.72);
 
 const EDGE_MEMORY_DECAY =
-  Number(process.env.TRADE_EDGE_MEMORY_DECAY || 0.88);
+  Number(process.env.TRADE_EDGE_MEMORY_DECAY || 0.86);
 
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
@@ -95,7 +96,7 @@ function makeDecision(context={}){
     paper?.cashBalance !== undefined &&
     paper?.equity !== undefined;
 
-  /* ================= STRATEGY ================= */
+/* ================= STRATEGY ================= */
 
   let strategy = {};
 
@@ -121,7 +122,7 @@ function makeDecision(context={}){
   if(!ACTIONS.has(action))
     action="WAIT";
 
-  /* ================= POSITION RULES ================= */
+/* ================= POSITION RULES ================= */
 
   if(!pos && action==="CLOSE")
     action="WAIT";
@@ -139,7 +140,7 @@ function makeDecision(context={}){
   if(!pos && action==="SELL" && !isPaper)
     action="WAIT";
 
-  /* ================= AI OVERLAY ================= */
+/* ================= AI OVERLAY ================= */
 
   try{
 
@@ -154,17 +155,17 @@ function makeDecision(context={}){
     const aiEdge = safeNum(ai.edge,0);
 
     confidence =
-      clamp((confidence*0.65)+(aiConf*0.35),0,1);
+      clamp((confidence*0.6)+(aiConf*0.4),0,1);
 
     edge =
-      clamp((edge*0.65)+(aiEdge*0.35),-1,1);
+      clamp((edge*0.6)+(aiEdge*0.4),-1,1);
 
   }catch{}
 
-  /* ================= CONFIDENCE SMOOTHING ================= */
+/* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
-    isPaper ? 0.25 : CONFIDENCE_DECAY;
+    isPaper ? 0.18 : CONFIDENCE_DECAY;
 
   brain.smoothedConfidence =
     brain.smoothedConfidence * decay +
@@ -180,19 +181,19 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
-  /* ================= CONFIDENCE GATE ================= */
+/* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.04 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.03 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
 
-  /* ================= EXPLORATION MODE ================= */
+/* ================= EXPLORATION MODE ================= */
 
   if(isPaper && action==="WAIT"){
 
-    const explorationChance = 0.08;
+    const explorationChance = 0.12;
 
     if(Math.random() < explorationChance){
 
@@ -207,7 +208,7 @@ function makeDecision(context={}){
 
   }
 
-  /* ================= HARD SAFETY ================= */
+/* ================= HARD SAFETY ================= */
 
   if(!isPaper){
 
@@ -225,7 +226,7 @@ function makeDecision(context={}){
 
   }
 
-  /* ================= RISK ================= */
+/* ================= RISK ================= */
 
   let riskPct =
     safeNum(strategy.riskPct,0.01);
@@ -233,7 +234,7 @@ function makeDecision(context={}){
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
 
-  /* ================= WAIT HANDLING ================= */
+/* ================= WAIT HANDLING ================= */
 
   if(action==="WAIT"){
     edge = edge * 0.5;
