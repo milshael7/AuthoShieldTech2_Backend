@@ -1,6 +1,16 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v19
-// STABILIZED: telemetry safety + crash guard + stats integrity
+// FILE: backend/src/services/paperTrader.js
+// MODULE: Autonomous Paper Trading Engine
+// VERSION: AI GOVERNED STABLE v20
+//
+// PURPOSE:
+// - Runs AI paper trading loop
+// - Executes AI trading decisions
+// - Tracks equity, cash, trades, telemetry
+//
+// MAINTENANCE NOTE:
+// Added capital protection and corruption guards to prevent
+// runaway negative balances in paper accounts.
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -112,6 +122,22 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   if(state._locked) return;
 
+  /* ================= CAPITAL GUARD ================= */
+
+  if(state.cashBalance <= 0 || state.equity <= 0){
+    console.warn("Paper account bankrupt — stopping engine");
+    state.running = false;
+    return;
+  }
+
+  /* Prevent corrupted runaway balances */
+
+  if(state.equity < -1000000 || state.cashBalance < -1000000){
+    console.warn("Paper account corrupted — resetting state");
+    STATES.set(tenantId, defaultState());
+    return;
+  }
+
   state._locked = true;
 
   try{
@@ -205,7 +231,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
           ts
         });
 
-      if(exec?.result){
+      /* Trade sanity validation */
+
+      if(exec?.result && Number(exec.result.qty) > 0){
 
         state.executionStats.trades++;
 
