@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v7)
-// STABLE ENGINE VERSION — Memory Safe
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v8)
+// FIXED: paper trading exploration + visible AI activity
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -32,9 +32,7 @@ const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
 const BRAIN_STATE = new Map();
 
-/* Prevent runaway tenant memory */
 const MAX_BRAIN_TENANTS = 500;
-const IDLE_RESET_MS = 1000 * 60 * 60 * 12; // 12h
 
 function getBrainState(tenantId){
 
@@ -185,10 +183,29 @@ function makeDecision(context={}){
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.10 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? 0.04 : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
+
+  /* ================= EXPLORATION MODE ================= */
+
+  if(isPaper && action==="WAIT"){
+
+    const explorationChance = 0.08;
+
+    if(Math.random() < explorationChance){
+
+      action =
+        Math.random() > 0.5
+          ? "BUY"
+          : "SELL";
+
+      confidence = Math.max(confidence,0.08);
+
+    }
+
+  }
 
   /* ================= HARD SAFETY ================= */
 
