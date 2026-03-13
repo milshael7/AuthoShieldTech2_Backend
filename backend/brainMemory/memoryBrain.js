@@ -1,7 +1,6 @@
 // ==========================================================
-// AUTOSHIELD MEMORY BRAIN — PERMANENT MEMORY CORE
-// Stores Trades • Signals • Market Context
-// Survives backend redeploys
+// AUTOSHIELD MEMORY BRAIN — PERMANENT MEMORY CORE v2
+// Optimized: safe persistence + batched writes
 // ==========================================================
 
 const fs = require("fs");
@@ -11,11 +10,15 @@ const path = require("path");
 
 const BASE_PATH =
   process.env.MEMORY_BRAIN_DIR ||
-  path.join(process.cwd(), "brainMemory", "store");
+  process.env.RENDER_DISK_PATH ||
+  path.join(process.cwd(),"brainMemory","store");
 
 const MAX_TRADES = 100000;
 const MAX_SIGNALS = 100000;
 const MAX_MARKET_STATES = 100000;
+
+/* Save every 5 seconds */
+const SAVE_INTERVAL = 5000;
 
 /* ================= HELPERS ================= */
 
@@ -29,18 +32,13 @@ function memoryPath(tenantId){
   return path.join(BASE_PATH,`memory_${tenantId}.json`);
 }
 
-function safeNum(v,fallback=0){
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 /* ================= DEFAULT MEMORY ================= */
 
 function defaultMemory(){
 
   return{
 
-    version:1,
+    version:2,
 
     createdAt:Date.now(),
     updatedAt:Date.now(),
@@ -63,6 +61,7 @@ function defaultMemory(){
 /* ================= CACHE ================= */
 
 const MEMORY = new Map();
+const DIRTY = new Set();
 
 /* ================= LOAD ================= */
 
@@ -105,6 +104,7 @@ function save(tenantId){
   try{
 
     const mem = MEMORY.get(tenantId);
+    if(!mem) return;
 
     mem.updatedAt = Date.now();
 
@@ -125,6 +125,20 @@ function save(tenantId){
   }
 
 }
+
+/* ================= BATCHED SAVE LOOP ================= */
+
+setInterval(()=>{
+
+  for(const tenantId of DIRTY){
+
+    save(tenantId);
+
+  }
+
+  DIRTY.clear();
+
+},SAVE_INTERVAL);
 
 /* ================= RECORD TRADE ================= */
 
@@ -168,7 +182,7 @@ function recordTrade({
   else
     mem.stats.losses++;
 
-  save(tenantId);
+  DIRTY.add(tenantId);
 
 }
 
@@ -203,7 +217,7 @@ function recordSignal({
 
   mem.stats.totalSignals++;
 
-  save(tenantId);
+  DIRTY.add(tenantId);
 
 }
 
@@ -231,7 +245,7 @@ function recordMarketState({
     mem.marketStates =
       mem.marketStates.slice(-MAX_MARKET_STATES);
 
-  save(tenantId);
+  DIRTY.add(tenantId);
 
 }
 
@@ -257,6 +271,7 @@ function snapshot(tenantId){
 
 module.exports = {
 
+  load,
   recordTrade,
   recordSignal,
   recordMarketState,
