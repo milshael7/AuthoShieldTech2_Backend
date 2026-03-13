@@ -1,6 +1,6 @@
 // ==========================================================
-// Autonomous Paper Trading Engine — AI GOVERNED STABLE v17
-// FIXED: UI trade display + risk config + stable equity
+// Autonomous Paper Trading Engine — AI GOVERNED STABLE v18
+// FIXED: crash protection + stable lock + telemetry safety
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -103,6 +103,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(!cfg.enabled) return;
   if(cfg.tradingMode !== "paper") return;
   if(!Number.isFinite(price) || price<=0) return;
+
   if(state._locked) return;
 
   state._locked = true;
@@ -149,8 +150,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         confidence:0,
         riskPct:0
       };
-
-    /* APPLY UI RISK SETTINGS */
 
     plan.riskPct =
       (Number(cfg.riskPercent)/100) *
@@ -254,6 +253,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     if(state.equity > state.peakEquity)
       state.peakEquity = state.equity;
+
+  }
+  catch(err){
+
+    console.error("AI engine error:",err.message);
 
   }
   finally{
