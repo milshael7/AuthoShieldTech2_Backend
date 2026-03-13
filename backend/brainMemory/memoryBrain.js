@@ -1,6 +1,6 @@
 // ==========================================================
-// AUTOSHIELD MEMORY BRAIN — PERMANENT MEMORY CORE v2
-// Optimized: safe persistence + batched writes
+// AUTOSHIELD MEMORY BRAIN — PERMANENT MEMORY CORE v3
+// FIXED: Render-safe storage path + atomic saves + fast restore
 // ==========================================================
 
 const fs = require("fs");
@@ -8,28 +8,77 @@ const path = require("path");
 
 /* ================= CONFIG ================= */
 
-const BASE_PATH =
-  process.env.MEMORY_BRAIN_DIR ||
-  process.env.RENDER_DISK_PATH ||
-  path.join(process.cwd(),"brainMemory","store");
-
 const MAX_TRADES = 100000;
 const MAX_SIGNALS = 100000;
 const MAX_MARKET_STATES = 100000;
 
-/* Save every 5 seconds */
 const SAVE_INTERVAL = 5000;
 
-/* ================= HELPERS ================= */
+/* ================= PATH RESOLUTION ================= */
+
+let ACTIVE_BASE_PATH = null;
 
 function ensureDir(p){
-  if(!fs.existsSync(p))
-    fs.mkdirSync(p,{recursive:true});
+  try{
+    if(!fs.existsSync(p)){
+      fs.mkdirSync(p,{recursive:true});
+    }
+    return true;
+  }catch{
+    return false;
+  }
+}
+
+function canWriteDir(p){
+  try{
+    if(!ensureDir(p)) return false;
+
+    const probe = path.join(p, `.probe_${Date.now()}_${Math.random().toString(16).slice(2)}.tmp`);
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+
+    return true;
+  }catch{
+    return false;
+  }
+}
+
+function resolveBasePath(){
+
+  if(ACTIVE_BASE_PATH)
+    return ACTIVE_BASE_PATH;
+
+  const candidates = [];
+
+  if(process.env.MEMORY_BRAIN_DIR)
+    candidates.push(process.env.MEMORY_BRAIN_DIR);
+
+  if(process.env.RENDER_DISK_PATH)
+    candidates.push(path.join(process.env.RENDER_DISK_PATH, "brain"));
+
+  candidates.push("/tmp/brain");
+  candidates.push(path.join(process.cwd(), "brainMemory", "store"));
+
+  for(const p of candidates){
+    if(canWriteDir(p)){
+      ACTIVE_BASE_PATH = p;
+      console.log(`[MEMORY] using store: ${ACTIVE_BASE_PATH}`);
+      return ACTIVE_BASE_PATH;
+    }
+  }
+
+  throw new Error("No writable memory brain directory found");
+
 }
 
 function memoryPath(tenantId){
-  ensureDir(BASE_PATH);
-  return path.join(BASE_PATH,`memory_${tenantId}.json`);
+  const base = resolveBasePath();
+  return path.join(base, `memory_${tenantId}.json`);
+}
+
+function safeNum(v,fallback=0){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /* ================= DEFAULT MEMORY ================= */
@@ -37,8 +86,7 @@ function memoryPath(tenantId){
 function defaultMemory(){
 
   return{
-
-    version:2,
+    version:3,
 
     createdAt:Date.now(),
     updatedAt:Date.now(),
@@ -53,7 +101,6 @@ function defaultMemory(){
     trades:[],
     signals:[],
     marketStates:[]
-
   };
 
 }
@@ -67,21 +114,30 @@ const DIRTY = new Set();
 
 function load(tenantId){
 
-  if(MEMORY.has(tenantId))
-    return MEMORY.get(tenantId);
+  const key = tenantId || "__default__";
+
+  if(MEMORY.has(key))
+    return MEMORY.get(key);
 
   let mem = defaultMemory();
 
-  const file = memoryPath(tenantId);
-
   try{
+
+    const file = memoryPath(key);
 
     if(fs.existsSync(file)){
 
       const raw =
         JSON.parse(fs.readFileSync(file,"utf-8"));
 
-      mem = {...mem,...raw};
+      mem = {
+        ...mem,
+        ...raw,
+        stats:{
+          ...mem.stats,
+          ...(raw?.stats || {})
+        }
+      };
 
     }
 
@@ -91,7 +147,7 @@ function load(tenantId){
 
   }
 
-  MEMORY.set(tenantId,mem);
+  MEMORY.set(key,mem);
 
   return mem;
 
@@ -101,14 +157,16 @@ function load(tenantId){
 
 function save(tenantId){
 
+  const key = tenantId || "__default__";
+
   try{
 
-    const mem = MEMORY.get(tenantId);
+    const mem = MEMORY.get(key);
     if(!mem) return;
 
     mem.updatedAt = Date.now();
 
-    const file = memoryPath(tenantId);
+    const file = memoryPath(key);
     const tmp = `${file}.tmp`;
 
     fs.writeFileSync(
@@ -155,19 +213,20 @@ function recordTrade({
   volatility
 }){
 
-  const mem = load(tenantId);
+  const key = tenantId || "__default__";
+  const mem = load(key);
 
   const trade = {
     ts:Date.now(),
     symbol,
-    entry,
-    exit,
-    qty,
-    pnl,
-    risk,
-    confidence,
-    edge,
-    volatility
+    entry:safeNum(entry),
+    exit:safeNum(exit),
+    qty:safeNum(qty),
+    pnl:safeNum(pnl),
+    risk:safeNum(risk),
+    confidence:safeNum(confidence),
+    edge:safeNum(edge),
+    volatility:safeNum(volatility)
   };
 
   mem.trades.push(trade);
@@ -177,12 +236,12 @@ function recordTrade({
 
   mem.stats.totalTrades++;
 
-  if(pnl > 0)
+  if(trade.pnl > 0)
     mem.stats.wins++;
-  else
+  else if(trade.pnl < 0)
     mem.stats.losses++;
 
-  DIRTY.add(tenantId);
+  DIRTY.add(key);
 
 }
 
@@ -198,16 +257,17 @@ function recordSignal({
   volatility
 }){
 
-  const mem = load(tenantId);
+  const key = tenantId || "__default__";
+  const mem = load(key);
 
   const signal = {
     ts:Date.now(),
     symbol,
     action,
-    confidence,
-    edge,
-    price,
-    volatility
+    confidence:safeNum(confidence),
+    edge:safeNum(edge),
+    price:safeNum(price),
+    volatility:safeNum(volatility)
   };
 
   mem.signals.push(signal);
@@ -217,7 +277,7 @@ function recordSignal({
 
   mem.stats.totalSignals++;
 
-  DIRTY.add(tenantId);
+  DIRTY.add(key);
 
 }
 
@@ -230,13 +290,14 @@ function recordMarketState({
   volatility
 }){
 
-  const mem = load(tenantId);
+  const key = tenantId || "__default__";
+  const mem = load(key);
 
   const state = {
     ts:Date.now(),
     symbol,
-    price,
-    volatility
+    price:safeNum(price),
+    volatility:safeNum(volatility)
   };
 
   mem.marketStates.push(state);
@@ -245,7 +306,23 @@ function recordMarketState({
     mem.marketStates =
       mem.marketStates.slice(-MAX_MARKET_STATES);
 
-  DIRTY.add(tenantId);
+  DIRTY.add(key);
+
+}
+
+/* ================= FAST RESTORE ================= */
+
+function restoreTenant(tenantId){
+
+  const key = tenantId || "__default__";
+  const mem = load(key);
+
+  return {
+    stats:mem.stats,
+    recentTrades:mem.trades.slice(-50),
+    recentSignals:mem.signals.slice(-100),
+    recentMarketStates:mem.marketStates.slice(-500)
+  };
 
 }
 
@@ -253,16 +330,15 @@ function recordMarketState({
 
 function snapshot(tenantId){
 
-  const mem = load(tenantId);
+  const key = tenantId || "__default__";
+  const mem = load(key);
 
   return{
-
     stats:mem.stats,
-
     tradesStored:mem.trades.length,
     signalsStored:mem.signals.length,
-    marketStatesStored:mem.marketStates.length
-
+    marketStatesStored:mem.marketStates.length,
+    storagePath:ACTIVE_BASE_PATH || resolveBasePath()
   };
 
 }
@@ -270,11 +346,10 @@ function snapshot(tenantId){
 /* ================= EXPORT ================= */
 
 module.exports = {
-
   load,
   recordTrade,
   recordSignal,
   recordMarketState,
+  restoreTenant,
   snapshot
-
 };
