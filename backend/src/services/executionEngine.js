@@ -1,6 +1,12 @@
 // ==========================================================
-// EXECUTION ENGINE — PAPER TRADING CORE v6
-// FIXED: trade persistence + reverse trade recording
+// FILE: backend/src/services/executionEngine.js
+// MODULE: Execution Engine — Paper Trading
+// VERSION: v7 (STABILIZED)
+//
+// FIXES:
+// - Correct capital accounting
+// - Prevent runaway negative balances
+// - Position size sanity checks
 // ==========================================================
 
 const outsideBrain =
@@ -38,7 +44,6 @@ function calculatePositionSize(state,price,riskPct){
   const qty = riskCapital / price;
 
   return clamp(qty,0,1000);
-
 }
 
 /* =========================================================
@@ -55,6 +60,18 @@ function openPosition({
 }){
 
   ensureTradeLog(state);
+
+  const cost = qty * price;
+
+  if(side === "LONG"){
+
+    if(state.cashBalance < cost){
+      return null;
+    }
+
+    state.cashBalance -= cost;
+
+  }
 
   state.position = {
     symbol,
@@ -96,17 +113,23 @@ function closePosition({
   if(!pos) return null;
 
   let pnl = 0;
+  let cashReturn = pos.qty * price;
 
   if(pos.side === "LONG"){
+
     pnl = (price - pos.entry) * pos.qty;
+
+    state.cashBalance += cashReturn;
+
   }
 
   if(pos.side === "SHORT"){
-    pnl = (pos.entry - price) * pos.qty;
-  }
 
-  state.cashBalance =
-    safeNum(state.cashBalance) + pnl;
+    pnl = (pos.entry - price) * pos.qty;
+
+    state.cashBalance += pnl;
+
+  }
 
   const trade = {
     side:"CLOSE",
@@ -119,8 +142,6 @@ function closePosition({
   state.trades.push(trade);
 
   state.position = null;
-
-  /* ================= AI LEARNING ================= */
 
   try{
 
@@ -159,6 +180,8 @@ function executePaperOrder({
   if(!state) return null;
   if(!symbol) return null;
   if(!Number.isFinite(price)) return null;
+
+  if(state.cashBalance <= 0) return null;
 
   riskPct = clamp(
     safeNum(riskPct,0.01),
