@@ -1,16 +1,21 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: AI GOVERNED STABLE v20
+// VERSION: AI GOVERNED STABLE v21
 //
-// PURPOSE:
-// - Runs AI paper trading loop
-// - Executes AI trading decisions
-// - Tracks equity, cash, trades, telemetry
+// PURPOSE
+// - Runs AI decision engine
+// - Routes orders to PAPER or LIVE depending on control panel
+// - Provides real-time telemetry for dashboard monitoring
 //
-// MAINTENANCE NOTE:
-// Added capital protection and corruption guards to prevent
-// runaway negative balances in paper accounts.
+// IMPORTANT
+// AI ALWAYS RUNS.
+// Only execution layer changes based on tradingMode.
+//
+// tradingMode:
+//   "paper" -> simulation
+//   "live"  -> real exchange execution
+//
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -18,11 +23,7 @@ const executionEngine = require("./executionEngine");
 const memoryBrain = require("../../brainMemory/memoryBrain");
 const { readDb } = require("../lib/db");
 
-/* ================= ENGINE START ================= */
-
 const ENGINE_START = Date.now();
-
-/* ================= CONFIG ================= */
 
 const START_BAL =
   Number(process.env.PAPER_START_BALANCE || 100000);
@@ -117,7 +118,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
   if(!state.running) return;
   if(!cfg.enabled) return;
-  if(cfg.tradingMode !== "paper") return;
   if(!Number.isFinite(price) || price<=0) return;
 
   if(state._locked) return;
@@ -127,14 +127,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(state.cashBalance <= 0 || state.equity <= 0){
     console.warn("Paper account bankrupt — stopping engine");
     state.running = false;
-    return;
-  }
-
-  /* Prevent corrupted runaway balances */
-
-  if(state.equity < -1000000 || state.cashBalance < -1000000){
-    console.warn("Paper account corrupted — resetting state");
-    STATES.set(tenantId, defaultState());
     return;
   }
 
@@ -200,50 +192,58 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       riskPct:plan.riskPct
     });
 
-    try{
-      memoryBrain.recordSignal({
-        tenantId,
-        symbol,
-        action:plan.action,
-        confidence:plan.confidence || 0,
-        edge:plan.edge || 0,
-        price,
-        volatility:state.volatility
-      });
-    }catch{}
-
     if(state.decisions.length > MAX_DECISIONS_MEMORY)
       state.decisions =
         state.decisions.slice(-MAX_DECISIONS_MEMORY);
 
-    /* ================= EXECUTION ================= */
+    /* ================= EXECUTION ROUTING ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action)){
 
-      const exec =
-        executionEngine.executePaperOrder({
-          tenantId,
-          symbol,
-          action:plan.action,
-          price,
-          riskPct:plan.riskPct,
-          state,
-          ts
-        });
+      let exec;
 
-      /* Trade sanity validation */
+      if(cfg.tradingMode === "live"){
+
+        exec =
+          executionEngine.executeLiveOrder({
+            tenantId,
+            symbol,
+            action:plan.action,
+            price,
+            riskPct:plan.riskPct,
+            state,
+            ts
+          });
+
+      }else{
+
+        exec =
+          executionEngine.executePaperOrder({
+            tenantId,
+            symbol,
+            action:plan.action,
+            price,
+            riskPct:plan.riskPct,
+            state,
+            ts
+          });
+
+      }
 
       if(exec?.result && Number(exec.result.qty) > 0){
 
         state.executionStats.trades++;
 
         const trade = {
-          time:ts,
           symbol,
           side:plan.action,
+          entry:state.position?.entry || price,
+          exit:price,
           price,
           qty:Number(exec.result.qty||0),
-          pnl:Number(exec.result.pnl||0)
+          pnl:Number(exec.result.pnl||0),
+          time:ts,
+          timeOpen:state.position?.time || ts
         };
 
         state.trades.push(trade);
@@ -252,8 +252,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
           memoryBrain.recordTrade({
             tenantId,
             symbol,
-            entry:price,
-            exit:price,
+            entry:trade.entry,
+            exit:trade.exit,
             qty:trade.qty,
             pnl:trade.pnl,
             risk:plan.riskPct,
@@ -295,51 +295,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       state.peakEquity = state.equity;
 
   }
-  catch(err){
-
-    console.error("AI engine error:",err.message);
-
-  }
   finally{
 
     state._locked = false;
-
-  }
-
-}
-
-/* ================= TELEMETRY ================= */
-
-function getTelemetry(state){
-
-  try{
-
-    const uptime =
-      Math.floor((Date.now() - ENGINE_START) / 1000);
-
-    const decisions =
-      state?.executionStats?.decisions || 0;
-
-    const decisionsPerMinute =
-      uptime > 0
-        ? (decisions / uptime) * 60
-        : 0;
-
-    return {
-
-      uptime,
-      decisionsPerMinute,
-      memoryUsage:process.memoryUsage().rss
-
-    };
-
-  }catch{
-
-    return {
-      uptime:0,
-      decisionsPerMinute:0,
-      memoryUsage:0
-    };
 
   }
 
@@ -365,22 +323,14 @@ function snapshot(tenantId){
     lastPrice:s.lastPrice,
     volatility:s.volatility,
 
-    executionStats:s.executionStats || {
-      ticks:0,
-      decisions:0,
-      trades:0
-    },
+    executionStats:s.executionStats,
 
     realized:s.realized,
-    limits:s.limits,
-
-    telemetry:getTelemetry(s)
+    limits:s.limits
 
   };
 
 }
-
-/* ================= EXPORT ================= */
 
 module.exports = {
 
