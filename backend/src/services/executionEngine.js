@@ -1,16 +1,24 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v8 (Paper + Live Ready)
+// VERSION: v9 (Realistic Risk Model)
 //
 // PURPOSE
 // - Handles both paper and live execution
 // - Paper execution uses internal simulation
 // - Live execution sends orders to exchange API
 //
-// IMPORTANT
-// Live trading will only activate if tradingMode = "live"
-// in the tradingConfig.
+// RISK MODEL UPDATE
+// ----------------------------------------------------------
+// Paper trading now enforces realistic exposure limits:
+//
+// • Max 5% of equity per trade
+// • Max $5000 absolute exposure per trade
+// • Minimum $25 trade size
+// • Quantity rounded to realistic precision
+//
+// This prevents unrealistic paper trading sizes while
+// preserving AI behavior and strategy logic.
 //
 // ==========================================================
 
@@ -37,8 +45,12 @@ function ensureTradeLog(state){
 }
 
 /* =========================================================
-POSITION SIZE
+POSITION SIZE (REALISTIC RISK MODEL)
 ========================================================= */
+
+const MAX_EQUITY_EXPOSURE = 0.05;
+const MAX_TRADE_USD = 5000;
+const MIN_TRADE_USD = 25;
 
 function calculatePositionSize(state,price,riskPct){
 
@@ -50,9 +62,21 @@ function calculatePositionSize(state,price,riskPct){
 
   const riskCapital = equity * riskPct;
 
-  const qty = riskCapital / price;
+  const equityCap =
+    equity * MAX_EQUITY_EXPOSURE;
 
-  return clamp(qty,0,1000);
+  const allowedCapital =
+    Math.min(riskCapital,equityCap,MAX_TRADE_USD);
+
+  if(allowedCapital < MIN_TRADE_USD)
+    return 0;
+
+  let qty = allowedCapital / price;
+
+  qty = Number(qty.toFixed(6));
+
+  return qty;
+
 }
 
 /* =========================================================
@@ -197,7 +221,7 @@ function executePaperOrder({
   riskPct = clamp(
     safeNum(riskPct,0.01),
     0.001,
-    0.1
+    0.05
   );
 
   const pos = state.position;
