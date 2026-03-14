@@ -1,16 +1,25 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// MODULE: Execution Engine — Paper Trading
-// VERSION: v7 (STABILIZED)
+// MODULE: Execution Engine
+// VERSION: v8 (Paper + Live Ready)
 //
-// FIXES:
-// - Correct capital accounting
-// - Prevent runaway negative balances
-// - Position size sanity checks
+// PURPOSE
+// - Handles both paper and live execution
+// - Paper execution uses internal simulation
+// - Live execution sends orders to exchange API
+//
+// IMPORTANT
+// Live trading will only activate if tradingMode = "live"
+// in the tradingConfig.
+//
 // ==========================================================
 
 const outsideBrain =
   require("../../brain/aiBrain");
+
+const axios = require("axios");
+
+/* ================= UTIL ================= */
 
 function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
@@ -83,6 +92,7 @@ function openPosition({
 
   const trade = {
     side,
+    symbol,
     price,
     qty,
     pnl:0,
@@ -133,6 +143,7 @@ function closePosition({
 
   const trade = {
     side:"CLOSE",
+    symbol:pos.symbol,
     price,
     qty:pos.qty,
     pnl,
@@ -161,7 +172,7 @@ function closePosition({
 }
 
 /* =========================================================
-MAIN EXECUTION
+PAPER EXECUTION
 ========================================================= */
 
 function executePaperOrder({
@@ -199,8 +210,6 @@ function executePaperOrder({
   }
 
   if(positionSize <= 0) return null;
-
-  /* ================= BUY ================= */
 
   if(action === "BUY"){
 
@@ -243,8 +252,6 @@ function executePaperOrder({
 
   }
 
-  /* ================= SELL ================= */
-
   if(action === "SELL"){
 
     if(pos){
@@ -286,8 +293,6 @@ function executePaperOrder({
 
   }
 
-  /* ================= CLOSE ================= */
-
   if(action === "CLOSE"){
 
     if(!pos) return null;
@@ -305,6 +310,82 @@ function executePaperOrder({
 
 }
 
+/* =========================================================
+LIVE EXECUTION
+========================================================= */
+
+async function executeLiveOrder({
+
+  symbol,
+  action,
+  price,
+  qty
+
+}){
+
+  try{
+
+    const apiKey =
+      process.env.EXCHANGE_API_KEY;
+
+    const secret =
+      process.env.EXCHANGE_SECRET;
+
+    if(!apiKey || !secret){
+
+      console.warn("Live trading keys missing");
+
+      return null;
+
+    }
+
+    const side =
+      action === "BUY"
+        ? "BUY"
+        : "SELL";
+
+    const response =
+      await axios.post(
+        process.env.EXCHANGE_ORDER_ENDPOINT,
+        {
+          symbol,
+          side,
+          type:"MARKET",
+          quantity:qty
+        },
+        {
+          headers:{
+            "X-API-KEY":apiKey
+          }
+        }
+      );
+
+    return {
+      result:{
+        side,
+        price,
+        qty,
+        live:true,
+        exchangeId:response.data?.orderId
+      }
+    };
+
+  }catch(err){
+
+    console.error(
+      "Live execution failed:",
+      err.message
+    );
+
+    return null;
+
+  }
+
+}
+
+/* ========================================================= */
+
 module.exports = {
-  executePaperOrder
+  executePaperOrder,
+  executeLiveOrder
 };
