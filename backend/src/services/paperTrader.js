@@ -1,20 +1,13 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: AI GOVERNED STABLE v21
+// VERSION: AI GOVERNED STABLE v22
 //
-// PURPOSE
-// - Runs AI decision engine
-// - Routes orders to PAPER or LIVE depending on control panel
-// - Provides real-time telemetry for dashboard monitoring
-//
-// IMPORTANT
-// AI ALWAYS RUNS.
-// Only execution layer changes based on tradingMode.
-//
-// tradingMode:
-//   "paper" -> simulation
-//   "live"  -> real exchange execution
+// ENHANCEMENTS
+// - Minimum trade interval guard
+// - Maximum trade duration guard
+// - Prevents AI trade spam
+// - Forces exit on long-running trades
 //
 // ==========================================================
 
@@ -31,6 +24,11 @@ const START_BAL =
 const MAX_TRADES_MEMORY = 500;
 const MAX_DECISIONS_MEMORY = 200;
 
+/* ================= TIMING GUARDS ================= */
+
+const MIN_TRADE_INTERVAL = 30000;      // 30 seconds
+const MAX_TRADE_DURATION = 20 * 60 * 1000; // 20 minutes
+
 /* ================= STATE ================= */
 
 function defaultState(){
@@ -44,6 +42,7 @@ function defaultState(){
     decisions:[],
     volatility:0.003,
     lastPrice:null,
+    lastTradeTime:0,
     realized:{wins:0,losses:0,net:0},
     limits:{tradesToday:0,lossesToday:0},
 
@@ -119,7 +118,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(!state.running) return;
   if(!cfg.enabled) return;
   if(!Number.isFinite(price) || price<=0) return;
-
   if(state._locked) return;
 
   /* ================= CAPITAL GUARD ================= */
@@ -162,6 +160,39 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       });
     }catch{}
 
+    /* ================= FORCE CLOSE IF TRADE TOO LONG ================= */
+
+    if(state.position){
+
+      const tradeAge =
+        ts - state.position.time;
+
+      if(tradeAge > MAX_TRADE_DURATION){
+
+        executionEngine.executePaperOrder({
+          tenantId,
+          symbol,
+          action:"CLOSE",
+          price,
+          state,
+          ts
+        });
+
+        state.lastTradeTime = ts;
+
+        return;
+      }
+
+    }
+
+    /* ================= TRADE INTERVAL GUARD ================= */
+
+    const sinceLastTrade =
+      ts - state.lastTradeTime;
+
+    const allowTrade =
+      sinceLastTrade >= MIN_TRADE_INTERVAL;
+
     /* ================= AI DECISION ================= */
 
     const plan =
@@ -198,7 +229,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     /* ================= EXECUTION ROUTING ================= */
 
-    if(["BUY","SELL","CLOSE"].includes(plan.action)){
+    if(["BUY","SELL","CLOSE"].includes(plan.action) && allowTrade){
 
       let exec;
 
@@ -233,6 +264,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       if(exec?.result && Number(exec.result.qty) > 0){
 
         state.executionStats.trades++;
+
+        state.lastTradeTime = ts;
 
         const trade = {
           symbol,
