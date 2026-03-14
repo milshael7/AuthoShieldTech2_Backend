@@ -1,3 +1,53 @@
+// ==========================================================
+// FILE: backend/src/server.js
+// MODULE: Core Backend Server
+// VERSION: Production Stable
+//
+// PURPOSE
+// This is the main runtime entry point for the backend.
+//
+// Responsibilities:
+// - Boot Express API
+// - Initialize database and security layers
+// - Start the autonomous AI trading engine
+// - Manage WebSocket real-time streams
+// - Broadcast market and paper trading updates
+//
+// ARCHITECTURE ROLE
+// All real-time data flows through this server.
+//
+// Market Data Flow:
+// marketEngine → price simulation → WebSocket → frontend
+//
+// Trading Data Flow:
+// marketEngine price → paperTrader.tick()
+// → AI decision → executionEngine
+// → snapshot → WebSocket → dashboard
+//
+// WEBSOCKET CHANNELS
+// market  → live market prices
+// paper   → AI paper trading engine state
+//
+// EXPECTED FILE LOCATION
+// backend/
+//   src/
+//     server.js   <-- THIS FILE
+//
+// DO NOT MOVE THIS FILE.
+// The entire backend boot process depends on this path.
+//
+// RENDER DEPLOYMENT NOTES
+// - Render injects PORT automatically.
+// - Never hardcode port values.
+// - Environment variables must be configured in Render.
+//
+// REQUIRED ENV VARIABLES
+// JWT_SECRET
+// STRIPE_SECRET_KEY
+// STRIPE_WEBHOOK_SECRET
+//
+// ==========================================================
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -6,7 +56,9 @@ const helmet = require("helmet");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-/* ================= CORE LIBS ================= */
+/* =========================================================
+CORE LIBRARIES
+========================================================= */
 
 const { ensureDb, readDb } = require("./lib/db");
 const { verifyAuditIntegrity } = require("./lib/audit");
@@ -22,13 +74,18 @@ const { authRequired } = require("./middleware/auth");
 const marketEngine = require("./services/marketEngine");
 const paperTrader = require("./services/paperTrader");
 
-/* ================= ROUTES ================= */
+/* =========================================================
+API ROUTES
+========================================================= */
 
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
 
-/* ================= SAFE BOOT ================= */
+/* =========================================================
+SAFE BOOT CHECK
+Ensures critical environment variables exist.
+========================================================= */
 
 function requireEnv(name){
   if(!process.env[name]){
@@ -41,16 +98,30 @@ requireEnv("JWT_SECRET");
 requireEnv("STRIPE_SECRET_KEY");
 requireEnv("STRIPE_WEBHOOK_SECRET");
 
+/* =========================================================
+SYSTEM INITIALIZATION
+========================================================= */
+
 ensureDb();
 users.ensureAdminFromEnv();
 verifyAuditIntegrity();
 
-/* ================= EXPRESS ================= */
+/* =========================================================
+EXPRESS SERVER
+========================================================= */
 
 const app = express();
 app.set("trust proxy",1);
 
+/* =========================================================
+STRIPE WEBHOOK
+========================================================= */
+
 app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
+
+/* =========================================================
+SECURITY MIDDLEWARE
+========================================================= */
 
 app.use(cors({
   origin:process.env.CORS_ORIGIN || false,
@@ -62,20 +133,31 @@ app.use(express.json({limit:"2mb"}));
 app.use(morgan("dev"));
 app.use(rateLimiter);
 
-/* ================= PUBLIC ROUTES ================= */
+/* =========================================================
+PUBLIC ROUTES
+========================================================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* ================= AUTH ================= */
+/* =========================================================
+AUTHENTICATION
+========================================================= */
 
 app.use("/api",(req,res,next)=>{
   if(req.path.startsWith("/auth")) return next();
   return authRequired(req,res,next);
 });
 
+/* =========================================================
+TENANT RESOLUTION
+Multi-company isolation layer.
+========================================================= */
+
 app.use("/api",tenantMiddleware);
 
-/* ================= CORE API ================= */
+/* =========================================================
+CORE API ROUTES
+========================================================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
@@ -87,14 +169,18 @@ app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
 app.use("/api/soc", require("./routes/soc.routes"));
 
-/* ================= TRADING ================= */
+/* =========================================================
+TRADING API
+========================================================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 app.use("/api/ai", tradingRoutes);
 app.use("/api/trading", tradingRoutes);
 
-/* ================= ZERO TRUST ================= */
+/* =========================================================
+ZERO TRUST LAYER
+========================================================= */
 
 app.use("/api",(req,res,next)=>{
 
@@ -113,15 +199,22 @@ app.use("/api",(req,res,next)=>{
 
 });
 
-/* ================= SERVER ================= */
+/* =========================================================
+HTTP SERVER
+========================================================= */
 
 const server = http.createServer(app);
 
-/* ================= ENGINE START ================= */
+/* =========================================================
+AI ENGINE START TIME
+========================================================= */
 
 const ENGINE_START_TIME = Date.now();
 
-/* ================= TENANT BOOT ================= */
+/* =========================================================
+TENANT DISCOVERY
+Find all tenants that must run AI trading engines.
+========================================================= */
 
 function getTenants(){
 
@@ -142,6 +235,11 @@ function getTenants(){
   return tenants;
 
 }
+
+/* =========================================================
+TENANT ENGINE BOOT
+Registers each tenant with the market engine.
+========================================================= */
 
 function bootTenants(){
 
@@ -167,8 +265,12 @@ function bootTenants(){
 
 bootTenants();
 
-/* ================= AUTONOMOUS AI ENGINE ================= */
-/* THIS RUNS EVEN WITH ZERO USERS CONNECTED */
+/* =========================================================
+AUTONOMOUS AI TRADING ENGINE
+Runs even if zero users are connected.
+
+This drives the entire AI simulation engine.
+========================================================= */
 
 setInterval(()=>{
 
@@ -206,7 +308,9 @@ setInterval(()=>{
 
 },1000);
 
-/* ================= WEBSOCKET ================= */
+/* =========================================================
+WEBSOCKET SERVER
+========================================================= */
 
 const wss = new WebSocketServer({
   server,
@@ -216,6 +320,10 @@ const wss = new WebSocketServer({
 function closeWs(ws){
   try{ws.close()}catch{}
 }
+
+/* =========================================================
+WEBSOCKET AUTHENTICATION
+========================================================= */
 
 wss.on("connection",(ws,req)=>{
 
@@ -261,7 +369,10 @@ wss.on("connection",(ws,req)=>{
 
 });
 
-/* ================= MARKET STREAM ================= */
+/* =========================================================
+MARKET STREAM
+Broadcasts price data to dashboards.
+========================================================= */
 
 setInterval(()=>{
 
@@ -300,7 +411,10 @@ setInterval(()=>{
 
 },250);
 
-/* ================= PAPER STREAM ================= */
+/* =========================================================
+PAPER TRADING STREAM
+Broadcasts AI trading performance to dashboards.
+========================================================= */
 
 setInterval(()=>{
 
@@ -342,7 +456,9 @@ setInterval(()=>{
 
 },800);
 
-/* ================= START ================= */
+/* =========================================================
+SERVER START
+========================================================= */
 
 const port = process.env.PORT || 5000;
 
