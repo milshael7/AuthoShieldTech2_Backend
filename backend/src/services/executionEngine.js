@@ -1,25 +1,21 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v9 (Realistic Risk Model)
+// VERSION: v10 (Institutional Risk Guard)
 //
 // PURPOSE
-// - Handles both paper and live execution
-// - Paper execution uses internal simulation
-// - Live execution sends orders to exchange API
-//
-// RISK MODEL UPDATE
 // ----------------------------------------------------------
-// Paper trading now enforces realistic exposure limits:
+// Handles both paper and live execution.
 //
-// • Max 5% of equity per trade
-// • Max $5000 absolute exposure per trade
-// • Minimum $25 trade size
-// • Quantity rounded to realistic precision
+// SAFETY LAYERS
+// ----------------------------------------------------------
+// 1. Strategy risk control
+// 2. Equity exposure cap
+// 3. Hard account risk guard
+// 4. Absolute trade size cap
 //
-// This prevents unrealistic paper trading sizes while
-// preserving AI behavior and strategy logic.
-//
+// These protections prevent catastrophic trades even if
+// configuration is changed incorrectly.
 // ==========================================================
 
 const outsideBrain =
@@ -45,12 +41,17 @@ function ensureTradeLog(state){
 }
 
 /* =========================================================
-POSITION SIZE (REALISTIC RISK MODEL)
+RISK CONFIGURATION
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.05;
-const MAX_TRADE_USD = 5000;
-const MIN_TRADE_USD = 25;
+const MAX_EQUITY_EXPOSURE = 0.05;   // strategy layer
+const HARD_ACCOUNT_RISK   = 0.02;   // hard engine guard
+const MAX_TRADE_USD       = 2000;   // absolute safety cap
+const MIN_TRADE_USD       = 25;
+
+/* =========================================================
+POSITION SIZE CALCULATION
+========================================================= */
 
 function calculatePositionSize(state,price,riskPct){
 
@@ -60,18 +61,36 @@ function calculatePositionSize(state,price,riskPct){
   if(equity <= 0 || price <= 0)
     return 0;
 
-  const riskCapital = equity * riskPct;
+  /* ================= STRATEGY RISK ================= */
 
-  const equityCap =
+  const riskCapital =
+    equity * riskPct;
+
+  /* ================= ENGINE EXPOSURE CAP ================= */
+
+  const equityExposureCap =
     equity * MAX_EQUITY_EXPOSURE;
 
+  /* ================= HARD ACCOUNT LIMIT ================= */
+
+  const hardAccountLimit =
+    equity * HARD_ACCOUNT_RISK;
+
+  /* ================= FINAL ALLOWED CAPITAL ================= */
+
   const allowedCapital =
-    Math.min(riskCapital,equityCap,MAX_TRADE_USD);
+    Math.min(
+      riskCapital,
+      equityExposureCap,
+      hardAccountLimit,
+      MAX_TRADE_USD
+    );
 
   if(allowedCapital < MIN_TRADE_USD)
     return 0;
 
-  let qty = allowedCapital / price;
+  let qty =
+    allowedCapital / price;
 
   qty = Number(qty.toFixed(6));
 
@@ -187,7 +206,10 @@ function closePosition({
 
   }catch(err){
 
-    console.error("AI learning error:",err.message);
+    console.error(
+      "AI learning error:",
+      err.message
+    );
 
   }
 
@@ -218,30 +240,36 @@ function executePaperOrder({
 
   if(state.cashBalance <= 0) return null;
 
-  riskPct = clamp(
-    safeNum(riskPct,0.01),
-    0.001,
-    0.05
-  );
+  riskPct =
+    clamp(
+      safeNum(riskPct,0.01),
+      0.001,
+      0.05
+    );
 
   const pos = state.position;
 
-  let positionSize = safeNum(qty,0);
+  let positionSize =
+    safeNum(qty,0);
 
   if(positionSize <= 0){
     positionSize =
-      calculatePositionSize(state,price,riskPct);
+      calculatePositionSize(
+        state,
+        price,
+        riskPct
+      );
   }
 
-  if(positionSize <= 0) return null;
+  if(positionSize <= 0)
+    return null;
 
   if(action === "BUY"){
 
     if(pos){
 
-      if(pos.side === "LONG"){
+      if(pos.side === "LONG")
         return null;
-      }
 
       if(pos.side === "SHORT"){
 
@@ -280,9 +308,8 @@ function executePaperOrder({
 
     if(pos){
 
-      if(pos.side === "SHORT"){
+      if(pos.side === "SHORT")
         return null;
-      }
 
       if(pos.side === "LONG"){
 
@@ -357,7 +384,9 @@ async function executeLiveOrder({
 
     if(!apiKey || !secret){
 
-      console.warn("Live trading keys missing");
+      console.warn(
+        "Live trading keys missing"
+      );
 
       return null;
 
@@ -390,7 +419,8 @@ async function executeLiveOrder({
         price,
         qty,
         live:true,
-        exchangeId:response.data?.orderId
+        exchangeId:
+          response.data?.orderId
       }
     };
 
