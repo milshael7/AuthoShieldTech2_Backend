@@ -1,18 +1,17 @@
 // ==========================================================
 // FILE: backend/src/services/marketEngine.js
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// INSTITUTIONAL STABLE VERSION v5
+// INSTITUTIONAL STABLE VERSION v6
 //
-// FIXES:
-// - Candle numeric safety
-// - Prevent NaN/undefined candle values
-// - Prevent corrupted state candle crash
+// FIXES
+// - Removed duplicate AI engine loop
+// - Server.js remains the single AI driver
+// - Prevents frozen AI stats and double ticks
+// - Stabilizes trading analytics panel
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
-
-const paperTrader = require("./paperTrader");
 
 /* ================= STORAGE ================= */
 
@@ -44,8 +43,6 @@ const SYMBOLS = {
 };
 
 const MARKET_TICK_MS = 200;
-const AI_TICK_MS = 1000;
-
 const CANDLE_MS = 60000;
 const MAX_CANDLES = 2000;
 
@@ -267,43 +264,6 @@ function tickTenant(tenantId){
 
 }
 
-/* ================= AI LOOP ================= */
-
-function runAI(tenantId){
-
-  ensureTenant(tenantId);
-
-  const state = TENANTS.get(tenantId);
-
-  for(const sym of Object.keys(state.prices)){
-
-    const price = state.prices[sym];
-
-    if(!price) continue;
-
-    try{
-
-      paperTrader.tick(
-        tenantId,
-        sym,
-        price,
-        Date.now()
-      );
-
-    }
-    catch(err){
-
-      console.error(
-        "AI tick error:",
-        err.message
-      );
-
-    }
-
-  }
-
-}
-
 /* ================= SNAPSHOT ================= */
 
 function getMarketSnapshot(tenantId){
@@ -343,7 +303,7 @@ function getCandles(tenantId,symbol,limit=200){
 
 }
 
-/* ================= ENGINE LOOPS ================= */
+/* ================= ENGINE LOOP ================= */
 
 setInterval(()=>{
 
@@ -371,18 +331,6 @@ setInterval(()=>{
   DIRTY.clear();
 
 },3000);
-
-setInterval(()=>{
-
-  for(const tenantId of TENANTS.keys()){
-
-    try{
-      runAI(tenantId);
-    }catch{}
-
-  }
-
-},AI_TICK_MS);
 
 /* ================= EXPORT ================= */
 
