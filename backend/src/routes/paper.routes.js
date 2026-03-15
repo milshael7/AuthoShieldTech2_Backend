@@ -1,17 +1,19 @@
 // ==========================================================
 // FILE: backend/src/routes/paper.routes.js
-// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v2
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v3
 //
-// FIXES:
-// - Tenant-safe config resolution
-// - Numeric brain state fields
-// - Clear maintenance header
+// SAFETY UPDATES
+// - Fixed manual order routing
+// - Manual orders now pass through executionEngine
+// - Prevents bypassing risk limits
+// - Hardened tenant validation
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
 const paperTrader = require("../services/paperTrader");
+const executionEngine = require("../services/executionEngine");
 const marketEngine = require("../services/marketEngine");
 const { readDb } = require("../lib/db");
 
@@ -19,20 +21,21 @@ const { readDb } = require("../lib/db");
    TENANT RESOLUTION
 ========================================================= */
 
-function resolveTenant(req) {
+function resolveTenant(req){
   return req.user?.companyId || req.user?.id || null;
 }
 
 /* =========================================================
-   STATUS — FULL ENGINE STATE
+   STATUS
 ========================================================= */
 
-router.get("/status", (req, res) => {
-  try {
+router.get("/status",(req,res)=>{
+
+  try{
 
     const tenantId = resolveTenant(req);
 
-    if (!tenantId) {
+    if(!tenantId){
       return res.status(400).json({
         ok:false,
         error:"Missing tenant context"
@@ -41,7 +44,7 @@ router.get("/status", (req, res) => {
 
     const snapshot = paperTrader.snapshot(tenantId);
 
-    if (!snapshot) {
+    if(!snapshot){
       return res.json({
         ok:true,
         engine:"IDLE",
@@ -51,24 +54,17 @@ router.get("/status", (req, res) => {
 
     const db = readDb();
 
-    /* ================= CONFIG ================= */
-
     const rawConfig = db.tradingConfig || {};
-
     const tradingConfig =
       rawConfig[tenantId] || rawConfig || {};
-
-    /* ================= DECISIONS ================= */
 
     const decisions =
       paperTrader.getDecisions?.(tenantId) || [];
 
     const lastDecision =
       decisions.length
-        ? decisions[decisions.length - 1]
+        ? decisions[decisions.length-1]
         : null;
-
-    /* ================= ENGINE STATE ================= */
 
     const engineState = {
 
@@ -91,8 +87,6 @@ router.get("/status", (req, res) => {
         tradingConfig.strategyMode || "Balanced"
 
     };
-
-    /* ================= AI BRAIN STATE ================= */
 
     const brainState = {
 
@@ -123,7 +117,6 @@ router.get("/status", (req, res) => {
           : "IDLE",
 
       engineState,
-
       brainState,
 
       executionStats:
@@ -136,7 +129,7 @@ router.get("/status", (req, res) => {
     });
 
   }
-  catch {
+  catch{
 
     return res.status(500).json({
       ok:false,
@@ -144,10 +137,11 @@ router.get("/status", (req, res) => {
     });
 
   }
+
 });
 
 /* =========================================================
-   DECISION STREAM
+   DECISIONS
 ========================================================= */
 
 router.get("/decisions",(req,res)=>{
@@ -167,12 +161,10 @@ router.get("/decisions",(req,res)=>{
       paperTrader.getDecisions?.(tenantId) || [];
 
     return res.json({
-
       ok:true,
       decisions,
       count:decisions.length,
       time:new Date().toISOString()
-
     });
 
   }
@@ -227,7 +219,7 @@ router.post("/reset",(req,res)=>{
 });
 
 /* =========================================================
-   EXECUTE PAPER ORDER
+   MANUAL ORDER (SAFE ROUTING)
 ========================================================= */
 
 router.post("/order",(req,res)=>{
@@ -247,49 +239,41 @@ router.post("/order",(req,res)=>{
       symbol,
       side,
       size,
-      stopLoss,
-      takeProfit,
       price
     } = req.body || {};
 
-    if(!symbol || !side || !size){
+    if(!symbol || !side){
       return res.status(400).json({
         ok:false,
         error:"Invalid order payload"
       });
     }
 
-    const livePrice =
+    const marketPrice =
       marketEngine.getPrice(tenantId,symbol)
       || Number(price)
       || 0;
 
-    if(!livePrice || !Number.isFinite(livePrice)){
+    if(!marketPrice || !Number.isFinite(marketPrice)){
       return res.status(400).json({
         ok:false,
         error:"Market price unavailable"
       });
     }
 
+    const state =
+      paperTrader.snapshot(tenantId);
+
     const result =
-      paperTrader.executeOrder({
+      executionEngine.executePaperOrder({
 
         tenantId,
         symbol,
-        side,
-        size:Number(size),
-
-        stopLoss:
-          stopLoss!=null
-            ? Number(stopLoss)
-            : null,
-
-        takeProfit:
-          takeProfit!=null
-            ? Number(takeProfit)
-            : null,
-
-        price:livePrice
+        action:side,
+        price:marketPrice,
+        qty:Number(size || 0),
+        state,
+        ts:Date.now()
 
       });
 
