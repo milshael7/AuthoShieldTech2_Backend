@@ -1,51 +1,16 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable
+// VERSION: Production Stable (AI Engine Resilient Patch)
 //
 // PURPOSE
-// This is the main runtime entry point for the backend.
+// Main backend runtime entry point.
 //
-// Responsibilities:
-// - Boot Express API
-// - Initialize database and security layers
-// - Start the autonomous AI trading engine
-// - Manage WebSocket real-time streams
-// - Broadcast market and paper trading updates
-//
-// ARCHITECTURE ROLE
-// All real-time data flows through this server.
-//
-// Market Data Flow:
-// marketEngine → price simulation → WebSocket → frontend
-//
-// Trading Data Flow:
-// marketEngine price → paperTrader.tick()
-// → AI decision → executionEngine
-// → snapshot → WebSocket → dashboard
-//
-// WEBSOCKET CHANNELS
-// market  → live market prices
-// paper   → AI paper trading engine state
-//
-// EXPECTED FILE LOCATION
-// backend/
-//   src/
-//     server.js   <-- THIS FILE
-//
-// DO NOT MOVE THIS FILE.
-// The entire backend boot process depends on this path.
-//
-// RENDER DEPLOYMENT NOTES
-// - Render injects PORT automatically.
-// - Never hardcode port values.
-// - Environment variables must be configured in Render.
-//
-// REQUIRED ENV VARIABLES
-// JWT_SECRET
-// STRIPE_SECRET_KEY
-// STRIPE_WEBHOOK_SECRET
-//
+// FIXES
+// - Prevent AI engine stall if market price temporarily missing
+// - Fallback to last known paperTrader price
+// - Final fallback to safe default price
+// - Ensures AI engine never stops generating ticks
 // ==========================================================
 
 require("dotenv").config();
@@ -84,7 +49,6 @@ const tradingRoutes = require("./routes/trading.routes");
 
 /* =========================================================
 SAFE BOOT CHECK
-Ensures critical environment variables exist.
 ========================================================= */
 
 function requireEnv(name){
@@ -150,7 +114,6 @@ app.use("/api",(req,res,next)=>{
 
 /* =========================================================
 TENANT RESOLUTION
-Multi-company isolation layer.
 ========================================================= */
 
 app.use("/api",tenantMiddleware);
@@ -213,7 +176,6 @@ const ENGINE_START_TIME = Date.now();
 
 /* =========================================================
 TENANT DISCOVERY
-Find all tenants that must run AI trading engines.
 ========================================================= */
 
 function getTenants(){
@@ -238,7 +200,6 @@ function getTenants(){
 
 /* =========================================================
 TENANT ENGINE BOOT
-Registers each tenant with the market engine.
 ========================================================= */
 
 function bootTenants(){
@@ -267,9 +228,6 @@ bootTenants();
 
 /* =========================================================
 AUTONOMOUS AI TRADING ENGINE
-Runs even if zero users are connected.
-
-This drives the entire AI simulation engine.
 ========================================================= */
 
 setInterval(()=>{
@@ -283,19 +241,31 @@ setInterval(()=>{
       const market =
         marketEngine.getMarketSnapshot(tenantId);
 
-      const price =
+      let price =
         market?.BTCUSDT?.price;
 
-      if(price){
+      /* ================= FAILSAFE PRICE ================= */
 
-        paperTrader.tick(
-          tenantId,
-          "BTCUSDT",
-          Number(price),
-          Date.now()
-        );
+      if(!price){
+
+        const last =
+          paperTrader.snapshot(tenantId)?.lastPrice;
+
+        if(last && Number.isFinite(last))
+          price = last;
 
       }
+
+      if(!price){
+        price = 60000;
+      }
+
+      paperTrader.tick(
+        tenantId,
+        "BTCUSDT",
+        Number(price),
+        Date.now()
+      );
 
     }
 
@@ -371,7 +341,6 @@ wss.on("connection",(ws,req)=>{
 
 /* =========================================================
 MARKET STREAM
-Broadcasts price data to dashboards.
 ========================================================= */
 
 setInterval(()=>{
@@ -413,7 +382,6 @@ setInterval(()=>{
 
 /* =========================================================
 PAPER TRADING STREAM
-Broadcasts AI trading performance to dashboards.
 ========================================================= */
 
 setInterval(()=>{
