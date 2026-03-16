@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v32 (Institutional Momentum Ride Engine)
+// VERSION: v33 (Institutional Momentum Ride Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -37,6 +37,7 @@ const MAX_TRADE_DURATION = 15 * 60 * 1000;
 /* --- RISK --- */
 
 const HARD_STOP_LOSS = -0.0025;
+const PROFIT_PROTECTION = 0.35; 
 
 /* ========================================================= */
 
@@ -60,7 +61,7 @@ function recordPrice(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 10)
+  if(arr.length > 12)
     arr.shift();
 
   return arr;
@@ -73,22 +74,23 @@ REVERSAL DETECTION
 
 function detectReversal(prices){
 
-  if(prices.length < 5) return false;
+  if(prices.length < 6) return false;
 
-  const a = prices[prices.length-5];
-  const b = prices[prices.length-4];
-  const c = prices[prices.length-3];
-  const d = prices[prices.length-2];
-  const e = prices[prices.length-1];
+  const a = prices[prices.length-6];
+  const b = prices[prices.length-5];
+  const c = prices[prices.length-4];
+  const d = prices[prices.length-3];
+  const e = prices[prices.length-2];
+  const f = prices[prices.length-1];
 
-  /* trend up then drop */
+  /* upward exhaustion */
 
-  if(a < b && b < c && c < d && e < d)
+  if(a < b && b < c && c < d && e < d && f < e)
     return true;
 
-  /* trend down then bounce */
+  /* downward exhaustion */
 
-  if(a > b && b > c && c > d && e > d)
+  if(a > b && b > c && c > d && e > d && f > e)
     return true;
 
   return false;
@@ -332,8 +334,6 @@ function handleOpenPosition({
       ? (price - pos.entry) * pos.qty
       : (pos.entry - price) * pos.qty;
 
-  /* TRACK PEAK PROFIT */
-
   pos.peakProfit =
     Math.max(pos.peakProfit || 0, unrealized);
 
@@ -345,6 +345,21 @@ function handleOpenPosition({
   if(detectReversal(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
+  /* PROFIT PROTECTION */
+
+  if(pos.peakProfit > 0){
+
+    const drawdown =
+      pos.peakProfit - unrealized;
+
+    const allowed =
+      pos.peakProfit * PROFIT_PROTECTION;
+
+    if(drawdown > allowed)
+      return closeTrade({tenantId,state,symbol,price,ts});
+
+  }
+
   /* HARD STOP */
 
   if(pnl <= HARD_STOP_LOSS)
@@ -354,14 +369,14 @@ function handleOpenPosition({
 
   if(elapsed >= pos.maxDuration){
 
-    const recentMove =
+    const move =
       prices[prices.length-1] -
       prices[prices.length-3];
 
     const momentumStillStrong =
       pos.side === "LONG"
-        ? recentMove > 0
-        : recentMove < 0;
+        ? move > 0
+        : move < 0;
 
     if(!momentumStillStrong)
       return closeTrade({tenantId,state,symbol,price,ts});
