@@ -1,13 +1,13 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v8
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v9
 // PURPOSE
-// Institutional swing detection + top/bottom trading
+// Institutional market structure + swing trading
 // Detects:
-// ✔ swing highs
-// ✔ swing lows
+// ✔ swing highs / lows
 // ✔ liquidity sweeps
 // ✔ exhaustion reversals
-// ✔ avoids mid-move trades
+// ✔ market structure (HH / HL / LH / LL)
+// ✔ break of structure
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -53,7 +53,7 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 120)
+  if(arr.length > 150)
     arr.shift();
 
   return arr;
@@ -61,67 +61,26 @@ function updatePriceMemory(tenantId,price){
 }
 
 /* =========================================================
-SUPPORT / RESISTANCE MEMORY
+STRUCTURE MEMORY
 ========================================================= */
 
-const LEVEL_MEMORY = new Map();
+const STRUCTURE_MEMORY = new Map();
 
-function getLevels(tenantId){
+function getStructure(tenantId){
 
   const key = tenantId || "__default__";
 
-  if(!LEVEL_MEMORY.has(key)){
+  if(!STRUCTURE_MEMORY.has(key)){
 
-    LEVEL_MEMORY.set(key,{
-      support:[],
-      resistance:[]
+    STRUCTURE_MEMORY.set(key,{
+      lastHigh:null,
+      lastLow:null,
+      trend:"neutral"
     });
 
   }
 
-  return LEVEL_MEMORY.get(key);
-
-}
-
-function recordSupport(tenantId,price){
-
-  const levels = getLevels(tenantId);
-
-  levels.support.push(price);
-
-  if(levels.support.length > 40)
-    levels.support.shift();
-
-}
-
-function recordResistance(tenantId,price){
-
-  const levels = getLevels(tenantId);
-
-  levels.resistance.push(price);
-
-  if(levels.resistance.length > 40)
-    levels.resistance.shift();
-
-}
-
-function nearSupport(tenantId,price){
-
-  const levels = getLevels(tenantId);
-
-  return levels.support.some(
-    s => Math.abs(price-s)/s < 0.0025
-  );
-
-}
-
-function nearResistance(tenantId,price){
-
-  const levels = getLevels(tenantId);
-
-  return levels.resistance.some(
-    r => Math.abs(price-r)/r < 0.0025
-  );
+  return STRUCTURE_MEMORY.get(key);
 
 }
 
@@ -141,13 +100,7 @@ function detectSwingLow(prices){
   const e = prices[prices.length-2];
   const f = prices[prices.length-1];
 
-  return (
-    a > b &&
-    b > c &&
-    c < d &&
-    d <= e &&
-    e <= f
-  );
+  return a > b && b > c && c < d && d <= e && e <= f;
 
 }
 
@@ -167,18 +120,48 @@ function detectSwingHigh(prices){
   const e = prices[prices.length-2];
   const f = prices[prices.length-1];
 
-  return (
-    a < b &&
-    b < c &&
-    c > d &&
-    d >= e &&
-    e >= f
-  );
+  return a < b && b < c && c > d && d >= e && e >= f;
 
 }
 
 /* =========================================================
-LIQUIDITY SWEEP DETECTION
+MARKET STRUCTURE UPDATE
+========================================================= */
+
+function updateStructure(tenantId,price,swingHigh,swingLow){
+
+  const structure = getStructure(tenantId);
+
+  if(swingHigh){
+
+    if(
+      structure.lastHigh &&
+      price > structure.lastHigh
+    ){
+      structure.trend = "uptrend";
+    }
+
+    structure.lastHigh = price;
+  }
+
+  if(swingLow){
+
+    if(
+      structure.lastLow &&
+      price < structure.lastLow
+    ){
+      structure.trend = "downtrend";
+    }
+
+    structure.lastLow = price;
+  }
+
+  return structure.trend;
+
+}
+
+/* =========================================================
+LIQUIDITY SWEEP
 ========================================================= */
 
 function detectLiquiditySweep(prices){
@@ -324,11 +307,13 @@ function buildDecision(context={}){
   const liquiditySweep =
     detectLiquiditySweep(prices);
 
-  if(swingLow)
-    recordSupport(tenantId,price);
-
-  if(swingHigh)
-    recordResistance(tenantId,price);
+  const trend =
+    updateStructure(
+      tenantId,
+      price,
+      swingHigh,
+      swingLow
+    );
 
   let regime =
     regimeMemory.detectRegime({
@@ -386,18 +371,14 @@ function buildDecision(context={}){
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
 
-  /* =========================================================
-     ENTRY LOGIC
-  ========================================================= */
-
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* BUY FROM SWING LOW */
+  /* BUY ONLY IN UPTREND */
 
   if(
     swingLow &&
-    nearSupport(tenantId,price) &&
+    trend !== "downtrend" &&
     edge > 0.002
   ){
 
@@ -413,11 +394,11 @@ function buildDecision(context={}){
 
   }
 
-  /* SELL FROM SWING HIGH */
+  /* SELL ONLY IN DOWNTREND */
 
   if(
     swingHigh &&
-    nearResistance(tenantId,price) &&
+    trend !== "uptrend" &&
     edge < -0.002
   ){
 
@@ -432,8 +413,6 @@ function buildDecision(context={}){
     };
 
   }
-
-  /* LIQUIDITY SWEEP REVERSAL */
 
   if(liquiditySweep){
 
