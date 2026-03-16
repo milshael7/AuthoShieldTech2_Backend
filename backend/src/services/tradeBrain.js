@@ -1,14 +1,17 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v13)
-// IMPROVEMENTS:
-// ✔ directional stability
-// ✔ adaptive risk scaling
-// ✔ smarter exploration
-// ✔ volatility awareness
-// ✔ paper trading confidence guard
-// ✔ volatility safety layer
-// ✔ fixed risk mutation bug
-// ✔ improved stability smoothing
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v14)
+// PURPOSE
+// Short-duration momentum trading AI
+//
+// IMPROVEMENTS
+// ✔ momentum burst detection
+// ✔ disciplined trade cooldown
+// ✔ short-move filtering
+// ✔ adaptive volatility safety
+// ✔ improved risk scaling
+// ✔ reduced exploration randomness
+// ✔ directional stability guard
+// ✔ cleaner confidence smoothing
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -31,10 +34,20 @@ const EDGE_MEMORY_DECAY =
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
 
-const PAPER_MIN_CONFIDENCE = 0.30;
+const PAPER_MIN_CONFIDENCE = 0.32;
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
+
+/* === NEW DISCIPLINE CONTROLS === */
+
+const TRADE_COOLDOWN_MS =
+  Number(process.env.TRADE_COOLDOWN_MS || 60000);
+
+const MIN_MOMENTUM_EDGE =
+  Number(process.env.TRADE_MIN_EDGE || 0.0003);
+
+const EXPLORATION_RATE = 0.03;
 
 const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
@@ -57,7 +70,8 @@ function getBrainState(tenantId){
       smoothedConfidence:0.25,
       edgeMomentum:0,
       lastAction:"WAIT",
-      lastDecisionTime:0
+      lastDecisionTime:0,
+      lastTradeTime:0
     });
 
   }
@@ -104,6 +118,23 @@ function makeDecision(context={}){
     paper?.cashBalance !== undefined &&
     paper?.equity !== undefined;
 
+  /* ================= TRADE COOLDOWN ================= */
+
+  const now = Date.now();
+
+  if(now - brain.lastTradeTime < TRADE_COOLDOWN_MS){
+
+    return {
+      symbol,
+      action:"WAIT",
+      confidence:0,
+      edge:0,
+      riskPct:0,
+      ts:now
+    };
+
+  }
+
   /* ================= STRATEGY ================= */
 
   let strategy = {};
@@ -130,6 +161,14 @@ function makeDecision(context={}){
 
   if(!ACTIONS.has(action))
     action="WAIT";
+
+  /* ================= MOMENTUM FILTER ================= */
+
+  if(Math.abs(edge) < MIN_MOMENTUM_EDGE){
+
+    action = "WAIT";
+
+  }
 
   /* ================= POSITION RULES ================= */
 
@@ -164,24 +203,22 @@ function makeDecision(context={}){
     const aiEdge = safeNum(ai.edge,0);
 
     confidence =
-      clamp((confidence*0.6)+(aiConf*0.4),0,1);
+      clamp((confidence*0.65)+(aiConf*0.35),0,1);
 
     edge =
-      clamp((edge*0.6)+(aiEdge*0.4),-1,1);
+      clamp((edge*0.65)+(aiEdge*0.35),-1,1);
 
   }catch{}
 
-  /* ================= VOLATILITY BOOST ================= */
+  /* ================= VOLATILITY CONTROL ================= */
 
   if(volatility > 0.006){
     confidence *= 1.15;
   }
 
-  /* ================= VOLATILITY SAFETY ================= */
+  if(volatility > 0.012){
 
-  if(volatility > 0.01){
-
-    confidence *= 0.8;
+    confidence *= 0.75;
     riskPct *= 0.7;
 
   }
@@ -208,13 +245,13 @@ function makeDecision(context={}){
   /* ================= DIRECTION STABILITY ================= */
 
   if(brain.lastAction === "BUY" && action === "SELL"){
-    if(confidence < 0.7)
-      action = "WAIT";
+    if(confidence < 0.72)
+      action="WAIT";
   }
 
   if(brain.lastAction === "SELL" && action === "BUY"){
-    if(confidence < 0.7)
-      action = "WAIT";
+    if(confidence < 0.72)
+      action="WAIT";
   }
 
   /* ================= CONFIDENCE GATE ================= */
@@ -225,17 +262,14 @@ function makeDecision(context={}){
   if(confidence < dynamicThreshold)
     action="WAIT";
 
-  /* ================= SMART EXPLORATION ================= */
+  /* ================= EXPLORATION (LOW) ================= */
 
   if(isPaper && action==="WAIT"){
 
-    const explorationChance = 0.12;
+    if(Math.random() < EXPLORATION_RATE){
 
-    if(Math.random() < explorationChance){
-
-      action = edge >= 0 ? "BUY" : "SELL";
-
-      confidence = Math.max(confidence,0.15);
+      action = edge >= 0 ? "BUY":"SELL";
+      confidence = Math.max(confidence,0.18);
 
     }
 
@@ -261,10 +295,10 @@ function makeDecision(context={}){
 
   /* ================= RISK SCALING ================= */
 
-  if(confidence > 0.8)
-    riskPct *= 1.6;
-  else if(confidence > 0.65)
-    riskPct *= 1.2;
+  if(confidence > 0.82)
+    riskPct *= 1.7;
+  else if(confidence > 0.68)
+    riskPct *= 1.25;
   else if(confidence < 0.45)
     riskPct *= 0.5;
 
@@ -274,11 +308,17 @@ function makeDecision(context={}){
   /* ================= WAIT HANDLING ================= */
 
   if(action==="WAIT"){
-    edge = edge * 0.5;
+    edge *= 0.5;
+  }
+
+  if(action === "BUY" || action === "SELL"){
+
+    brain.lastTradeTime = now;
+
   }
 
   brain.lastAction = action;
-  brain.lastDecisionTime = Date.now();
+  brain.lastDecisionTime = now;
 
   return{
     symbol,
@@ -286,7 +326,7 @@ function makeDecision(context={}){
     confidence,
     edge,
     riskPct,
-    ts:Date.now()
+    ts:now
   };
 
 }
