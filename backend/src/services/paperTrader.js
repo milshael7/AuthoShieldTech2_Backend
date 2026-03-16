@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v28 (Institutional Short-Duration Engine)
+// VERSION: v29 (Institutional Short-Duration Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -23,12 +23,13 @@ const START_BAL =
 
 const MAX_DECISIONS_MEMORY = 200;
 
-const MIN_TRADE_INTERVAL = 30000;
+/* --- TRADE CONTROL --- */
 
+const COOLDOWN_AFTER_TRADE = 120000; // 2 minutes
 const MAX_TRADES_PER_DAY = 40;
 const MAX_DAILY_LOSSES = 12;
 
-/* ================= SHORT DURATION CONFIG ================= */
+/* --- SHORT DURATION STRATEGY --- */
 
 const MIN_TRADE_DURATION = 5 * 60 * 1000;
 const MAX_TRADE_DURATION = 8 * 60 * 1000;
@@ -149,12 +150,6 @@ function load(tenantId){
   const state =
     diskState || defaultState();
 
-  if(state.availableCapital === undefined)
-    state.availableCapital = state.cashBalance;
-
-  if(state.lockedCapital === undefined)
-    state.lockedCapital = 0;
-
   STATES.set(tenantId,state);
 
   return state;
@@ -180,8 +175,12 @@ function getTradingConfig(tenantId){
 
       enabled: cfg.enabled ?? true,
       tradingMode: cfg.tradingMode || "paper",
-      riskPercent: Number(cfg.riskPercent || 1.5),
-      positionMultiplier: Number(cfg.positionMultiplier || 1)
+
+      riskPercent:
+        Number(cfg.riskPercent || 1),
+
+      positionMultiplier:
+        Number(cfg.positionMultiplier || 1)
 
     };
 
@@ -191,7 +190,7 @@ function getTradingConfig(tenantId){
 
       enabled:true,
       tradingMode:"paper",
-      riskPercent:1.5,
+      riskPercent:1,
       positionMultiplier:1
 
     };
@@ -206,11 +205,8 @@ DURATION ENGINE
 
 function computeDuration(confidence){
 
-  if(!confidence)
-    return MIN_TRADE_DURATION;
-
   const ratio =
-    Math.min(Math.max(confidence,0),1);
+    Math.min(Math.max(confidence || 0,0),1);
 
   return Math.floor(
     MIN_TRADE_DURATION +
@@ -220,17 +216,15 @@ function computeDuration(confidence){
 }
 
 /* =========================================================
-CLOSE TRADE HANDLER
+CLOSE TRADE
 ========================================================= */
 
 function closeTrade({
-
   tenantId,
   state,
   symbol,
   price,
   ts
-
 }){
 
   const closed =
@@ -252,15 +246,14 @@ function closeTrade({
   state.realized.net += pnl;
 
   if(pnl > 0){
-
     state.realized.wins++;
-
-  }else{
-
+  }
+  else{
     state.realized.losses++;
     state.limits.lossesToday++;
-
   }
+
+  state.lastTradeTime = ts;
 
   return true;
 
@@ -271,17 +264,14 @@ ACTIVE TRADE MANAGEMENT
 ========================================================= */
 
 function handleOpenPosition({
-
   tenantId,
   state,
   symbol,
   price,
   ts
-
 }){
 
   const pos = state.position;
-
   if(!pos) return false;
 
   const elapsed = ts - pos.time;
@@ -291,35 +281,14 @@ function handleOpenPosition({
       ? (price - pos.entry) / pos.entry
       : (pos.entry - price) / pos.entry;
 
-  /* PROFIT TARGET */
+  if(pnl >= PROFIT_TARGET)
+    return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(pnl >= PROFIT_TARGET){
+  if(pnl <= STOP_LOSS)
+    return closeTrade({tenantId,state,symbol,price,ts});
 
-    return closeTrade({
-      tenantId,state,symbol,price,ts
-    });
-
-  }
-
-  /* STOP LOSS */
-
-  if(pnl <= STOP_LOSS){
-
-    return closeTrade({
-      tenantId,state,symbol,price,ts
-    });
-
-  }
-
-  /* MAX DURATION */
-
-  if(elapsed >= (pos.maxDuration || MIN_TRADE_DURATION)){
-
-    return closeTrade({
-      tenantId,state,symbol,price,ts
-    });
-
-  }
+  if(elapsed >= pos.maxDuration)
+    return closeTrade({tenantId,state,symbol,price,ts});
 
   return false;
 
@@ -343,8 +312,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(state._locked) return;
 
   state._locked = true;
-
-  let stateChanged = false;
 
   try{
 
@@ -378,25 +345,36 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }catch{}
 
-    /* HANDLE ACTIVE POSITION */
+    /* ================= HANDLE OPEN TRADE ================= */
 
     if(state.position){
 
-      const closed =
-        handleOpenPosition({
-          tenantId,
-          state,
-          symbol,
-          price,
-          ts
-        });
+      handleOpenPosition({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts
+      });
 
-      if(closed)
-        stateChanged = true;
-
+      return;
     }
 
-    /* ================= DECISION ================= */
+    /* ================= TRADE COOLDOWN ================= */
+
+    const sinceLastTrade =
+      ts - state.lastTradeTime;
+
+    if(sinceLastTrade < COOLDOWN_AFTER_TRADE)
+      return;
+
+    if(
+      state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
+      state.limits.lossesToday >= MAX_DAILY_LOSSES
+    )
+      return;
+
+    /* ================= AI DECISION ================= */
 
     const plan =
       makeDecision({
@@ -411,83 +389,48 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.decisions++;
 
-    if(
-      state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
-      state.limits.lossesToday >= MAX_DAILY_LOSSES
-    )
+    state.decisions.push({
+      time:ts,
+      action:plan.action,
+      confidence:plan.confidence,
+      price
+    });
+
+    if(state.decisions.length > MAX_DECISIONS_MEMORY)
+      state.decisions =
+        state.decisions.slice(-MAX_DECISIONS_MEMORY);
+
+    if(!["BUY","SELL"].includes(plan.action))
       return;
 
-    const sinceLastTrade =
-      ts - state.lastTradeTime;
+    const exec =
+      executionEngine.executePaperOrder({
 
-    const allowTrade =
-      sinceLastTrade >= MIN_TRADE_INTERVAL;
+        tenantId,
+        symbol,
+        action:plan.action,
+        price,
+        riskPct:cfg.riskPercent / 100,
+        state,
+        ts
 
-    if(
-      ["BUY","SELL"].includes(plan.action) &&
-      allowTrade &&
-      !state.position
-    ){
+      });
 
-      const exec =
-        executionEngine.executePaperOrder({
+    if(exec?.result){
 
-          tenantId,
-          symbol,
-          action:plan.action,
-          price,
-          riskPct:plan.riskPct,
-          state,
-          ts
+      state.executionStats.trades++;
+      state.limits.tradesToday++;
 
-        });
+      if(state.position){
 
-      if(exec?.result){
-
-        state.executionStats.trades++;
-        state.lastTradeTime = ts;
-
-        state.limits.tradesToday++;
-
-        if(state.position){
-
-          state.position.maxDuration =
-            computeDuration(plan.confidence)
-            || MIN_TRADE_DURATION;
-
-        }
-
-        stateChanged = true;
+        state.position.maxDuration =
+          computeDuration(plan.confidence);
 
       }
 
-    }
-
-    /* ================= EQUITY ================= */
-
-    if(state.position){
-
-      const unrealized =
-        state.position.side === "LONG"
-          ? (price - state.position.entry) * state.position.qty
-          : (state.position.entry - price) * state.position.qty;
-
-      state.equity =
-        state.availableCapital + unrealized;
-
-    }
-    else{
-
-      state.equity =
-        state.availableCapital;
-
-    }
-
-    if(state.equity > state.peakEquity)
-      state.peakEquity = state.equity;
-
-    if(stateChanged)
       saveState(state);
+
+    }
 
   }
   finally{
@@ -511,30 +454,23 @@ function snapshot(tenantId){
     uptime:
       Date.now() - ENGINE_START,
 
-    cashBalance:Number(s.cashBalance||0),
+    cashBalance:s.cashBalance,
+    availableCapital:s.availableCapital,
+    lockedCapital:s.lockedCapital,
 
-    availableCapital:Number(s.availableCapital||0),
-
-    lockedCapital:Number(s.lockedCapital||0),
-
-    equity:Number(s.equity||0),
-
-    peakEquity:Number(s.peakEquity||0),
+    equity:s.equity,
+    peakEquity:s.peakEquity,
 
     position:s.position || null,
 
     trades:s.trades || [],
-
     decisions:s.decisions || [],
 
     lastPrice:s.lastPrice,
-
     volatility:s.volatility,
 
     executionStats:s.executionStats,
-
     realized:s.realized,
-
     limits:s.limits
 
   };
