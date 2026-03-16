@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v30 (Institutional Short-Duration Engine)
+// VERSION: v31 (Momentum Ride Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -31,13 +31,53 @@ const MAX_DAILY_LOSSES = 12;
 
 /* --- SHORT DURATION --- */
 
-const MIN_TRADE_DURATION = 5 * 60 * 1000;
-const MAX_TRADE_DURATION = 8 * 60 * 1000;
+const MIN_TRADE_DURATION = 10 * 60 * 1000;
+const MAX_TRADE_DURATION = 15 * 60 * 1000;
 
 /* ========================================================= */
 
 const STATE_FILE =
   path.join(process.cwd(),"paperTrader_state.json");
+
+/* =========================================================
+PRICE MOMENTUM MEMORY
+========================================================= */
+
+const PRICE_HISTORY = new Map();
+
+function recordPrice(tenantId,price){
+
+  const key = tenantId || "__default__";
+
+  if(!PRICE_HISTORY.has(key))
+    PRICE_HISTORY.set(key,[]);
+
+  const arr = PRICE_HISTORY.get(key);
+
+  arr.push(price);
+
+  if(arr.length > 8)
+    arr.shift();
+
+  return arr;
+
+}
+
+function detectReversal(prices){
+
+  if(prices.length < 4) return false;
+
+  const a = prices[prices.length-4];
+  const b = prices[prices.length-3];
+  const c = prices[prices.length-2];
+  const d = prices[prices.length-1];
+
+  if(a < b && b < c && d < c) return true;
+  if(a > b && b > c && d > c) return true;
+
+  return false;
+
+}
 
 /* =========================================================
 STATE
@@ -128,10 +168,6 @@ function loadStateFromDisk(){
 
 }
 
-/* =========================================================
-LOAD STATE
-========================================================= */
-
 function load(tenantId){
 
   if(STATES.has(tenantId))
@@ -185,27 +221,6 @@ function getTradingConfig(tenantId){
     };
 
   }
-
-}
-
-/* =========================================================
-VOLATILITY TARGET
-========================================================= */
-
-function computeTargets(volatility){
-
-  const base = volatility || 0.002;
-
-  const profitTarget =
-    Math.max(0.0015, base * 1.2);
-
-  const stopLoss =
-    -Math.max(0.001, base * 0.8);
-
-  return{
-    profitTarget,
-    stopLoss
-  };
 
 }
 
@@ -293,14 +308,20 @@ function handleOpenPosition({
       ? (price - pos.entry) / pos.entry
       : (pos.entry - price) / pos.entry;
 
-  const targets =
-    computeTargets(state.volatility);
+  const prices =
+    recordPrice(tenantId,price);
 
-  if(pnl >= targets.profitTarget)
+  /* REVERSAL EXIT */
+
+  if(detectReversal(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(pnl <= targets.stopLoss)
+  /* HARD STOP */
+
+  if(pnl <= -0.0025)
     return closeTrade({tenantId,state,symbol,price,ts});
+
+  /* MAX TIME */
 
   if(elapsed >= pos.maxDuration)
     return closeTrade({tenantId,state,symbol,price,ts});
