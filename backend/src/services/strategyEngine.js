@@ -1,11 +1,16 @@
 // ==========================================================
-// STRATEGY ENGINE — PAPER TRADING CORE (ENHANCED v3)
+// STRATEGY ENGINE — PAPER TRADING CORE (ENHANCED v4)
+// PURPOSE
+// Short-duration momentum scalping engine
+//
 // IMPROVEMENTS
-// ✔ smoother momentum
-// ✔ stronger signal stability
-// ✔ volatility aware scalping
-// ✔ reduced noise trades
-// ✔ better short-duration entries
+// ✔ micro-trend burst detection
+// ✔ volatility-adaptive scalping
+// ✔ stronger noise filtering
+// ✔ improved short-duration signal confidence
+// ✔ better regime weighting
+// ✔ smarter learning scaling
+// ✔ safer risk model
 // ==========================================================
 
 const fs = require("fs");
@@ -25,15 +30,15 @@ BASE CONFIG
 
 const BASE_CONFIG = Object.freeze({
 
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.08),
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.09),
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00002),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
   maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
 
-  regimeTrendEdgeBoost:1.25,
-  regimeRangeEdgeCut:0.80,
-  regimeExpansionBoost:1.35
+  regimeTrendEdgeBoost:1.30,
+  regimeRangeEdgeCut:0.75,
+  regimeExpansionBoost:1.40
 
 });
 
@@ -41,7 +46,7 @@ const BASE_CONFIG = Object.freeze({
 LEARNING SYSTEM
 ========================================================= */
 
-const LEARNING_VERSION = 7;
+const LEARNING_VERSION = 8;
 
 const LEARNING_DIR =
   process.env.STRATEGY_LEARNING_DIR ||
@@ -124,7 +129,8 @@ function getMomentum(tenantId){
   if(!MOMENTUM_MEMORY.has(key)){
 
     MOMENTUM_MEMORY.set(key,{
-      momentum:0
+      momentum:0,
+      acceleration:0
     });
 
   }
@@ -150,16 +156,23 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
 
   const mem = getMomentum(tenantId);
 
-  /* smoother momentum memory */
+  /* momentum smoothing */
+
+  const prevMomentum = mem.momentum;
 
   mem.momentum =
-    mem.momentum * 0.82 +
-    rawMomentum * 0.18;
+    mem.momentum * 0.80 +
+    rawMomentum * 0.20;
+
+  /* acceleration detection */
+
+  mem.acceleration =
+    mem.acceleration * 0.75 +
+    (mem.momentum - prevMomentum) * 0.25;
 
   let normalized =
-    mem.momentum/(vol || 0.001);
-
-  /* regime adjustments */
+    (mem.momentum + mem.acceleration) /
+    (vol || 0.001);
 
   if(regime==="trend")
     normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
@@ -170,7 +183,7 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   if(regime==="expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
-  return clamp(normalized,-0.07,0.07);
+  return clamp(normalized,-0.08,0.08);
 
 }
 
@@ -181,20 +194,21 @@ CONFIDENCE MODEL
 function computeConfidence({edge,ticksSeen,regime}){
 
   if(ticksSeen < 12)
-    return 0.32;
+    return 0.34;
 
-  let base = Math.abs(edge) * 16;
+  let base =
+    Math.abs(edge) * 18;
 
   if(regime==="trend")
-    base *= 1.08;
+    base *= 1.1;
 
   if(regime==="range")
-    base *= 0.92;
+    base *= 0.9;
 
   if(regime==="expansion")
-    base *= 1.20;
+    base *= 1.25;
 
-  return clamp(base,0.05,1);
+  return clamp(base,0.06,1);
 
 }
 
@@ -281,7 +295,7 @@ function buildDecision(context={}){
   confidence *= flow.boost || 1;
   edge *= flow.boost || 1;
 
-  /* ================= COUNTERFACTUAL LEARNING ================= */
+  /* ================= COUNTERFACTUAL ================= */
 
   const missedBoost =
     counterfactualEngine.getLearningAdjustment?.({
@@ -291,13 +305,13 @@ function buildDecision(context={}){
   confidence *= missedBoost;
   edge *= missedBoost;
 
-  /* ================= LEARNING WEIGHTS ================= */
+  /* ================= LEARNING ================= */
 
   edge *= learning.edgeMultiplier;
   confidence *= learning.confidenceMultiplier;
 
-  edge = clamp(edge,-0.07,0.07);
-  confidence = clamp(confidence,0.05,1);
+  edge = clamp(edge,-0.08,0.08);
+  confidence = clamp(confidence,0.06,1);
 
   if(!Number.isFinite(price))
     return {action:"WAIT",confidence:0,edge:0};
@@ -310,10 +324,17 @@ function buildDecision(context={}){
 
   /* =========================================================
      SCALPING FILTER
-     Avoid trades when edge too weak for short trades
+     Ensure strong burst moves only
   ========================================================= */
 
-  if(Math.abs(edge) < 0.002)
+  if(Math.abs(edge) < 0.0025)
+    return {action:"WAIT",confidence,edge};
+
+  /* =========================================================
+     VOLATILITY ADAPTIVE FILTER
+  ========================================================= */
+
+  if(volatility < 0.0006)
     return {action:"WAIT",confidence,edge};
 
   /* =========================================================
@@ -322,7 +343,7 @@ function buildDecision(context={}){
 
   let riskPct =
     BASE_CONFIG.baseRiskPct *
-    (0.55 + confidence * 0.85);
+    (0.60 + confidence * 0.80);
 
   riskPct =
     clamp(
