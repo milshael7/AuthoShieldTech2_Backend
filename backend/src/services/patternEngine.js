@@ -370,12 +370,3 @@ function getPatternEdgeBoost({
   boost *= livePattern.boost;
 
   return clamp(boost,0.6,1.9);
-
-}
-
-module.exports={
-  recordSignal,
-  recordTrade,
-  recordPrice,
-  getPatternEdgeBoost
-};
