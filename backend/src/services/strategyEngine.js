@@ -1,8 +1,8 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v7
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v8
 // PURPOSE
-// Smart top/bottom detection with momentum confirmation
-// Avoid mid-move entries and detect exhaustion
+// Smart top/bottom detection with market structure awareness
+// Detect trend shifts and avoid mid-move entries
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -48,7 +48,7 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 100)
+  if(arr.length > 120)
     arr.shift();
 
   return arr;
@@ -121,6 +121,40 @@ function nearResistance(tenantId,price){
 }
 
 /* =========================================================
+MARKET STRUCTURE DETECTION
+========================================================= */
+
+function detectMarketStructure(prices){
+
+  if(prices.length < 20)
+    return "neutral";
+
+  const recent = prices.slice(-20);
+
+  let highs = 0;
+  let lows = 0;
+
+  for(let i=2;i<recent.length;i++){
+
+    if(recent[i] > recent[i-1] && recent[i-1] > recent[i-2])
+      highs++;
+
+    if(recent[i] < recent[i-1] && recent[i-1] < recent[i-2])
+      lows++;
+
+  }
+
+  if(highs > lows * 1.5)
+    return "uptrend";
+
+  if(lows > highs * 1.5)
+    return "downtrend";
+
+  return "range";
+
+}
+
+/* =========================================================
 TOP / BOTTOM DETECTION
 ========================================================= */
 
@@ -154,7 +188,6 @@ function detectTop(prices){
 
 /* =========================================================
 MOVE EXTENSION DETECTION
-Prevents entering after move already happened
 ========================================================= */
 
 function moveTooExtended(prices){
@@ -167,7 +200,7 @@ function moveTooExtended(prices){
 
   const move = Math.abs(last-first)/first;
 
-  return move > 0.004; // already moved too far
+  return move > 0.004;
 
 }
 
@@ -267,6 +300,9 @@ function buildDecision(context={}){
   const prices =
     updatePriceMemory(tenantId,price);
 
+  const structure =
+    detectMarketStructure(prices);
+
   const bottomDetected =
     detectBottom(prices);
 
@@ -335,19 +371,18 @@ function buildDecision(context={}){
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
 
-  /* =========================================================
-     ENTRY LOGIC
-  ========================================================= */
-
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* ---- BUY FROM BOTTOM ---- */
+  /* =========================================================
+     BUY FROM BOTTOM
+  ========================================================= */
 
   if(
     bottomDetected &&
     nearSupport(tenantId,price) &&
-    edge > 0.002
+    edge > 0.002 &&
+    structure !== "downtrend"
   ){
 
     return{
@@ -357,17 +392,21 @@ function buildDecision(context={}){
       edge,
       riskPct:BASE_CONFIG.baseRiskPct,
       regime,
+      structure,
       ts:Date.now()
     };
 
   }
 
-  /* ---- SELL FROM TOP ---- */
+  /* =========================================================
+     SELL FROM TOP
+  ========================================================= */
 
   if(
     topDetected &&
     nearResistance(tenantId,price) &&
-    edge < -0.002
+    edge < -0.002 &&
+    structure !== "uptrend"
   ){
 
     return{
@@ -377,6 +416,7 @@ function buildDecision(context={}){
       edge,
       riskPct:BASE_CONFIG.baseRiskPct,
       regime,
+      structure,
       ts:Date.now()
     };
 
@@ -385,7 +425,8 @@ function buildDecision(context={}){
   return{
     action:"WAIT",
     confidence,
-    edge
+    edge,
+    structure
   };
 
 }
