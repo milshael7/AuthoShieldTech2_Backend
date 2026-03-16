@@ -1,16 +1,8 @@
 // ==========================================================
-// STRATEGY ENGINE — PAPER TRADING CORE (ENHANCED v4)
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v4
 // PURPOSE
-// Short-duration momentum scalping engine
-//
-// IMPROVEMENTS
-// ✔ micro-trend burst detection
-// ✔ volatility-adaptive scalping
-// ✔ stronger noise filtering
-// ✔ improved short-duration signal confidence
-// ✔ better regime weighting
-// ✔ smarter learning scaling
-// ✔ safer risk model
+// Detect strong entry zones near tops/bottoms
+// and avoid mid-move trades
 // ==========================================================
 
 const fs = require("fs");
@@ -30,89 +22,70 @@ BASE CONFIG
 
 const BASE_CONFIG = Object.freeze({
 
-  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.09),
+  minConfidence:Number(process.env.TRADE_MIN_CONF || 0.08),
   minEdge:Number(process.env.TRADE_MIN_EDGE || 0.00002),
 
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
   maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
 
-  regimeTrendEdgeBoost:1.30,
-  regimeRangeEdgeCut:0.75,
-  regimeExpansionBoost:1.40
+  regimeTrendEdgeBoost:1.25,
+  regimeRangeEdgeCut:0.80,
+  regimeExpansionBoost:1.35
 
 });
 
 /* =========================================================
-LEARNING SYSTEM
+PRICE MEMORY
 ========================================================= */
 
-const LEARNING_VERSION = 8;
+const PRICE_MEMORY = new Map();
 
-const LEARNING_DIR =
-  process.env.STRATEGY_LEARNING_DIR ||
-  path.join("/tmp","strategy_learning");
-
-function ensureDir(p){
-  if(!fs.existsSync(p))
-    fs.mkdirSync(p,{recursive:true});
-}
-
-function learningPath(tenantId){
-
-  ensureDir(LEARNING_DIR);
+function updatePriceMemory(tenantId,price){
 
   const key = tenantId || "__default__";
 
-  return path.join(
-    LEARNING_DIR,
-    `learning_${key}.json`
-  );
+  if(!PRICE_MEMORY.has(key)){
+    PRICE_MEMORY.set(key,[]);
+  }
+
+  const arr = PRICE_MEMORY.get(key);
+
+  arr.push(price);
+
+  if(arr.length > 30)
+    arr.shift();
+
+  return arr;
 
 }
 
-function defaultLearning(){
-  return{
-    version:LEARNING_VERSION,
-    edgeMultiplier:1,
-    confidenceMultiplier:1,
-    lastWinRate:0.5,
-    lastEvaluatedTradeCount:0,
-    lastUpdated:Date.now()
-  };
+/* =========================================================
+BOTTOM / TOP DETECTION
+========================================================= */
+
+function detectBottom(prices){
+
+  if(prices.length < 6)
+    return false;
+
+  const a = prices[prices.length-6];
+  const b = prices[prices.length-4];
+  const c = prices[prices.length-2];
+
+  return a > b && b < c;
+
 }
 
-const LEARNING_CACHE = new Map();
+function detectTop(prices){
 
-function loadLearning(tenantId){
+  if(prices.length < 6)
+    return false;
 
-  const key = tenantId || "__default__";
+  const a = prices[prices.length-6];
+  const b = prices[prices.length-4];
+  const c = prices[prices.length-2];
 
-  if(LEARNING_CACHE.has(key))
-    return LEARNING_CACHE.get(key);
-
-  const file = learningPath(key);
-
-  let state = defaultLearning();
-
-  try{
-
-    if(fs.existsSync(file)){
-
-      const raw =
-        JSON.parse(fs.readFileSync(file,"utf-8"));
-
-      state = {...state,...raw};
-
-      if(state.version !== LEARNING_VERSION)
-        state = defaultLearning();
-
-    }
-
-  }catch{}
-
-  LEARNING_CACHE.set(key,state);
-
-  return state;
+  return a < b && b > c;
 
 }
 
@@ -129,8 +102,7 @@ function getMomentum(tenantId){
   if(!MOMENTUM_MEMORY.has(key)){
 
     MOMENTUM_MEMORY.set(key,{
-      momentum:0,
-      acceleration:0
+      momentum:0
     });
 
   }
@@ -156,23 +128,12 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
 
   const mem = getMomentum(tenantId);
 
-  /* momentum smoothing */
-
-  const prevMomentum = mem.momentum;
-
   mem.momentum =
-    mem.momentum * 0.80 +
-    rawMomentum * 0.20;
-
-  /* acceleration detection */
-
-  mem.acceleration =
-    mem.acceleration * 0.75 +
-    (mem.momentum - prevMomentum) * 0.25;
+    mem.momentum * 0.82 +
+    rawMomentum * 0.18;
 
   let normalized =
-    (mem.momentum + mem.acceleration) /
-    (vol || 0.001);
+    mem.momentum/(vol || 0.001);
 
   if(regime==="trend")
     normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
@@ -183,7 +144,7 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   if(regime==="expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
-  return clamp(normalized,-0.08,0.08);
+  return clamp(normalized,-0.07,0.07);
 
 }
 
@@ -194,21 +155,20 @@ CONFIDENCE MODEL
 function computeConfidence({edge,ticksSeen,regime}){
 
   if(ticksSeen < 12)
-    return 0.34;
+    return 0.32;
 
-  let base =
-    Math.abs(edge) * 18;
+  let base = Math.abs(edge) * 16;
 
   if(regime==="trend")
-    base *= 1.1;
+    base *= 1.08;
 
   if(regime==="range")
-    base *= 0.9;
+    base *= 0.92;
 
   if(regime==="expansion")
-    base *= 1.25;
+    base *= 1.20;
 
-  return clamp(base,0.06,1);
+  return clamp(base,0.05,1);
 
 }
 
@@ -240,7 +200,14 @@ function buildDecision(context={}){
     ticksSeen=0
   } = context;
 
-  const learning = loadLearning(tenantId);
+  const prices =
+    updatePriceMemory(tenantId,price);
+
+  const bottomDetected =
+    detectBottom(prices);
+
+  const topDetected =
+    detectTop(prices);
 
   let regime =
     regimeMemory.detectRegime({
@@ -250,8 +217,6 @@ function buildDecision(context={}){
     });
 
   regime = normalizeRegime(regime);
-
-  /* ================= EDGE ================= */
 
   let edge =
     computeEdge({
@@ -278,8 +243,6 @@ function buildDecision(context={}){
     symbol
   });
 
-  /* ================= CONFIDENCE ================= */
-
   let confidence =
     computeConfidence({
       edge,
@@ -287,15 +250,11 @@ function buildDecision(context={}){
       regime
     });
 
-  /* ================= ORDER FLOW ================= */
-
   const flow =
     orderFlowEngine.analyzeFlow({tenantId});
 
   confidence *= flow.boost || 1;
   edge *= flow.boost || 1;
-
-  /* ================= COUNTERFACTUAL ================= */
 
   const missedBoost =
     counterfactualEngine.getLearningAdjustment?.({
@@ -305,67 +264,51 @@ function buildDecision(context={}){
   confidence *= missedBoost;
   edge *= missedBoost;
 
-  /* ================= LEARNING ================= */
-
-  edge *= learning.edgeMultiplier;
-  confidence *= learning.confidenceMultiplier;
-
-  edge = clamp(edge,-0.08,0.08);
-  confidence = clamp(confidence,0.06,1);
-
-  if(!Number.isFinite(price))
-    return {action:"WAIT",confidence:0,edge:0};
-
-  if(confidence < BASE_CONFIG.minConfidence)
-    return {action:"WAIT",confidence,edge};
-
-  if(Math.abs(edge) < BASE_CONFIG.minEdge)
-    return {action:"WAIT",confidence,edge};
+  edge = clamp(edge,-0.07,0.07);
+  confidence = clamp(confidence,0.05,1);
 
   /* =========================================================
-     SCALPING FILTER
-     Ensure strong burst moves only
+     ENTRY LOGIC
   ========================================================= */
 
-  if(Math.abs(edge) < 0.0025)
-    return {action:"WAIT",confidence,edge};
+  if(bottomDetected && edge > 0){
 
-  /* =========================================================
-     VOLATILITY ADAPTIVE FILTER
-  ========================================================= */
+    return{
+      symbol,
+      action:"BUY",
+      confidence,
+      edge,
+      riskPct:BASE_CONFIG.baseRiskPct,
+      regime,
+      ts:Date.now()
+    };
 
-  if(volatility < 0.0006)
-    return {action:"WAIT",confidence,edge};
+  }
 
-  /* =========================================================
-     RISK MODEL
-  ========================================================= */
+  if(topDetected && edge < 0){
 
-  let riskPct =
-    BASE_CONFIG.baseRiskPct *
-    (0.60 + confidence * 0.80);
+    return{
+      symbol,
+      action:"SELL",
+      confidence,
+      edge,
+      riskPct:BASE_CONFIG.baseRiskPct,
+      regime,
+      ts:Date.now()
+    };
 
-  riskPct =
-    clamp(
-      riskPct,
-      BASE_CONFIG.baseRiskPct,
-      BASE_CONFIG.maxRiskPct
-    );
+  }
 
   return{
-    symbol,
-    action:edge > 0 ? "BUY":"SELL",
+    action:"WAIT",
     confidence,
-    edge,
-    riskPct,
-    regime,
-    ts:Date.now()
+    edge
   };
 
 }
 
 /* =========================================================
-COMPATIBILITY EXPORT
+EXPORT
 ========================================================= */
 
 function makeDecision(context){
