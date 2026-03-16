@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v31 (Momentum Ride Engine)
+// VERSION: v32 (Institutional Momentum Ride Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -29,10 +29,14 @@ const COOLDOWN_AFTER_TRADE = 120000;
 const MAX_TRADES_PER_DAY = 40;
 const MAX_DAILY_LOSSES = 12;
 
-/* --- SHORT DURATION --- */
+/* --- TRADE WINDOW --- */
 
 const MIN_TRADE_DURATION = 10 * 60 * 1000;
 const MAX_TRADE_DURATION = 15 * 60 * 1000;
+
+/* --- RISK --- */
+
+const HARD_STOP_LOSS = -0.0025;
 
 /* ========================================================= */
 
@@ -40,7 +44,7 @@ const STATE_FILE =
   path.join(process.cwd(),"paperTrader_state.json");
 
 /* =========================================================
-PRICE MOMENTUM MEMORY
+PRICE MEMORY
 ========================================================= */
 
 const PRICE_HISTORY = new Map();
@@ -56,24 +60,36 @@ function recordPrice(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 8)
+  if(arr.length > 10)
     arr.shift();
 
   return arr;
 
 }
 
+/* =========================================================
+REVERSAL DETECTION
+========================================================= */
+
 function detectReversal(prices){
 
-  if(prices.length < 4) return false;
+  if(prices.length < 5) return false;
 
-  const a = prices[prices.length-4];
-  const b = prices[prices.length-3];
-  const c = prices[prices.length-2];
-  const d = prices[prices.length-1];
+  const a = prices[prices.length-5];
+  const b = prices[prices.length-4];
+  const c = prices[prices.length-3];
+  const d = prices[prices.length-2];
+  const e = prices[prices.length-1];
 
-  if(a < b && b < c && d < c) return true;
-  if(a > b && b > c && d > c) return true;
+  /* trend up then drop */
+
+  if(a < b && b < c && c < d && e < d)
+    return true;
+
+  /* trend down then bounce */
+
+  if(a > b && b > c && c > d && e > d)
+    return true;
 
   return false;
 
@@ -138,12 +154,16 @@ STATE STORAGE
 function saveState(state){
 
   try{
+
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(state,null,2)
     );
+
   }catch(err){
+
     console.error("State save failed:",err.message);
+
   }
 
 }
@@ -270,9 +290,8 @@ function closeTrade({
 
   state.realized.net += pnl;
 
-  if(pnl > 0){
+  if(pnl > 0)
     state.realized.wins++;
-  }
   else{
     state.realized.losses++;
     state.limits.lossesToday++;
@@ -287,7 +306,7 @@ function closeTrade({
 }
 
 /* =========================================================
-ACTIVE POSITION
+ACTIVE POSITION MANAGEMENT
 ========================================================= */
 
 function handleOpenPosition({
@@ -308,6 +327,16 @@ function handleOpenPosition({
       ? (price - pos.entry) / pos.entry
       : (pos.entry - price) / pos.entry;
 
+  const unrealized =
+    pos.side === "LONG"
+      ? (price - pos.entry) * pos.qty
+      : (pos.entry - price) * pos.qty;
+
+  /* TRACK PEAK PROFIT */
+
+  pos.peakProfit =
+    Math.max(pos.peakProfit || 0, unrealized);
+
   const prices =
     recordPrice(tenantId,price);
 
@@ -318,13 +347,26 @@ function handleOpenPosition({
 
   /* HARD STOP */
 
-  if(pnl <= -0.0025)
+  if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  /* MAX TIME */
+  /* TIME EXIT */
 
-  if(elapsed >= pos.maxDuration)
-    return closeTrade({tenantId,state,symbol,price,ts});
+  if(elapsed >= pos.maxDuration){
+
+    const recentMove =
+      prices[prices.length-1] -
+      prices[prices.length-3];
+
+    const momentumStillStrong =
+      pos.side === "LONG"
+        ? recentMove > 0
+        : recentMove < 0;
+
+    if(!momentumStillStrong)
+      return closeTrade({tenantId,state,symbol,price,ts});
+
+  }
 
   return false;
 
