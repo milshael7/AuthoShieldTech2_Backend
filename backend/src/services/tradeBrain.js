@@ -1,10 +1,12 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v11)
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v12)
 // IMPROVED:
 // - directional stability
 // - adaptive risk scaling
 // - smarter exploration
 // - volatility awareness
+// - paper trading confidence guard
+// - volatility safety layer
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -26,6 +28,8 @@ const EDGE_MEMORY_DECAY =
 
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
+
+const PAPER_MIN_CONFIDENCE = 0.30;
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
@@ -170,6 +174,17 @@ function makeDecision(context={}){
     confidence *= 1.15;
   }
 
+/* ================= VOLATILITY SAFETY ================= */
+
+  if(volatility > 0.01){
+
+    confidence *= 0.8;
+
+    strategy.riskPct =
+      safeNum(strategy.riskPct,0.01) * 0.7;
+
+  }
+
 /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
@@ -204,7 +219,7 @@ function makeDecision(context={}){
 /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
-    isPaper ? 0.05 : MIN_CONFIDENCE_TO_TRADE;
+    isPaper ? PAPER_MIN_CONFIDENCE : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
@@ -251,8 +266,6 @@ function makeDecision(context={}){
 
   let riskPct =
     safeNum(strategy.riskPct,0.01);
-
-  /* adaptive scaling */
 
   if(confidence > 0.8)
     riskPct *= 1.6;
