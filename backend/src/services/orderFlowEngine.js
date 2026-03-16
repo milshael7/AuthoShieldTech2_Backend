@@ -1,14 +1,10 @@
 // backend/src/services/orderFlowEngine.js
-// ======================================================
-// Phase 3 — Institutional Order Flow Engine
-// Detects liquidity sweeps, fake breakouts,
-// trend acceleration, compression, exhaustion
-// and volatility shocks
-// ======================================================
+// Institutional Order Flow Engine — Stable v2
 
 const FLOW = new Map();
 
 const MAX_MEMORY = 120;
+const MAX_TENANTS = 200;
 
 /* ======================================================
 STATE
@@ -19,11 +15,16 @@ function getState(tenantId){
   const key = tenantId || "__default__";
 
   if(!FLOW.has(key)){
+
+    if(FLOW.size > MAX_TENANTS)
+      FLOW.clear();
+
     FLOW.set(key,{
       prices:[],
       velocity:0,
       lastFlow:"neutral"
     });
+
   }
 
   return FLOW.get(key);
@@ -69,9 +70,16 @@ function recordPrice({
 FLOW ANALYSIS
 ====================================================== */
 
-function analyzeFlow({ tenantId }){
+function analyzeFlow({ tenantId, price }){
 
   const state = getState(tenantId);
+
+  /* automatically record price */
+
+  if(Number.isFinite(price)){
+    recordPrice({ tenantId, price });
+  }
+
   const prices = state.prices;
 
   if(prices.length < 8)
@@ -82,127 +90,117 @@ function analyzeFlow({ tenantId }){
 
   const move = (last-first)/first;
 
-  const max = Math.max(...prices.map(p=>p.price));
-  const min = Math.min(...prices.map(p=>p.price));
+  let max = first;
+  let min = first;
+
+  for(const p of prices){
+
+    if(p.price > max) max = p.price;
+    if(p.price < min) min = p.price;
+
+  }
 
   const range = (max-min)/first;
 
-  /* ===================================================
-  VELOCITY
-  ==================================================== */
+  /* ================= VELOCITY ================= */
 
-  const diffs = [];
+  let velocity = 0;
 
   for(let i=1;i<prices.length;i++){
 
     const prev = prices[i-1].price;
     const cur = prices[i].price;
 
-    diffs.push((cur-prev)/prev);
+    velocity += (cur-prev)/prev;
 
   }
 
-  const velocity =
-    diffs.reduce((a,b)=>a+b,0)/diffs.length;
+  velocity = velocity/(prices.length-1);
 
   state.velocity = velocity;
 
   const absMove = Math.abs(move);
   const absVel = Math.abs(velocity);
 
-  /* ===================================================
-  VOLATILITY SHOCK
-  ==================================================== */
+  /* ================= VOLATILITY SHOCK ================= */
 
-  if(absMove > 0.02){
+  if(absMove > 0.018){
 
     return {
       type:"volatility_shock",
-      boost:0.4,
+      boost:0.5,
       velocity
     };
 
   }
 
-  /* ===================================================
-  LIQUIDITY SWEEP
-  ==================================================== */
+  /* ================= LIQUIDITY SWEEP ================= */
 
-  if(range > 0.01 && absMove < 0.002){
+  if(range > 0.009 && absMove < 0.002){
 
     return {
       type:"liquidity_sweep",
-      boost:0.65,
-      velocity
-    };
-
-  }
-
-  /* ===================================================
-  AGGRESSIVE TREND
-  ==================================================== */
-
-  if(absMove > 0.007 && absVel > 0.0005){
-
-    return {
-      type:"aggressive_trend",
-      boost:1.35,
-      velocity
-    };
-
-  }
-
-  /* ===================================================
-  TREND ACCELERATION
-  ==================================================== */
-
-  if(absVel > 0.001){
-
-    return {
-      type:"trend_acceleration",
-      boost:1.2,
-      velocity
-    };
-
-  }
-
-  /* ===================================================
-  TREND EXHAUSTION
-  ==================================================== */
-
-  if(absMove > 0.008 && absVel < 0.0002){
-
-    return {
-      type:"trend_exhaustion",
       boost:0.7,
       velocity
     };
 
   }
 
-  /* ===================================================
-  FAKE BREAKOUT
-  ==================================================== */
+  /* ================= AGGRESSIVE TREND ================= */
 
-  if(range > 0.008 && absMove < 0.001){
+  if(absMove > 0.006 && absVel > 0.00045){
 
     return {
-      type:"fake_breakout",
-      boost:0.6,
+      type:"aggressive_trend",
+      boost:1.3,
       velocity
     };
 
   }
 
-  /* ===================================================
-  MARKET COMPRESSION
-  ==================================================== */
+  /* ================= TREND ACCELERATION ================= */
 
-  if(range < 0.0015){
+  if(absVel > 0.0009){
+
+    return {
+      type:"trend_acceleration",
+      boost:1.18,
+      velocity
+    };
+
+  }
+
+  /* ================= TREND EXHAUSTION ================= */
+
+  if(absMove > 0.007 && absVel < 0.0002){
+
+    return {
+      type:"trend_exhaustion",
+      boost:0.75,
+      velocity
+    };
+
+  }
+
+  /* ================= FAKE BREAKOUT ================= */
+
+  if(range > 0.007 && absMove < 0.001){
+
+    return {
+      type:"fake_breakout",
+      boost:0.65,
+      velocity
+    };
+
+  }
+
+  /* ================= MARKET COMPRESSION ================= */
+
+  if(range < 0.0013){
 
     return {
       type:"compression",
-      boost:1.15,
+      boost:1.12,
       velocity
     };
 
