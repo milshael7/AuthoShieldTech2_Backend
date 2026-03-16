@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v36 (Institutional Entry + Exit Engine)
+// VERSION: v37 (Institutional Entry + Exit Engine)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -242,6 +242,11 @@ function handleOpenPosition({
   const prices =
     recordPrice(tenantId,price);
 
+  /* MIN TRADE TIME PROTECTION */
+
+  if(elapsed < MIN_TRADE_DURATION && pnl > HARD_STOP_LOSS)
+    return false;
+
   /* REVERSAL */
 
   if(detectReversal(prices) && pnl > 0)
@@ -259,10 +264,10 @@ function handleOpenPosition({
 
   /* PROFIT TRAILING */
 
-  pos.bestPnl =
-    Math.max(pos.bestPnl || 0,pnl);
+  if(pnl > 0.001){
 
-  if(pos.bestPnl > 0){
+    pos.bestPnl =
+      Math.max(pos.bestPnl || 0,pnl);
 
     const drawdown =
       pos.bestPnl - pnl;
@@ -324,7 +329,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    /* OPEN POSITION MANAGEMENT */
+    /* HANDLE OPEN POSITION */
 
     if(state.position){
 
@@ -391,6 +396,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.position.maxDuration =
           computeDuration(plan.confidence);
+
+        state.position.bestPnl = 0;
 
       }
 
