@@ -1,6 +1,10 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v10)
-// STABILIZED: confidence smoothing + exploration stability
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v11)
+// IMPROVED:
+// - directional stability
+// - adaptive risk scaling
+// - smarter exploration
+// - volatility awareness
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -14,7 +18,6 @@ const MAX_TRADES_PER_DAY =
 const MAX_LOSS_STREAK =
   Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
 
-/* Faster learning feedback */
 const CONFIDENCE_DECAY =
   Number(process.env.TRADE_CONFIDENCE_DECAY || 0.72);
 
@@ -161,6 +164,12 @@ function makeDecision(context={}){
 
   }catch{}
 
+/* ================= VOLATILITY BOOST ================= */
+
+  if(volatility > 0.006){
+    confidence *= 1.15;
+  }
+
 /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
@@ -180,6 +189,18 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
+/* ================= DIRECTION STABILITY ================= */
+
+  if(brain.lastAction === "BUY" && action === "SELL"){
+    if(confidence < 0.7)
+      action = "WAIT";
+  }
+
+  if(brain.lastAction === "SELL" && action === "BUY"){
+    if(confidence < 0.7)
+      action = "WAIT";
+  }
+
 /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
@@ -188,20 +209,21 @@ function makeDecision(context={}){
   if(confidence < dynamicThreshold)
     action="WAIT";
 
-/* ================= EXPLORATION MODE ================= */
+/* ================= SMART EXPLORATION ================= */
 
   if(isPaper && action==="WAIT"){
 
-    const explorationChance = 0.15;
+    const explorationChance = 0.12;
 
     if(Math.random() < explorationChance){
 
-      action =
-        Math.random() > 0.5
-          ? "BUY"
-          : "SELL";
+      if(edge >= 0){
+        action = "BUY";
+      }else{
+        action = "SELL";
+      }
 
-      confidence = Math.max(confidence,0.1);
+      confidence = Math.max(confidence,0.15);
 
     }
 
@@ -229,6 +251,15 @@ function makeDecision(context={}){
 
   let riskPct =
     safeNum(strategy.riskPct,0.01);
+
+  /* adaptive scaling */
+
+  if(confidence > 0.8)
+    riskPct *= 1.6;
+  else if(confidence > 0.65)
+    riskPct *= 1.2;
+  else if(confidence < 0.45)
+    riskPct *= 0.5;
 
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
