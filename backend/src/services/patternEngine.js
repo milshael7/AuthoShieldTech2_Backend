@@ -1,14 +1,14 @@
-// backend/src/services/patternEngine.js
-// Phase 2 Pattern Discovery Engine
-// Breakout • Fake Breakout • Reversal • Volatility Pattern Learning
-// Tenant Safe
+// ==========================================================
+// PATTERN ENGINE — Adaptive Pattern Discovery v2
+// Improved learning speed + stable signal discovery
+// ==========================================================
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 const PATTERN_MEMORY = new Map();
 
 const MAX_MEMORY = 300;
-const MIN_PATTERN_OCCURRENCES = 5;
+const MIN_PATTERN_OCCURRENCES = 3;
 
 /* ======================================================
 STATE
@@ -78,7 +78,7 @@ function recordPrice({
     ts:Date.now()
   });
 
-  if(state.priceHistory.length > 40)
+  if(state.priceHistory.length > 60)
     state.priceHistory.shift();
 
 }
@@ -110,33 +110,33 @@ function detectMarketPattern({
 
   /* ================= BREAKOUT ================= */
 
-  if(Math.abs(move) > 0.007){
+  if(Math.abs(move) > 0.003){
 
     return{
       type:"breakout",
-      boost:1.3
+      boost:1.25
     };
 
   }
 
   /* ================= FAKE BREAKOUT ================= */
 
-  if(range > 0.01 && Math.abs(move) < 0.002){
+  if(range > 0.008 && Math.abs(move) < 0.0015){
 
     return{
       type:"fake_breakout",
-      boost:0.7
+      boost:0.8
     };
 
   }
 
   /* ================= REVERSAL ================= */
 
-  if(range > 0.006 && Math.abs(move) < 0.0008){
+  if(range > 0.004 && Math.abs(move) < 0.0006){
 
     return{
       type:"reversal",
-      boost:0.85
+      boost:0.9
     };
 
   }
@@ -209,11 +209,11 @@ function getPatternEdgeBoost({
 
       const winRate = p.wins / total;
 
-      if(winRate > 0.65)
-        boost *= clamp(1 + (winRate - 0.5),1,1.8);
+      if(winRate > 0.6)
+        boost *= clamp(1 + (winRate - 0.5),1,1.6);
 
       if(winRate < 0.4)
-        boost *= 0.7;
+        boost *= 0.75;
 
     }
 
@@ -226,7 +226,7 @@ function getPatternEdgeBoost({
 
   boost *= livePattern.boost;
 
-  return clamp(boost,0.5,2);
+  return clamp(boost,0.6,1.8);
 
 }
 
