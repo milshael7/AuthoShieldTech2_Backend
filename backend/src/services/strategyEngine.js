@@ -1,6 +1,6 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v13
-// Adds Institutional Risk Allocation Engine
+// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v14
+// Adds Liquidity Gravity Engine
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -148,6 +148,43 @@ function detectTrend(prices,len){
 }
 
 /* =========================================================
+LIQUIDITY GRAVITY ENGINE
+Predicts where price is pulled
+========================================================= */
+
+function detectLiquidityGravity(prices){
+
+  if(prices.length < 20)
+    return "neutral";
+
+  const highs =
+    prices.slice(-20);
+
+  const max =
+    Math.max(...highs);
+
+  const min =
+    Math.min(...highs);
+
+  const last =
+    prices[prices.length-1];
+
+  const distHigh =
+    Math.abs(max-last)/last;
+
+  const distLow =
+    Math.abs(last-min)/last;
+
+  if(distHigh < distLow)
+    return "up";
+
+  if(distLow < distHigh)
+    return "down";
+
+  return "neutral";
+}
+
+/* =========================================================
 LIQUIDITY SWEEP
 ========================================================= */
 
@@ -227,7 +264,7 @@ function computeConfidence(edge){
 }
 
 /* =========================================================
-RISK ALLOCATION ENGINE
+RISK ENGINE
 ========================================================= */
 
 function computeRisk({
@@ -239,8 +276,6 @@ function computeRisk({
   let risk =
     BASE_CONFIG.baseRiskPct;
 
-  /* confidence scaling */
-
   if(confidence > 0.85)
     risk *= 2.4;
   else if(confidence > 0.70)
@@ -250,15 +285,11 @@ function computeRisk({
   else
     risk *= 0.6;
 
-  /* volatility protection */
-
   if(volatility > 0.01)
     risk *= 0.6;
 
   if(volatility > 0.015)
     risk *= 0.4;
-
-  /* regime adjustment */
 
   if(regime==="range")
     risk *= 0.7;
@@ -306,6 +337,9 @@ function buildDecision(context={}){
 
   const liquiditySweep =
     detectLiquiditySweep(prices);
+
+  const liquidityGravity =
+    detectLiquidityGravity(prices);
 
   const microTrend =
     detectTrend(prices,5);
@@ -360,6 +394,14 @@ function buildDecision(context={}){
 
   confidence *= learningBoost;
   edge *= learningBoost;
+
+  /* Liquidity gravity alignment */
+
+  if(liquidityGravity==="up")
+    confidence *= 1.05;
+
+  if(liquidityGravity==="down")
+    confidence *= 1.05;
 
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
