@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Global Alpha v20)
-// Controlled Exploration + Faster Learning
+// AutoShield — Institutional Trade Brain (Global Alpha v21)
+// Faster Learning Cycle + Safe Hands-On Training
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -9,7 +9,7 @@ const { buildDecision } = require("./strategyEngine");
 /* ================= CONFIG ================= */
 
 const MAX_TRADES_PER_DAY =
-  Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
+  Number(process.env.TRADE_MAX_TRADES_PER_DAY || 80);
 
 const MAX_LOSS_STREAK =
   Number(process.env.TRADE_MAX_LOSS_STREAK || 3);
@@ -36,12 +36,12 @@ const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
 
 const TRADE_COOLDOWN_MS =
-  Number(process.env.TRADE_COOLDOWN_MS || 60000);
+  Number(process.env.TRADE_COOLDOWN_MS || 20000);
 
 const MIN_MOMENTUM_EDGE =
   Number(process.env.TRADE_MIN_EDGE || 0.00025);
 
-/* NEW: exploration learning */
+/* ================= EXPLORATION LEARNING ================= */
 
 const EXPLORATION_RATE =
   Number(process.env.TRADE_EXPLORATION_RATE || 0.02);
