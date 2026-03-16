@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v40 (Institutional Position Management Engine)
+// VERSION: v41 (Institutional Exit Optimization Engine)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -53,18 +53,18 @@ PRICE MEMORY
 
 const PRICE_HISTORY = new Map();
 
-function recordPrice(tenantId, price) {
+function recordPrice(tenantId, price){
 
   const key = tenantId || "__default__";
 
-  if (!PRICE_HISTORY.has(key))
-    PRICE_HISTORY.set(key, []);
+  if(!PRICE_HISTORY.has(key))
+    PRICE_HISTORY.set(key,[]);
 
   const arr = PRICE_HISTORY.get(key);
 
   arr.push(price);
 
-  if (arr.length > 40)
+  if(arr.length > 50)
     arr.shift();
 
   return arr;
@@ -75,22 +75,22 @@ function recordPrice(tenantId, price) {
 TREND DETECTION
 ========================================================= */
 
-function detectTrendRun(prices, side) {
+function detectTrendRun(prices,side){
 
-  if (prices.length < STRONG_TREND_CANDLES + 1)
+  if(prices.length < STRONG_TREND_CANDLES + 1)
     return false;
 
   let run = 0;
 
-  for (let i = prices.length - 1; i > 0; i--) {
+  for(let i = prices.length-1; i > 0; i--){
 
-    const move = prices[i] - prices[i - 1];
+    const move = prices[i] - prices[i-1];
 
-    if (side === "LONG" && move > 0) run++;
-    else if (side === "SHORT" && move < 0) run++;
+    if(side==="LONG" && move>0) run++;
+    else if(side==="SHORT" && move<0) run++;
     else break;
 
-    if (run >= STRONG_TREND_CANDLES)
+    if(run >= STRONG_TREND_CANDLES)
       return true;
 
   }
@@ -99,46 +99,30 @@ function detectTrendRun(prices, side) {
 
 }
 
-function detectReversal(prices) {
+function detectMomentumWeakening(prices){
 
-  if (prices.length < 6) return false;
+  if(prices.length < 6)
+    return false;
 
-  const a = prices[prices.length - 6];
-  const b = prices[prices.length - 5];
-  const c = prices[prices.length - 4];
-  const d = prices[prices.length - 3];
-  const e = prices[prices.length - 2];
-  const f = prices[prices.length - 1];
-
-  if (a < b && b < c && c < d && e < d && f < e) return true;
-  if (a > b && b > c && c > d && e > d && f > e) return true;
-
-  return false;
-
-}
-
-function detectMomentumWeakening(prices) {
-
-  if (prices.length < 6) return false;
-
-  const m1 = prices[prices.length - 1] - prices[prices.length - 2];
-  const m2 = prices[prices.length - 2] - prices[prices.length - 3];
-  const m3 = prices[prices.length - 3] - prices[prices.length - 4];
+  const m1 = prices[prices.length-1] - prices[prices.length-2];
+  const m2 = prices[prices.length-2] - prices[prices.length-3];
+  const m3 = prices[prices.length-3] - prices[prices.length-4];
 
   return Math.abs(m1) < Math.abs(m2) &&
          Math.abs(m2) < Math.abs(m3);
 
 }
 
-function detectHardMomentumBreak(prices, side) {
+function detectHardMomentumBreak(prices,side){
 
-  if (prices.length < 4) return false;
+  if(prices.length < 4)
+    return false;
 
-  const m1 = prices[prices.length - 1] - prices[prices.length - 2];
-  const m2 = prices[prices.length - 2] - prices[prices.length - 3];
+  const m1 = prices[prices.length-1] - prices[prices.length-2];
+  const m2 = prices[prices.length-2] - prices[prices.length-3];
 
-  if (side === "LONG") return m1 < 0 && m2 < 0;
-  if (side === "SHORT") return m1 > 0 && m2 > 0;
+  if(side==="LONG") return m1<0 && m2<0;
+  if(side==="SHORT") return m1>0 && m2>0;
 
   return false;
 
@@ -148,17 +132,21 @@ function detectHardMomentumBreak(prices, side) {
 PROFIT LOCK MODEL
 ========================================================= */
 
-function computeProfitLock(bestPnl, volatility) {
+function computeProfitLock(bestPnl,volatility,strongTrend){
 
-  if (bestPnl >= 0.02) return MAX_PROFIT_LOCK;
+  if(bestPnl >= 0.02)
+    return MAX_PROFIT_LOCK;
 
-  if (volatility > 0.01)
+  if(strongTrend)
+    return 0.75;
+
+  if(volatility > 0.01)
     return 0.55;
 
-  if (bestPnl >= 0.01)
+  if(bestPnl >= 0.01)
     return 0.65;
 
-  if (bestPnl >= 0.005)
+  if(bestPnl >= 0.005)
     return 0.50;
 
   return MIN_PROFIT_LOCK;
@@ -169,9 +157,9 @@ function computeProfitLock(bestPnl, volatility) {
 STATE
 ========================================================= */
 
-function defaultState() {
+function defaultState(){
 
-  return {
+  return{
 
     running:true,
 
@@ -216,31 +204,6 @@ function load(tenantId){
   STATES.set(tenantId,state);
 
   return state;
-
-}
-
-/* =========================================================
-PARTIAL PROFIT
-========================================================= */
-
-function maybeTakePartialProfit(state, price){
-
-  const pos = state.position;
-
-  if(!pos || pos.partialTaken) return;
-
-  const pnl =
-    pos.side === "LONG"
-      ? (price - pos.entry)/pos.entry
-      : (pos.entry - price)/pos.entry;
-
-  if(pnl > 0.01){
-
-    pos.partialTaken = true;
-
-    pos.qty = pos.qty * 0.6;
-
-  }
 
 }
 
@@ -292,7 +255,7 @@ function handleOpenPosition({
   const elapsed = ts - pos.time;
 
   const pnl =
-    pos.side === "LONG"
+    pos.side==="LONG"
       ? (price-pos.entry)/pos.entry
       : (pos.entry-price)/pos.entry;
 
@@ -302,8 +265,8 @@ function handleOpenPosition({
   const strongTrend =
     detectTrendRun(prices,pos.side);
 
-  const reversal =
-    detectReversal(prices);
+  const momentumWeak =
+    detectMomentumWeakening(prices);
 
   const momentumBreak =
     detectHardMomentumBreak(prices,pos.side);
@@ -314,17 +277,20 @@ function handleOpenPosition({
   if(pnl > pos.bestPnl)
     pos.bestPnl = pnl;
 
-  maybeTakePartialProfit(state,price);
+  /* HARD STOP */
 
   if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
+
+  /* PROFIT LOCK */
 
   if(pos.bestPnl > MIN_PROFIT_TO_TRAIL){
 
     const lockPct =
       computeProfitLock(
         pos.bestPnl,
-        state.volatility
+        state.volatility,
+        strongTrend
       );
 
     const floor =
@@ -335,11 +301,25 @@ function handleOpenPosition({
 
   }
 
+  /* EARLY WEAKNESS EXIT */
+
+  if(pnl > 0 && momentumWeak)
+    return closeTrade({tenantId,state,symbol,price,ts});
+
   if(pnl > 0 && momentumBreak)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(!strongTrend && pnl > 0 && reversal)
-    return closeTrade({tenantId,state,symbol,price,ts});
+  /* MOMENTUM EXTENSION */
+
+  if(strongTrend && pnl > 0){
+
+    const extended =
+      pos.maxDuration + MAX_EXTENSION_DURATION;
+
+    pos.maxDuration =
+      Math.min(extended,pos.maxDuration + 60000);
+
+  }
 
   if(elapsed >= pos.maxDuration)
     return closeTrade({tenantId,state,symbol,price,ts});
