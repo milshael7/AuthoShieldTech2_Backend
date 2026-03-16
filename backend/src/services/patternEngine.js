@@ -1,13 +1,13 @@
 // ==========================================================
-// PATTERN ENGINE — Adaptive Pattern Discovery v3
-// Adds candle momentum + exhaustion detection
+// PATTERN ENGINE — Institutional Liquidity Map Engine v4
+// Detects liquidity pools, stop hunts, traps, and momentum
 // ==========================================================
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 const PATTERN_MEMORY = new Map();
 
-const MAX_MEMORY = 300;
+const MAX_MEMORY = 400;
 const MIN_PATTERN_OCCURRENCES = 3;
 
 /* ======================================================
@@ -23,7 +23,11 @@ function getState(tenantId){
     PATTERN_MEMORY.set(key,{
       signals:[],
       patterns:{},
-      priceHistory:[]
+      priceHistory:[],
+      liquidity:{
+        highs:[],
+        lows:[]
+      }
     });
 
   }
@@ -78,8 +82,86 @@ function recordPrice({
     ts:Date.now()
   });
 
-  if(state.priceHistory.length > 60)
+  if(state.priceHistory.length > 80)
     state.priceHistory.shift();
+
+}
+
+/* ======================================================
+EQUAL HIGH / LOW DETECTION
+====================================================== */
+
+function detectEqualHighs(prices){
+
+  if(prices.length < 6) return false;
+
+  const highs =
+    prices.slice(-6).map(p=>p.price);
+
+  const max = Math.max(...highs);
+
+  let touches = 0;
+
+  for(const p of highs){
+
+    if(Math.abs(p-max)/max < 0.0006)
+      touches++;
+
+  }
+
+  return touches >= 3;
+
+}
+
+function detectEqualLows(prices){
+
+  if(prices.length < 6) return false;
+
+  const lows =
+    prices.slice(-6).map(p=>p.price);
+
+  const min = Math.min(...lows);
+
+  let touches = 0;
+
+  for(const p of lows){
+
+    if(Math.abs(p-min)/min < 0.0006)
+      touches++;
+
+  }
+
+  return touches >= 3;
+
+}
+
+/* ======================================================
+LIQUIDITY SWEEP DETECTION
+====================================================== */
+
+function detectLiquiditySweep(prices){
+
+  if(prices.length < 8)
+    return null;
+
+  const recent = prices.slice(-8);
+
+  const high =
+    Math.max(...recent.slice(0,6).map(p=>p.price));
+
+  const low =
+    Math.min(...recent.slice(0,6).map(p=>p.price));
+
+  const prev = recent[6].price;
+  const last = recent[7].price;
+
+  if(prev > high && last < prev)
+    return "bearish_sweep";
+
+  if(prev < low && last > prev)
+    return "bullish_sweep";
+
+  return null;
 
 }
 
@@ -113,7 +195,7 @@ function analyzeMomentum(prices){
   const bias = up - down;
   const strength = Math.abs(bias)/total;
 
-  if(strength > 0.6){
+  if(strength > 0.65){
 
     if(bias > 0)
       return {strength,type:"bullish"};
@@ -136,24 +218,62 @@ function detectMarketPattern({
 }){
 
   const state = getState(tenantId);
-
   const prices = state.priceHistory;
 
-  if(prices.length < 6)
+  if(prices.length < 8)
     return {type:"neutral",boost:1};
 
-  const first = prices[0].price;
-  const last = prices[prices.length-1].price;
+  const equalHighs =
+    detectEqualHighs(prices);
 
-  const move = (last-first)/first;
+  const equalLows =
+    detectEqualLows(prices);
 
-  const max = Math.max(...prices.map(p=>p.price));
-  const min = Math.min(...prices.map(p=>p.price));
-
-  const range = (max-min)/first;
+  const liquiditySweep =
+    detectLiquiditySweep(prices);
 
   const momentum =
     analyzeMomentum(prices);
+
+  /* ================= STOP HUNT ================= */
+
+  if(liquiditySweep === "bearish_sweep"){
+
+    return{
+      type:"stop_hunt_short",
+      boost:1.35
+    };
+
+  }
+
+  if(liquiditySweep === "bullish_sweep"){
+
+    return{
+      type:"stop_hunt_long",
+      boost:1.35
+    };
+
+  }
+
+  /* ================= LIQUIDITY POOL ================= */
+
+  if(equalHighs){
+
+    return{
+      type:"liquidity_pool_high",
+      boost:1.2
+    };
+
+  }
+
+  if(equalLows){
+
+    return{
+      type:"liquidity_pool_low",
+      boost:1.2
+    };
+
+  }
 
   /* ================= STRONG TREND ================= */
 
@@ -161,40 +281,7 @@ function detectMarketPattern({
 
     return{
       type:"strong_trend",
-      boost:1.35
-    };
-
-  }
-
-  /* ================= BREAKOUT ================= */
-
-  if(Math.abs(move) > 0.003){
-
-    return{
-      type:"breakout",
       boost:1.25
-    };
-
-  }
-
-  /* ================= FAKE BREAKOUT ================= */
-
-  if(range > 0.008 && Math.abs(move) < 0.0015){
-
-    return{
-      type:"fake_breakout",
-      boost:0.8
-    };
-
-  }
-
-  /* ================= REVERSAL ================= */
-
-  if(range > 0.004 && Math.abs(move) < 0.0006){
-
-    return{
-      type:"reversal",
-      boost:0.9
     };
 
   }
@@ -268,7 +355,7 @@ function getPatternEdgeBoost({
       const winRate = p.wins / total;
 
       if(winRate > 0.6)
-        boost *= clamp(1 + (winRate - 0.5),1,1.6);
+        boost *= clamp(1+(winRate-0.5),1,1.6);
 
       if(winRate < 0.4)
         boost *= 0.75;
@@ -277,14 +364,12 @@ function getPatternEdgeBoost({
 
   }
 
-  /* ================= LIVE MARKET PATTERN ================= */
-
   const livePattern =
     detectMarketPattern({tenantId});
 
   boost *= livePattern.boost;
 
-  return clamp(boost,0.6,1.8);
+  return clamp(boost,0.6,1.9);
 
 }
 
