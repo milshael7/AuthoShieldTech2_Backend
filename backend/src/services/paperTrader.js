@@ -1,16 +1,11 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v35 (Institutional Entry + Exit Engine)
+// VERSION: v36 (Institutional Entry + Exit Engine)
 // ==========================================================
-
-const fs = require("fs");
-const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
-
-const ENGINE_START = Date.now();
 
 /* =========================================================
 CONFIG
@@ -28,9 +23,6 @@ const MAX_TRADE_DURATION = 15 * 60 * 1000;
 
 const HARD_STOP_LOSS = -0.0025;
 const PROFIT_PROTECTION = 0.35;
-
-const STATE_FILE =
-  path.join(process.cwd(),"paperTrader_state.json");
 
 /* =========================================================
 PRICE MEMORY
@@ -159,10 +151,6 @@ function defaultState(){
 
 const STATES = new Map();
 
-/* =========================================================
-STATE LOAD
-========================================================= */
-
 function load(tenantId){
 
   if(STATES.has(tenantId))
@@ -173,6 +161,22 @@ function load(tenantId){
   STATES.set(tenantId,state);
 
   return state;
+
+}
+
+/* =========================================================
+TRADE DURATION
+========================================================= */
+
+function computeDuration(confidence){
+
+  const ratio =
+    Math.min(Math.max(confidence || 0,0),1);
+
+  return Math.floor(
+    MIN_TRADE_DURATION +
+    ratio*(MAX_TRADE_DURATION-MIN_TRADE_DURATION)
+  );
 
 }
 
@@ -235,43 +239,47 @@ function handleOpenPosition({
       ? (price - pos.entry) / pos.entry
       : (pos.entry - price) / pos.entry;
 
-  const unrealized =
-    pos.side === "LONG"
-      ? (price - pos.entry) * pos.qty
-      : (pos.entry - price) * pos.qty;
-
-  pos.peakProfit =
-    Math.max(pos.peakProfit || 0, unrealized);
-
   const prices =
     recordPrice(tenantId,price);
+
+  /* REVERSAL */
 
   if(detectReversal(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
+  /* MOMENTUM WEAKENING */
+
   if(detectMomentumWeakening(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
+
+  /* STALL */
 
   if(detectStall(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(pos.peakProfit > 0){
+  /* PROFIT TRAILING */
+
+  pos.bestPnl =
+    Math.max(pos.bestPnl || 0,pnl);
+
+  if(pos.bestPnl > 0){
 
     const drawdown =
-      pos.peakProfit - unrealized;
+      pos.bestPnl - pnl;
 
-    const allowed =
-      pos.peakProfit * PROFIT_PROTECTION;
-
-    if(drawdown > allowed)
+    if(drawdown > pos.bestPnl * PROFIT_PROTECTION)
       return closeTrade({tenantId,state,symbol,price,ts});
 
   }
 
+  /* HARD STOP */
+
   if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(elapsed >= MAX_TRADE_DURATION)
+  /* MAX TIME */
+
+  if(elapsed >= pos.maxDuration)
     return closeTrade({tenantId,state,symbol,price,ts});
 
   return false;
@@ -316,7 +324,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    /* HANDLE OPEN POSITION */
+    /* OPEN POSITION MANAGEMENT */
 
     if(state.position){
 
@@ -382,7 +390,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       if(state.position){
 
         state.position.maxDuration =
-          MIN_TRADE_DURATION;
+          computeDuration(plan.confidence);
 
       }
 
