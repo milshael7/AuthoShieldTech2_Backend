@@ -1,7 +1,19 @@
+// ==========================================================
 // backend/src/services/regimeMemory.js
-// Institutional Market Regime Engine v3
-// Detects trend / range / volatility / dead markets
-// Adaptive learning + memory decay
+// Institutional Market Regime Engine v4
+//
+// Detects:
+// ✔ trend
+// ✔ range
+// ✔ compression
+// ✔ volatility expansion
+// ✔ dead markets
+//
+// NEW:
+// ✔ regime prediction
+// ✔ volatility shock detection
+// ✔ breakout probability modeling
+// ==========================================================
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
@@ -27,7 +39,8 @@ function getState(tenantId){
 
     REGIMES.set(key,{
       regimes:{},
-      lastRegime:"neutral"
+      lastRegime:"neutral",
+      volatilityMemory:[]
     });
 
   }
@@ -37,14 +50,57 @@ function getState(tenantId){
 }
 
 /* ======================================================
-DETECT REGIME
+VOLATILITY MEMORY
+====================================================== */
+
+function recordVolatility(tenantId,volatility){
+
+  const state = getState(tenantId);
+
+  const arr = state.volatilityMemory;
+
+  arr.push(volatility);
+
+  if(arr.length > 30)
+    arr.shift();
+
+}
+
+/* ======================================================
+VOLATILITY SHOCK DETECTION
+====================================================== */
+
+function detectVolatilityShock(state,volatility){
+
+  const arr = state.volatilityMemory;
+
+  if(arr.length < 10)
+    return false;
+
+  const avg =
+    arr.reduce((a,b)=>a+b,0)/arr.length;
+
+  if(volatility > avg * 1.8)
+    return true;
+
+  return false;
+
+}
+
+/* ======================================================
+DETECT CURRENT REGIME
 ====================================================== */
 
 function detectRegime({
+  tenantId,
   price,
   lastPrice,
   volatility
 }){
+
+  const state = getState(tenantId);
+
+  recordVolatility(tenantId,volatility);
 
   if(!lastPrice)
     return "neutral";
@@ -52,10 +108,18 @@ function detectRegime({
   const move =
     Math.abs((price-lastPrice)/lastPrice);
 
+  const shock =
+    detectVolatilityShock(state,volatility);
+
   /* DEAD MARKET */
 
   if(volatility < 0.001 && move < 0.0005)
     return "dead_market";
+
+  /* VOLATILITY SHOCK */
+
+  if(shock)
+    return "volatility_shock";
 
   /* VOLATILITY EXPANSION */
 
@@ -75,6 +139,43 @@ function detectRegime({
   /* RANGE */
 
   return "range";
+
+}
+
+/* ======================================================
+REGIME PREDICTION
+Predict next likely regime
+====================================================== */
+
+function predictNextRegime({
+  tenantId,
+  volatility
+}){
+
+  const state = getState(tenantId);
+
+  const arr = state.volatilityMemory;
+
+  if(arr.length < 10)
+    return "unknown";
+
+  const avg =
+    arr.reduce((a,b)=>a+b,0)/arr.length;
+
+  const recent =
+    arr[arr.length-1];
+
+  /* compression likely breakout */
+
+  if(recent < avg * 0.6)
+    return "compression_breakout";
+
+  /* rising volatility */
+
+  if(recent > avg * 1.3)
+    return "volatility_expansion";
+
+  return "range_continuation";
 
 }
 
@@ -106,7 +207,7 @@ function recordTrade({
   r.wins *= DECAY;
   r.losses *= DECAY;
 
-  if(profit>0)
+  if(profit > 0)
     r.wins++;
   else
     r.losses++;
@@ -136,12 +237,8 @@ function getRegimeBoost({
 
   const winRate = r.wins / total;
 
-  /* strong regime */
-
   if(winRate > 0.65)
     return clamp(1 + (winRate - 0.5)*1.2 ,1,1.8);
-
-  /* weak regime */
 
   if(winRate < 0.40)
     return 0.75;
@@ -177,6 +274,7 @@ function getRegimeConfidence({
 
 module.exports={
   detectRegime,
+  predictNextRegime,
   recordTrade,
   getRegimeBoost,
   getRegimeConfidence
