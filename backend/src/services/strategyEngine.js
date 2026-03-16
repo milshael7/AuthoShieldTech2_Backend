@@ -1,6 +1,6 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v12
-// Unified system containing ALL strategies
+// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v13
+// Adds Institutional Risk Allocation Engine
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -16,7 +16,9 @@ CONFIG
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
-  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01)
+  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
+  maxRiskPct:0.03,
+  minRiskPct:0.002
 });
 
 /* =========================================================
@@ -108,24 +110,20 @@ function updateStructure(tenantId,price,swingHigh,swingLow){
 
     if(s.lastHigh && price > s.lastHigh)
       s.structure="HH";
-
     else if(s.lastHigh && price < s.lastHigh)
       s.structure="LH";
 
     s.lastHigh = price;
-
   }
 
   if(swingLow){
 
     if(s.lastLow && price > s.lastLow)
       s.structure="HL";
-
     else if(s.lastLow && price < s.lastLow)
       s.structure="LL";
 
     s.lastLow = price;
-
   }
 
   return s.structure;
@@ -229,6 +227,53 @@ function computeConfidence(edge){
 }
 
 /* =========================================================
+RISK ALLOCATION ENGINE
+========================================================= */
+
+function computeRisk({
+  confidence,
+  volatility,
+  regime
+}){
+
+  let risk =
+    BASE_CONFIG.baseRiskPct;
+
+  /* confidence scaling */
+
+  if(confidence > 0.85)
+    risk *= 2.4;
+  else if(confidence > 0.70)
+    risk *= 1.7;
+  else if(confidence > 0.55)
+    risk *= 1.2;
+  else
+    risk *= 0.6;
+
+  /* volatility protection */
+
+  if(volatility > 0.01)
+    risk *= 0.6;
+
+  if(volatility > 0.015)
+    risk *= 0.4;
+
+  /* regime adjustment */
+
+  if(regime==="range")
+    risk *= 0.7;
+
+  if(regime==="volatility_expansion")
+    risk *= 0.75;
+
+  return clamp(
+    risk,
+    BASE_CONFIG.minRiskPct,
+    BASE_CONFIG.maxRiskPct
+  );
+}
+
+/* =========================================================
 CORE DECISION
 ========================================================= */
 
@@ -264,9 +309,6 @@ function buildDecision(context={}){
 
   const microTrend =
     detectTrend(prices,5);
-
-  const localTrend =
-    detectTrend(prices,20);
 
   const macroTrend =
     detectTrend(prices,80);
@@ -325,7 +367,14 @@ function buildDecision(context={}){
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* ================= TREND PULLBACK ================= */
+  const riskPct =
+    computeRisk({
+      confidence,
+      volatility,
+      regime
+    });
+
+  /* ================= BUY ================= */
 
   if(
     swingLow &&
@@ -339,11 +388,13 @@ function buildDecision(context={}){
       action:"BUY",
       confidence,
       edge,
-      riskPct:BASE_CONFIG.baseRiskPct,
+      riskPct,
       ts:Date.now()
     };
 
   }
+
+  /* ================= SELL ================= */
 
   if(
     swingHigh &&
@@ -357,7 +408,7 @@ function buildDecision(context={}){
       action:"SELL",
       confidence,
       edge,
-      riskPct:BASE_CONFIG.baseRiskPct,
+      riskPct,
       ts:Date.now()
     };
 
@@ -372,7 +423,7 @@ function buildDecision(context={}){
       action:"BUY",
       confidence:confidence*0.9,
       edge:0.003,
-      riskPct:BASE_CONFIG.baseRiskPct,
+      riskPct,
       ts:Date.now()
     };
 
@@ -385,7 +436,7 @@ function buildDecision(context={}){
       action:"SELL",
       confidence:confidence*0.9,
       edge:-0.003,
-      riskPct:BASE_CONFIG.baseRiskPct,
+      riskPct,
       ts:Date.now()
     };
 
