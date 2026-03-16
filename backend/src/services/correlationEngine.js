@@ -1,6 +1,6 @@
 // ======================================================
-// Institutional Correlation Intelligence Engine
-// Multi-Asset Correlation + Regime Awareness
+// Institutional Correlation Intelligence Engine v2.1
+// Multi-Asset Correlation + Market Leadership + Liquidity
 // Deterministic • Crash Safe • Analytics Ready
 // ======================================================
 
@@ -61,7 +61,7 @@ RETURNS SERIES
 
 function computeReturns(series){
 
-  const returns = [];
+  const returns=[];
 
   for(let i=1;i<series.length;i++){
 
@@ -125,6 +125,95 @@ function computeCorrelation(a,b){
 }
 
 /* =====================================================
+MARKET LEADER DETECTION
+===================================================== */
+
+function detectLeader(state){
+
+  const symbols =
+    Object.keys(state.markets);
+
+  let leader=null;
+  let strongestMove=0;
+
+  for(const s of symbols){
+
+    const series = state.markets[s];
+
+    if(series.length < 5)
+      continue;
+
+    const first =
+      series[series.length-5].price;
+
+    const last =
+      series[series.length-1].price;
+
+    const move =
+      Math.abs((last-first)/first);
+
+    if(move > strongestMove){
+
+      strongestMove = move;
+      leader = s;
+
+    }
+
+  }
+
+  return leader;
+
+}
+
+/* =====================================================
+RISK REGIME DETECTION
+===================================================== */
+
+function detectRiskRegime(state){
+
+  const markets = state.markets;
+
+  const btc = markets["BTC"] || markets["BTCUSDT"];
+  const spy = markets["SPY"];
+  const dxy = markets["DXY"];
+
+  if(!btc || btc.length<5)
+    return "neutral";
+
+  const btcMove =
+    (btc[btc.length-1].price - btc[btc.length-5].price) /
+    btc[btc.length-5].price;
+
+  let spyMove=0;
+  let dxyMove=0;
+
+  if(spy && spy.length>=5){
+
+    spyMove =
+      (spy[spy.length-1].price - spy[spy.length-5].price) /
+      spy[spy.length-5].price;
+
+  }
+
+  if(dxy && dxy.length>=5){
+
+    dxyMove =
+      (dxy[dxy.length-1].price - dxy[dxy.length-5].price) /
+      dxy[dxy.length-5].price;
+
+  }
+
+  if(btcMove>0 && spyMove>0)
+    return "risk_on";
+
+  if(btcMove<0 && dxyMove>0)
+    return "risk_off";
+
+  return "neutral";
+
+}
+
+/* =====================================================
 CORRELATION BOOST MODEL
 ===================================================== */
 
@@ -135,12 +224,14 @@ function getCorrelationBoost({
 
   const state = getState(tenantId);
 
-  const symbols = Object.keys(state.markets);
+  const symbols =
+    Object.keys(state.markets);
 
   if(symbols.length < 2)
     return 1;
 
-  const base = state.markets[symbol];
+  const base =
+    state.markets[symbol];
 
   if(!base)
     return 1;
@@ -166,8 +257,6 @@ function getCorrelationBoost({
 
   }
 
-  /* ================= BOOST MODEL ================= */
-
   if(strongest > 0.85)
     return 1.15;
 
@@ -182,7 +271,7 @@ function getCorrelationBoost({
 }
 
 /* =====================================================
-CORRELATION MATRIX (for analytics UI)
+CORRELATION MATRIX (Analytics)
 ===================================================== */
 
 function getMatrix(tenantId){
@@ -222,6 +311,22 @@ function getMatrix(tenantId){
 }
 
 /* =====================================================
+INTELLIGENCE SNAPSHOT
+===================================================== */
+
+function getMarketIntelligence(tenantId){
+
+  const state = getState(tenantId);
+
+  return{
+    leader: detectLeader(state),
+    regime: detectRiskRegime(state),
+    matrix: getMatrix(tenantId)
+  };
+
+}
+
+/* =====================================================
 RESET
 ===================================================== */
 
@@ -235,5 +340,6 @@ module.exports = {
   recordPrice,
   getCorrelationBoost,
   getMatrix,
+  getMarketIntelligence,
   resetTenant
 };
