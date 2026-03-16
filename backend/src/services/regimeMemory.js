@@ -1,11 +1,16 @@
 // backend/src/services/regimeMemory.js
-// Phase 1 — Market Regime Memory Engine
+// Market Regime Memory Engine — Stable v2
+// Improvements:
+// - memory safety
+// - learning decay
+// - faster regime detection
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 const REGIMES = new Map();
 
-const MIN_TRADES = 8;
+const MIN_TRADES = 6;
+const MAX_TENANTS = 200;
 
 /* ======================================================
 STATE
@@ -16,6 +21,11 @@ function getState(tenantId){
   const key = tenantId || "__default__";
 
   if(!REGIMES.has(key)){
+
+    /* prevent memory growth */
+
+    if(REGIMES.size > MAX_TENANTS)
+      REGIMES.clear();
 
     REGIMES.set(key,{
       regimes:{}
@@ -43,13 +53,19 @@ function detectRegime({
   const move =
     Math.abs((price-lastPrice)/lastPrice);
 
-  if(volatility > 0.02 && move > 0.01)
+  /* volatility expansion */
+
+  if(volatility > 0.01 && move > 0.006)
     return "volatility_expansion";
 
-  if(move > volatility*1.5)
+  /* directional trend */
+
+  if(move > volatility * 1.2)
     return "trend";
 
-  if(move < volatility*0.4)
+  /* compression / low movement */
+
+  if(move < volatility * 0.35)
     return "compression";
 
   return "range";
@@ -79,6 +95,11 @@ function recordTrade({
 
   const r = state.regimes[regime];
 
+  /* decay old memory so learning adapts */
+
+  r.wins *= 0.995;
+  r.losses *= 0.995;
+
   if(profit>0)
     r.wins++;
   else
@@ -102,18 +123,18 @@ function getRegimeBoost({
   if(!r)
     return 1;
 
-  const total = r.wins+r.losses;
+  const total = r.wins + r.losses;
 
   if(total < MIN_TRADES)
     return 1;
 
-  const winRate = r.wins/total;
+  const winRate = r.wins / total;
 
-  if(winRate > 0.65)
-    return clamp(1+(winRate-0.5),1,1.7);
+  if(winRate > 0.6)
+    return clamp(1+(winRate-0.5),1,1.6);
 
   if(winRate < 0.4)
-    return 0.75;
+    return 0.8;
 
   return 1;
 
