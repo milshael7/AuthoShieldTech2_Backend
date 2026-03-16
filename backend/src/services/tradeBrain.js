@@ -1,12 +1,14 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v12)
-// IMPROVED:
-// - directional stability
-// - adaptive risk scaling
-// - smarter exploration
-// - volatility awareness
-// - paper trading confidence guard
-// - volatility safety layer
+// AutoShield — Institutional Trade Brain (Adaptive Balanced v13)
+// IMPROVEMENTS:
+// ✔ directional stability
+// ✔ adaptive risk scaling
+// ✔ smarter exploration
+// ✔ volatility awareness
+// ✔ paper trading confidence guard
+// ✔ volatility safety layer
+// ✔ fixed risk mutation bug
+// ✔ improved stability smoothing
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -102,7 +104,7 @@ function makeDecision(context={}){
     paper?.cashBalance !== undefined &&
     paper?.equity !== undefined;
 
-/* ================= STRATEGY ================= */
+  /* ================= STRATEGY ================= */
 
   let strategy = {};
 
@@ -124,11 +126,12 @@ function makeDecision(context={}){
   let action = strategy.action || "WAIT";
   let confidence = safeNum(strategy.confidence,0.25);
   let edge = safeNum(strategy.edge,0);
+  let riskPct = safeNum(strategy.riskPct,0.01);
 
   if(!ACTIONS.has(action))
     action="WAIT";
 
-/* ================= POSITION RULES ================= */
+  /* ================= POSITION RULES ================= */
 
   if(!pos && action==="CLOSE")
     action="WAIT";
@@ -146,7 +149,7 @@ function makeDecision(context={}){
   if(!pos && action==="SELL" && !isPaper)
     action="WAIT";
 
-/* ================= AI OVERLAY ================= */
+  /* ================= AI OVERLAY ================= */
 
   try{
 
@@ -168,24 +171,22 @@ function makeDecision(context={}){
 
   }catch{}
 
-/* ================= VOLATILITY BOOST ================= */
+  /* ================= VOLATILITY BOOST ================= */
 
   if(volatility > 0.006){
     confidence *= 1.15;
   }
 
-/* ================= VOLATILITY SAFETY ================= */
+  /* ================= VOLATILITY SAFETY ================= */
 
   if(volatility > 0.01){
 
     confidence *= 0.8;
-
-    strategy.riskPct =
-      safeNum(strategy.riskPct,0.01) * 0.7;
+    riskPct *= 0.7;
 
   }
 
-/* ================= CONFIDENCE SMOOTHING ================= */
+  /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
     isPaper ? 0.25 : CONFIDENCE_DECAY;
@@ -204,7 +205,7 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
-/* ================= DIRECTION STABILITY ================= */
+  /* ================= DIRECTION STABILITY ================= */
 
   if(brain.lastAction === "BUY" && action === "SELL"){
     if(confidence < 0.7)
@@ -216,7 +217,7 @@ function makeDecision(context={}){
       action = "WAIT";
   }
 
-/* ================= CONFIDENCE GATE ================= */
+  /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
     isPaper ? PAPER_MIN_CONFIDENCE : MIN_CONFIDENCE_TO_TRADE;
@@ -224,7 +225,7 @@ function makeDecision(context={}){
   if(confidence < dynamicThreshold)
     action="WAIT";
 
-/* ================= SMART EXPLORATION ================= */
+  /* ================= SMART EXPLORATION ================= */
 
   if(isPaper && action==="WAIT"){
 
@@ -232,11 +233,7 @@ function makeDecision(context={}){
 
     if(Math.random() < explorationChance){
 
-      if(edge >= 0){
-        action = "BUY";
-      }else{
-        action = "SELL";
-      }
+      action = edge >= 0 ? "BUY" : "SELL";
 
       confidence = Math.max(confidence,0.15);
 
@@ -244,7 +241,7 @@ function makeDecision(context={}){
 
   }
 
-/* ================= HARD SAFETY ================= */
+  /* ================= HARD SAFETY ================= */
 
   if(!isPaper){
 
@@ -262,10 +259,7 @@ function makeDecision(context={}){
 
   }
 
-/* ================= RISK ================= */
-
-  let riskPct =
-    safeNum(strategy.riskPct,0.01);
+  /* ================= RISK SCALING ================= */
 
   if(confidence > 0.8)
     riskPct *= 1.6;
@@ -277,7 +271,7 @@ function makeDecision(context={}){
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
 
-/* ================= WAIT HANDLING ================= */
+  /* ================= WAIT HANDLING ================= */
 
   if(action==="WAIT"){
     edge = edge * 0.5;
