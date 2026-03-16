@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v16 (Institutional Paper + Live Execution)
+// VERSION: v17 (Institutional Safe Execution)
 // ==========================================================
 
 const outsideBrain =
@@ -46,6 +46,11 @@ const LIVE_MIN_TRADE_INTERVAL = 10000;
 const MAX_LIVE_QTY = 100;
 
 let LAST_LIVE_TRADE = 0;
+
+/* ================= MICRO LOCK ================= */
+
+let LAST_EXECUTION_TIME = 0;
+const EXECUTION_COOLDOWN = 500;
 
 /* =========================================================
 POSITION SIZE
@@ -125,7 +130,8 @@ function openPosition({
     entry:price,
     qty,
     capitalUsed:cost,
-    time:ts
+    time:ts,
+    peakProfit:0
   };
 
   const trade = {
@@ -187,6 +193,7 @@ function closePosition({
     qty:pos.qty,
     pnl,
     duration: ts - pos.time,
+    peakProfit:pos.peakProfit || 0,
     time:ts
   };
 
@@ -233,7 +240,20 @@ function executePaperOrder({
 
   if(!state) return null;
   if(!symbol) return null;
-  if(!Number.isFinite(price)) return null;
+
+  price = safeNum(price,0);
+
+  if(price <= 0)
+    return null;
+
+  /* MICRO EXECUTION LOCK */
+
+  const now = Date.now();
+
+  if(now - LAST_EXECUTION_TIME < EXECUTION_COOLDOWN)
+    return null;
+
+  LAST_EXECUTION_TIME = now;
 
   const pos = state.position;
 
@@ -323,21 +343,13 @@ async function executeLiveOrder({
 
   try{
 
-    if(!LIVE_TRADING_ENABLED){
-
-      console.warn("Live trading disabled");
+    if(!LIVE_TRADING_ENABLED)
       return null;
-
-    }
 
     const now = Date.now();
 
-    if(now - LAST_LIVE_TRADE < LIVE_MIN_TRADE_INTERVAL){
-
-      console.warn("Live trade blocked: too frequent");
+    if(now - LAST_LIVE_TRADE < LIVE_MIN_TRADE_INTERVAL)
       return null;
-
-    }
 
     const apiKey =
       process.env.EXCHANGE_API_KEY;
@@ -345,47 +357,29 @@ async function executeLiveOrder({
     const secret =
       process.env.EXCHANGE_SECRET;
 
-    if(!apiKey || !secret){
-
-      console.warn("Live trading keys missing");
+    if(!apiKey || !secret)
       return null;
-
-    }
 
     const quantity =
       safeNum(qty,0);
 
-    if(quantity <= 0 || quantity > MAX_LIVE_QTY){
-
-      console.warn("Invalid trade quantity");
+    if(quantity <= 0 || quantity > MAX_LIVE_QTY)
       return null;
-
-    }
 
     const tradeCapital =
       quantity * safeNum(price,0);
 
-    if(tradeCapital > MAX_TRADE_USD){
-
-      console.warn("Trade exceeds max capital");
+    if(tradeCapital > MAX_TRADE_USD)
       return null;
-
-    }
 
     const maxExposure =
       equity * MAX_EQUITY_EXPOSURE;
 
-    if(tradeCapital > maxExposure){
-
-      console.warn("Trade exceeds equity exposure");
+    if(tradeCapital > maxExposure)
       return null;
 
-    }
-
     const side =
-      action === "BUY"
-        ? "BUY"
-        : "SELL";
+      action === "BUY" ? "BUY":"SELL";
 
     const response =
       await axios.post(
@@ -403,12 +397,8 @@ async function executeLiveOrder({
         }
       );
 
-    if(!response?.data?.orderId){
-
-      console.warn("Exchange rejected order");
+    if(!response?.data?.orderId)
       return null;
-
-    }
 
     LAST_LIVE_TRADE = now;
 
