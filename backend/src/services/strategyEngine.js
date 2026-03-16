@@ -1,12 +1,6 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL STRUCTURE ENGINE v11
-// Detects:
-// ✔ swing highs / lows
-// ✔ liquidity sweeps
-// ✔ market structure (HH HL LH LL)
-// ✔ break of structure
-// ✔ change of character
-// ✔ multi timeframe trends
+// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v12
+// Unified system containing ALL strategies
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -22,13 +16,7 @@ CONFIG
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
-
-  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
-
-  regimeTrendEdgeBoost:1.25,
-  regimeRangeEdgeCut:0.80,
-  regimeExpansionBoost:1.35
-
+  baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01)
 });
 
 /* =========================================================
@@ -49,11 +37,10 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 220)
+  if(arr.length > 250)
     arr.shift();
 
   return arr;
-
 }
 
 /* =========================================================
@@ -75,7 +62,6 @@ function getStructureState(tenantId){
   }
 
   return STRUCTURE_MEMORY.get(key);
-
 }
 
 /* =========================================================
@@ -93,7 +79,7 @@ function detectSwingLow(prices){
   const e = prices[prices.length-2];
   const f = prices[prices.length-1];
 
-  return a > b && b > c && c < d && d <= e && e <= f;
+  return a>b && b>c && c<d && d<=e && e<=f;
 }
 
 function detectSwingHigh(prices){
@@ -107,69 +93,58 @@ function detectSwingHigh(prices){
   const e = prices[prices.length-2];
   const f = prices[prices.length-1];
 
-  return a < b && b < c && c > d && d >= e && e >= f;
+  return a<b && b<c && c>d && d>=e && e>=f;
 }
 
 /* =========================================================
-MARKET STRUCTURE
+STRUCTURE UPDATE
 ========================================================= */
 
 function updateStructure(tenantId,price,swingHigh,swingLow){
 
-  const state = getStructureState(tenantId);
+  const s = getStructureState(tenantId);
 
   if(swingHigh){
 
-    if(state.lastHigh && price > state.lastHigh){
+    if(s.lastHigh && price > s.lastHigh)
+      s.structure="HH";
 
-      state.structure = "HH";
+    else if(s.lastHigh && price < s.lastHigh)
+      s.structure="LH";
 
-    }
-    else if(state.lastHigh && price < state.lastHigh){
-
-      state.structure = "LH";
-
-    }
-
-    state.lastHigh = price;
+    s.lastHigh = price;
 
   }
 
   if(swingLow){
 
-    if(state.lastLow && price > state.lastLow){
+    if(s.lastLow && price > s.lastLow)
+      s.structure="HL";
 
-      state.structure = "HL";
+    else if(s.lastLow && price < s.lastLow)
+      s.structure="LL";
 
-    }
-    else if(state.lastLow && price < state.lastLow){
-
-      state.structure = "LL";
-
-    }
-
-    state.lastLow = price;
+    s.lastLow = price;
 
   }
 
-  return state.structure;
-
+  return s.structure;
 }
 
 /* =========================================================
 TREND DETECTION
 ========================================================= */
 
-function detectTrend(prices,length){
+function detectTrend(prices,len){
 
-  if(prices.length < length)
+  if(prices.length < len)
     return "neutral";
 
-  const a = prices[prices.length-length];
+  const a = prices[prices.length-len];
   const b = prices[prices.length-1];
 
-  if(b > a) return "up";
-  if(b < a) return "down";
+  if(b>a) return "up";
+  if(b<a) return "down";
 
   return "neutral";
 }
@@ -185,21 +160,29 @@ function detectLiquiditySweep(prices){
   const prevHigh =
     Math.max(...prices.slice(-8,-2));
 
+  const prevLow =
+    Math.min(...prices.slice(-8,-2));
+
   const last = prices[prices.length-1];
+  const prev = prices[prices.length-2];
 
-  const breakout = last > prevHigh;
-  const snapBack = prices[prices.length-2] < prevHigh;
+  if(prev > prevHigh && last < prev)
+    return "bearish";
 
-  return breakout && snapBack;
+  if(prev < prevLow && last > prev)
+    return "bullish";
+
+  return false;
 }
 
 /* =========================================================
-MOVE EXTENSION
+MOVE EXTENSION FILTER
 ========================================================= */
 
 function moveTooExtended(prices){
 
-  if(prices.length < 12) return false;
+  if(prices.length < 12)
+    return false;
 
   const first = prices[prices.length-12];
   const last  = prices[prices.length-1];
@@ -210,7 +193,7 @@ function moveTooExtended(prices){
 }
 
 /* =========================================================
-EDGE
+EDGE MODEL
 ========================================================= */
 
 function computeEdge({price,lastPrice,volatility,regime}){
@@ -224,13 +207,13 @@ function computeEdge({price,lastPrice,volatility,regime}){
     rawMomentum/(volatility || 0.002);
 
   if(regime==="trend")
-    normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
+    normalized *= 1.25;
 
   if(regime==="range")
-    normalized *= BASE_CONFIG.regimeRangeEdgeCut;
+    normalized *= 0.80;
 
   if(regime==="volatility_expansion")
-    normalized *= BASE_CONFIG.regimeExpansionBoost;
+    normalized *= 1.35;
 
   return clamp(normalized,-0.07,0.07);
 }
@@ -288,7 +271,7 @@ function buildDecision(context={}){
   const macroTrend =
     detectTrend(prices,80);
 
-  let regime =
+  const regime =
     regimeMemory.detectRegime({
       price,
       lastPrice,
@@ -342,14 +325,13 @@ function buildDecision(context={}){
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* ================= BUY ================= */
+  /* ================= TREND PULLBACK ================= */
 
   if(
     swingLow &&
-    structure === "HL" &&
-    macroTrend !== "down" &&
-    microTrend === "up" &&
-    edge > 0.002
+    structure==="HL" &&
+    macroTrend!=="down" &&
+    microTrend==="up"
   ){
 
     return{
@@ -363,14 +345,11 @@ function buildDecision(context={}){
 
   }
 
-  /* ================= SELL ================= */
-
   if(
     swingHigh &&
-    structure === "LH" &&
-    macroTrend !== "up" &&
-    microTrend === "down" &&
-    edge < -0.002
+    structure==="LH" &&
+    macroTrend!=="up" &&
+    microTrend==="down"
   ){
 
     return{
@@ -386,7 +365,20 @@ function buildDecision(context={}){
 
   /* ================= LIQUIDITY REVERSAL ================= */
 
-  if(liquiditySweep){
+  if(liquiditySweep==="bullish"){
+
+    return{
+      symbol,
+      action:"BUY",
+      confidence:confidence*0.9,
+      edge:0.003,
+      riskPct:BASE_CONFIG.baseRiskPct,
+      ts:Date.now()
+    };
+
+  }
+
+  if(liquiditySweep==="bearish"){
 
     return{
       symbol,
@@ -411,7 +403,7 @@ function makeDecision(context){
   return buildDecision(context);
 }
 
-module.exports = {
+module.exports={
   buildDecision,
   makeDecision
 };
