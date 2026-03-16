@@ -1,6 +1,6 @@
 // ==========================================================
-// PATTERN ENGINE — Adaptive Pattern Discovery v2
-// Improved learning speed + stable signal discovery
+// PATTERN ENGINE — Adaptive Pattern Discovery v3
+// Adds candle momentum + exhaustion detection
 // ==========================================================
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
@@ -84,6 +84,50 @@ function recordPrice({
 }
 
 /* ======================================================
+MOMENTUM ANALYSIS
+====================================================== */
+
+function analyzeMomentum(prices){
+
+  if(prices.length < 6)
+    return {strength:0,type:"neutral"};
+
+  let up = 0;
+  let down = 0;
+
+  for(let i=1;i<prices.length;i++){
+
+    if(prices[i].price > prices[i-1].price)
+      up++;
+
+    if(prices[i].price < prices[i-1].price)
+      down++;
+
+  }
+
+  const total = up + down;
+
+  if(total === 0)
+    return {strength:0,type:"neutral"};
+
+  const bias = up - down;
+  const strength = Math.abs(bias)/total;
+
+  if(strength > 0.6){
+
+    if(bias > 0)
+      return {strength,type:"bullish"};
+
+    if(bias < 0)
+      return {strength,type:"bearish"};
+
+  }
+
+  return {strength,type:"neutral"};
+
+}
+
+/* ======================================================
 PATTERN DETECTION
 ====================================================== */
 
@@ -107,6 +151,20 @@ function detectMarketPattern({
   const min = Math.min(...prices.map(p=>p.price));
 
   const range = (max-min)/first;
+
+  const momentum =
+    analyzeMomentum(prices);
+
+  /* ================= STRONG TREND ================= */
+
+  if(momentum.strength > 0.7){
+
+    return{
+      type:"strong_trend",
+      boost:1.35
+    };
+
+  }
 
   /* ================= BREAKOUT ================= */
 
