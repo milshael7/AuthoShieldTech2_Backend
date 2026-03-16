@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v12 (Institutional Capital Accounting)
+// VERSION: v13 (Institutional Live Safety Layer)
 // ==========================================================
 
 const outsideBrain =
@@ -34,6 +34,11 @@ const MAX_EQUITY_EXPOSURE = 0.05;
 const HARD_ACCOUNT_RISK   = 0.02;
 const MAX_TRADE_USD       = 2000;
 const MIN_TRADE_USD       = 25;
+
+/* ================= LIVE SAFETY ================= */
+
+const LIVE_MIN_TRADE_INTERVAL = 10000; // 10 seconds
+let LAST_LIVE_TRADE = 0;
 
 /* =========================================================
 POSITION SIZE CALCULATION
@@ -93,8 +98,6 @@ function openPosition({
 
   const cost = qty * price;
 
-  /* ================= CAPITAL CHECK ================= */
-
   if(state.availableCapital === undefined)
     state.availableCapital = state.cashBalance;
 
@@ -103,8 +106,6 @@ function openPosition({
 
   if(cost > state.availableCapital)
     return null;
-
-  /* ================= LOCK CAPITAL ================= */
 
   state.availableCapital -= cost;
   state.lockedCapital += cost;
@@ -155,21 +156,15 @@ function closePosition({
   let pnl = 0;
 
   if(pos.side === "LONG"){
-
     pnl = (price - pos.entry) * pos.qty;
-
   }
 
   if(pos.side === "SHORT"){
-
     pnl = (pos.entry - price) * pos.qty;
-
   }
 
   const capitalReturn =
     pos.capitalUsed + pnl;
-
-  /* ================= RELEASE CAPITAL ================= */
 
   state.lockedCapital -= pos.capitalUsed;
   state.availableCapital += capitalReturn;
@@ -262,8 +257,6 @@ function executePaperOrder({
   if(positionSize <= 0)
     return null;
 
-  /* ================= BUY ================= */
-
   if(action === "BUY"){
 
     if(pos){
@@ -303,8 +296,6 @@ function executePaperOrder({
     });
 
   }
-
-  /* ================= SELL ================= */
 
   if(action === "SELL"){
 
@@ -346,8 +337,6 @@ function executePaperOrder({
 
   }
 
-  /* ================= CLOSE ================= */
-
   if(action === "CLOSE"){
 
     if(!pos) return null;
@@ -380,6 +369,13 @@ async function executeLiveOrder({
 
   try{
 
+    const now = Date.now();
+
+    if(now - LAST_LIVE_TRADE < LIVE_MIN_TRADE_INTERVAL){
+      console.warn("Live trade blocked: too frequent");
+      return null;
+    }
+
     const apiKey =
       process.env.EXCHANGE_API_KEY;
 
@@ -396,6 +392,20 @@ async function executeLiveOrder({
 
     }
 
+    const quantity = safeNum(qty,0);
+
+    if(quantity <= 0){
+      console.warn("Invalid trade quantity");
+      return null;
+    }
+
+    const tradeCapital = quantity * safeNum(price,0);
+
+    if(tradeCapital > MAX_TRADE_USD){
+      console.warn("Live trade exceeds capital limit");
+      return null;
+    }
+
     const side =
       action === "BUY"
         ? "BUY"
@@ -408,7 +418,7 @@ async function executeLiveOrder({
           symbol,
           side,
           type:"MARKET",
-          quantity:qty
+          quantity
         },
         {
           headers:{
@@ -417,14 +427,21 @@ async function executeLiveOrder({
         }
       );
 
+    if(!response?.data?.orderId){
+      console.warn("Exchange rejected order");
+      return null;
+    }
+
+    LAST_LIVE_TRADE = now;
+
     return {
       result:{
         side,
         price,
-        qty,
+        qty:quantity,
         live:true,
         exchangeId:
-          response.data?.orderId
+          response.data.orderId
       }
     };
 
