@@ -1,6 +1,7 @@
 // ==========================================================
-// PATTERN ENGINE — Institutional Liquidity Map Engine v4
-// Detects liquidity pools, stop hunts, traps, and momentum
+// PATTERN ENGINE — Institutional Liquidity Map Engine v5
+// Liquidity Pools • Stop Hunts • Liquidity Magnets
+// Vacuums • Momentum Exhaustion • Trap Detection
 // ==========================================================
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
@@ -23,11 +24,7 @@ function getState(tenantId){
     PATTERN_MEMORY.set(key,{
       signals:[],
       patterns:{},
-      priceHistory:[],
-      liquidity:{
-        highs:[],
-        lows:[]
-      }
+      priceHistory:[]
     });
 
   }
@@ -70,10 +67,7 @@ function recordSignal({
 PRICE MEMORY
 ====================================================== */
 
-function recordPrice({
-  tenantId,
-  price
-}){
+function recordPrice({ tenantId, price }){
 
   const state = getState(tenantId);
 
@@ -82,7 +76,7 @@ function recordPrice({
     ts:Date.now()
   });
 
-  if(state.priceHistory.length > 80)
+  if(state.priceHistory.length > 120)
     state.priceHistory.shift();
 
 }
@@ -166,6 +160,75 @@ function detectLiquiditySweep(prices){
 }
 
 /* ======================================================
+LIQUIDITY MAGNET DETECTION
+====================================================== */
+
+function detectLiquidityMagnet(prices){
+
+  if(prices.length < 20)
+    return "neutral";
+
+  const highs =
+    prices.slice(-20).map(p=>p.price);
+
+  const max =
+    Math.max(...highs);
+
+  const min =
+    Math.min(...highs);
+
+  const last =
+    prices[prices.length-1].price;
+
+  const distHigh =
+    Math.abs(max-last)/last;
+
+  const distLow =
+    Math.abs(last-min)/last;
+
+  if(distHigh < distLow)
+    return "up";
+
+  if(distLow < distHigh)
+    return "down";
+
+  return "neutral";
+
+}
+
+/* ======================================================
+LIQUIDITY VACUUM
+====================================================== */
+
+function detectLiquidityVacuum(prices){
+
+  if(prices.length < 10)
+    return false;
+
+  const moves=[];
+
+  for(let i=1;i<prices.length;i++){
+
+    moves.push(
+      Math.abs(
+        (prices[i].price-prices[i-1].price) /
+        prices[i-1].price
+      )
+    );
+
+  }
+
+  const avg =
+    moves.reduce((a,b)=>a+b,0)/moves.length;
+
+  const lastMove =
+    moves[moves.length-1];
+
+  return lastMove > avg*2;
+
+}
+
+/* ======================================================
 MOMENTUM ANALYSIS
 ====================================================== */
 
@@ -210,12 +273,36 @@ function analyzeMomentum(prices){
 }
 
 /* ======================================================
+MOMENTUM EXHAUSTION
+====================================================== */
+
+function detectMomentumExhaustion(prices){
+
+  if(prices.length < 5)
+    return false;
+
+  const m1 =
+    prices[prices.length-1].price -
+    prices[prices.length-2].price;
+
+  const m2 =
+    prices[prices.length-2].price -
+    prices[prices.length-3].price;
+
+  const m3 =
+    prices[prices.length-3].price -
+    prices[prices.length-4].price;
+
+  return Math.abs(m1) < Math.abs(m2) &&
+         Math.abs(m2) < Math.abs(m3);
+
+}
+
+/* ======================================================
 PATTERN DETECTION
 ====================================================== */
 
-function detectMarketPattern({
-  tenantId
-}){
+function detectMarketPattern({ tenantId }){
 
   const state = getState(tenantId);
   const prices = state.priceHistory;
@@ -235,61 +322,43 @@ function detectMarketPattern({
   const momentum =
     analyzeMomentum(prices);
 
-  /* ================= STOP HUNT ================= */
+  const vacuum =
+    detectLiquidityVacuum(prices);
 
-  if(liquiditySweep === "bearish_sweep"){
+  const magnet =
+    detectLiquidityMagnet(prices);
 
-    return{
-      type:"stop_hunt_short",
-      boost:1.35
-    };
+  const exhaustion =
+    detectMomentumExhaustion(prices);
 
-  }
+  if(liquiditySweep === "bearish_sweep")
+    return { type:"stop_hunt_short", boost:1.35 };
 
-  if(liquiditySweep === "bullish_sweep"){
+  if(liquiditySweep === "bullish_sweep")
+    return { type:"stop_hunt_long", boost:1.35 };
 
-    return{
-      type:"stop_hunt_long",
-      boost:1.35
-    };
+  if(equalHighs)
+    return { type:"liquidity_pool_high", boost:1.2 };
 
-  }
+  if(equalLows)
+    return { type:"liquidity_pool_low", boost:1.2 };
 
-  /* ================= LIQUIDITY POOL ================= */
+  if(vacuum)
+    return { type:"liquidity_vacuum", boost:1.25 };
 
-  if(equalHighs){
+  if(exhaustion)
+    return { type:"momentum_exhaustion", boost:0.9 };
 
-    return{
-      type:"liquidity_pool_high",
-      boost:1.2
-    };
+  if(momentum.strength > 0.7)
+    return { type:"strong_trend", boost:1.25 };
 
-  }
+  if(magnet === "up")
+    return { type:"liquidity_magnet_up", boost:1.15 };
 
-  if(equalLows){
+  if(magnet === "down")
+    return { type:"liquidity_magnet_down", boost:1.15 };
 
-    return{
-      type:"liquidity_pool_low",
-      boost:1.2
-    };
-
-  }
-
-  /* ================= STRONG TREND ================= */
-
-  if(momentum.strength > 0.7){
-
-    return{
-      type:"strong_trend",
-      boost:1.25
-    };
-
-  }
-
-  return{
-    type:"neutral",
-    boost:1
-  };
+  return { type:"neutral", boost:1 };
 
 }
 
@@ -370,3 +439,12 @@ function getPatternEdgeBoost({
   boost *= livePattern.boost;
 
   return clamp(boost,0.6,1.9);
+
+}
+
+module.exports={
+  recordSignal,
+  recordTrade,
+  recordPrice,
+  getPatternEdgeBoost
+};
