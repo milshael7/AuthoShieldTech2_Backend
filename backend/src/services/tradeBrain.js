@@ -1,5 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Risk Governor v18)
+// AutoShield — Institutional Trade Brain (Global Alpha v19)
+// Final Production Build
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -30,8 +31,6 @@ const EDGE_MEMORY_DECAY =
 
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
-
-const PAPER_MIN_CONFIDENCE = 0.35;
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
@@ -90,6 +89,45 @@ function updatePriceMemory(brain,price){
 
   if(brain.priceMemory.length > 30)
     brain.priceMemory.shift();
+
+}
+
+/* ================= SESSION INTELLIGENCE ================= */
+
+function getSessionBoost(){
+
+  const hour =
+    new Date().getUTCHours();
+
+  if(hour >= 12 && hour <= 16)
+    return 1.08;   // NY session
+
+  if(hour >= 7 && hour < 12)
+    return 1.05;   // London session
+
+  return 0.98;     // Asia / low liquidity
+
+}
+
+/* ================= EXECUTION ALPHA ================= */
+
+function detectExecutionAlpha(prices){
+
+  if(prices.length < 4)
+    return 1;
+
+  const m1 =
+    prices[prices.length-1] -
+    prices[prices.length-2];
+
+  const m2 =
+    prices[prices.length-2] -
+    prices[prices.length-3];
+
+  if(Math.abs(m1) > Math.abs(m2)*1.3)
+    return 1.05;
+
+  return 1;
 
 }
 
@@ -257,6 +295,14 @@ function makeDecision(context={}){
 
   }catch{}
 
+  /* ================= SESSION BOOST ================= */
+
+  confidence *= getSessionBoost();
+
+  /* ================= EXECUTION ALPHA ================= */
+
+  confidence *= detectExecutionAlpha(prices);
+
   /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
@@ -276,10 +322,7 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
-  const threshold =
-    MIN_CONFIDENCE_TO_TRADE;
-
-  if(confidence < threshold)
+  if(confidence < MIN_CONFIDENCE_TO_TRADE)
     action="WAIT";
 
   /* ================= RISK SCALING ================= */
