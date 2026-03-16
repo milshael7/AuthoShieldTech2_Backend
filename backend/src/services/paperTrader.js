@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v29 (Institutional Short-Duration Engine)
+// VERSION: v30 (Institutional Short-Duration Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -25,17 +25,14 @@ const MAX_DECISIONS_MEMORY = 200;
 
 /* --- TRADE CONTROL --- */
 
-const COOLDOWN_AFTER_TRADE = 120000; // 2 minutes
+const COOLDOWN_AFTER_TRADE = 120000;
 const MAX_TRADES_PER_DAY = 40;
 const MAX_DAILY_LOSSES = 12;
 
-/* --- SHORT DURATION STRATEGY --- */
+/* --- SHORT DURATION --- */
 
 const MIN_TRADE_DURATION = 5 * 60 * 1000;
 const MAX_TRADE_DURATION = 8 * 60 * 1000;
-
-const PROFIT_TARGET = 0.0035;
-const STOP_LOSS = -0.0025;
 
 /* ========================================================= */
 
@@ -95,22 +92,18 @@ function defaultState(){
 const STATES = new Map();
 
 /* =========================================================
-STATE PERSISTENCE
+STATE STORAGE
 ========================================================= */
 
 function saveState(state){
 
   try{
-
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(state,null,2)
     );
-
   }catch(err){
-
     console.error("State save failed:",err.message);
-
   }
 
 }
@@ -157,7 +150,7 @@ function load(tenantId){
 }
 
 /* =========================================================
-CONFIG FETCH
+CONFIG
 ========================================================= */
 
 function getTradingConfig(tenantId){
@@ -177,10 +170,7 @@ function getTradingConfig(tenantId){
       tradingMode: cfg.tradingMode || "paper",
 
       riskPercent:
-        Number(cfg.riskPercent || 1),
-
-      positionMultiplier:
-        Number(cfg.positionMultiplier || 1)
+        Number(cfg.riskPercent || 1)
 
     };
 
@@ -190,8 +180,7 @@ function getTradingConfig(tenantId){
 
       enabled:true,
       tradingMode:"paper",
-      riskPercent:1,
-      positionMultiplier:1
+      riskPercent:1
 
     };
 
@@ -200,7 +189,28 @@ function getTradingConfig(tenantId){
 }
 
 /* =========================================================
-DURATION ENGINE
+VOLATILITY TARGET
+========================================================= */
+
+function computeTargets(volatility){
+
+  const base = volatility || 0.002;
+
+  const profitTarget =
+    Math.max(0.0015, base * 1.2);
+
+  const stopLoss =
+    -Math.max(0.001, base * 0.8);
+
+  return{
+    profitTarget,
+    stopLoss
+  };
+
+}
+
+/* =========================================================
+TRADE DURATION
 ========================================================= */
 
 function computeDuration(confidence){
@@ -255,12 +265,14 @@ function closeTrade({
 
   state.lastTradeTime = ts;
 
+  saveState(state);
+
   return true;
 
 }
 
 /* =========================================================
-ACTIVE TRADE MANAGEMENT
+ACTIVE POSITION
 ========================================================= */
 
 function handleOpenPosition({
@@ -281,10 +293,13 @@ function handleOpenPosition({
       ? (price - pos.entry) / pos.entry
       : (pos.entry - price) / pos.entry;
 
-  if(pnl >= PROFIT_TARGET)
+  const targets =
+    computeTargets(state.volatility);
+
+  if(pnl >= targets.profitTarget)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(pnl <= STOP_LOSS)
+  if(pnl <= targets.stopLoss)
     return closeTrade({tenantId,state,symbol,price,ts});
 
   if(elapsed >= pos.maxDuration)
@@ -345,7 +360,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }catch{}
 
-    /* ================= HANDLE OPEN TRADE ================= */
+    /* ACTIVE TRADE */
 
     if(state.position){
 
@@ -358,9 +373,10 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       });
 
       return;
+
     }
 
-    /* ================= TRADE COOLDOWN ================= */
+    /* COOLDOWN */
 
     const sinceLastTrade =
       ts - state.lastTradeTime;
@@ -374,7 +390,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     )
       return;
 
-    /* ================= AI DECISION ================= */
+    /* AI DECISION */
 
     const plan =
       makeDecision({
@@ -388,17 +404,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       }) || {action:"WAIT"};
 
     state.executionStats.decisions++;
-
-    state.decisions.push({
-      time:ts,
-      action:plan.action,
-      confidence:plan.confidence,
-      price
-    });
-
-    if(state.decisions.length > MAX_DECISIONS_MEMORY)
-      state.decisions =
-        state.decisions.slice(-MAX_DECISIONS_MEMORY);
 
     if(!["BUY","SELL"].includes(plan.action))
       return;
