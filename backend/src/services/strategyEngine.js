@@ -1,8 +1,8 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v6
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v7
 // PURPOSE
-// Detect strong entry zones near tops/bottoms
-// Avoid mid-move trades and ride momentum bursts
+// Smart top/bottom detection with momentum confirmation
+// Avoid mid-move entries and detect exhaustion
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -48,7 +48,7 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 80)
+  if(arr.length > 100)
     arr.shift();
 
   return arr;
@@ -84,7 +84,7 @@ function recordSupport(tenantId,price){
 
   levels.support.push(price);
 
-  if(levels.support.length > 25)
+  if(levels.support.length > 30)
     levels.support.shift();
 
 }
@@ -95,7 +95,7 @@ function recordResistance(tenantId,price){
 
   levels.resistance.push(price);
 
-  if(levels.resistance.length > 25)
+  if(levels.resistance.length > 30)
     levels.resistance.shift();
 
 }
@@ -121,32 +121,53 @@ function nearResistance(tenantId,price){
 }
 
 /* =========================================================
-BOTTOM / TOP DETECTION
+TOP / BOTTOM DETECTION
 ========================================================= */
 
 function detectBottom(prices){
 
-  if(prices.length < 6)
+  if(prices.length < 8)
     return false;
 
-  const a = prices[prices.length-6];
-  const b = prices[prices.length-4];
-  const c = prices[prices.length-2];
+  const a = prices[prices.length-8];
+  const b = prices[prices.length-6];
+  const c = prices[prices.length-4];
+  const d = prices[prices.length-2];
 
-  return a > b && b < c;
+  return a > b && b >= c && c < d;
 
 }
 
 function detectTop(prices){
 
-  if(prices.length < 6)
+  if(prices.length < 8)
     return false;
 
-  const a = prices[prices.length-6];
-  const b = prices[prices.length-4];
-  const c = prices[prices.length-2];
+  const a = prices[prices.length-8];
+  const b = prices[prices.length-6];
+  const c = prices[prices.length-4];
+  const d = prices[prices.length-2];
 
-  return a < b && b > c;
+  return a < b && b <= c && c > d;
+
+}
+
+/* =========================================================
+MOVE EXTENSION DETECTION
+Prevents entering after move already happened
+========================================================= */
+
+function moveTooExtended(prices){
+
+  if(prices.length < 12)
+    return false;
+
+  const first = prices[prices.length-12];
+  const last  = prices[prices.length-1];
+
+  const move = Math.abs(last-first)/first;
+
+  return move > 0.004; // already moved too far
 
 }
 
@@ -185,8 +206,8 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   const mem = getMomentum(tenantId);
 
   mem.momentum =
-    mem.momentum * 0.80 +
-    rawMomentum * 0.20;
+    mem.momentum * 0.78 +
+    rawMomentum * 0.22;
 
   let normalized =
     mem.momentum/(vol || 0.001);
@@ -211,9 +232,9 @@ CONFIDENCE MODEL
 function computeConfidence({edge,ticksSeen,regime}){
 
   if(ticksSeen < 12)
-    return 0.32;
+    return 0.30;
 
-  let base = Math.abs(edge) * 16;
+  let base = Math.abs(edge) * 18;
 
   if(regime==="trend")
     base *= 1.08;
@@ -222,7 +243,7 @@ function computeConfidence({edge,ticksSeen,regime}){
     base *= 0.92;
 
   if(regime==="expansion")
-    base *= 1.20;
+    base *= 1.25;
 
   return clamp(base,0.05,1);
 
@@ -318,6 +339,11 @@ function buildDecision(context={}){
      ENTRY LOGIC
   ========================================================= */
 
+  if(moveTooExtended(prices))
+    return {action:"WAIT",confidence,edge};
+
+  /* ---- BUY FROM BOTTOM ---- */
+
   if(
     bottomDetected &&
     nearSupport(tenantId,price) &&
@@ -335,6 +361,8 @@ function buildDecision(context={}){
     };
 
   }
+
+  /* ---- SELL FROM TOP ---- */
 
   if(
     topDetected &&
