@@ -1,8 +1,13 @@
 // ==========================================================
 // STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v8
 // PURPOSE
-// Smart top/bottom detection with market structure awareness
-// Detect trend shifts and avoid mid-move entries
+// Institutional swing detection + top/bottom trading
+// Detects:
+// ✔ swing highs
+// ✔ swing lows
+// ✔ liquidity sweeps
+// ✔ exhaustion reversals
+// ✔ avoids mid-move trades
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -84,7 +89,7 @@ function recordSupport(tenantId,price){
 
   levels.support.push(price);
 
-  if(levels.support.length > 30)
+  if(levels.support.length > 40)
     levels.support.shift();
 
 }
@@ -95,7 +100,7 @@ function recordResistance(tenantId,price){
 
   levels.resistance.push(price);
 
-  if(levels.resistance.length > 30)
+  if(levels.resistance.length > 40)
     levels.resistance.shift();
 
 }
@@ -105,7 +110,7 @@ function nearSupport(tenantId,price){
   const levels = getLevels(tenantId);
 
   return levels.support.some(
-    s => Math.abs(price-s)/s < 0.002
+    s => Math.abs(price-s)/s < 0.0025
   );
 
 }
@@ -115,79 +120,89 @@ function nearResistance(tenantId,price){
   const levels = getLevels(tenantId);
 
   return levels.resistance.some(
-    r => Math.abs(price-r)/r < 0.002
+    r => Math.abs(price-r)/r < 0.0025
   );
 
 }
 
 /* =========================================================
-MARKET STRUCTURE DETECTION
+SWING LOW DETECTION
 ========================================================= */
 
-function detectMarketStructure(prices){
+function detectSwingLow(prices){
 
-  if(prices.length < 20)
-    return "neutral";
+  if(prices.length < 6)
+    return false;
 
-  const recent = prices.slice(-20);
+  const a = prices[prices.length-6];
+  const b = prices[prices.length-5];
+  const c = prices[prices.length-4];
+  const d = prices[prices.length-3];
+  const e = prices[prices.length-2];
+  const f = prices[prices.length-1];
 
-  let highs = 0;
-  let lows = 0;
-
-  for(let i=2;i<recent.length;i++){
-
-    if(recent[i] > recent[i-1] && recent[i-1] > recent[i-2])
-      highs++;
-
-    if(recent[i] < recent[i-1] && recent[i-1] < recent[i-2])
-      lows++;
-
-  }
-
-  if(highs > lows * 1.5)
-    return "uptrend";
-
-  if(lows > highs * 1.5)
-    return "downtrend";
-
-  return "range";
+  return (
+    a > b &&
+    b > c &&
+    c < d &&
+    d <= e &&
+    e <= f
+  );
 
 }
 
 /* =========================================================
-TOP / BOTTOM DETECTION
+SWING HIGH DETECTION
 ========================================================= */
 
-function detectBottom(prices){
+function detectSwingHigh(prices){
 
-  if(prices.length < 8)
+  if(prices.length < 6)
     return false;
 
-  const a = prices[prices.length-8];
-  const b = prices[prices.length-6];
+  const a = prices[prices.length-6];
+  const b = prices[prices.length-5];
   const c = prices[prices.length-4];
-  const d = prices[prices.length-2];
+  const d = prices[prices.length-3];
+  const e = prices[prices.length-2];
+  const f = prices[prices.length-1];
 
-  return a > b && b >= c && c < d;
-
-}
-
-function detectTop(prices){
-
-  if(prices.length < 8)
-    return false;
-
-  const a = prices[prices.length-8];
-  const b = prices[prices.length-6];
-  const c = prices[prices.length-4];
-  const d = prices[prices.length-2];
-
-  return a < b && b <= c && c > d;
+  return (
+    a < b &&
+    b < c &&
+    c > d &&
+    d >= e &&
+    e >= f
+  );
 
 }
 
 /* =========================================================
-MOVE EXTENSION DETECTION
+LIQUIDITY SWEEP DETECTION
+========================================================= */
+
+function detectLiquiditySweep(prices){
+
+  if(prices.length < 8)
+    return false;
+
+  const prevHigh =
+    Math.max(...prices.slice(-8,-2));
+
+  const last = prices[prices.length-1];
+
+  const breakout =
+    last > prevHigh;
+
+  const snapBack =
+    prices[prices.length-2] < prevHigh;
+
+  return breakout && snapBack;
+
+}
+
+/* =========================================================
+MOVE EXTENSION FILTER
 ========================================================= */
 
 function moveTooExtended(prices){
@@ -200,7 +215,7 @@ function moveTooExtended(prices){
 
   const move = Math.abs(last-first)/first;
 
-  return move > 0.004;
+  return move > 0.0045;
 
 }
 
@@ -239,8 +254,8 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   const mem = getMomentum(tenantId);
 
   mem.momentum =
-    mem.momentum * 0.78 +
-    rawMomentum * 0.22;
+    mem.momentum * 0.75 +
+    rawMomentum * 0.25;
 
   let normalized =
     mem.momentum/(vol || 0.001);
@@ -300,19 +315,19 @@ function buildDecision(context={}){
   const prices =
     updatePriceMemory(tenantId,price);
 
-  const structure =
-    detectMarketStructure(prices);
+  const swingLow =
+    detectSwingLow(prices);
 
-  const bottomDetected =
-    detectBottom(prices);
+  const swingHigh =
+    detectSwingHigh(prices);
 
-  const topDetected =
-    detectTop(prices);
+  const liquiditySweep =
+    detectLiquiditySweep(prices);
 
-  if(bottomDetected)
+  if(swingLow)
     recordSupport(tenantId,price);
 
-  if(topDetected)
+  if(swingHigh)
     recordResistance(tenantId,price);
 
   let regime =
@@ -371,18 +386,19 @@ function buildDecision(context={}){
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
 
+  /* =========================================================
+     ENTRY LOGIC
+  ========================================================= */
+
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* =========================================================
-     BUY FROM BOTTOM
-  ========================================================= */
+  /* BUY FROM SWING LOW */
 
   if(
-    bottomDetected &&
+    swingLow &&
     nearSupport(tenantId,price) &&
-    edge > 0.002 &&
-    structure !== "downtrend"
+    edge > 0.002
   ){
 
     return{
@@ -392,21 +408,17 @@ function buildDecision(context={}){
       edge,
       riskPct:BASE_CONFIG.baseRiskPct,
       regime,
-      structure,
       ts:Date.now()
     };
 
   }
 
-  /* =========================================================
-     SELL FROM TOP
-  ========================================================= */
+  /* SELL FROM SWING HIGH */
 
   if(
-    topDetected &&
+    swingHigh &&
     nearResistance(tenantId,price) &&
-    edge < -0.002 &&
-    structure !== "uptrend"
+    edge < -0.002
   ){
 
     return{
@@ -416,7 +428,22 @@ function buildDecision(context={}){
       edge,
       riskPct:BASE_CONFIG.baseRiskPct,
       regime,
-      structure,
+      ts:Date.now()
+    };
+
+  }
+
+  /* LIQUIDITY SWEEP REVERSAL */
+
+  if(liquiditySweep){
+
+    return{
+      symbol,
+      action:"SELL",
+      confidence:confidence*0.9,
+      edge:-0.003,
+      riskPct:BASE_CONFIG.baseRiskPct,
+      regime,
       ts:Date.now()
     };
 
@@ -425,8 +452,7 @@ function buildDecision(context={}){
   return{
     action:"WAIT",
     confidence,
-    edge,
-    structure
+    edge
   };
 
 }
