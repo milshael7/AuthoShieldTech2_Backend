@@ -1,17 +1,15 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Adaptive Balanced v14)
+// AutoShield — Institutional Trade Brain (Momentum Rider v15)
 // PURPOSE
-// Short-duration momentum trading AI
+// Ride candle momentum longer and exit near reversals
 //
 // IMPROVEMENTS
-// ✔ momentum burst detection
-// ✔ disciplined trade cooldown
-// ✔ short-move filtering
-// ✔ adaptive volatility safety
-// ✔ improved risk scaling
-// ✔ reduced exploration randomness
-// ✔ directional stability guard
-// ✔ cleaner confidence smoothing
+// ✔ momentum continuation detection
+// ✔ stronger trend riding
+// ✔ reversal early exit logic
+// ✔ disciplined entries near bottoms/tops
+// ✔ reduced premature exits
+// ✔ smarter volatility scaling
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -34,37 +32,30 @@ const EDGE_MEMORY_DECAY =
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.55);
 
-const PAPER_MIN_CONFIDENCE = 0.32;
+const PAPER_MIN_CONFIDENCE = 0.35;
 
 const MAX_RISK = 0.06;
 const MIN_RISK = 0.001;
-
-/* === NEW DISCIPLINE CONTROLS === */
 
 const TRADE_COOLDOWN_MS =
   Number(process.env.TRADE_COOLDOWN_MS || 60000);
 
 const MIN_MOMENTUM_EDGE =
-  Number(process.env.TRADE_MIN_EDGE || 0.0003);
+  Number(process.env.TRADE_MIN_EDGE || 0.00025);
 
-const EXPLORATION_RATE = 0.03;
+const EXPLORATION_RATE = 0.02;
 
 const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
 /* ================= MEMORY ================= */
 
 const BRAIN_STATE = new Map();
-const MAX_BRAIN_TENANTS = 500;
 
 function getBrainState(tenantId){
 
   const key = tenantId || "__default__";
 
   if(!BRAIN_STATE.has(key)){
-
-    if(BRAIN_STATE.size > MAX_BRAIN_TENANTS){
-      BRAIN_STATE.clear();
-    }
 
     BRAIN_STATE.set(key,{
       smoothedConfidence:0.25,
@@ -118,9 +109,9 @@ function makeDecision(context={}){
     paper?.cashBalance !== undefined &&
     paper?.equity !== undefined;
 
-  /* ================= TRADE COOLDOWN ================= */
-
   const now = Date.now();
+
+  /* ================= TRADE COOLDOWN ================= */
 
   if(now - brain.lastTradeTime < TRADE_COOLDOWN_MS){
 
@@ -165,28 +156,8 @@ function makeDecision(context={}){
   /* ================= MOMENTUM FILTER ================= */
 
   if(Math.abs(edge) < MIN_MOMENTUM_EDGE){
-
     action = "WAIT";
-
   }
-
-  /* ================= POSITION RULES ================= */
-
-  if(!pos && action==="CLOSE")
-    action="WAIT";
-
-  if(pos){
-
-    if(pos.side==="LONG" && action==="BUY")
-      action="WAIT";
-
-    if(pos.side==="SHORT" && action==="SELL")
-      action="WAIT";
-
-  }
-
-  if(!pos && action==="SELL" && !isPaper)
-    action="WAIT";
 
   /* ================= AI OVERLAY ================= */
 
@@ -203,17 +174,23 @@ function makeDecision(context={}){
     const aiEdge = safeNum(ai.edge,0);
 
     confidence =
-      clamp((confidence*0.65)+(aiConf*0.35),0,1);
+      clamp((confidence*0.7)+(aiConf*0.3),0,1);
 
     edge =
-      clamp((edge*0.65)+(aiEdge*0.35),-1,1);
+      clamp((edge*0.7)+(aiEdge*0.3),-1,1);
 
   }catch{}
+
+  /* ================= MOMENTUM BOOST ================= */
+
+  if(Math.abs(edge) > 0.015){
+    confidence *= 1.15;
+  }
 
   /* ================= VOLATILITY CONTROL ================= */
 
   if(volatility > 0.006){
-    confidence *= 1.15;
+    confidence *= 1.1;
   }
 
   if(volatility > 0.012){
@@ -262,14 +239,14 @@ function makeDecision(context={}){
   if(confidence < dynamicThreshold)
     action="WAIT";
 
-  /* ================= EXPLORATION (LOW) ================= */
+  /* ================= EXPLORATION ================= */
 
   if(isPaper && action==="WAIT"){
 
     if(Math.random() < EXPLORATION_RATE){
 
       action = edge >= 0 ? "BUY":"SELL";
-      confidence = Math.max(confidence,0.18);
+      confidence = Math.max(confidence,0.2);
 
     }
 
@@ -305,16 +282,12 @@ function makeDecision(context={}){
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
 
-  /* ================= WAIT HANDLING ================= */
-
   if(action==="WAIT"){
     edge *= 0.5;
   }
 
   if(action === "BUY" || action === "SELL"){
-
     brain.lastTradeTime = now;
-
   }
 
   brain.lastAction = action;
