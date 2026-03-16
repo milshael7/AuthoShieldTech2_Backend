@@ -1,21 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v10 (Institutional Risk Guard)
-//
-// PURPOSE
-// ----------------------------------------------------------
-// Handles both paper and live execution.
-//
-// SAFETY LAYERS
-// ----------------------------------------------------------
-// 1. Strategy risk control
-// 2. Equity exposure cap
-// 3. Hard account risk guard
-// 4. Absolute trade size cap
-//
-// These protections prevent catastrophic trades even if
-// configuration is changed incorrectly.
+// VERSION: v11 (Stability + Trade Integrity)
 // ==========================================================
 
 const outsideBrain =
@@ -44,9 +30,9 @@ function ensureTradeLog(state){
 RISK CONFIGURATION
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.05;   // strategy layer
-const HARD_ACCOUNT_RISK   = 0.02;   // hard engine guard
-const MAX_TRADE_USD       = 2000;   // absolute safety cap
+const MAX_EQUITY_EXPOSURE = 0.05;
+const HARD_ACCOUNT_RISK   = 0.02;
+const MAX_TRADE_USD       = 2000;
 const MIN_TRADE_USD       = 25;
 
 /* =========================================================
@@ -61,22 +47,14 @@ function calculatePositionSize(state,price,riskPct){
   if(equity <= 0 || price <= 0)
     return 0;
 
-  /* ================= STRATEGY RISK ================= */
-
   const riskCapital =
     equity * riskPct;
-
-  /* ================= ENGINE EXPOSURE CAP ================= */
 
   const equityExposureCap =
     equity * MAX_EQUITY_EXPOSURE;
 
-  /* ================= HARD ACCOUNT LIMIT ================= */
-
   const hardAccountLimit =
     equity * HARD_ACCOUNT_RISK;
-
-  /* ================= FINAL ALLOWED CAPITAL ================= */
 
   const allowedCapital =
     Math.min(
@@ -117,9 +95,8 @@ function openPosition({
 
   if(side === "LONG"){
 
-    if(state.cashBalance < cost){
+    if(state.cashBalance < cost)
       return null;
-    }
 
     state.cashBalance -= cost;
 
@@ -136,6 +113,7 @@ function openPosition({
   const trade = {
     side,
     symbol,
+    entry:price,
     price,
     qty,
     pnl:0,
@@ -171,7 +149,6 @@ function closePosition({
   if(pos.side === "LONG"){
 
     pnl = (price - pos.entry) * pos.qty;
-
     state.cashBalance += cashReturn;
 
   }
@@ -179,7 +156,6 @@ function closePosition({
   if(pos.side === "SHORT"){
 
     pnl = (pos.entry - price) * pos.qty;
-
     state.cashBalance += pnl;
 
   }
@@ -187,9 +163,11 @@ function closePosition({
   const trade = {
     side:"CLOSE",
     symbol:pos.symbol,
+    entry:pos.entry,
     price,
     qty:pos.qty,
     pnl,
+    duration: ts - pos.time,
     time:ts
   };
 
@@ -436,8 +414,6 @@ async function executeLiveOrder({
   }
 
 }
-
-/* ========================================================= */
 
 module.exports = {
   executePaperOrder,
