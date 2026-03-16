@@ -1,12 +1,9 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v4
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v5
 // PURPOSE
 // Detect strong entry zones near tops/bottoms
-// and avoid mid-move trades
+// with SUPPORT / RESISTANCE memory
 // ==========================================================
-
-const fs = require("fs");
-const path = require("path");
 
 const patternEngine = require("./patternEngine");
 const regimeMemory = require("./regimeMemory");
@@ -44,18 +41,92 @@ function updatePriceMemory(tenantId,price){
 
   const key = tenantId || "__default__";
 
-  if(!PRICE_MEMORY.has(key)){
+  if(!PRICE_MEMORY.has(key))
     PRICE_MEMORY.set(key,[]);
-  }
 
   const arr = PRICE_MEMORY.get(key);
 
   arr.push(price);
 
-  if(arr.length > 30)
+  if(arr.length > 60)
     arr.shift();
 
   return arr;
+
+}
+
+/* =========================================================
+SUPPORT / RESISTANCE MEMORY
+========================================================= */
+
+const LEVEL_MEMORY = new Map();
+
+function getLevels(tenantId){
+
+  const key = tenantId || "__default__";
+
+  if(!LEVEL_MEMORY.has(key)){
+
+    LEVEL_MEMORY.set(key,{
+      support:[],
+      resistance:[]
+    });
+
+  }
+
+  return LEVEL_MEMORY.get(key);
+
+}
+
+function recordSupport(tenantId,price){
+
+  const levels = getLevels(tenantId);
+
+  levels.support.push(price);
+
+  if(levels.support.length > 20)
+    levels.support.shift();
+
+}
+
+function recordResistance(tenantId,price){
+
+  const levels = getLevels(tenantId);
+
+  levels.resistance.push(price);
+
+  if(levels.resistance.length > 20)
+    levels.resistance.shift();
+
+}
+
+function nearSupport(tenantId,price){
+
+  const levels = getLevels(tenantId);
+
+  for(const s of levels.support){
+
+    if(Math.abs(price-s)/s < 0.002)
+      return true;
+
+  }
+
+  return false;
+
+}
+
+function nearResistance(tenantId,price){
+
+  const levels = getLevels(tenantId);
+
+  for(const r of levels.resistance){
+
+    if(Math.abs(price-r)/r < 0.002)
+      return true;
+
+  }
+
+  return false;
 
 }
 
@@ -99,13 +170,8 @@ function getMomentum(tenantId){
 
   const key = tenantId || "__default__";
 
-  if(!MOMENTUM_MEMORY.has(key)){
-
-    MOMENTUM_MEMORY.set(key,{
-      momentum:0
-    });
-
-  }
+  if(!MOMENTUM_MEMORY.has(key))
+    MOMENTUM_MEMORY.set(key,{momentum:0});
 
   return MOMENTUM_MEMORY.get(key);
 
@@ -209,6 +275,12 @@ function buildDecision(context={}){
   const topDetected =
     detectTop(prices);
 
+  if(bottomDetected)
+    recordSupport(tenantId,price);
+
+  if(topDetected)
+    recordResistance(tenantId,price);
+
   let regime =
     regimeMemory.detectRegime({
       price,
@@ -271,7 +343,7 @@ function buildDecision(context={}){
      ENTRY LOGIC
   ========================================================= */
 
-  if(bottomDetected && edge > 0){
+  if(bottomDetected && nearSupport(tenantId,price) && edge > 0){
 
     return{
       symbol,
@@ -285,7 +357,7 @@ function buildDecision(context={}){
 
   }
 
-  if(topDetected && edge < 0){
+  if(topDetected && nearResistance(tenantId,price) && edge < 0){
 
     return{
       symbol,
