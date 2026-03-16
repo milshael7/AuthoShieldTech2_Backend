@@ -1,14 +1,12 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v10
-// PURPOSE
-// Multi-timeframe institutional swing engine
+// STRATEGY ENGINE — INSTITUTIONAL STRUCTURE ENGINE v11
 // Detects:
 // ✔ swing highs / lows
 // ✔ liquidity sweeps
-// ✔ market structure
-// ✔ micro / local / macro trend
-// ✔ pullback entries
-// ✔ trend alignment
+// ✔ market structure (HH HL LH LL)
+// ✔ break of structure
+// ✔ change of character
+// ✔ multi timeframe trends
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -38,6 +36,7 @@ PRICE MEMORY
 ========================================================= */
 
 const PRICE_MEMORY = new Map();
+const STRUCTURE_MEMORY = new Map();
 
 function updatePriceMemory(tenantId,price){
 
@@ -50,7 +49,7 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 200)
+  if(arr.length > 220)
     arr.shift();
 
   return arr;
@@ -58,46 +57,25 @@ function updatePriceMemory(tenantId,price){
 }
 
 /* =========================================================
-TREND DETECTION
+STRUCTURE STATE
 ========================================================= */
 
-function detectMicroTrend(prices){
+function getStructureState(tenantId){
 
-  if(prices.length < 5) return "neutral";
+  const key = tenantId || "__default__";
 
-  const a = prices[prices.length-5];
-  const b = prices[prices.length-1];
+  if(!STRUCTURE_MEMORY.has(key)){
 
-  if(b > a) return "up";
-  if(b < a) return "down";
+    STRUCTURE_MEMORY.set(key,{
+      lastHigh:null,
+      lastLow:null,
+      structure:"neutral"
+    });
 
-  return "neutral";
-}
+  }
 
-function detectLocalTrend(prices){
+  return STRUCTURE_MEMORY.get(key);
 
-  if(prices.length < 20) return "neutral";
-
-  const a = prices[prices.length-20];
-  const b = prices[prices.length-1];
-
-  if(b > a) return "up";
-  if(b < a) return "down";
-
-  return "neutral";
-}
-
-function detectMacroTrend(prices){
-
-  if(prices.length < 80) return "neutral";
-
-  const a = prices[prices.length-80];
-  const b = prices[prices.length-1];
-
-  if(b > a) return "up";
-  if(b < a) return "down";
-
-  return "neutral";
 }
 
 /* =========================================================
@@ -133,6 +111,70 @@ function detectSwingHigh(prices){
 }
 
 /* =========================================================
+MARKET STRUCTURE
+========================================================= */
+
+function updateStructure(tenantId,price,swingHigh,swingLow){
+
+  const state = getStructureState(tenantId);
+
+  if(swingHigh){
+
+    if(state.lastHigh && price > state.lastHigh){
+
+      state.structure = "HH";
+
+    }
+    else if(state.lastHigh && price < state.lastHigh){
+
+      state.structure = "LH";
+
+    }
+
+    state.lastHigh = price;
+
+  }
+
+  if(swingLow){
+
+    if(state.lastLow && price > state.lastLow){
+
+      state.structure = "HL";
+
+    }
+    else if(state.lastLow && price < state.lastLow){
+
+      state.structure = "LL";
+
+    }
+
+    state.lastLow = price;
+
+  }
+
+  return state.structure;
+
+}
+
+/* =========================================================
+TREND DETECTION
+========================================================= */
+
+function detectTrend(prices,length){
+
+  if(prices.length < length)
+    return "neutral";
+
+  const a = prices[prices.length-length];
+  const b = prices[prices.length-1];
+
+  if(b > a) return "up";
+  if(b < a) return "down";
+
+  return "neutral";
+}
+
+/* =========================================================
 LIQUIDITY SWEEP
 ========================================================= */
 
@@ -152,7 +194,7 @@ function detectLiquiditySweep(prices){
 }
 
 /* =========================================================
-MOVE EXTENSION FILTER
+MOVE EXTENSION
 ========================================================= */
 
 function moveTooExtended(prices){
@@ -168,43 +210,18 @@ function moveTooExtended(prices){
 }
 
 /* =========================================================
-MOMENTUM MEMORY
+EDGE
 ========================================================= */
 
-const MOMENTUM_MEMORY = new Map();
+function computeEdge({price,lastPrice,volatility,regime}){
 
-function getMomentum(tenantId){
-
-  const key = tenantId || "__default__";
-
-  if(!MOMENTUM_MEMORY.has(key))
-    MOMENTUM_MEMORY.set(key,{momentum:0});
-
-  return MOMENTUM_MEMORY.get(key);
-}
-
-/* =========================================================
-EDGE MODEL
-========================================================= */
-
-function computeEdge({price,lastPrice,volatility,regime,tenantId}){
-
-  if(!Number.isFinite(price) || !Number.isFinite(lastPrice))
-    return 0;
-
-  const vol = volatility || 0.002;
+  if(!lastPrice) return 0;
 
   const rawMomentum =
     (price-lastPrice)/lastPrice;
 
-  const mem = getMomentum(tenantId);
-
-  mem.momentum =
-    mem.momentum * 0.75 +
-    rawMomentum * 0.25;
-
   let normalized =
-    mem.momentum/(vol || 0.001);
+    rawMomentum/(volatility || 0.002);
 
   if(regime==="trend")
     normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
@@ -212,7 +229,7 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   if(regime==="range")
     normalized *= BASE_CONFIG.regimeRangeEdgeCut;
 
-  if(regime==="expansion")
+  if(regime==="volatility_expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
   return clamp(normalized,-0.07,0.07);
@@ -224,9 +241,8 @@ CONFIDENCE
 
 function computeConfidence(edge){
 
-  let base = Math.abs(edge) * 18;
+  return clamp(Math.abs(edge)*18,0.05,1);
 
-  return clamp(base,0.05,1);
 }
 
 /* =========================================================
@@ -246,23 +262,31 @@ function buildDecision(context={}){
   const prices =
     updatePriceMemory(tenantId,price);
 
-  const microTrend =
-    detectMicroTrend(prices);
-
-  const localTrend =
-    detectLocalTrend(prices);
-
-  const macroTrend =
-    detectMacroTrend(prices);
-
   const swingLow =
     detectSwingLow(prices);
 
   const swingHigh =
     detectSwingHigh(prices);
 
+  const structure =
+    updateStructure(
+      tenantId,
+      price,
+      swingHigh,
+      swingLow
+    );
+
   const liquiditySweep =
     detectLiquiditySweep(prices);
+
+  const microTrend =
+    detectTrend(prices,5);
+
+  const localTrend =
+    detectTrend(prices,20);
+
+  const macroTrend =
+    detectTrend(prices,80);
 
   let regime =
     regimeMemory.detectRegime({
@@ -276,8 +300,7 @@ function buildDecision(context={}){
       price,
       lastPrice,
       volatility,
-      regime,
-      tenantId
+      regime
     });
 
   edge *= patternEngine.getPatternEdgeBoost({
@@ -319,14 +342,12 @@ function buildDecision(context={}){
   if(moveTooExtended(prices))
     return {action:"WAIT",confidence,edge};
 
-  /* =========================================================
-     BUY LOGIC
-  ========================================================= */
+  /* ================= BUY ================= */
 
   if(
     swingLow &&
+    structure === "HL" &&
     macroTrend !== "down" &&
-    localTrend !== "down" &&
     microTrend === "up" &&
     edge > 0.002
   ){
@@ -342,14 +363,12 @@ function buildDecision(context={}){
 
   }
 
-  /* =========================================================
-     SELL LOGIC
-  ========================================================= */
+  /* ================= SELL ================= */
 
   if(
     swingHigh &&
+    structure === "LH" &&
     macroTrend !== "up" &&
-    localTrend !== "up" &&
     microTrend === "down" &&
     edge < -0.002
   ){
@@ -365,9 +384,7 @@ function buildDecision(context={}){
 
   }
 
-  /* =========================================================
-     LIQUIDITY SWEEP REVERSAL
-  ========================================================= */
+  /* ================= LIQUIDITY REVERSAL ================= */
 
   if(liquiditySweep){
 
