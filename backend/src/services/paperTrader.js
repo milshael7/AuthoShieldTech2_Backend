@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v37 (Institutional Entry + Exit Engine)
+// VERSION: v38 (Institutional Candle Ride Engine)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -24,6 +24,8 @@ const MAX_TRADE_DURATION = 15 * 60 * 1000;
 const HARD_STOP_LOSS = -0.0025;
 const PROFIT_PROTECTION = 0.35;
 
+const STRONG_TREND_CANDLES = 4;
+
 /* =========================================================
 PRICE MEMORY
 ========================================================= */
@@ -41,10 +43,42 @@ function recordPrice(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 14)
+  if(arr.length > 20)
     arr.shift();
 
   return arr;
+
+}
+
+/* =========================================================
+TREND RUN DETECTION
+========================================================= */
+
+function detectTrendRun(prices,side){
+
+  if(prices.length < STRONG_TREND_CANDLES + 1)
+    return false;
+
+  let run = 0;
+
+  for(let i=prices.length-1;i>0;i--){
+
+    const move =
+      prices[i] - prices[i-1];
+
+    if(side === "LONG" && move > 0)
+      run++;
+    else if(side === "SHORT" && move < 0)
+      run++;
+    else
+      break;
+
+    if(run >= STRONG_TREND_CANDLES)
+      return true;
+
+  }
+
+  return false;
 
 }
 
@@ -242,27 +276,30 @@ function handleOpenPosition({
   const prices =
     recordPrice(tenantId,price);
 
-  /* MIN TRADE TIME PROTECTION */
+  const strongTrend =
+    detectTrendRun(prices,pos.side);
+
+  /* MIN TRADE TIME */
 
   if(elapsed < MIN_TRADE_DURATION && pnl > HARD_STOP_LOSS)
     return false;
 
-  /* REVERSAL */
+  /* EXIT ONLY IF TREND NOT STRONG */
 
-  if(detectReversal(prices) && pnl > 0)
-    return closeTrade({tenantId,state,symbol,price,ts});
+  if(!strongTrend){
 
-  /* MOMENTUM WEAKENING */
+    if(detectReversal(prices) && pnl > 0)
+      return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(detectMomentumWeakening(prices) && pnl > 0)
-    return closeTrade({tenantId,state,symbol,price,ts});
+    if(detectMomentumWeakening(prices) && pnl > 0)
+      return closeTrade({tenantId,state,symbol,price,ts});
 
-  /* STALL */
+    if(detectStall(prices) && pnl > 0)
+      return closeTrade({tenantId,state,symbol,price,ts});
 
-  if(detectStall(prices) && pnl > 0)
-    return closeTrade({tenantId,state,symbol,price,ts});
+  }
 
-  /* PROFIT TRAILING */
+  /* TRAILING PROFIT */
 
   if(pnl > 0.001){
 
@@ -300,10 +337,7 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   const state = load(tenantId);
 
   if(!state.running) return;
-
-  if(!Number.isFinite(price) || price<=0)
-    return;
-
+  if(!Number.isFinite(price) || price<=0) return;
   if(state._locked) return;
 
   state._locked = true;
@@ -329,8 +363,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    /* HANDLE OPEN POSITION */
-
     if(state.position){
 
       handleOpenPosition({
@@ -345,8 +377,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }
 
-    /* COOLDOWN */
-
     if(ts - state.lastTradeTime < COOLDOWN_AFTER_TRADE)
       return;
 
@@ -355,8 +385,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       state.limits.lossesToday >= MAX_DAILY_LOSSES
     )
       return;
-
-    /* AI DECISION */
 
     const plan =
       makeDecision({
