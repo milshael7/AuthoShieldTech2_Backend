@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v11 (Stability + Trade Integrity)
+// VERSION: v12 (Institutional Capital Accounting)
 // ==========================================================
 
 const outsideBrain =
@@ -93,20 +93,28 @@ function openPosition({
 
   const cost = qty * price;
 
-  if(side === "LONG"){
+  /* ================= CAPITAL CHECK ================= */
 
-    if(state.cashBalance < cost)
-      return null;
+  if(state.availableCapital === undefined)
+    state.availableCapital = state.cashBalance;
 
-    state.cashBalance -= cost;
+  if(state.lockedCapital === undefined)
+    state.lockedCapital = 0;
 
-  }
+  if(cost > state.availableCapital)
+    return null;
+
+  /* ================= LOCK CAPITAL ================= */
+
+  state.availableCapital -= cost;
+  state.lockedCapital += cost;
 
   state.position = {
     symbol,
     side,
     entry:price,
     qty,
+    capitalUsed:cost,
     time:ts
   };
 
@@ -116,6 +124,7 @@ function openPosition({
     entry:price,
     price,
     qty,
+    capitalUsed:cost,
     pnl:0,
     time:ts
   };
@@ -144,21 +153,29 @@ function closePosition({
   if(!pos) return null;
 
   let pnl = 0;
-  let cashReturn = pos.qty * price;
 
   if(pos.side === "LONG"){
 
     pnl = (price - pos.entry) * pos.qty;
-    state.cashBalance += cashReturn;
 
   }
 
   if(pos.side === "SHORT"){
 
     pnl = (pos.entry - price) * pos.qty;
-    state.cashBalance += pnl;
 
   }
+
+  const capitalReturn =
+    pos.capitalUsed + pnl;
+
+  /* ================= RELEASE CAPITAL ================= */
+
+  state.lockedCapital -= pos.capitalUsed;
+  state.availableCapital += capitalReturn;
+
+  state.cashBalance =
+    state.availableCapital;
 
   const trade = {
     side:"CLOSE",
@@ -216,7 +233,8 @@ function executePaperOrder({
   if(!symbol) return null;
   if(!Number.isFinite(price)) return null;
 
-  if(state.cashBalance <= 0) return null;
+  if(state.cashBalance <= 0)
+    return null;
 
   riskPct =
     clamp(
@@ -231,16 +249,20 @@ function executePaperOrder({
     safeNum(qty,0);
 
   if(positionSize <= 0){
+
     positionSize =
       calculatePositionSize(
         state,
         price,
         riskPct
       );
+
   }
 
   if(positionSize <= 0)
     return null;
+
+  /* ================= BUY ================= */
 
   if(action === "BUY"){
 
@@ -282,6 +304,8 @@ function executePaperOrder({
 
   }
 
+  /* ================= SELL ================= */
+
   if(action === "SELL"){
 
     if(pos){
@@ -321,6 +345,8 @@ function executePaperOrder({
     });
 
   }
+
+  /* ================= CLOSE ================= */
 
   if(action === "CLOSE"){
 
