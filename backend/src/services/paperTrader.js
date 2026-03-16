@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v34 (Institutional Exit Intelligence Engine)
+// VERSION: v35 (Institutional Entry + Exit Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -9,8 +9,6 @@ const path = require("path");
 
 const { makeDecision } = require("./tradeBrain");
 const executionEngine = require("./executionEngine");
-const memoryBrain = require("../../brainMemory/memoryBrain");
-const { readDb } = require("../lib/db");
 
 const ENGINE_START = Date.now();
 
@@ -108,16 +106,16 @@ function detectStall(prices){
 
   if(prices.length < 5) return false;
 
-  const range1 =
+  const r1 =
     Math.abs(prices[prices.length-1] - prices[prices.length-2]);
 
-  const range2 =
+  const r2 =
     Math.abs(prices[prices.length-2] - prices[prices.length-3]);
 
-  const range3 =
+  const r3 =
     Math.abs(prices[prices.length-3] - prices[prices.length-4]);
 
-  return range1 < range2 && range2 < range3;
+  return r1 < r2 && r2 < r3;
 
 }
 
@@ -127,33 +125,21 @@ STATE
 
 function defaultState(){
 
-  const startingCapital = START_BAL;
-
   return{
 
     running:true,
 
-    cashBalance:startingCapital,
-    availableCapital:startingCapital,
+    cashBalance:START_BAL,
+    availableCapital:START_BAL,
     lockedCapital:0,
-
-    equity:startingCapital,
-    peakEquity:startingCapital,
 
     position:null,
 
     trades:[],
-    decisions:[],
 
     volatility:0.003,
     lastPrice:60000,
     lastTradeTime:0,
-
-    realized:{
-      wins:0,
-      losses:0,
-      net:0
-    },
 
     limits:{
       tradesToday:0,
@@ -174,76 +160,19 @@ function defaultState(){
 const STATES = new Map();
 
 /* =========================================================
-STATE STORAGE
+STATE LOAD
 ========================================================= */
-
-function saveState(state){
-
-  try{
-
-    fs.writeFileSync(
-      STATE_FILE,
-      JSON.stringify(state,null,2)
-    );
-
-  }catch(err){
-
-    console.error("State save failed:",err.message);
-
-  }
-
-}
-
-function loadStateFromDisk(){
-
-  try{
-
-    if(!fs.existsSync(STATE_FILE))
-      return null;
-
-    return JSON.parse(
-      fs.readFileSync(STATE_FILE,"utf-8")
-    );
-
-  }catch(err){
-
-    console.error("State load failed:",err.message);
-    return null;
-
-  }
-
-}
 
 function load(tenantId){
 
   if(STATES.has(tenantId))
     return STATES.get(tenantId);
 
-  const diskState =
-    loadStateFromDisk();
-
-  const state =
-    diskState || defaultState();
+  const state = defaultState();
 
   STATES.set(tenantId,state);
 
   return state;
-
-}
-
-/* =========================================================
-TRADE DURATION
-========================================================= */
-
-function computeDuration(confidence){
-
-  const ratio =
-    Math.min(Math.max(confidence || 0,0),1);
-
-  return Math.floor(
-    MIN_TRADE_DURATION +
-    ratio*(MAX_TRADE_DURATION-MIN_TRADE_DURATION)
-  );
 
 }
 
@@ -275,25 +204,17 @@ function closeTrade({
 
   const pnl = closed.result.pnl || 0;
 
-  state.realized.net += pnl;
-
-  if(pnl > 0)
-    state.realized.wins++;
-  else{
-    state.realized.losses++;
+  if(pnl < 0)
     state.limits.lossesToday++;
-  }
 
   state.lastTradeTime = ts;
-
-  saveState(state);
 
   return true;
 
 }
 
 /* =========================================================
-ACTIVE POSITION MANAGEMENT
+POSITION MANAGEMENT
 ========================================================= */
 
 function handleOpenPosition({
@@ -325,22 +246,14 @@ function handleOpenPosition({
   const prices =
     recordPrice(tenantId,price);
 
-  /* REVERSAL */
-
   if(detectReversal(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
-
-  /* MOMENTUM WEAKENING */
 
   if(detectMomentumWeakening(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  /* STALL DETECTION */
-
   if(detectStall(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
-
-  /* PROFIT PROTECTION */
 
   if(pos.peakProfit > 0){
 
@@ -355,35 +268,18 @@ function handleOpenPosition({
 
   }
 
-  /* HARD STOP */
-
   if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
 
-  /* TIME EXIT */
-
-  if(elapsed >= pos.maxDuration){
-
-    const move =
-      prices[prices.length-1] -
-      prices[prices.length-3];
-
-    const momentumStillStrong =
-      pos.side === "LONG"
-        ? move > 0
-        : move < 0;
-
-    if(!momentumStillStrong)
-      return closeTrade({tenantId,state,symbol,price,ts});
-
-  }
+  if(elapsed >= MAX_TRADE_DURATION)
+    return closeTrade({tenantId,state,symbol,price,ts});
 
   return false;
 
 }
 
 /* =========================================================
-AI TICK
+TICK
 ========================================================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
@@ -420,6 +316,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
+    /* HANDLE OPEN POSITION */
+
     if(state.position){
 
       handleOpenPosition({
@@ -431,6 +329,62 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       });
 
       return;
+
+    }
+
+    /* COOLDOWN */
+
+    if(ts - state.lastTradeTime < COOLDOWN_AFTER_TRADE)
+      return;
+
+    if(
+      state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
+      state.limits.lossesToday >= MAX_DAILY_LOSSES
+    )
+      return;
+
+    /* AI DECISION */
+
+    const plan =
+      makeDecision({
+
+        tenantId,
+        symbol,
+        last:price,
+        paper:state,
+        ticksSeen:state.executionStats.ticks
+
+      }) || {action:"WAIT"};
+
+    state.executionStats.decisions++;
+
+    if(!["BUY","SELL"].includes(plan.action))
+      return;
+
+    const exec =
+      executionEngine.executePaperOrder({
+
+        tenantId,
+        symbol,
+        action:plan.action,
+        price,
+        riskPct:0.01,
+        state,
+        ts
+
+      });
+
+    if(exec?.result){
+
+      state.executionStats.trades++;
+      state.limits.tradesToday++;
+
+      if(state.position){
+
+        state.position.maxDuration =
+          MIN_TRADE_DURATION;
+
+      }
 
     }
 
