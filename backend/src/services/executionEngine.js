@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v17 (Institutional Safe Execution)
+// VERSION: v18 (Institutional Scaling Execution Engine)
 // ==========================================================
 
 const outsideBrain =
@@ -152,7 +152,71 @@ function openPosition({
 }
 
 /* =========================================================
-CLOSE POSITION
+PARTIAL CLOSE
+========================================================= */
+
+function partialClosePosition({
+  tenantId,
+  state,
+  price,
+  closePct,
+  ts
+}){
+
+  ensureTradeLog(state);
+
+  const pos = state.position;
+
+  if(!pos) return null;
+
+  closePct = clamp(closePct,0.01,1);
+
+  const qtyClose =
+    pos.qty * closePct;
+
+  const remainingQty =
+    pos.qty - qtyClose;
+
+  let pnl = 0;
+
+  if(pos.side === "LONG")
+    pnl = (price - pos.entry) * qtyClose;
+
+  if(pos.side === "SHORT")
+    pnl = (pos.entry - price) * qtyClose;
+
+  const capitalReleased =
+    (pos.capitalUsed * closePct) + pnl;
+
+  state.lockedCapital -=
+    pos.capitalUsed * closePct;
+
+  state.availableCapital +=
+    capitalReleased;
+
+  pos.qty = remainingQty;
+
+  pos.capitalUsed =
+    pos.capitalUsed * (1 - closePct);
+
+  const trade = {
+    side:"PARTIAL_CLOSE",
+    symbol:pos.symbol,
+    entry:pos.entry,
+    price,
+    qty:qtyClose,
+    pnl,
+    time:ts
+  };
+
+  state.trades.push(trade);
+
+  return { result: trade };
+
+}
+
+/* =========================================================
+FULL CLOSE
 ========================================================= */
 
 function closePosition({
@@ -233,6 +297,7 @@ function executePaperOrder({
   price,
   riskPct,
   qty,
+  closePct,
   state,
   ts = Date.now()
 
@@ -245,8 +310,6 @@ function executePaperOrder({
 
   if(price <= 0)
     return null;
-
-  /* MICRO EXECUTION LOCK */
 
   const now = Date.now();
 
@@ -308,6 +371,22 @@ function executePaperOrder({
 
   }
 
+  /* PARTIAL CLOSE */
+
+  if(action === "PARTIAL_CLOSE"){
+
+    if(!pos) return null;
+
+    return partialClosePosition({
+      tenantId,
+      state,
+      price,
+      closePct: safeNum(closePct,0.25),
+      ts
+    });
+
+  }
+
   /* CLOSE */
 
   if(action === "CLOSE"){
@@ -327,106 +406,6 @@ function executePaperOrder({
 
 }
 
-/* =========================================================
-LIVE EXECUTION
-========================================================= */
-
-async function executeLiveOrder({
-
-  symbol,
-  action,
-  price,
-  qty,
-  equity
-
-}){
-
-  try{
-
-    if(!LIVE_TRADING_ENABLED)
-      return null;
-
-    const now = Date.now();
-
-    if(now - LAST_LIVE_TRADE < LIVE_MIN_TRADE_INTERVAL)
-      return null;
-
-    const apiKey =
-      process.env.EXCHANGE_API_KEY;
-
-    const secret =
-      process.env.EXCHANGE_SECRET;
-
-    if(!apiKey || !secret)
-      return null;
-
-    const quantity =
-      safeNum(qty,0);
-
-    if(quantity <= 0 || quantity > MAX_LIVE_QTY)
-      return null;
-
-    const tradeCapital =
-      quantity * safeNum(price,0);
-
-    if(tradeCapital > MAX_TRADE_USD)
-      return null;
-
-    const maxExposure =
-      equity * MAX_EQUITY_EXPOSURE;
-
-    if(tradeCapital > maxExposure)
-      return null;
-
-    const side =
-      action === "BUY" ? "BUY":"SELL";
-
-    const response =
-      await axios.post(
-        process.env.EXCHANGE_ORDER_ENDPOINT,
-        {
-          symbol,
-          side,
-          type:"MARKET",
-          quantity
-        },
-        {
-          headers:{
-            "X-API-KEY":apiKey
-          }
-        }
-      );
-
-    if(!response?.data?.orderId)
-      return null;
-
-    LAST_LIVE_TRADE = now;
-
-    return {
-      result:{
-        side,
-        price,
-        qty:quantity,
-        live:true,
-        exchangeId:
-          response.data.orderId
-      }
-    };
-
-  }catch(err){
-
-    console.error(
-      "Live execution failed:",
-      err.message
-    );
-
-    return null;
-
-  }
-
-}
-
 module.exports = {
-  executePaperOrder,
-  executeLiveOrder
+  executePaperOrder
 };
