@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v27 (Short-Duration AI Trading)
+// VERSION: v28 (Institutional Short-Duration Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -14,10 +14,15 @@ const { readDb } = require("../lib/db");
 
 const ENGINE_START = Date.now();
 
+/* =========================================================
+CONFIG
+========================================================= */
+
 const START_BAL =
   Number(process.env.PAPER_START_BALANCE || 100000);
 
 const MAX_DECISIONS_MEMORY = 200;
+
 const MIN_TRADE_INTERVAL = 30000;
 
 const MAX_TRADES_PER_DAY = 40;
@@ -28,15 +33,17 @@ const MAX_DAILY_LOSSES = 12;
 const MIN_TRADE_DURATION = 5 * 60 * 1000;
 const MAX_TRADE_DURATION = 8 * 60 * 1000;
 
-const PROFIT_TARGET = 0.0025;
-const STOP_LOSS = -0.002;
+const PROFIT_TARGET = 0.0035;
+const STOP_LOSS = -0.0025;
 
 /* ========================================================= */
 
 const STATE_FILE =
   path.join(process.cwd(),"paperTrader_state.json");
 
-/* ================= STATE ================= */
+/* =========================================================
+STATE
+========================================================= */
 
 function defaultState(){
 
@@ -81,21 +88,28 @@ function defaultState(){
 
     _locked:false
   };
+
 }
 
 const STATES = new Map();
 
-/* ================= STATE PERSISTENCE ================= */
+/* =========================================================
+STATE PERSISTENCE
+========================================================= */
 
 function saveState(state){
 
   try{
+
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(state,null,2)
     );
+
   }catch(err){
+
     console.error("State save failed:",err.message);
+
   }
 
 }
@@ -120,7 +134,9 @@ function loadStateFromDisk(){
 
 }
 
-/* ================= LOAD ================= */
+/* =========================================================
+LOAD STATE
+========================================================= */
 
 function load(tenantId){
 
@@ -145,7 +161,9 @@ function load(tenantId){
 
 }
 
-/* ================= CONFIG ================= */
+/* =========================================================
+CONFIG FETCH
+========================================================= */
 
 function getTradingConfig(tenantId){
 
@@ -161,15 +179,9 @@ function getTradingConfig(tenantId){
     return {
 
       enabled: cfg.enabled ?? true,
-
-      tradingMode:
-        cfg.tradingMode || "paper",
-
-      riskPercent:
-        Number(cfg.riskPercent || 1.5),
-
-      positionMultiplier:
-        Number(cfg.positionMultiplier || 1)
+      tradingMode: cfg.tradingMode || "paper",
+      riskPercent: Number(cfg.riskPercent || 1.5),
+      positionMultiplier: Number(cfg.positionMultiplier || 1)
 
     };
 
@@ -188,11 +200,14 @@ function getTradingConfig(tenantId){
 
 }
 
-/* ================= DURATION ENGINE ================= */
+/* =========================================================
+DURATION ENGINE
+========================================================= */
 
 function computeDuration(confidence){
 
-  if(!confidence) return MIN_TRADE_DURATION;
+  if(!confidence)
+    return MIN_TRADE_DURATION;
 
   const ratio =
     Math.min(Math.max(confidence,0),1);
@@ -204,7 +219,56 @@ function computeDuration(confidence){
 
 }
 
-/* ================= POSITION TIMER ================= */
+/* =========================================================
+CLOSE TRADE HANDLER
+========================================================= */
+
+function closeTrade({
+
+  tenantId,
+  state,
+  symbol,
+  price,
+  ts
+
+}){
+
+  const closed =
+    executionEngine.executePaperOrder({
+
+      tenantId,
+      symbol,
+      action:"CLOSE",
+      price,
+      state,
+      ts
+
+    });
+
+  if(!closed?.result) return false;
+
+  const pnl = closed.result.pnl || 0;
+
+  state.realized.net += pnl;
+
+  if(pnl > 0){
+
+    state.realized.wins++;
+
+  }else{
+
+    state.realized.losses++;
+    state.limits.lossesToday++;
+
+  }
+
+  return true;
+
+}
+
+/* =========================================================
+ACTIVE TRADE MANAGEMENT
+========================================================= */
 
 function handleOpenPosition({
 
@@ -217,7 +281,8 @@ function handleOpenPosition({
 }){
 
   const pos = state.position;
-  if(!pos) return;
+
+  if(!pos) return false;
 
   const elapsed = ts - pos.time;
 
@@ -230,52 +295,39 @@ function handleOpenPosition({
 
   if(pnl >= PROFIT_TARGET){
 
-    executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action:"CLOSE",
-      price,
-      state,
-      ts
+    return closeTrade({
+      tenantId,state,symbol,price,ts
     });
 
-    return;
   }
 
   /* STOP LOSS */
 
   if(pnl <= STOP_LOSS){
 
-    executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action:"CLOSE",
-      price,
-      state,
-      ts
+    return closeTrade({
+      tenantId,state,symbol,price,ts
     });
 
-    return;
   }
 
   /* MAX DURATION */
 
-  if(elapsed >= pos.maxDuration){
+  if(elapsed >= (pos.maxDuration || MIN_TRADE_DURATION)){
 
-    executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action:"CLOSE",
-      price,
-      state,
-      ts
+    return closeTrade({
+      tenantId,state,symbol,price,ts
     });
 
   }
 
+  return false;
+
 }
 
-/* ================= AI TICK ================= */
+/* =========================================================
+AI TICK
+========================================================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
 
@@ -291,6 +343,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
   if(state._locked) return;
 
   state._locked = true;
+
+  let stateChanged = false;
 
   try{
 
@@ -316,27 +370,29 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     try{
 
       memoryBrain.recordMarketState({
-
         tenantId,
         symbol,
         price,
         volatility:state.volatility
-
       });
 
     }catch{}
 
-    /* HANDLE ACTIVE TRADE */
+    /* HANDLE ACTIVE POSITION */
 
     if(state.position){
 
-      handleOpenPosition({
-        tenantId,
-        state,
-        symbol,
-        price,
-        ts
-      });
+      const closed =
+        handleOpenPosition({
+          tenantId,
+          state,
+          symbol,
+          price,
+          ts
+        });
+
+      if(closed)
+        stateChanged = true;
 
     }
 
@@ -393,14 +449,15 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
         state.limits.tradesToday++;
 
-        /* STORE TRADE DURATION */
-
         if(state.position){
 
           state.position.maxDuration =
-            computeDuration(plan.confidence);
+            computeDuration(plan.confidence)
+            || MIN_TRADE_DURATION;
 
         }
+
+        stateChanged = true;
 
       }
 
@@ -429,7 +486,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     if(state.equity > state.peakEquity)
       state.peakEquity = state.equity;
 
-    saveState(state);
+    if(stateChanged)
+      saveState(state);
 
   }
   finally{
@@ -440,7 +498,9 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
 }
 
-/* ================= SNAPSHOT ================= */
+/* =========================================================
+SNAPSHOT
+========================================================= */
 
 function snapshot(tenantId){
 
