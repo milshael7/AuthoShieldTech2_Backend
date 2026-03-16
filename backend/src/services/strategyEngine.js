@@ -1,8 +1,8 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v5
+// STRATEGY ENGINE — INSTITUTIONAL MOMENTUM ENTRY v6
 // PURPOSE
 // Detect strong entry zones near tops/bottoms
-// with SUPPORT / RESISTANCE memory
+// Avoid mid-move trades and ride momentum bursts
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -48,7 +48,7 @@ function updatePriceMemory(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 60)
+  if(arr.length > 80)
     arr.shift();
 
   return arr;
@@ -84,7 +84,7 @@ function recordSupport(tenantId,price){
 
   levels.support.push(price);
 
-  if(levels.support.length > 20)
+  if(levels.support.length > 25)
     levels.support.shift();
 
 }
@@ -95,7 +95,7 @@ function recordResistance(tenantId,price){
 
   levels.resistance.push(price);
 
-  if(levels.resistance.length > 20)
+  if(levels.resistance.length > 25)
     levels.resistance.shift();
 
 }
@@ -104,14 +104,9 @@ function nearSupport(tenantId,price){
 
   const levels = getLevels(tenantId);
 
-  for(const s of levels.support){
-
-    if(Math.abs(price-s)/s < 0.002)
-      return true;
-
-  }
-
-  return false;
+  return levels.support.some(
+    s => Math.abs(price-s)/s < 0.002
+  );
 
 }
 
@@ -119,14 +114,9 @@ function nearResistance(tenantId,price){
 
   const levels = getLevels(tenantId);
 
-  for(const r of levels.resistance){
-
-    if(Math.abs(price-r)/r < 0.002)
-      return true;
-
-  }
-
-  return false;
+  return levels.resistance.some(
+    r => Math.abs(price-r)/r < 0.002
+  );
 
 }
 
@@ -195,8 +185,8 @@ function computeEdge({price,lastPrice,volatility,regime,tenantId}){
   const mem = getMomentum(tenantId);
 
   mem.momentum =
-    mem.momentum * 0.82 +
-    rawMomentum * 0.18;
+    mem.momentum * 0.80 +
+    rawMomentum * 0.20;
 
   let normalized =
     mem.momentum/(vol || 0.001);
@@ -239,19 +229,6 @@ function computeConfidence({edge,ticksSeen,regime}){
 }
 
 /* =========================================================
-REGIME NORMALIZER
-========================================================= */
-
-function normalizeRegime(regime){
-
-  if(regime === "volatility_expansion")
-    return "expansion";
-
-  return regime;
-
-}
-
-/* =========================================================
 CORE DECISION
 ========================================================= */
 
@@ -287,8 +264,6 @@ function buildDecision(context={}){
       lastPrice,
       volatility
     });
-
-  regime = normalizeRegime(regime);
 
   let edge =
     computeEdge({
@@ -328,13 +303,13 @@ function buildDecision(context={}){
   confidence *= flow.boost || 1;
   edge *= flow.boost || 1;
 
-  const missedBoost =
+  const learningBoost =
     counterfactualEngine.getLearningAdjustment?.({
       tenantId
     }) || 1;
 
-  confidence *= missedBoost;
-  edge *= missedBoost;
+  confidence *= learningBoost;
+  edge *= learningBoost;
 
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
@@ -343,7 +318,11 @@ function buildDecision(context={}){
      ENTRY LOGIC
   ========================================================= */
 
-  if(bottomDetected && nearSupport(tenantId,price) && edge > 0){
+  if(
+    bottomDetected &&
+    nearSupport(tenantId,price) &&
+    edge > 0.002
+  ){
 
     return{
       symbol,
@@ -357,7 +336,11 @@ function buildDecision(context={}){
 
   }
 
-  if(topDetected && nearResistance(tenantId,price) && edge < 0){
+  if(
+    topDetected &&
+    nearResistance(tenantId,price) &&
+    edge < -0.002
+  ){
 
     return{
       symbol,
