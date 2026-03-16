@@ -1,14 +1,14 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: AI GOVERNED STABLE v24
+// VERSION: AI GOVERNED STABLE v25
 //
-// FIXES
-// ----------------------------------------------------------
-// ✔ Persistent engine state (prevents memory reset)
-// ✔ Removed duplicate trade logging
-// ✔ Crash recovery support
-// ✔ Stable AI loop
+// IMPROVEMENTS
+// ✔ persistent engine state
+// ✔ decision tracking
+// ✔ trade/day tracking
+// ✔ loss tracking
+// ✔ directional stability
 // ==========================================================
 
 const fs = require("fs");
@@ -25,7 +25,6 @@ const START_BAL =
   Number(process.env.PAPER_START_BALANCE || 100000);
 
 const MAX_DECISIONS_MEMORY = 200;
-
 const MIN_TRADE_INTERVAL = 30000;
 
 const STATE_FILE =
@@ -63,52 +62,28 @@ const STATES = new Map();
 
 /* ================= STATE PERSISTENCE ================= */
 
-function saveState(tenantId,state){
-
+function saveState(state){
   try{
-
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(state,null,2)
     );
-
   }catch(err){
-
-    console.error(
-      "State save failed:",
-      err.message
-    );
-
+    console.error("State save failed:",err.message);
   }
-
 }
 
 function loadStateFromDisk(){
-
   try{
-
     if(fs.existsSync(STATE_FILE)){
-
-      const raw =
-        JSON.parse(
-          fs.readFileSync(STATE_FILE,"utf-8")
-        );
-
-      return raw;
-
+      return JSON.parse(
+        fs.readFileSync(STATE_FILE,"utf-8")
+      );
     }
-
   }catch(err){
-
-    console.error(
-      "State load failed:",
-      err.message
-    );
-
+    console.error("State load failed:",err.message);
   }
-
   return null;
-
 }
 
 /* ================= LOAD ================= */
@@ -118,8 +93,7 @@ function load(tenantId){
   if(STATES.has(tenantId))
     return STATES.get(tenantId);
 
-  const diskState =
-    loadStateFromDisk();
+  const diskState = loadStateFromDisk();
 
   const state =
     diskState || defaultState();
@@ -199,21 +173,15 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     state.executionStats.ticks++;
 
     try{
-
       memoryBrain.recordMarketState({
         tenantId,
         symbol,
         price,
         volatility:state.volatility
       });
-
     }catch{}
 
-    const sinceLastTrade =
-      ts - state.lastTradeTime;
-
-    const allowTrade =
-      sinceLastTrade >= MIN_TRADE_INTERVAL;
+    /* ================= DECISION ================= */
 
     const plan =
       makeDecision({
@@ -222,17 +190,46 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         last: price,
         paper: state,
         ticksSeen: state.executionStats.ticks
-      }) || {
-        action:"WAIT",
-        confidence:0,
-        riskPct:0
-      };
-
-    plan.riskPct =
-      (Number(cfg.riskPercent)/100) *
-      Number(cfg.positionMultiplier);
+      }) || {action:"WAIT"};
 
     state.executionStats.decisions++;
+
+    state.decisions.push({
+      time:ts,
+      action:plan.action,
+      confidence:plan.confidence,
+      price
+    });
+
+    if(state.decisions.length > MAX_DECISIONS_MEMORY)
+      state.decisions =
+        state.decisions.slice(-MAX_DECISIONS_MEMORY);
+
+    /* ================= TRADE CONTROL ================= */
+
+    const sinceLastTrade =
+      ts - state.lastTradeTime;
+
+    const allowTrade =
+      sinceLastTrade >= MIN_TRADE_INTERVAL;
+
+    /* Prevent rapid direction flipping */
+
+    if(state.position){
+
+      if(state.position.side === "LONG" &&
+         plan.action === "SELL" &&
+         plan.confidence < 0.7)
+        plan.action = "WAIT";
+
+      if(state.position.side === "SHORT" &&
+         plan.action === "BUY" &&
+         plan.confidence < 0.7)
+        plan.action = "WAIT";
+
+    }
+
+    /* ================= EXECUTION ================= */
 
     if(["BUY","SELL","CLOSE"].includes(plan.action) && allowTrade){
 
@@ -252,9 +249,21 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         state.executionStats.trades++;
         state.lastTradeTime = ts;
 
+        state.limits.tradesToday++;
+
+        if(exec.result.pnl > 0)
+          state.realized.wins++;
+
+        if(exec.result.pnl < 0){
+          state.realized.losses++;
+          state.limits.lossesToday++;
+        }
+
       }
 
     }
+
+    /* ================= EQUITY ================= */
 
     if(state.position){
 
@@ -276,13 +285,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     if(state.equity > state.peakEquity)
       state.peakEquity = state.equity;
 
-    saveState(tenantId,state);
+    saveState(state);
 
   }
   finally{
-
     state._locked = false;
-
   }
 
 }
