@@ -1,15 +1,5 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Momentum Rider v15)
-// PURPOSE
-// Ride candle momentum longer and exit near reversals
-//
-// IMPROVEMENTS
-// ✔ momentum continuation detection
-// ✔ stronger trend riding
-// ✔ reversal early exit logic
-// ✔ disciplined entries near bottoms/tops
-// ✔ reduced premature exits
-// ✔ smarter volatility scaling
+// AutoShield — Institutional Trade Brain (Liquidity Hunter v16)
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -62,7 +52,8 @@ function getBrainState(tenantId){
       edgeMomentum:0,
       lastAction:"WAIT",
       lastDecisionTime:0,
-      lastTradeTime:0
+      lastTradeTime:0,
+      priceMemory:[]
     });
 
   }
@@ -82,6 +73,46 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
+/* ================= PRICE MEMORY ================= */
+
+function updatePriceMemory(brain,price){
+
+  brain.priceMemory.push(price);
+
+  if(brain.priceMemory.length > 20)
+    brain.priceMemory.shift();
+
+}
+
+/* ================= LIQUIDITY SWEEP ================= */
+
+function detectLiquiditySweep(prices){
+
+  if(prices.length < 6)
+    return null;
+
+  const recent = prices.slice(-6);
+
+  const high = Math.max(...recent.slice(0,4));
+  const low  = Math.min(...recent.slice(0,4));
+
+  const last = recent[5];
+  const prev = recent[4];
+
+  /* sweep above resistance */
+
+  if(prev > high && last < prev)
+    return "SELL";
+
+  /* sweep below support */
+
+  if(prev < low && last > prev)
+    return "BUY";
+
+  return null;
+
+}
+
 /* ================= DECISION ================= */
 
 function makeDecision(context={}){
@@ -97,6 +128,10 @@ function makeDecision(context={}){
   const brain = getBrainState(tenantId);
 
   const price = safeNum(last,NaN);
+
+  updatePriceMemory(brain,price);
+
+  const prices = brain.priceMemory;
 
   const limits = paper.limits || {};
   const pos = paper.position || null;
@@ -153,6 +188,22 @@ function makeDecision(context={}){
   if(!ACTIONS.has(action))
     action="WAIT";
 
+  /* ================= LIQUIDITY HUNTER ================= */
+
+  const sweep = detectLiquiditySweep(prices);
+
+  if(sweep){
+
+    action = sweep;
+
+    confidence =
+      Math.max(confidence,0.62);
+
+    edge =
+      clamp(edge + (sweep==="BUY"?0.002:-0.002),-1,1);
+
+  }
+
   /* ================= MOMENTUM FILTER ================= */
 
   if(Math.abs(edge) < MIN_MOMENTUM_EDGE){
@@ -181,17 +232,7 @@ function makeDecision(context={}){
 
   }catch{}
 
-  /* ================= MOMENTUM BOOST ================= */
-
-  if(Math.abs(edge) > 0.015){
-    confidence *= 1.15;
-  }
-
   /* ================= VOLATILITY CONTROL ================= */
-
-  if(volatility > 0.006){
-    confidence *= 1.1;
-  }
 
   if(volatility > 0.012){
 
@@ -219,18 +260,6 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
-  /* ================= DIRECTION STABILITY ================= */
-
-  if(brain.lastAction === "BUY" && action === "SELL"){
-    if(confidence < 0.72)
-      action="WAIT";
-  }
-
-  if(brain.lastAction === "SELL" && action === "BUY"){
-    if(confidence < 0.72)
-      action="WAIT";
-  }
-
   /* ================= CONFIDENCE GATE ================= */
 
   const dynamicThreshold =
@@ -238,19 +267,6 @@ function makeDecision(context={}){
 
   if(confidence < dynamicThreshold)
     action="WAIT";
-
-  /* ================= EXPLORATION ================= */
-
-  if(isPaper && action==="WAIT"){
-
-    if(Math.random() < EXPLORATION_RATE){
-
-      action = edge >= 0 ? "BUY":"SELL";
-      confidence = Math.max(confidence,0.2);
-
-    }
-
-  }
 
   /* ================= HARD SAFETY ================= */
 
@@ -282,10 +298,6 @@ function makeDecision(context={}){
   riskPct =
     clamp(riskPct,MIN_RISK,MAX_RISK);
 
-  if(action==="WAIT"){
-    edge *= 0.5;
-  }
-
   if(action === "BUY" || action === "SELL"){
     brain.lastTradeTime = now;
   }
@@ -303,8 +315,6 @@ function makeDecision(context={}){
   };
 
 }
-
-/* ================= RESET ================= */
 
 function resetTenant(tenantId){
   BRAIN_STATE.delete(tenantId);
