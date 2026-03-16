@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: AI GOVERNED STABLE v26 (Institutional Safe)
+// VERSION: v27 (Short-Duration AI Trading)
 // ==========================================================
 
 const fs = require("fs");
@@ -22,6 +22,16 @@ const MIN_TRADE_INTERVAL = 30000;
 
 const MAX_TRADES_PER_DAY = 40;
 const MAX_DAILY_LOSSES = 12;
+
+/* ================= SHORT DURATION CONFIG ================= */
+
+const MIN_TRADE_DURATION = 5 * 60 * 1000;
+const MAX_TRADE_DURATION = 8 * 60 * 1000;
+
+const PROFIT_TARGET = 0.0025;
+const STOP_LOSS = -0.002;
+
+/* ========================================================= */
 
 const STATE_FILE =
   path.join(process.cwd(),"paperTrader_state.json");
@@ -80,19 +90,12 @@ const STATES = new Map();
 function saveState(state){
 
   try{
-
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(state,null,2)
     );
-
   }catch(err){
-
-    console.error(
-      "State save failed:",
-      err.message
-    );
-
+    console.error("State save failed:",err.message);
   }
 
 }
@@ -104,23 +107,13 @@ function loadStateFromDisk(){
     if(!fs.existsSync(STATE_FILE))
       return null;
 
-    const raw =
-      JSON.parse(
-        fs.readFileSync(STATE_FILE,"utf-8")
-      );
-
-    if(!raw || typeof raw !== "object")
-      return null;
-
-    return raw;
+    return JSON.parse(
+      fs.readFileSync(STATE_FILE,"utf-8")
+    );
 
   }catch(err){
 
-    console.error(
-      "State load failed:",
-      err.message
-    );
-
+    console.error("State load failed:",err.message);
     return null;
 
   }
@@ -195,6 +188,93 @@ function getTradingConfig(tenantId){
 
 }
 
+/* ================= DURATION ENGINE ================= */
+
+function computeDuration(confidence){
+
+  if(!confidence) return MIN_TRADE_DURATION;
+
+  const ratio =
+    Math.min(Math.max(confidence,0),1);
+
+  return Math.floor(
+    MIN_TRADE_DURATION +
+    ratio*(MAX_TRADE_DURATION-MIN_TRADE_DURATION)
+  );
+
+}
+
+/* ================= POSITION TIMER ================= */
+
+function handleOpenPosition({
+
+  tenantId,
+  state,
+  symbol,
+  price,
+  ts
+
+}){
+
+  const pos = state.position;
+  if(!pos) return;
+
+  const elapsed = ts - pos.time;
+
+  const pnl =
+    pos.side === "LONG"
+      ? (price - pos.entry) / pos.entry
+      : (pos.entry - price) / pos.entry;
+
+  /* PROFIT TARGET */
+
+  if(pnl >= PROFIT_TARGET){
+
+    executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action:"CLOSE",
+      price,
+      state,
+      ts
+    });
+
+    return;
+  }
+
+  /* STOP LOSS */
+
+  if(pnl <= STOP_LOSS){
+
+    executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action:"CLOSE",
+      price,
+      state,
+      ts
+    });
+
+    return;
+  }
+
+  /* MAX DURATION */
+
+  if(elapsed >= pos.maxDuration){
+
+    executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action:"CLOSE",
+      price,
+      state,
+      ts
+    });
+
+  }
+
+}
+
 /* ================= AI TICK ================= */
 
 function tick(tenantId,symbol,price,ts=Date.now()){
@@ -246,6 +326,20 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }catch{}
 
+    /* HANDLE ACTIVE TRADE */
+
+    if(state.position){
+
+      handleOpenPosition({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts
+      });
+
+    }
+
     /* ================= DECISION ================= */
 
     const plan =
@@ -261,29 +355,11 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.decisions++;
 
-    state.decisions.push({
-
-      time:ts,
-      action:plan.action,
-      confidence:plan.confidence,
-      price
-
-    });
-
-    if(state.decisions.length > MAX_DECISIONS_MEMORY)
-
-      state.decisions =
-        state.decisions.slice(-MAX_DECISIONS_MEMORY);
-
-    /* ================= DAILY LIMITS ================= */
-
-    if(state.limits.tradesToday >= MAX_TRADES_PER_DAY)
+    if(
+      state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
+      state.limits.lossesToday >= MAX_DAILY_LOSSES
+    )
       return;
-
-    if(state.limits.lossesToday >= MAX_DAILY_LOSSES)
-      return;
-
-    /* ================= TRADE CONTROL ================= */
 
     const sinceLastTrade =
       ts - state.lastTradeTime;
@@ -291,31 +367,10 @@ function tick(tenantId,symbol,price,ts=Date.now()){
     const allowTrade =
       sinceLastTrade >= MIN_TRADE_INTERVAL;
 
-    if(state.position){
-
-      if(
-        state.position.side === "LONG" &&
-        plan.action === "SELL" &&
-        plan.confidence < 0.7
-      )
-        plan.action="WAIT";
-
-      if(
-        state.position.side === "SHORT" &&
-        plan.action === "BUY" &&
-        plan.confidence < 0.7
-      )
-        plan.action="WAIT";
-
-    }
-
-    /* ================= EXECUTION ================= */
-
     if(
-
-      ["BUY","SELL","CLOSE"].includes(plan.action) &&
-      allowTrade
-
+      ["BUY","SELL"].includes(plan.action) &&
+      allowTrade &&
+      !state.position
     ){
 
       const exec =
@@ -334,20 +389,16 @@ function tick(tenantId,symbol,price,ts=Date.now()){
       if(exec?.result){
 
         state.executionStats.trades++;
-
         state.lastTradeTime = ts;
 
         state.limits.tradesToday++;
 
-        const pnl = exec.result.pnl || 0;
+        /* STORE TRADE DURATION */
 
-        if(pnl > 0)
-          state.realized.wins++;
+        if(state.position){
 
-        if(pnl < 0){
-
-          state.realized.losses++;
-          state.limits.lossesToday++;
+          state.position.maxDuration =
+            computeDuration(plan.confidence);
 
         }
 
