@@ -1,13 +1,11 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v18 (Institutional Scaling Execution Engine)
+// VERSION: v19 (Institutional Multi-Execution Engine)
 // ==========================================================
 
 const outsideBrain =
   require("../../brain/aiBrain");
-
-const axios = require("axios");
 
 /* ================= UTIL ================= */
 
@@ -35,17 +33,6 @@ const HARD_ACCOUNT_RISK   = 0.02;
 
 const MAX_TRADE_USD       = 2000;
 const MIN_TRADE_USD       = 25;
-
-/* ================= LIVE SAFETY ================= */
-
-const LIVE_TRADING_ENABLED =
-  process.env.LIVE_TRADING_ENABLED === "true";
-
-const LIVE_MIN_TRADE_INTERVAL = 10000;
-
-const MAX_LIVE_QTY = 100;
-
-let LAST_LIVE_TRADE = 0;
 
 /* ================= MICRO LOCK ================= */
 
@@ -131,7 +118,8 @@ function openPosition({
     qty,
     capitalUsed:cost,
     time:ts,
-    peakProfit:0
+    peakProfit:0,
+    pyramidCount:0
   };
 
   const trade = {
@@ -142,6 +130,59 @@ function openPosition({
     qty,
     capitalUsed:cost,
     pnl:0,
+    time:ts
+  };
+
+  state.trades.push(trade);
+
+  return { result: trade };
+
+}
+
+/* =========================================================
+ADD TO POSITION (PYRAMIDING)
+========================================================= */
+
+function addToPosition({
+  state,
+  price,
+  qty,
+  ts
+}){
+
+  ensureTradeLog(state);
+
+  const pos = state.position;
+
+  if(!pos) return null;
+
+  const cost = qty * price;
+
+  if(cost > state.availableCapital)
+    return null;
+
+  const newQty =
+    pos.qty + qty;
+
+  const newEntry =
+    ((pos.entry * pos.qty) + (price * qty)) / newQty;
+
+  pos.qty = newQty;
+  pos.entry = newEntry;
+  pos.capitalUsed += cost;
+
+  state.availableCapital -= cost;
+  state.lockedCapital += cost;
+
+  pos.pyramidCount =
+    (pos.pyramidCount || 0) + 1;
+
+  const trade = {
+    side:"ADD",
+    symbol:pos.symbol,
+    entry:newEntry,
+    price,
+    qty,
     time:ts
   };
 
@@ -195,7 +236,6 @@ function partialClosePosition({
     capitalReleased;
 
   pos.qty = remainingQty;
-
   pos.capitalUsed =
     pos.capitalUsed * (1 - closePct);
 
@@ -210,6 +250,9 @@ function partialClosePosition({
   };
 
   state.trades.push(trade);
+
+  if(pos.qty <= 0.000001)
+    state.position = null;
 
   return { result: trade };
 
@@ -258,6 +301,7 @@ function closePosition({
     pnl,
     duration: ts - pos.time,
     peakProfit:pos.peakProfit || 0,
+    pyramids:pos.pyramidCount || 0,
     time:ts
   };
 
@@ -286,7 +330,7 @@ function closePosition({
 }
 
 /* =========================================================
-PAPER EXECUTION
+EXECUTION
 ========================================================= */
 
 function executePaperOrder({
@@ -366,6 +410,21 @@ function executePaperOrder({
       price,
       qty:positionSize,
       side:"SHORT",
+      ts
+    });
+
+  }
+
+  /* ADD (PYRAMID) */
+
+  if(action === "ADD"){
+
+    if(!pos) return null;
+
+    return addToPosition({
+      state,
+      price,
+      qty:positionSize * 0.5,
       ts
     });
 
