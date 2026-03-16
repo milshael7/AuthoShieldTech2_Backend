@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v41 (Institutional Exit Optimization Engine)
+// VERSION: v42 (Sabbath Learning Mode + Full v41 Logic)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -46,6 +46,29 @@ const MAX_PROFIT_LOCK =
 
 const MIN_PROFIT_LOCK =
   Number(process.env.TRADE_MIN_PROFIT_LOCK || 0.35);
+
+/* =========================================================
+SABBATH RULE
+========================================================= */
+
+function isTradingAllowed(){
+
+  const now = new Date();
+
+  const day = now.getDay(); // 0 Sun - 6 Sat
+  const hour = now.getHours();
+
+  // Friday sunset (approx)
+  if(day === 5 && hour >= 19)
+    return false;
+
+  // Saturday before sunset
+  if(day === 6 && hour < 19)
+    return false;
+
+  return true;
+
+}
 
 /* =========================================================
 PRICE MEMORY
@@ -277,12 +300,8 @@ function handleOpenPosition({
   if(pnl > pos.bestPnl)
     pos.bestPnl = pnl;
 
-  /* HARD STOP */
-
   if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
-
-  /* PROFIT LOCK */
 
   if(pos.bestPnl > MIN_PROFIT_TO_TRAIL){
 
@@ -301,15 +320,11 @@ function handleOpenPosition({
 
   }
 
-  /* EARLY WEAKNESS EXIT */
-
   if(pnl > 0 && momentumWeak)
     return closeTrade({tenantId,state,symbol,price,ts});
 
   if(pnl > 0 && momentumBreak)
     return closeTrade({tenantId,state,symbol,price,ts});
-
-  /* MOMENTUM EXTENSION */
 
   if(strongTrend && pnl > 0){
 
@@ -379,6 +394,8 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
+    const tradingAllowed = isTradingAllowed();
+
     if(state.position){
 
       handleOpenPosition({
@@ -387,6 +404,20 @@ function tick(tenantId,symbol,price,ts=Date.now()){
         symbol,
         price,
         ts
+      });
+
+      return;
+
+    }
+
+    if(!tradingAllowed){
+
+      makeDecision({
+        tenantId,
+        symbol,
+        last:price,
+        paper:state,
+        ticksSeen:state.executionStats.ticks
       });
 
       return;
