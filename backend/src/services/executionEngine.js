@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v19 (Institutional Multi-Execution Engine)
+// VERSION: v20 (Institutional Alpha Execution Engine)
 // ==========================================================
 
 const outsideBrain =
@@ -33,6 +33,8 @@ const HARD_ACCOUNT_RISK   = 0.02;
 
 const MAX_TRADE_USD       = 2000;
 const MIN_TRADE_USD       = 25;
+
+const MAX_PYRAMIDS        = 3;
 
 /* ================= MICRO LOCK ================= */
 
@@ -140,7 +142,27 @@ function openPosition({
 }
 
 /* =========================================================
-ADD TO POSITION (PYRAMIDING)
+PYRAMID FILTER
+========================================================= */
+
+function allowPyramid(pos,price){
+
+  if(!pos) return false;
+
+  if((pos.pyramidCount || 0) >= MAX_PYRAMIDS)
+    return false;
+
+  const pnl =
+    pos.side === "LONG"
+      ? (price-pos.entry)/pos.entry
+      : (pos.entry-price)/pos.entry;
+
+  return pnl > 0.002;
+
+}
+
+/* =========================================================
+ADD TO POSITION
 ========================================================= */
 
 function addToPosition({
@@ -154,7 +176,8 @@ function addToPosition({
 
   const pos = state.position;
 
-  if(!pos) return null;
+  if(!allowPyramid(pos,price))
+    return null;
 
   const cost = qty * price;
 
@@ -236,6 +259,7 @@ function partialClosePosition({
     capitalReleased;
 
   pos.qty = remainingQty;
+
   pos.capitalUsed =
     pos.capitalUsed * (1 - closePct);
 
@@ -300,7 +324,6 @@ function closePosition({
     qty:pos.qty,
     pnl,
     duration: ts - pos.time,
-    peakProfit:pos.peakProfit || 0,
     pyramids:pos.pyramidCount || 0,
     time:ts
   };
@@ -381,12 +404,8 @@ function executePaperOrder({
   if(positionSize <= 0)
     return null;
 
-  /* BUY */
-
   if(action === "BUY"){
-
     if(pos) return null;
-
     return openPosition({
       state,
       symbol,
@@ -395,15 +414,10 @@ function executePaperOrder({
       side:"LONG",
       ts
     });
-
   }
 
-  /* SELL */
-
   if(action === "SELL"){
-
     if(pos) return null;
-
     return openPosition({
       state,
       symbol,
@@ -412,30 +426,20 @@ function executePaperOrder({
       side:"SHORT",
       ts
     });
-
   }
 
-  /* ADD (PYRAMID) */
-
   if(action === "ADD"){
-
     if(!pos) return null;
-
     return addToPosition({
       state,
       price,
       qty:positionSize * 0.5,
       ts
     });
-
   }
 
-  /* PARTIAL CLOSE */
-
   if(action === "PARTIAL_CLOSE"){
-
     if(!pos) return null;
-
     return partialClosePosition({
       tenantId,
       state,
@@ -443,22 +447,16 @@ function executePaperOrder({
       closePct: safeNum(closePct,0.25),
       ts
     });
-
   }
 
-  /* CLOSE */
-
   if(action === "CLOSE"){
-
     if(!pos) return null;
-
     return closePosition({
       tenantId,
       state,
       price,
       ts
     });
-
   }
 
   return null;
