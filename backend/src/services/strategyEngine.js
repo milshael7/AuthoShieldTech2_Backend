@@ -1,6 +1,6 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL MULTI-STRATEGY CORE v14
-// Adds Liquidity Gravity Engine
+// STRATEGY ENGINE — INSTITUTIONAL GLOBAL LIQUIDITY CORE v15
+// Liquidity Gravity + Market Intelligence + Structure Engine
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -64,6 +64,7 @@ function getStructureState(tenantId){
   }
 
   return STRUCTURE_MEMORY.get(key);
+
 }
 
 /* =========================================================
@@ -148,8 +149,7 @@ function detectTrend(prices,len){
 }
 
 /* =========================================================
-LIQUIDITY GRAVITY ENGINE
-Predicts where price is pulled
+LIQUIDITY GRAVITY
 ========================================================= */
 
 function detectLiquidityGravity(prices){
@@ -258,9 +258,7 @@ CONFIDENCE
 ========================================================= */
 
 function computeConfidence(edge){
-
   return clamp(Math.abs(edge)*18,0.05,1);
-
 }
 
 /* =========================================================
@@ -354,6 +352,12 @@ function buildDecision(context={}){
       volatility
     });
 
+  const marketIntel =
+    correlationEngine.getMarketIntelligence?.(tenantId) || {};
+
+  const riskRegime =
+    marketIntel.regime || "neutral";
+
   let edge =
     computeEdge({
       price,
@@ -395,7 +399,15 @@ function buildDecision(context={}){
   confidence *= learningBoost;
   edge *= learningBoost;
 
-  /* Liquidity gravity alignment */
+  /* Macro Risk Filter */
+
+  if(riskRegime === "risk_off"){
+    confidence *= 0.85;
+  }
+
+  if(riskRegime === "risk_on"){
+    confidence *= 1.05;
+  }
 
   if(liquidityGravity==="up")
     confidence *= 1.05;
@@ -416,8 +428,6 @@ function buildDecision(context={}){
       regime
     });
 
-  /* ================= BUY ================= */
-
   if(
     swingLow &&
     structure==="HL" &&
@@ -431,12 +441,11 @@ function buildDecision(context={}){
       confidence,
       edge,
       riskPct,
+      regime,
       ts:Date.now()
     };
 
   }
-
-  /* ================= SELL ================= */
 
   if(
     swingHigh &&
@@ -451,12 +460,11 @@ function buildDecision(context={}){
       confidence,
       edge,
       riskPct,
+      regime,
       ts:Date.now()
     };
 
   }
-
-  /* ================= LIQUIDITY REVERSAL ================= */
 
   if(liquiditySweep==="bullish"){
 
@@ -466,6 +474,7 @@ function buildDecision(context={}){
       confidence:confidence*0.9,
       edge:0.003,
       riskPct,
+      regime,
       ts:Date.now()
     };
 
@@ -479,6 +488,7 @@ function buildDecision(context={}){
       confidence:confidence*0.9,
       edge:-0.003,
       riskPct,
+      regime,
       ts:Date.now()
     };
 
@@ -487,7 +497,8 @@ function buildDecision(context={}){
   return{
     action:"WAIT",
     confidence,
-    edge
+    edge,
+    regime
   };
 
 }
