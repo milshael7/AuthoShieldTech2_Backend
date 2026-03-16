@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
 // MODULE: Execution Engine
-// VERSION: v15 (Paper + Live Execution Fixed)
+// VERSION: v16 (Institutional Paper + Live Execution)
 // ==========================================================
 
 const outsideBrain =
@@ -32,6 +32,7 @@ RISK CONFIGURATION
 
 const MAX_EQUITY_EXPOSURE = 0.05;
 const HARD_ACCOUNT_RISK   = 0.02;
+
 const MAX_TRADE_USD       = 2000;
 const MIN_TRADE_USD       = 25;
 
@@ -47,31 +48,33 @@ const MAX_LIVE_QTY = 100;
 let LAST_LIVE_TRADE = 0;
 
 /* =========================================================
-POSITION SIZE CALCULATION
+POSITION SIZE
 ========================================================= */
 
 function calculatePositionSize(state,price,riskPct){
 
   const equity =
-    safeNum(state.equity,safeNum(state.cashBalance,0));
+    safeNum(state.equity,
+      safeNum(state.cashBalance,0)
+    );
 
   if(equity <= 0 || price <= 0)
     return 0;
 
   const riskCapital =
-    equity * riskPct;
+    equity * safeNum(riskPct,0.01);
 
-  const equityExposureCap =
+  const exposureCap =
     equity * MAX_EQUITY_EXPOSURE;
 
-  const hardAccountLimit =
+  const accountRiskLimit =
     equity * HARD_ACCOUNT_RISK;
 
   const allowedCapital =
     Math.min(
       riskCapital,
-      equityExposureCap,
-      hardAccountLimit,
+      exposureCap,
+      accountRiskLimit,
       MAX_TRADE_USD
     );
 
@@ -81,9 +84,9 @@ function calculatePositionSize(state,price,riskPct){
   let qty =
     allowedCapital / price;
 
-  qty = Number(qty.toFixed(6));
+  qty = clamp(qty,0,1e9);
 
-  return qty;
+  return Number(qty.toFixed(6));
 
 }
 
@@ -251,6 +254,8 @@ function executePaperOrder({
   if(positionSize <= 0)
     return null;
 
+  /* BUY */
+
   if(action === "BUY"){
 
     if(pos) return null;
@@ -266,6 +271,8 @@ function executePaperOrder({
 
   }
 
+  /* SELL */
+
   if(action === "SELL"){
 
     if(pos) return null;
@@ -280,6 +287,8 @@ function executePaperOrder({
     });
 
   }
+
+  /* CLOSE */
 
   if(action === "CLOSE"){
 
