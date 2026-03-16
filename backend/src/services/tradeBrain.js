@@ -1,5 +1,5 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Liquidity Hunter v16)
+// AutoShield — Institutional Trade Brain (Trade Memory Engine v17)
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -37,6 +37,10 @@ const EXPLORATION_RATE = 0.02;
 
 const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
+const SETUP_MEMORY = new Map();
+
+const MIN_SETUP_TRADES = 5;
+
 /* ================= MEMORY ================= */
 
 const BRAIN_STATE = new Map();
@@ -73,6 +77,102 @@ function clamp(n,min,max){
   return Math.max(min,Math.min(max,n));
 }
 
+/* ======================================================
+SETUP FINGERPRINT
+====================================================== */
+
+function getSetupKey({
+  regime,
+  volatility,
+  action
+}){
+
+  const volBucket =
+    volatility > 0.01 ? "highVol" :
+    volatility > 0.005 ? "midVol" :
+    "lowVol";
+
+  return `${regime}_${volBucket}_${action}`;
+}
+
+/* ======================================================
+RECORD TRADE OUTCOME
+====================================================== */
+
+function recordTradeOutcome({
+  tenantId,
+  regime,
+  volatility,
+  action,
+  pnl
+}){
+
+  const key =
+    getSetupKey({
+      regime,
+      volatility,
+      action
+    });
+
+  if(!SETUP_MEMORY.has(key)){
+
+    SETUP_MEMORY.set(key,{
+      wins:0,
+      losses:0
+    });
+
+  }
+
+  const s = SETUP_MEMORY.get(key);
+
+  if(pnl > 0)
+    s.wins++;
+  else
+    s.losses++;
+
+}
+
+/* ======================================================
+SETUP EDGE BOOST
+====================================================== */
+
+function getSetupBoost({
+  regime,
+  volatility,
+  action
+}){
+
+  const key =
+    getSetupKey({
+      regime,
+      volatility,
+      action
+    });
+
+  const s = SETUP_MEMORY.get(key);
+
+  if(!s)
+    return 1;
+
+  const total =
+    s.wins + s.losses;
+
+  if(total < MIN_SETUP_TRADES)
+    return 1;
+
+  const winRate =
+    s.wins / total;
+
+  if(winRate > 0.65)
+    return 1.15;
+
+  if(winRate < 0.40)
+    return 0.85;
+
+  return 1;
+
+}
+
 /* ================= PRICE MEMORY ================= */
 
 function updatePriceMemory(brain,price){
@@ -99,12 +199,8 @@ function detectLiquiditySweep(prices){
   const last = recent[5];
   const prev = recent[4];
 
-  /* sweep above resistance */
-
   if(prev > high && last < prev)
     return "SELL";
-
-  /* sweep below support */
 
   if(prev < low && last > prev)
     return "BUY";
@@ -146,8 +242,6 @@ function makeDecision(context={}){
 
   const now = Date.now();
 
-  /* ================= TRADE COOLDOWN ================= */
-
   if(now - brain.lastTradeTime < TRADE_COOLDOWN_MS){
 
     return {
@@ -160,8 +254,6 @@ function makeDecision(context={}){
     };
 
   }
-
-  /* ================= STRATEGY ================= */
 
   let strategy = {};
 
@@ -184,6 +276,7 @@ function makeDecision(context={}){
   let confidence = safeNum(strategy.confidence,0.25);
   let edge = safeNum(strategy.edge,0);
   let riskPct = safeNum(strategy.riskPct,0.01);
+  let regime = strategy.regime || "unknown";
 
   if(!ACTIONS.has(action))
     action="WAIT";
@@ -203,6 +296,18 @@ function makeDecision(context={}){
       clamp(edge + (sweep==="BUY"?0.002:-0.002),-1,1);
 
   }
+
+  /* ================= SETUP MEMORY BOOST ================= */
+
+  const setupBoost =
+    getSetupBoost({
+      regime,
+      volatility,
+      action
+    });
+
+  confidence *= setupBoost;
+  edge *= setupBoost;
 
   /* ================= MOMENTUM FILTER ================= */
 
@@ -241,8 +346,6 @@ function makeDecision(context={}){
 
   }
 
-  /* ================= CONFIDENCE SMOOTHING ================= */
-
   const decay =
     isPaper ? 0.25 : CONFIDENCE_DECAY;
 
@@ -260,15 +363,11 @@ function makeDecision(context={}){
   edge =
     clamp(brain.edgeMomentum,-1,1);
 
-  /* ================= CONFIDENCE GATE ================= */
-
   const dynamicThreshold =
     isPaper ? PAPER_MIN_CONFIDENCE : MIN_CONFIDENCE_TO_TRADE;
 
   if(confidence < dynamicThreshold)
     action="WAIT";
-
-  /* ================= HARD SAFETY ================= */
 
   if(!isPaper){
 
@@ -285,8 +384,6 @@ function makeDecision(context={}){
       action="WAIT";
 
   }
-
-  /* ================= RISK SCALING ================= */
 
   if(confidence > 0.82)
     riskPct *= 1.7;
@@ -322,5 +419,6 @@ function resetTenant(tenantId){
 
 module.exports = {
   makeDecision,
-  resetTenant
+  resetTenant,
+  recordTradeOutcome
 };
