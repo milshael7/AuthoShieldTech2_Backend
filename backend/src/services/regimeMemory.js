@@ -1,9 +1,7 @@
 // backend/src/services/regimeMemory.js
-// Market Regime Memory Engine — Stable v2
-// Improvements:
-// - memory safety
-// - learning decay
-// - faster regime detection
+// Institutional Market Regime Engine v3
+// Detects trend / range / volatility / dead markets
+// Adaptive learning + memory decay
 
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
@@ -11,6 +9,8 @@ const REGIMES = new Map();
 
 const MIN_TRADES = 6;
 const MAX_TENANTS = 200;
+
+const DECAY = 0.995;
 
 /* ======================================================
 STATE
@@ -22,13 +22,12 @@ function getState(tenantId){
 
   if(!REGIMES.has(key)){
 
-    /* prevent memory growth */
-
     if(REGIMES.size > MAX_TENANTS)
       REGIMES.clear();
 
     REGIMES.set(key,{
-      regimes:{}
+      regimes:{},
+      lastRegime:"neutral"
     });
 
   }
@@ -53,20 +52,27 @@ function detectRegime({
   const move =
     Math.abs((price-lastPrice)/lastPrice);
 
-  /* volatility expansion */
+  /* DEAD MARKET */
+
+  if(volatility < 0.001 && move < 0.0005)
+    return "dead_market";
+
+  /* VOLATILITY EXPANSION */
 
   if(volatility > 0.01 && move > 0.006)
     return "volatility_expansion";
 
-  /* directional trend */
+  /* TREND */
 
   if(move > volatility * 1.2)
     return "trend";
 
-  /* compression / low movement */
+  /* COMPRESSION */
 
-  if(move < volatility * 0.35)
+  if(move < volatility * 0.25)
     return "compression";
+
+  /* RANGE */
 
   return "range";
 
@@ -95,10 +101,10 @@ function recordTrade({
 
   const r = state.regimes[regime];
 
-  /* decay old memory so learning adapts */
+  /* decay old memory */
 
-  r.wins *= 0.995;
-  r.losses *= 0.995;
+  r.wins *= DECAY;
+  r.losses *= DECAY;
 
   if(profit>0)
     r.wins++;
@@ -108,7 +114,7 @@ function recordTrade({
 }
 
 /* ======================================================
-EDGE BOOST
+REGIME BOOST
 ====================================================== */
 
 function getRegimeBoost({
@@ -130,18 +136,48 @@ function getRegimeBoost({
 
   const winRate = r.wins / total;
 
-  if(winRate > 0.6)
-    return clamp(1+(winRate-0.5),1,1.6);
+  /* strong regime */
 
-  if(winRate < 0.4)
-    return 0.8;
+  if(winRate > 0.65)
+    return clamp(1 + (winRate - 0.5)*1.2 ,1,1.8);
+
+  /* weak regime */
+
+  if(winRate < 0.40)
+    return 0.75;
 
   return 1;
+
+}
+
+/* ======================================================
+REGIME CONFIDENCE
+====================================================== */
+
+function getRegimeConfidence({
+  tenantId,
+  regime
+}){
+
+  const state = getState(tenantId);
+
+  const r = state.regimes[regime];
+
+  if(!r)
+    return 0.5;
+
+  const total = r.wins + r.losses;
+
+  if(total < MIN_TRADES)
+    return 0.5;
+
+  return clamp(r.wins/total,0.2,0.9);
 
 }
 
 module.exports={
   detectRegime,
   recordTrade,
-  getRegimeBoost
+  getRegimeBoost,
+  getRegimeConfidence
 };
