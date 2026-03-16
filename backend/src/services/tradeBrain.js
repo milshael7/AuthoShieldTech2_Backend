@@ -1,6 +1,6 @@
 // -----------------------------------------------------------
-// AutoShield — Institutional Trade Brain (Global Alpha v19)
-// Final Production Build
+// AutoShield — Institutional Trade Brain (Global Alpha v20)
+// Controlled Exploration + Faster Learning
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -40,6 +40,11 @@ const TRADE_COOLDOWN_MS =
 
 const MIN_MOMENTUM_EDGE =
   Number(process.env.TRADE_MIN_EDGE || 0.00025);
+
+/* NEW: exploration learning */
+
+const EXPLORATION_RATE =
+  Number(process.env.TRADE_EXPLORATION_RATE || 0.02);
 
 const ACTIONS = new Set(["WAIT","BUY","SELL","CLOSE"]);
 
@@ -100,12 +105,12 @@ function getSessionBoost(){
     new Date().getUTCHours();
 
   if(hour >= 12 && hour <= 16)
-    return 1.08;   // NY session
+    return 1.08;
 
   if(hour >= 7 && hour < 12)
-    return 1.05;   // London session
+    return 1.05;
 
-  return 0.98;     // Asia / low liquidity
+  return 0.98;
 
 }
 
@@ -213,8 +218,6 @@ function makeDecision(context={}){
 
   const now = Date.now();
 
-  /* ================= RISK GOVERNOR ================= */
-
   const riskStop =
     riskGovernor({
       brain,
@@ -236,8 +239,6 @@ function makeDecision(context={}){
     };
 
   }
-
-  /* ================= STRATEGY ================= */
 
   let strategy = {};
 
@@ -270,8 +271,6 @@ function makeDecision(context={}){
   if(!ACTIONS.has(action))
     action="WAIT";
 
-  /* ================= MOMENTUM FILTER ================= */
-
   if(Math.abs(edge) < MIN_MOMENTUM_EDGE)
     action="WAIT";
 
@@ -295,15 +294,8 @@ function makeDecision(context={}){
 
   }catch{}
 
-  /* ================= SESSION BOOST ================= */
-
   confidence *= getSessionBoost();
-
-  /* ================= EXECUTION ALPHA ================= */
-
   confidence *= detectExecutionAlpha(prices);
-
-  /* ================= CONFIDENCE SMOOTHING ================= */
 
   const decay =
     CONFIDENCE_DECAY;
@@ -324,6 +316,25 @@ function makeDecision(context={}){
 
   if(confidence < MIN_CONFIDENCE_TO_TRADE)
     action="WAIT";
+
+  /* ================= EXPLORATION LEARNING ================= */
+
+  if(
+    action === "WAIT" &&
+    Math.random() < EXPLORATION_RATE &&
+    Math.abs(edge) > MIN_MOMENTUM_EDGE * 0.5
+  ){
+
+    action =
+      edge > 0 ? "BUY" : "SELL";
+
+    confidence =
+      clamp(confidence * 0.7,0.25,0.55);
+
+    riskPct =
+      clamp(riskPct * 0.5,MIN_RISK,MAX_RISK);
+
+  }
 
   /* ================= RISK SCALING ================= */
 
