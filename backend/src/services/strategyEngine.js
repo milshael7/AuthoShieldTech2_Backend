@@ -1,7 +1,10 @@
 // ==========================================================
-// STRATEGY ENGINE — PAPER TRADING CORE (UNLOCKED)
-// STABLE VERSION — Regime Fix + Signal Stability
-// FIXED: confidence scaling + makeDecision export
+// STRATEGY ENGINE — PAPER TRADING CORE (ENHANCED v2)
+// IMPROVED:
+// - smoother momentum
+// - stronger signal stability
+// - better regime scaling
+// - stable risk control
 // ==========================================================
 
 const fs = require("fs");
@@ -16,7 +19,7 @@ const counterfactualEngine = require("./counterfactualEngine");
 const clamp = (n,min,max)=>Math.max(min,Math.min(max,n));
 
 /* =========================================================
-BASE CONFIG (PAPER FRIENDLY)
+BASE CONFIG
 ========================================================= */
 
 const BASE_CONFIG = Object.freeze({
@@ -27,9 +30,9 @@ const BASE_CONFIG = Object.freeze({
   baseRiskPct:Number(process.env.TRADE_BASE_RISK || 0.01),
   maxRiskPct:Number(process.env.TRADE_MAX_RISK || 0.03),
 
-  regimeTrendEdgeBoost:1.25,
-  regimeRangeEdgeCut:0.8,
-  regimeExpansionBoost:1.35
+  regimeTrendEdgeBoost:1.3,
+  regimeRangeEdgeCut:0.85,
+  regimeExpansionBoost:1.4
 
 });
 
@@ -96,10 +99,30 @@ function loadLearning(tenantId){
 }
 
 /* =========================================================
+MOMENTUM MEMORY
+========================================================= */
+
+const MOMENTUM_MEMORY = new Map();
+
+function getMomentum(tenantId){
+
+  const key = tenantId || "__default__";
+
+  if(!MOMENTUM_MEMORY.has(key)){
+    MOMENTUM_MEMORY.set(key,{
+      momentum:0
+    });
+  }
+
+  return MOMENTUM_MEMORY.get(key);
+
+}
+
+/* =========================================================
 EDGE MODEL
 ========================================================= */
 
-function computeEdge({price,lastPrice,volatility,regime}){
+function computeEdge({price,lastPrice,volatility,regime,tenantId}){
 
   if(!Number.isFinite(price) ||
      !Number.isFinite(lastPrice))
@@ -110,8 +133,14 @@ function computeEdge({price,lastPrice,volatility,regime}){
   const momentum =
     (price-lastPrice)/lastPrice;
 
+  const mem = getMomentum(tenantId);
+
+  mem.momentum =
+    mem.momentum * 0.75 +
+    momentum * 0.25;
+
   let normalized =
-    momentum/(vol || 0.001);
+    mem.momentum/(vol || 0.001);
 
   if(regime==="trend")
     normalized *= BASE_CONFIG.regimeTrendEdgeBoost;
@@ -122,7 +151,7 @@ function computeEdge({price,lastPrice,volatility,regime}){
   if(regime==="expansion")
     normalized *= BASE_CONFIG.regimeExpansionBoost;
 
-  return clamp(normalized,-0.06,0.06);
+  return clamp(normalized,-0.08,0.08);
 }
 
 /* =========================================================
@@ -134,15 +163,18 @@ function computeConfidence({edge,ticksSeen,regime}){
   if(ticksSeen < 10)
     return 0.35;
 
-  let base = Math.abs(edge) * 20;
+  let base = Math.abs(edge) * 18;
 
-  if(regime==="expansion")
-    base *= 1.2;
+  if(regime==="trend")
+    base *= 1.1;
 
   if(regime==="range")
     base *= 0.9;
 
-  return clamp(base,0.02,1); // small floor so UI moves
+  if(regime==="expansion")
+    base *= 1.25;
+
+  return clamp(base,0.02,1);
 }
 
 /* =========================================================
@@ -189,7 +221,8 @@ function buildDecision(context={}){
       price,
       lastPrice,
       volatility,
-      regime
+      regime,
+      tenantId
     });
 
   edge *= patternEngine.getPatternEdgeBoost({
@@ -232,7 +265,7 @@ function buildDecision(context={}){
   edge *= learning.edgeMultiplier;
   confidence *= learning.confidenceMultiplier;
 
-  edge = clamp(edge,-0.06,0.06);
+  edge = clamp(edge,-0.08,0.08);
   confidence = clamp(confidence,0.02,1);
 
   if(!Number.isFinite(price))
@@ -244,9 +277,15 @@ function buildDecision(context={}){
   if(Math.abs(edge) < BASE_CONFIG.minEdge)
     return {action:"WAIT",confidence,edge};
 
-  const riskPct =
+  /* ================= RISK ================= */
+
+  let riskPct =
+    BASE_CONFIG.baseRiskPct *
+    (0.6 + confidence * 0.8);
+
+  riskPct =
     clamp(
-      BASE_CONFIG.baseRiskPct * confidence,
+      riskPct,
       BASE_CONFIG.baseRiskPct,
       BASE_CONFIG.maxRiskPct
     );
