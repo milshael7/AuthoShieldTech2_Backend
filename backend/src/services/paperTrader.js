@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
 // MODULE: Autonomous Paper Trading Engine
-// VERSION: v33 (Institutional Momentum Ride Engine)
+// VERSION: v34 (Institutional Exit Intelligence Engine)
 // ==========================================================
 
 const fs = require("fs");
@@ -21,25 +21,15 @@ CONFIG
 const START_BAL =
   Number(process.env.PAPER_START_BALANCE || 100000);
 
-const MAX_DECISIONS_MEMORY = 200;
-
-/* --- TRADE CONTROL --- */
-
 const COOLDOWN_AFTER_TRADE = 120000;
 const MAX_TRADES_PER_DAY = 40;
 const MAX_DAILY_LOSSES = 12;
 
-/* --- TRADE WINDOW --- */
-
 const MIN_TRADE_DURATION = 10 * 60 * 1000;
 const MAX_TRADE_DURATION = 15 * 60 * 1000;
 
-/* --- RISK --- */
-
 const HARD_STOP_LOSS = -0.0025;
-const PROFIT_PROTECTION = 0.35; 
-
-/* ========================================================= */
+const PROFIT_PROTECTION = 0.35;
 
 const STATE_FILE =
   path.join(process.cwd(),"paperTrader_state.json");
@@ -61,7 +51,7 @@ function recordPrice(tenantId,price){
 
   arr.push(price);
 
-  if(arr.length > 12)
+  if(arr.length > 14)
     arr.shift();
 
   return arr;
@@ -83,17 +73,51 @@ function detectReversal(prices){
   const e = prices[prices.length-2];
   const f = prices[prices.length-1];
 
-  /* upward exhaustion */
-
   if(a < b && b < c && c < d && e < d && f < e)
     return true;
-
-  /* downward exhaustion */
 
   if(a > b && b > c && c > d && e > d && f > e)
     return true;
 
   return false;
+
+}
+
+/* =========================================================
+MOMENTUM WEAKENING
+========================================================= */
+
+function detectMomentumWeakening(prices){
+
+  if(prices.length < 6) return false;
+
+  const m1 = prices[prices.length-1] - prices[prices.length-2];
+  const m2 = prices[prices.length-2] - prices[prices.length-3];
+  const m3 = prices[prices.length-3] - prices[prices.length-4];
+
+  return Math.abs(m1) < Math.abs(m2) &&
+         Math.abs(m2) < Math.abs(m3);
+
+}
+
+/* =========================================================
+STALL DETECTION
+========================================================= */
+
+function detectStall(prices){
+
+  if(prices.length < 5) return false;
+
+  const range1 =
+    Math.abs(prices[prices.length-1] - prices[prices.length-2]);
+
+  const range2 =
+    Math.abs(prices[prices.length-2] - prices[prices.length-3]);
+
+  const range3 =
+    Math.abs(prices[prices.length-3] - prices[prices.length-4]);
+
+  return range1 < range2 && range2 < range3;
 
 }
 
@@ -208,45 +232,6 @@ function load(tenantId){
 }
 
 /* =========================================================
-CONFIG
-========================================================= */
-
-function getTradingConfig(tenantId){
-
-  try{
-
-    const db = readDb();
-
-    const cfg =
-      db.tradingConfig?.[tenantId] ||
-      db.tradingConfig ||
-      {};
-
-    return {
-
-      enabled: cfg.enabled ?? true,
-      tradingMode: cfg.tradingMode || "paper",
-
-      riskPercent:
-        Number(cfg.riskPercent || 1)
-
-    };
-
-  }catch{
-
-    return {
-
-      enabled:true,
-      tradingMode:"paper",
-      riskPercent:1
-
-    };
-
-  }
-
-}
-
-/* =========================================================
 TRADE DURATION
 ========================================================= */
 
@@ -340,9 +325,19 @@ function handleOpenPosition({
   const prices =
     recordPrice(tenantId,price);
 
-  /* REVERSAL EXIT */
+  /* REVERSAL */
 
   if(detectReversal(prices) && pnl > 0)
+    return closeTrade({tenantId,state,symbol,price,ts});
+
+  /* MOMENTUM WEAKENING */
+
+  if(detectMomentumWeakening(prices) && pnl > 0)
+    return closeTrade({tenantId,state,symbol,price,ts});
+
+  /* STALL DETECTION */
+
+  if(detectStall(prices) && pnl > 0)
     return closeTrade({tenantId,state,symbol,price,ts});
 
   /* PROFIT PROTECTION */
@@ -394,10 +389,8 @@ AI TICK
 function tick(tenantId,symbol,price,ts=Date.now()){
 
   const state = load(tenantId);
-  const cfg = getTradingConfig(tenantId);
 
   if(!state.running) return;
-  if(!cfg.enabled) return;
 
   if(!Number.isFinite(price) || price<=0)
     return;
@@ -427,19 +420,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     state.executionStats.ticks++;
 
-    try{
-
-      memoryBrain.recordMarketState({
-        tenantId,
-        symbol,
-        price,
-        volatility:state.volatility
-      });
-
-    }catch{}
-
-    /* ACTIVE TRADE */
-
     if(state.position){
 
       handleOpenPosition({
@@ -454,67 +434,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
     }
 
-    /* COOLDOWN */
-
-    const sinceLastTrade =
-      ts - state.lastTradeTime;
-
-    if(sinceLastTrade < COOLDOWN_AFTER_TRADE)
-      return;
-
-    if(
-      state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
-      state.limits.lossesToday >= MAX_DAILY_LOSSES
-    )
-      return;
-
-    /* AI DECISION */
-
-    const plan =
-      makeDecision({
-
-        tenantId,
-        symbol,
-        last:price,
-        paper:state,
-        ticksSeen:state.executionStats.ticks
-
-      }) || {action:"WAIT"};
-
-    state.executionStats.decisions++;
-
-    if(!["BUY","SELL"].includes(plan.action))
-      return;
-
-    const exec =
-      executionEngine.executePaperOrder({
-
-        tenantId,
-        symbol,
-        action:plan.action,
-        price,
-        riskPct:cfg.riskPercent / 100,
-        state,
-        ts
-
-      });
-
-    if(exec?.result){
-
-      state.executionStats.trades++;
-      state.limits.tradesToday++;
-
-      if(state.position){
-
-        state.position.maxDuration =
-          computeDuration(plan.confidence);
-
-      }
-
-      saveState(state);
-
-    }
-
   }
   finally{
 
@@ -524,57 +443,6 @@ function tick(tenantId,symbol,price,ts=Date.now()){
 
 }
 
-/* =========================================================
-SNAPSHOT
-========================================================= */
-
-function snapshot(tenantId){
-
-  const s = load(tenantId);
-
-  return {
-
-    uptime:
-      Date.now() - ENGINE_START,
-
-    cashBalance:s.cashBalance,
-    availableCapital:s.availableCapital,
-    lockedCapital:s.lockedCapital,
-
-    equity:s.equity,
-    peakEquity:s.peakEquity,
-
-    position:s.position || null,
-
-    trades:s.trades || [],
-    decisions:s.decisions || [],
-
-    lastPrice:s.lastPrice,
-    volatility:s.volatility,
-
-    executionStats:s.executionStats,
-    realized:s.realized,
-    limits:s.limits
-
-  };
-
-}
-
 module.exports = {
-
-  tick,
-  snapshot,
-
-  getDecisions:
-    tenantId =>
-      load(tenantId)
-        .decisions.slice(-50),
-
-  hardReset:
-    tenantId =>
-      STATES.set(
-        tenantId,
-        defaultState()
-      )
-
+  tick
 };
