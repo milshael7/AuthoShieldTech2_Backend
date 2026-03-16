@@ -1,6 +1,6 @@
 // ==========================================================
-// STRATEGY ENGINE — INSTITUTIONAL GLOBAL LIQUIDITY CORE v15
-// Liquidity Gravity + Market Intelligence + Structure Engine
+// STRATEGY ENGINE — INSTITUTIONAL GLOBAL LIQUIDITY CORE v16
+// Liquidity Gravity + Micro Opportunity Engine
 // ==========================================================
 
 const patternEngine = require("./patternEngine");
@@ -20,6 +20,11 @@ const BASE_CONFIG = Object.freeze({
   maxRiskPct:0.03,
   minRiskPct:0.002
 });
+
+/* Micro opportunity thresholds */
+
+const MICRO_EDGE = 0.0015;
+const MICRO_CONFIDENCE = 0.45;
 
 /* =========================================================
 PRICE MEMORY
@@ -46,7 +51,7 @@ function updatePriceMemory(tenantId,price){
 }
 
 /* =========================================================
-STRUCTURE STATE
+STRUCTURE
 ========================================================= */
 
 function getStructureState(tenantId){
@@ -64,7 +69,6 @@ function getStructureState(tenantId){
   }
 
   return STRUCTURE_MEMORY.get(key);
-
 }
 
 /* =========================================================
@@ -131,7 +135,7 @@ function updateStructure(tenantId,price,swingHigh,swingLow){
 }
 
 /* =========================================================
-TREND DETECTION
+TREND
 ========================================================= */
 
 function detectTrend(prices,len){
@@ -157,29 +161,16 @@ function detectLiquidityGravity(prices){
   if(prices.length < 20)
     return "neutral";
 
-  const highs =
-    prices.slice(-20);
+  const max = Math.max(...prices.slice(-20));
+  const min = Math.min(...prices.slice(-20));
 
-  const max =
-    Math.max(...highs);
+  const last = prices[prices.length-1];
 
-  const min =
-    Math.min(...highs);
+  const distHigh = Math.abs(max-last)/last;
+  const distLow  = Math.abs(last-min)/last;
 
-  const last =
-    prices[prices.length-1];
-
-  const distHigh =
-    Math.abs(max-last)/last;
-
-  const distLow =
-    Math.abs(last-min)/last;
-
-  if(distHigh < distLow)
-    return "up";
-
-  if(distLow < distHigh)
-    return "down";
+  if(distHigh < distLow) return "up";
+  if(distLow < distHigh) return "down";
 
   return "neutral";
 }
@@ -192,11 +183,8 @@ function detectLiquiditySweep(prices){
 
   if(prices.length < 8) return false;
 
-  const prevHigh =
-    Math.max(...prices.slice(-8,-2));
-
-  const prevLow =
-    Math.min(...prices.slice(-8,-2));
+  const prevHigh = Math.max(...prices.slice(-8,-2));
+  const prevLow  = Math.min(...prices.slice(-8,-2));
 
   const last = prices[prices.length-1];
   const prev = prices[prices.length-2];
@@ -208,23 +196,6 @@ function detectLiquiditySweep(prices){
     return "bullish";
 
   return false;
-}
-
-/* =========================================================
-MOVE EXTENSION FILTER
-========================================================= */
-
-function moveTooExtended(prices){
-
-  if(prices.length < 12)
-    return false;
-
-  const first = prices[prices.length-12];
-  const last  = prices[prices.length-1];
-
-  const move = Math.abs(last-first)/first;
-
-  return move > 0.0045;
 }
 
 /* =========================================================
@@ -241,14 +212,9 @@ function computeEdge({price,lastPrice,volatility,regime}){
   let normalized =
     rawMomentum/(volatility || 0.002);
 
-  if(regime==="trend")
-    normalized *= 1.25;
-
-  if(regime==="range")
-    normalized *= 0.80;
-
-  if(regime==="volatility_expansion")
-    normalized *= 1.35;
+  if(regime==="trend") normalized*=1.25;
+  if(regime==="range") normalized*=0.8;
+  if(regime==="volatility_expansion") normalized*=1.35;
 
   return clamp(normalized,-0.07,0.07);
 }
@@ -271,35 +237,25 @@ function computeRisk({
   regime
 }){
 
-  let risk =
-    BASE_CONFIG.baseRiskPct;
+  let risk = BASE_CONFIG.baseRiskPct;
 
-  if(confidence > 0.85)
-    risk *= 2.4;
-  else if(confidence > 0.70)
-    risk *= 1.7;
-  else if(confidence > 0.55)
-    risk *= 1.2;
-  else
-    risk *= 0.6;
+  if(confidence > 0.85) risk*=2.4;
+  else if(confidence > 0.70) risk*=1.7;
+  else if(confidence > 0.55) risk*=1.2;
+  else risk*=0.6;
 
-  if(volatility > 0.01)
-    risk *= 0.6;
+  if(volatility > 0.01) risk*=0.6;
+  if(volatility > 0.015) risk*=0.4;
 
-  if(volatility > 0.015)
-    risk *= 0.4;
-
-  if(regime==="range")
-    risk *= 0.7;
-
-  if(regime==="volatility_expansion")
-    risk *= 0.75;
+  if(regime==="range") risk*=0.7;
+  if(regime==="volatility_expansion") risk*=0.75;
 
   return clamp(
     risk,
     BASE_CONFIG.minRiskPct,
     BASE_CONFIG.maxRiskPct
   );
+
 }
 
 /* =========================================================
@@ -352,12 +308,6 @@ function buildDecision(context={}){
       volatility
     });
 
-  const marketIntel =
-    correlationEngine.getMarketIntelligence?.(tenantId) || {};
-
-  const riskRegime =
-    marketIntel.regime || "neutral";
-
   let edge =
     computeEdge({
       price,
@@ -399,27 +349,16 @@ function buildDecision(context={}){
   confidence *= learningBoost;
   edge *= learningBoost;
 
-  /* Macro Risk Filter */
+  /* liquidity gravity alignment */
 
-  if(riskRegime === "risk_off"){
-    confidence *= 0.85;
-  }
+  if(liquidityGravity==="up" && microTrend==="up")
+    confidence *= 1.08;
 
-  if(riskRegime === "risk_on"){
-    confidence *= 1.05;
-  }
-
-  if(liquidityGravity==="up")
-    confidence *= 1.05;
-
-  if(liquidityGravity==="down")
-    confidence *= 1.05;
+  if(liquidityGravity==="down" && microTrend==="down")
+    confidence *= 1.08;
 
   edge = clamp(edge,-0.07,0.07);
   confidence = clamp(confidence,0.05,1);
-
-  if(moveTooExtended(prices))
-    return {action:"WAIT",confidence,edge};
 
   const riskPct =
     computeRisk({
@@ -427,6 +366,10 @@ function buildDecision(context={}){
       volatility,
       regime
     });
+
+  /* =========================================================
+  HIGH QUALITY STRUCTURE TRADES
+  ========================================================= */
 
   if(
     swingLow &&
@@ -466,8 +409,40 @@ function buildDecision(context={}){
 
   }
 
-  if(liquiditySweep==="bullish"){
+  /* =========================================================
+  MICRO OPPORTUNITY ENGINE
+  ========================================================= */
 
+  if(
+    Math.abs(edge) > MICRO_EDGE &&
+    confidence > MICRO_CONFIDENCE
+  ){
+
+    if(microTrend==="up")
+      return{
+        symbol,
+        action:"BUY",
+        confidence:confidence*0.8,
+        edge,
+        riskPct:riskPct*0.5,
+        regime,
+        ts:Date.now()
+      };
+
+    if(microTrend==="down")
+      return{
+        symbol,
+        action:"SELL",
+        confidence:confidence*0.8,
+        edge,
+        riskPct:riskPct*0.5,
+        regime,
+        ts:Date.now()
+      };
+
+  }
+
+  if(liquiditySweep==="bullish"){
     return{
       symbol,
       action:"BUY",
@@ -477,11 +452,9 @@ function buildDecision(context={}){
       regime,
       ts:Date.now()
     };
-
   }
 
   if(liquiditySweep==="bearish"){
-
     return{
       symbol,
       action:"SELL",
@@ -491,7 +464,6 @@ function buildDecision(context={}){
       regime,
       ts:Date.now()
     };
-
   }
 
   return{
