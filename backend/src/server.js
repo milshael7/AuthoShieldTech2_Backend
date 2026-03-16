@@ -1,16 +1,13 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable (AI Engine Resilient Patch)
-//
+// VERSION: Production Stable + Real-Time Trade Broadcast
 // PURPOSE
 // Main backend runtime entry point.
 //
-// FIXES
-// - Prevent AI engine stall if market price temporarily missing
-// - Fallback to last known paperTrader price
-// - Final fallback to safe default price
-// - Ensures AI engine never stops generating ticks
+// ADDED
+// - Real-time AI trade broadcasting for chart markers
+// - Allows frontend to display BUY/SELL instantly
 // ==========================================================
 
 require("dotenv").config();
@@ -244,8 +241,6 @@ setInterval(()=>{
       let price =
         market?.BTCUSDT?.price;
 
-      /* ================= FAILSAFE PRICE ================= */
-
       if(!price){
 
         const last =
@@ -286,6 +281,38 @@ const wss = new WebSocketServer({
   server,
   path:"/ws"
 });
+
+/* =========================================================
+REAL TIME TRADE BROADCAST
+========================================================= */
+
+function broadcastTrade(trade, tenantId){
+
+  wss.clients.forEach(ws=>{
+
+    if(ws.channel !== "paper") return;
+    if(ws.tenantId !== tenantId) return;
+
+    try{
+
+      ws.send(JSON.stringify({
+
+        channel:"paper",
+        type:"trade",
+        trade,
+        ts:Date.now()
+
+      }));
+
+    }catch{}
+
+  });
+
+}
+
+/* expose globally so executionEngine can use it */
+
+global.broadcastTrade = broadcastTrade;
 
 function closeWs(ws){
   try{ws.close()}catch{}
