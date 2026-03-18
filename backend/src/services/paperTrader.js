@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v48.1 (Dual Slot Safer Tick Control + Replay Guard)
+// VERSION: v49.0 (Execution-Aligned + Safer Capital + Replay Clean)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -157,6 +157,14 @@ function defaultState() {
     cashBalance: START_BAL,
     availableCapital: START_BAL,
     lockedCapital: 0,
+    equity: START_BAL,
+    peakEquity: START_BAL,
+    realized: {
+      wins: 0,
+      losses: 0,
+      net: 0,
+      fees: 0,
+    },
     position: null,
     positions: {
       structure: null,
@@ -165,6 +173,7 @@ function defaultState() {
     trades: [],
     decisions: [],
     volatility: 0.003,
+    lastPrice: NaN,
     lastPriceBySymbol: {},
     lastTradeTime: 0,
     lastTradeTimeBySlot: {
@@ -188,23 +197,12 @@ function defaultState() {
       decisions: 0,
       trades: 0,
     },
+    executionConfig: {},
     _locked: false,
   };
 }
 
 const STATES = new Map();
-
-function load(tenantId) {
-  if (STATES.has(tenantId)) {
-    const existing = STATES.get(tenantId);
-    ensureStateShape(existing);
-    return existing;
-  }
-
-  const state = defaultState();
-  STATES.set(tenantId, state);
-  return state;
-}
 
 /* =========================================================
 HELPERS
@@ -219,6 +217,10 @@ function safeNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function roundMoney(v) {
+  return Number(safeNum(v, 0).toFixed(8));
+}
+
 function normalizeSlot(slot) {
   return String(slot || "").toLowerCase() === "structure"
     ? "structure"
@@ -231,6 +233,18 @@ function getDayKey(ts = Date.now()) {
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function load(tenantId) {
+  if (STATES.has(tenantId)) {
+    const existing = STATES.get(tenantId);
+    ensureStateShape(existing);
+    return existing;
+  }
+
+  const state = defaultState();
+  STATES.set(tenantId, state);
+  return state;
 }
 
 function ensureStateShape(state) {
@@ -293,6 +307,49 @@ function ensureStateShape(state) {
     state.lastDecisionTimeBySlot.scalp = 0;
   }
 
+  if (!state.limits || typeof state.limits !== "object") {
+    state.limits = {
+      tradesToday: 0,
+      lossesToday: 0,
+      lastResetDate: getDayKey(),
+    };
+  }
+
+  if (!state.executionStats || typeof state.executionStats !== "object") {
+    state.executionStats = {
+      ticks: 0,
+      decisions: 0,
+      trades: 0,
+    };
+  }
+
+  if (!state.realized || typeof state.realized !== "object") {
+    state.realized = {
+      wins: 0,
+      losses: 0,
+      net: 0,
+      fees: 0,
+    };
+  }
+
+  if (!Array.isArray(state.trades)) state.trades = [];
+  if (!Array.isArray(state.decisions)) state.decisions = [];
+  if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
+    state.lastPriceBySymbol = {};
+  }
+
+  state.cashBalance = roundMoney(safeNum(state.cashBalance, START_BAL));
+  state.availableCapital = roundMoney(
+    safeNum(state.availableCapital, state.cashBalance)
+  );
+  state.lockedCapital = roundMoney(safeNum(state.lockedCapital, 0));
+  state.equity = roundMoney(
+    safeNum(state.equity, state.cashBalance)
+  );
+  state.peakEquity = roundMoney(
+    safeNum(state.peakEquity, state.equity)
+  );
+
   state.position =
     state.positions.structure ||
     state.positions.scalp ||
@@ -344,12 +401,21 @@ function recordDecision(state, plan, ts = Date.now()) {
 function snapshot(tenantId) {
   const s = load(tenantId);
   ensureStateShape(s);
+  updateCapitalView(s);
 
   return {
     running: !!s.running,
     cashBalance: safeNum(s.cashBalance),
     availableCapital: safeNum(s.availableCapital, safeNum(s.cashBalance)),
     lockedCapital: safeNum(s.lockedCapital),
+    equity: safeNum(s.equity, safeNum(s.cashBalance)),
+    peakEquity: safeNum(s.peakEquity, safeNum(s.equity, s.cashBalance)),
+    realized: {
+      wins: safeNum(s.realized?.wins),
+      losses: safeNum(s.realized?.losses),
+      net: safeNum(s.realized?.net),
+      fees: safeNum(s.realized?.fees),
+    },
     position: s.position ? { ...s.position } : null,
     positions: {
       structure: s.positions.structure ? { ...s.positions.structure } : null,
@@ -358,6 +424,7 @@ function snapshot(tenantId) {
     trades: Array.isArray(s.trades) ? s.trades.slice(-500) : [],
     decisions: Array.isArray(s.decisions) ? s.decisions.slice(-200) : [],
     volatility: safeNum(s.volatility, 0.003),
+    lastPrice: safeNum(s.lastPrice, NaN),
     lastPriceBySymbol: { ...(s.lastPriceBySymbol || {}) },
     lastTradeTime: safeNum(s.lastTradeTime),
     lastTradeTimeBySlot: {
@@ -389,13 +456,17 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
 
   if (!openPositions.length) {
     state.lockedCapital = 0;
-    state.availableCapital = Math.max(0, safeNum(state.cashBalance));
+    state.availableCapital = roundMoney(Math.max(0, safeNum(state.cashBalance)));
+    state.equity = roundMoney(safeNum(state.cashBalance));
+    state.peakEquity = roundMoney(
+      Math.max(safeNum(state.peakEquity, state.equity), state.equity)
+    );
     state.position = null;
     return;
   }
 
   let totalLocked = 0;
-  let positiveUnrealized = 0;
+  let unrealized = 0;
 
   for (const { pos } of openPositions) {
     const markPrice =
@@ -411,19 +482,22 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
       safeNum(pos.qty) * safeNum(pos.entry)
     );
 
-    const unrealized =
+    const pnl =
       pos.side === "LONG"
         ? (markPrice - pos.entry) * pos.qty
         : (pos.entry - markPrice) * pos.qty;
 
     totalLocked += Math.max(0, capitalUsed);
-    positiveUnrealized += Math.max(0, unrealized);
+    unrealized += pnl;
   }
 
-  state.lockedCapital = Math.max(0, totalLocked);
-  state.availableCapital = Math.max(
-    0,
-    safeNum(state.cashBalance) - state.lockedCapital + positiveUnrealized
+  state.lockedCapital = roundMoney(Math.max(0, totalLocked));
+  state.availableCapital = roundMoney(
+    Math.max(0, safeNum(state.cashBalance) - state.lockedCapital)
+  );
+  state.equity = roundMoney(safeNum(state.cashBalance) + unrealized);
+  state.peakEquity = roundMoney(
+    Math.max(safeNum(state.peakEquity, state.equity), state.equity)
   );
 
   state.position =
@@ -476,6 +550,16 @@ function recordPrice(tenantId, symbol, price) {
 
 function getPrices(tenantId, symbol) {
   return PRICE_HISTORY.get(historyKey(tenantId, symbol)) || [];
+}
+
+function clearPriceHistory(tenantId) {
+  const prefix = `${tenantId || "__default__"}::`;
+
+  for (const key of PRICE_HISTORY.keys()) {
+    if (key.startsWith(prefix)) {
+      PRICE_HISTORY.delete(key);
+    }
+  }
 }
 
 /* =========================================================
@@ -768,16 +852,16 @@ function isExtendedFromBase(prices, action) {
   if (prices.length < ENTRY_EXTENSION_LOOKBACK) return false;
 
   const slice = prices.slice(-ENTRY_EXTENSION_LOOKBACK);
-  const price = slice[slice.length - 1];
+  const last = slice[slice.length - 1];
   const low = Math.min(...slice);
   const high = Math.max(...slice);
 
   if (action === "BUY") {
-    return ((price - low) / low) >= ENTRY_EXTENSION_BLOCK_PCT;
+    return ((last - low) / low) >= ENTRY_EXTENSION_BLOCK_PCT;
   }
 
   if (action === "SELL") {
-    return ((high - price) / high) >= ENTRY_EXTENSION_BLOCK_PCT;
+    return ((high - last) / high) >= ENTRY_EXTENSION_BLOCK_PCT;
   }
 
   return false;
@@ -888,11 +972,53 @@ function buildQuickScalpPlan({ symbol, price, prices }) {
 }
 
 /* =========================================================
+PRICE / EXECUTION HELPERS
+========================================================= */
+
+function getExecutableClosePrice(state, symbol, side, rawPrice) {
+  const price = safeNum(rawPrice, 0);
+  if (price <= 0) return 0;
+
+  const cfg = state?.executionConfig || {};
+  const bySymbol = cfg.bySymbol?.[symbol] || {};
+
+  const slippageBps = clamp(
+    safeNum(bySymbol.slippageBps, cfg.slippageBps ?? 3),
+    0,
+    500
+  );
+
+  const spreadBps = clamp(
+    safeNum(bySymbol.spreadBps, cfg.spreadBps ?? 2),
+    0,
+    500
+  );
+
+  const spreadHalf = price * (spreadBps / 10000) * 0.5;
+  const slippage = price * (slippageBps / 10000);
+
+  if (side === "LONG") {
+    return roundMoney(price - spreadHalf - slippage);
+  }
+
+  if (side === "SHORT") {
+    return roundMoney(price + spreadHalf + slippage);
+  }
+
+  return roundMoney(price);
+}
+
+/* =========================================================
 CLOSE TRADE
 ========================================================= */
 
 function closeTrade({ tenantId, state, symbol, slot, price, ts }) {
   const normalizedSlot = normalizeSlot(slot);
+  const beforePos = getPosition(state, normalizedSlot);
+
+  if (!beforePos || beforePos.symbol !== symbol) {
+    return false;
+  }
 
   const closed = executionEngine.executePaperOrder({
     tenantId,
@@ -904,9 +1030,19 @@ function closeTrade({ tenantId, state, symbol, slot, price, ts }) {
     ts,
   });
 
-  if (!closed?.result) return false;
+  const closeResults = Array.isArray(closed?.results)
+    ? closed.results
+    : closed?.result
+      ? [closed.result]
+      : [];
 
-  const pnl = Number(closed.result.pnl || 0);
+  if (!closeResults.length) return false;
+
+  const relevant = closeResults.find(
+    (x) => normalizeSlot(x.slot) === normalizedSlot
+  ) || closeResults[0];
+
+  const pnl = Number(relevant?.pnl || 0);
 
   if (pnl < 0) {
     state.limits.lossesToday++;
@@ -961,11 +1097,11 @@ function computeWarningPrice(pos) {
   return pos.entry * (1 + pullbackPct);
 }
 
-function isWarningTouched(pos, price) {
+function isWarningTouched(pos, executablePrice) {
   if (!Number.isFinite(pos.warningPrice)) return false;
 
-  if (pos.side === "LONG") return price <= pos.warningPrice;
-  return price >= pos.warningPrice;
+  if (pos.side === "LONG") return executablePrice <= pos.warningPrice;
+  return executablePrice >= pos.warningPrice;
 }
 
 function protectProfitFloor(pos, strongTrend) {
@@ -1046,17 +1182,17 @@ function protectScalpProfitFloor(pos, strongTrend) {
   }
 }
 
-function shouldExitByLockedFloor(pos, price) {
+function shouldExitByLockedFloor(pos, executablePrice) {
   if (!Number.isFinite(pos.lockedProfitFloor)) return false;
 
-  if (pos.side === "LONG") return price <= pos.lockedProfitFloor;
-  return price >= pos.lockedProfitFloor;
+  if (pos.side === "LONG") return executablePrice <= pos.lockedProfitFloor;
+  return executablePrice >= pos.lockedProfitFloor;
 }
 
-function getPnLPct(pos, price) {
+function getPnLPct(pos, executablePrice) {
   return pos.side === "LONG"
-    ? (price - pos.entry) / pos.entry
-    : (pos.entry - price) / pos.entry;
+    ? (executablePrice - pos.entry) / pos.entry
+    : (pos.entry - executablePrice) / pos.entry;
 }
 
 function reachedScalpTarget(pos, pnl, strongTrend) {
@@ -1093,6 +1229,7 @@ function handleStructurePosition({
   pnl,
   elapsed,
   prices,
+  executableExitPrice,
 }) {
   const strongTrend = detectTrendRun(prices, pos.side, 4);
   const momentumWeak = detectMomentumWeakening(prices);
@@ -1115,11 +1252,11 @@ function handleStructurePosition({
   if (Number.isFinite(targetPrice) && !pos.targetReached) {
     const longHit =
       pos.side === "LONG" &&
-      price >= targetPrice * (1 - STRUCTURE_TARGET_BUFFER);
+      executableExitPrice >= targetPrice * (1 - STRUCTURE_TARGET_BUFFER);
 
     const shortHit =
       pos.side === "SHORT" &&
-      price <= targetPrice * (1 + STRUCTURE_TARGET_BUFFER);
+      executableExitPrice <= targetPrice * (1 + STRUCTURE_TARGET_BUFFER);
 
     if (longHit || shortHit) {
       if (!strongTrend) {
@@ -1147,7 +1284,7 @@ function handleStructurePosition({
   if (pos.targetReached) {
     protectProfitFloor(pos, strongTrend);
 
-    if (shouldExitByLockedFloor(pos, price)) {
+    if (shouldExitByLockedFloor(pos, executableExitPrice)) {
       return closeTrade({ tenantId, state, symbol, slot: "structure", price, ts });
     }
 
@@ -1155,7 +1292,7 @@ function handleStructurePosition({
       return closeTrade({ tenantId, state, symbol, slot: "structure", price, ts });
     }
 
-    if (isWarningTouched(pos, price) && !strongTrend) {
+    if (isWarningTouched(pos, executableExitPrice) && !strongTrend) {
       pos.warningTouches += 1;
     } else if (strongTrend) {
       pos.warningTouches = 0;
@@ -1189,7 +1326,7 @@ function handleStructurePosition({
 
   if (
     pnl > 0 &&
-    isWarningTouched(pos, price) &&
+    isWarningTouched(pos, executableExitPrice) &&
     (hardBreak || weakReversal) &&
     !strongTrend
   ) {
@@ -1213,6 +1350,7 @@ function handleScalpPosition({
   pnl,
   elapsed,
   prices,
+  executableExitPrice,
 }) {
   const strongTrend = detectTrendRun(prices, pos.side, 3);
   const momentumWeak = detectMomentumWeakening(prices);
@@ -1231,7 +1369,7 @@ function handleScalpPosition({
 
   if (elapsed < MIN_HOLD_TIME) return false;
 
-  if (shouldExitByLockedFloor(pos, price)) {
+  if (shouldExitByLockedFloor(pos, executableExitPrice)) {
     return closeTrade({ tenantId, state, symbol, slot: "scalp", price, ts });
   }
 
@@ -1261,7 +1399,7 @@ function handleScalpPosition({
 
   if (
     pnl > 0 &&
-    isWarningTouched(pos, price) &&
+    isWarningTouched(pos, executableExitPrice) &&
     !strongTrend &&
     (hardBreak || weakReversal)
   ) {
@@ -1295,7 +1433,13 @@ function handleOpenPosition({
   if (pos.symbol !== symbol) return false;
 
   const elapsed = ts - pos.time;
-  const pnl = getPnLPct(pos, price);
+  const executableExitPrice = getExecutableClosePrice(
+    state,
+    symbol,
+    pos.side,
+    price
+  );
+  const pnl = getPnLPct(pos, executableExitPrice);
 
   if (normalizedSlot === "structure" || pos.mode === "STRUCTURE") {
     return handleStructurePosition({
@@ -1308,6 +1452,7 @@ function handleOpenPosition({
       pnl,
       elapsed,
       prices,
+      executableExitPrice,
     });
   }
 
@@ -1321,6 +1466,7 @@ function handleOpenPosition({
     pnl,
     elapsed,
     prices,
+    executableExitPrice,
   });
 }
 
@@ -1365,6 +1511,8 @@ function openTrade({
     price,
     riskPct: Number(plan.riskPct || 0.01),
     confidence: Number(plan.confidence || 0.5),
+    stopLoss: Number.isFinite(Number(plan.stopLoss)) ? Number(plan.stopLoss) : undefined,
+    takeProfit: Number.isFinite(Number(plan.takeProfit)) ? Number(plan.takeProfit) : undefined,
     state,
     slot: normalizedSlot,
     ts,
@@ -1462,6 +1610,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     resetDailyLimitsIfNeeded(state, ts);
 
     const prev = safeNum(state.lastPriceBySymbol?.[symbol], NaN);
+    state.lastPrice = price;
     state.lastPriceBySymbol[symbol] = price;
     rememberProcessedTick(state, symbol, price, ts);
 
@@ -1703,6 +1852,7 @@ MANUAL RESET
 
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
+  clearPriceHistory(tenantId);
 }
 
 /* =========================================================
