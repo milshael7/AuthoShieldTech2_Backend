@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v25.0 (Dual Slot Execution + Safe Ledger + SL/TP Guard)
+// VERSION: v26.0 (Deterministic + Risk-Based + Realistic Fills)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -33,9 +33,17 @@ function roundQty(qty) {
   return Number(safeNum(qty, 0).toFixed(6));
 }
 
+function roundMoney(v) {
+  return Number(safeNum(v, 0).toFixed(8));
+}
+
 function normalizeSlot(slot) {
   const s = String(slot || "").toLowerCase();
   return s === "structure" ? "structure" : "scalp";
+}
+
+function epsilonEq(a, b, eps = 0.000001) {
+  return Math.abs(safeNum(a, 0) - safeNum(b, 0)) <= eps;
 }
 
 function ensureTradeLog(state) {
@@ -46,12 +54,13 @@ function ensureTradeLog(state) {
 
 function ensureRealized(state) {
   if (!state.realized || typeof state.realized !== "object") {
-    state.realized = { wins: 0, losses: 0, net: 0 };
+    state.realized = { wins: 0, losses: 0, net: 0, fees: 0 };
   }
 
   state.realized.wins = safeNum(state.realized.wins, 0);
   state.realized.losses = safeNum(state.realized.losses, 0);
   state.realized.net = safeNum(state.realized.net, 0);
+  state.realized.fees = safeNum(state.realized.fees, 0);
 }
 
 function ensurePositionsShape(state) {
@@ -131,7 +140,7 @@ function ensureBalances(state) {
     state.lockedCapital = Math.max(0, locked);
   }
 
-  state.cashBalance = state.availableCapital + state.lockedCapital;
+  state.cashBalance = roundMoney(state.availableCapital + state.lockedCapital);
 }
 
 function ensurePositionRuntime(position, slot = "scalp") {
@@ -140,10 +149,11 @@ function ensurePositionRuntime(position, slot = "scalp") {
   position.slot = normalizeSlot(position.slot || slot);
   position.qty = roundQty(position.qty);
   position.entry = safeNum(position.entry, 0);
-  position.capitalUsed = safeNum(position.capitalUsed, 0);
+  position.capitalUsed = roundMoney(safeNum(position.capitalUsed, 0));
   position.time = safeNum(position.time, Date.now());
   position.peakProfit = safeNum(position.peakProfit, 0);
   position.pyramidCount = safeNum(position.pyramidCount, 0);
+  position.openFee = roundMoney(safeNum(position.openFee, 0));
 
   if (!Number.isFinite(position.stopLoss)) {
     position.stopLoss = null;
@@ -154,11 +164,54 @@ function ensurePositionRuntime(position, slot = "scalp") {
   }
 }
 
+function ensureMarketState(state) {
+  if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
+    state.lastPriceBySymbol = {};
+  }
+}
+
+function assertStateInvariants(state) {
+  ensureBalances(state);
+  ensurePositionsShape(state);
+  ensureTradeLog(state);
+  ensureRealized(state);
+
+  if (state.availableCapital < -0.000001) {
+    throw new Error("Invariant failed: availableCapital < 0");
+  }
+
+  if (state.lockedCapital < -0.000001) {
+    throw new Error("Invariant failed: lockedCapital < 0");
+  }
+
+  const expectedCash = roundMoney(state.availableCapital + state.lockedCapital);
+  if (!epsilonEq(expectedCash, state.cashBalance, 0.00001)) {
+    state.cashBalance = expectedCash;
+  }
+
+  for (const { slot, pos } of getOpenPositions(state)) {
+    ensurePositionRuntime(pos, slot);
+
+    if (pos.qty <= 0) {
+      throw new Error(`Invariant failed: non-positive qty in slot ${slot}`);
+    }
+
+    if (pos.entry <= 0) {
+      throw new Error(`Invariant failed: non-positive entry in slot ${slot}`);
+    }
+
+    if (pos.capitalUsed < 0) {
+      throw new Error(`Invariant failed: negative capitalUsed in slot ${slot}`);
+    }
+  }
+}
+
 function syncAccountState(state, markPrices = {}) {
   ensureTradeLog(state);
   ensureBalances(state);
   ensureRealized(state);
   ensurePositionsShape(state);
+  ensureMarketState(state);
 
   let lockedCapital = 0;
   let unrealized = 0;
@@ -174,31 +227,32 @@ function syncAccountState(state, markPrices = {}) {
         ? safeNum(state.lastPriceBySymbol[pos.symbol], NaN)
         : safeNum(state.lastPrice, NaN);
 
-    const price = Number.isFinite(explicitMark) && explicitMark > 0
-      ? explicitMark
-      : fallbackLast;
+    const price =
+      Number.isFinite(explicitMark) && explicitMark > 0
+        ? explicitMark
+        : fallbackLast;
 
     if (price > 0) {
-      unrealized +=
+      const grossPnl =
         pos.side === "LONG"
           ? (price - pos.entry) * pos.qty
           : (pos.entry - price) * pos.qty;
+
+      unrealized += grossPnl;
     }
   }
 
-  state.lockedCapital = Math.max(0, lockedCapital);
-  state.availableCapital = Math.max(
-    0,
-    safeNum(state.cashBalance, 0) - state.lockedCapital
+  state.lockedCapital = roundMoney(Math.max(0, lockedCapital));
+  state.availableCapital = roundMoney(
+    Math.max(0, safeNum(state.cashBalance, 0) - state.lockedCapital)
   );
-  state.equity = safeNum(state.cashBalance, 0) + unrealized;
+  state.equity = roundMoney(safeNum(state.cashBalance, 0) + unrealized);
 
   if (!Number.isFinite(state.peakEquity)) {
     state.peakEquity = state.equity;
   } else {
-    state.peakEquity = Math.max(
-      safeNum(state.peakEquity, state.equity),
-      state.equity
+    state.peakEquity = roundMoney(
+      Math.max(safeNum(state.peakEquity, state.equity), state.equity)
     );
   }
 
@@ -206,21 +260,29 @@ function syncAccountState(state, markPrices = {}) {
     state.positions.structure ||
     state.positions.scalp ||
     null;
+
+  assertStateInvariants(state);
 }
 
-function applyRealizedPnl(state, pnl) {
+function applyRealizedPnl(state, pnl, fees = 0) {
   ensureRealized(state);
 
-  pnl = safeNum(pnl, 0);
+  pnl = roundMoney(safeNum(pnl, 0));
+  fees = roundMoney(safeNum(fees, 0));
 
   if (pnl > 0) state.realized.wins += 1;
   else if (pnl < 0) state.realized.losses += 1;
 
-  state.realized.net += pnl;
+  state.realized.net = roundMoney(state.realized.net + pnl);
+  state.realized.fees = roundMoney(state.realized.fees + fees);
 }
 
 /* =========================================================
 RISK CONFIGURATION
+Synthetic margin model:
+- LONG and SHORT both reserve notional capital in paper mode
+- capitalUsed represents reserved margin/notional budget
+- this keeps ledger deterministic and capital-constrained
 ========================================================= */
 
 const MAX_EQUITY_EXPOSURE = 0.03;
@@ -238,7 +300,75 @@ const PYRAMID_TRIGGER_PNL = 0.003;
 const PYRAMID_SIZE_FACTOR = 0.35;
 
 /* =========================================================
+EXECUTION REALISM
+========================================================= */
+
+const DEFAULT_FEES_BPS = 5;      // 0.05%
+const DEFAULT_SLIPPAGE_BPS = 3;  // 0.03%
+const DEFAULT_SPREAD_BPS = 2;    // 0.02%
+
+function getExecutionConfig(state, symbol) {
+  const globalConfig = state?.executionConfig || {};
+  const bySymbol = globalConfig.bySymbol?.[symbol] || {};
+
+  const feeBps = clamp(
+    safeNum(bySymbol.feeBps, globalConfig.feeBps ?? DEFAULT_FEES_BPS),
+    0,
+    100
+  );
+
+  const slippageBps = clamp(
+    safeNum(bySymbol.slippageBps, globalConfig.slippageBps ?? DEFAULT_SLIPPAGE_BPS),
+    0,
+    500
+  );
+
+  const spreadBps = clamp(
+    safeNum(bySymbol.spreadBps, globalConfig.spreadBps ?? DEFAULT_SPREAD_BPS),
+    0,
+    500
+  );
+
+  return { feeBps, slippageBps, spreadBps };
+}
+
+function applyExecutionPriceModel({
+  symbol,
+  rawPrice,
+  side,
+  state,
+}) {
+  const price = safeNum(rawPrice, 0);
+  if (price <= 0) return 0;
+
+  const { slippageBps, spreadBps } = getExecutionConfig(state, symbol);
+
+  const spreadHalf = price * (spreadBps / 10000) * 0.5;
+  const slippage = price * (slippageBps / 10000);
+
+  if (side === "BUY") {
+    return roundMoney(price + spreadHalf + slippage);
+  }
+
+  if (side === "SELL") {
+    return roundMoney(price - spreadHalf - slippage);
+  }
+
+  return roundMoney(price);
+}
+
+function calculateFee({
+  symbol,
+  notional,
+  state,
+}) {
+  const { feeBps } = getExecutionConfig(state, symbol);
+  return roundMoney(safeNum(notional, 0) * (feeBps / 10000));
+}
+
+/* =========================================================
 EXECUTION COOLDOWN
+FIX: Use event time, not wall clock
 ========================================================= */
 
 const EXECUTION_COOLDOWN_MS = 400;
@@ -248,9 +378,10 @@ function executionKey(tenantId, symbol, slot) {
   return `${tenantId || "__default__"}:${symbol || "__symbol__"}:${normalizeSlot(slot)}`;
 }
 
-function isCoolingDown(tenantId, symbol, slot, now) {
+function isCoolingDown(tenantId, symbol, slot, eventTs) {
   const key = executionKey(tenantId, symbol, slot);
   const last = safeNum(LAST_EXECUTION_BY_KEY.get(key), 0);
+  const now = safeNum(eventTs, 0);
 
   if (now - last < EXECUTION_COOLDOWN_MS) {
     return true;
@@ -268,9 +399,18 @@ function isCoolingDown(tenantId, symbol, slot, now) {
 
 /* =========================================================
 POSITION SIZE
+FIX: Use stop distance when stopLoss is provided
 ========================================================= */
 
-function calculatePositionSize(state, price, riskPct, confidence = 0.5, slot = "scalp") {
+function calculatePositionSize(
+  state,
+  price,
+  riskPct,
+  confidence = 0.5,
+  slot = "scalp",
+  stopLoss = null,
+  side = "LONG"
+) {
   ensureBalances(state);
   ensurePositionsShape(state);
 
@@ -285,7 +425,6 @@ function calculatePositionSize(state, price, riskPct, confidence = 0.5, slot = "
   const boundedConfidence = clamp(safeNum(confidence, 0.5), 0, 1);
 
   let confidenceScale = 1;
-
   if (boundedConfidence >= 0.9) confidenceScale = 1.15;
   else if (boundedConfidence >= 0.8) confidenceScale = 1.05;
   else if (boundedConfidence < 0.4) confidenceScale = 0.75;
@@ -297,7 +436,7 @@ function calculatePositionSize(state, price, riskPct, confidence = 0.5, slot = "
   const exposureCap = equity * MAX_EQUITY_EXPOSURE;
   const hardRiskCap = equity * HARD_ACCOUNT_RISK;
 
-  const allowedCapital = Math.min(
+  let allowedNotional = Math.min(
     requestedRiskCapital,
     exposureCap,
     hardRiskCap,
@@ -306,11 +445,33 @@ function calculatePositionSize(state, price, riskPct, confidence = 0.5, slot = "
     safeNum(state.availableCapital, 0)
   );
 
-  if (allowedCapital < MIN_TRADE_USD) {
+  // Risk sizing by stop distance when SL is valid
+  if (Number.isFinite(stopLoss) && stopLoss > 0) {
+    const perUnitRisk = Math.abs(price - stopLoss);
+    if (perUnitRisk > 0) {
+      const riskBudget = Math.min(
+        equity * boundedRiskPct * confidenceScale,
+        equity * HARD_ACCOUNT_RISK,
+        MAX_TRADE_USD
+      );
+
+      const riskQty = riskBudget / perUnitRisk;
+      const notionalCappedQty = allowedNotional / price;
+      const sizedQty = Math.min(riskQty, notionalCappedQty);
+
+      if (sizedQty * price < MIN_TRADE_USD) {
+        return 0;
+      }
+
+      return roundQty(sizedQty);
+    }
+  }
+
+  if (allowedNotional < MIN_TRADE_USD) {
     return 0;
   }
 
-  return roundQty(allowedCapital / price);
+  return roundQty(allowedNotional / price);
 }
 
 /* =========================================================
@@ -381,6 +542,7 @@ function openPosition({
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensureRealized(state);
   ensurePositionsShape(state);
 
   const normalizedSlot = normalizeSlot(slot);
@@ -389,9 +551,17 @@ function openPosition({
   if (getPosition(state, normalizedSlot)) return null;
   if (qty <= 0) return null;
 
-  const cost = safeNum(qty * price, 0);
-  if (cost <= 0) return null;
-  if (cost > state.availableCapital) return null;
+  const reservedNotional = roundMoney(qty * price);
+  if (reservedNotional <= 0) return null;
+
+  const openFee = calculateFee({
+    symbol,
+    notional: reservedNotional,
+    state,
+  });
+
+  const totalRequired = roundMoney(reservedNotional + openFee);
+  if (totalRequired > state.availableCapital) return null;
 
   const sltp = normalizeStopLossTakeProfit({
     side,
@@ -400,8 +570,11 @@ function openPosition({
     takeProfit: safeNum(takeProfit, NaN),
   });
 
-  state.availableCapital -= cost;
-  state.lockedCapital += cost;
+  // Synthetic margin model:
+  // reserve notional + pay fee from available capital immediately
+  state.availableCapital = roundMoney(state.availableCapital - totalRequired);
+  state.lockedCapital = roundMoney(state.lockedCapital + reservedNotional);
+  state.cashBalance = roundMoney(state.cashBalance - openFee);
 
   const position = {
     slot: normalizedSlot,
@@ -409,7 +582,8 @@ function openPosition({
     side,
     entry: price,
     qty,
-    capitalUsed: cost,
+    capitalUsed: reservedNotional,
+    openFee,
     time: ts,
     peakProfit: 0,
     pyramidCount: 0,
@@ -427,7 +601,8 @@ function openPosition({
     entry: price,
     price,
     qty,
-    capitalUsed: cost,
+    capitalUsed: reservedNotional,
+    fee: openFee,
     stopLoss: position.stopLoss,
     takeProfit: position.takeProfit,
     pnl: 0,
@@ -435,9 +610,14 @@ function openPosition({
   };
 
   state.trades.push(trade);
+  applyRealizedPnl(state, 0, openFee);
   syncAccountState(state, { [symbol]: price });
 
-  return { result: trade };
+  return {
+    ok: true,
+    result: trade,
+    results: [trade],
+  };
 }
 
 /* =========================================================
@@ -466,6 +646,7 @@ function addToPosition({
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensureRealized(state);
   ensurePositionsShape(state);
 
   const normalizedSlot = normalizeSlot(slot);
@@ -478,8 +659,15 @@ function addToPosition({
   qty = roundQty(qty);
   if (qty <= 0) return null;
 
-  const cost = safeNum(qty * price, 0);
-  if (cost <= 0 || cost > state.availableCapital) return null;
+  const reservedNotional = roundMoney(qty * price);
+  const addFee = calculateFee({
+    symbol,
+    notional: reservedNotional,
+    state,
+  });
+
+  const totalRequired = roundMoney(reservedNotional + addFee);
+  if (totalRequired <= 0 || totalRequired > state.availableCapital) return null;
 
   const oldQty = pos.qty;
   const newQty = roundQty(oldQty + qty);
@@ -489,11 +677,13 @@ function addToPosition({
 
   pos.qty = newQty;
   pos.entry = safeNum(newEntry, price);
-  pos.capitalUsed += cost;
+  pos.capitalUsed = roundMoney(pos.capitalUsed + reservedNotional);
+  pos.openFee = roundMoney(safeNum(pos.openFee, 0) + addFee);
   pos.pyramidCount = safeNum(pos.pyramidCount, 0) + 1;
 
-  state.availableCapital -= cost;
-  state.lockedCapital += cost;
+  state.availableCapital = roundMoney(state.availableCapital - totalRequired);
+  state.lockedCapital = roundMoney(state.lockedCapital + reservedNotional);
+  state.cashBalance = roundMoney(state.cashBalance - addFee);
 
   const trade = {
     side: "ADD",
@@ -502,14 +692,20 @@ function addToPosition({
     entry: pos.entry,
     price,
     qty,
-    capitalUsed: cost,
+    capitalUsed: reservedNotional,
+    fee: addFee,
     time: ts,
   };
 
   state.trades.push(trade);
+  applyRealizedPnl(state, 0, addFee);
   syncAccountState(state, { [symbol]: price });
 
-  return { result: trade };
+  return {
+    ok: true,
+    result: trade,
+    results: [trade],
+  };
 }
 
 /* =========================================================
@@ -528,6 +724,7 @@ function partialClosePosition({
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensureRealized(state);
   ensurePositionsShape(state);
 
   const normalizedSlot = normalizeSlot(slot);
@@ -547,21 +744,33 @@ function partialClosePosition({
   if (qtyClose > originalQty) qtyClose = originalQty;
 
   const effectiveClosePct = qtyClose / originalQty;
-  const releasedCost = pos.capitalUsed * effectiveClosePct;
+  const releasedCost = roundMoney(pos.capitalUsed * effectiveClosePct);
+  const allocatedOpenFee = roundMoney(safeNum(pos.openFee, 0) * effectiveClosePct);
 
-  let pnl = 0;
+  let grossPnl = 0;
 
   if (pos.side === "LONG") {
-    pnl = (price - pos.entry) * qtyClose;
+    grossPnl = (price - pos.entry) * qtyClose;
   } else if (pos.side === "SHORT") {
-    pnl = (pos.entry - price) * qtyClose;
+    grossPnl = (pos.entry - price) * qtyClose;
   }
 
-  state.lockedCapital -= releasedCost;
-  state.availableCapital += releasedCost + pnl;
+  const closeNotional = roundMoney(qtyClose * price);
+  const closeFee = calculateFee({
+    symbol,
+    notional: closeNotional,
+    state,
+  });
+
+  const pnl = roundMoney(grossPnl - closeFee);
+
+  state.lockedCapital = roundMoney(state.lockedCapital - releasedCost);
+  state.availableCapital = roundMoney(state.availableCapital + releasedCost + pnl);
+  state.cashBalance = roundMoney(state.cashBalance - closeFee + grossPnl);
 
   pos.qty = roundQty(originalQty - qtyClose);
-  pos.capitalUsed = Math.max(0, pos.capitalUsed - releasedCost);
+  pos.capitalUsed = roundMoney(Math.max(0, pos.capitalUsed - releasedCost));
+  pos.openFee = roundMoney(Math.max(0, safeNum(pos.openFee, 0) - allocatedOpenFee));
   pos.peakProfit = 0;
 
   const trade = {
@@ -571,13 +780,15 @@ function partialClosePosition({
     entry: pos.entry,
     price,
     qty: qtyClose,
+    grossPnl: roundMoney(grossPnl),
+    fee: closeFee,
     pnl,
     closePct: effectiveClosePct,
     time: ts,
   };
 
   state.trades.push(trade);
-  applyRealizedPnl(state, pnl);
+  applyRealizedPnl(state, pnl, closeFee);
 
   if (pos.qty <= 0.000001 || pos.capitalUsed <= 0.01) {
     setPosition(state, normalizedSlot, null);
@@ -591,6 +802,7 @@ function partialClosePosition({
       pnl,
       slot: normalizedSlot,
       symbol,
+      reason,
     });
   } catch (err) {
     console.error("AI learning error:", err.message);
@@ -598,7 +810,11 @@ function partialClosePosition({
 
   syncAccountState(state, { [symbol]: price });
 
-  return { result: trade };
+  return {
+    ok: true,
+    result: trade,
+    results: [trade],
+  };
 }
 
 /* =========================================================
@@ -616,6 +832,7 @@ function closePosition({
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensureRealized(state);
   ensurePositionsShape(state);
 
   const normalizedSlot = normalizeSlot(slot);
@@ -624,18 +841,27 @@ function closePosition({
   if (!pos) return null;
   if (pos.symbol !== symbol) return null;
 
-  let pnl = 0;
+  let grossPnl = 0;
 
   if (pos.side === "LONG") {
-    pnl = (price - pos.entry) * pos.qty;
+    grossPnl = (price - pos.entry) * pos.qty;
   } else if (pos.side === "SHORT") {
-    pnl = (pos.entry - price) * pos.qty;
+    grossPnl = (pos.entry - price) * pos.qty;
   }
 
-  const capitalReturn = pos.capitalUsed + pnl;
+  const closeNotional = roundMoney(pos.qty * price);
+  const closeFee = calculateFee({
+    symbol,
+    notional: closeNotional,
+    state,
+  });
 
-  state.lockedCapital -= pos.capitalUsed;
-  state.availableCapital += capitalReturn;
+  const pnl = roundMoney(grossPnl - closeFee);
+  const capitalReturn = roundMoney(pos.capitalUsed + pnl);
+
+  state.lockedCapital = roundMoney(state.lockedCapital - pos.capitalUsed);
+  state.availableCapital = roundMoney(state.availableCapital + capitalReturn);
+  state.cashBalance = roundMoney(state.cashBalance - closeFee + grossPnl);
 
   const trade = {
     side: reason,
@@ -644,6 +870,8 @@ function closePosition({
     entry: pos.entry,
     price,
     qty: pos.qty,
+    grossPnl: roundMoney(grossPnl),
+    fee: closeFee,
     pnl,
     duration: ts - pos.time,
     pyramids: safeNum(pos.pyramidCount, 0),
@@ -655,7 +883,7 @@ function closePosition({
   state.trades.push(trade);
   setPosition(state, normalizedSlot, null);
 
-  applyRealizedPnl(state, pnl);
+  applyRealizedPnl(state, pnl, closeFee);
 
   try {
     outsideBrain.recordTradeOutcome({
@@ -663,6 +891,7 @@ function closePosition({
       pnl,
       slot: normalizedSlot,
       symbol,
+      reason,
     });
   } catch (err) {
     console.error("AI learning error:", err.message);
@@ -670,11 +899,16 @@ function closePosition({
 
   syncAccountState(state, { [symbol]: price });
 
-  return { result: trade };
+  return {
+    ok: true,
+    result: trade,
+    results: [trade],
+  };
 }
 
 /* =========================================================
 TRIGGER CHECKS
+FIX: Can close multiple slots in same tick
 ========================================================= */
 
 function evaluateProtectiveExit({
@@ -691,6 +925,8 @@ function evaluateProtectiveExit({
     ? [normalizeSlot(slot)]
     : ["structure", "scalp"];
 
+  const outputs = [];
+
   for (const currentSlot of slots) {
     const pos = getPosition(state, currentSlot);
 
@@ -698,7 +934,7 @@ function evaluateProtectiveExit({
     if (pos.symbol !== symbol) continue;
 
     if (stopLossHit(pos, price)) {
-      return closePosition({
+      const result = closePosition({
         tenantId,
         state,
         symbol,
@@ -707,10 +943,12 @@ function evaluateProtectiveExit({
         ts,
         reason: "STOP_LOSS",
       });
+      if (result?.result) outputs.push(result.result);
+      continue;
     }
 
     if (takeProfitHit(pos, price)) {
-      return closePosition({
+      const result = closePosition({
         tenantId,
         state,
         symbol,
@@ -719,10 +957,17 @@ function evaluateProtectiveExit({
         ts,
         reason: "TAKE_PROFIT",
       });
+      if (result?.result) outputs.push(result.result);
     }
   }
 
-  return null;
+  if (outputs.length === 0) return null;
+
+  return {
+    ok: true,
+    result: outputs[0],
+    results: outputs,
+  };
 }
 
 /* =========================================================
@@ -751,20 +996,15 @@ function executePaperOrder({
   ensureBalances(state);
   ensureRealized(state);
   ensurePositionsShape(state);
+  ensureMarketState(state);
 
   const normalizedSlot = normalizeSlot(slot);
+  const rawPrice = safeNum(price, 0);
+  if (rawPrice <= 0) return null;
 
-  price = safeNum(price, 0);
-  if (price <= 0) return null;
+  state.lastPrice = rawPrice;
+  state.lastPriceBySymbol[symbol] = rawPrice;
 
-  state.lastPrice = price;
-
-  if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
-    state.lastPriceBySymbol = {};
-  }
-  state.lastPriceBySymbol[symbol] = price;
-
-  const now = Date.now();
   const normalizedAction = String(action || "").toUpperCase();
   const pos = getPosition(state, normalizedSlot);
 
@@ -775,12 +1015,31 @@ function executePaperOrder({
   );
   state.lastConfidence = boundedConfidence;
 
+  // Protective exits should use executable exit prices,
+  // not idealized raw price.
+  const worstCaseExitPriceForLong = applyExecutionPriceModel({
+    symbol,
+    rawPrice,
+    side: "SELL",
+    state,
+  });
+
+  const worstCaseExitPriceForShort = applyExecutionPriceModel({
+    symbol,
+    rawPrice,
+    side: "BUY",
+    state,
+  });
+
   const protectiveExit = evaluateProtectiveExit({
     tenantId,
     state,
     symbol,
-    price,
-    slot: normalizedSlot,
+    price:
+      pos?.side === "SHORT"
+        ? worstCaseExitPriceForShort
+        : worstCaseExitPriceForLong,
+    slot: null,
     ts,
   });
 
@@ -793,20 +1052,35 @@ function executePaperOrder({
     ["BUY", "SELL", "ADD", "PARTIAL_CLOSE", "CLOSE", "STOP_LOSS", "TAKE_PROFIT"]
       .includes(normalizedAction)
   ) {
-    if (isCoolingDown(tenantId, symbol, normalizedSlot, now)) {
+    if (isCoolingDown(tenantId, symbol, normalizedSlot, ts)) {
       return null;
     }
   }
 
   let positionSize = roundQty(safeNum(qty, 0));
 
+  const orderSideForSizing =
+    normalizedAction === "SELL" ? "SHORT" : "LONG";
+
+  let effectiveStopLoss = safeNum(stopLoss, NaN);
+  if (!Number.isFinite(effectiveStopLoss)) effectiveStopLoss = null;
+
   if (positionSize <= 0 && ["BUY", "SELL", "ADD"].includes(normalizedAction)) {
+    const executableEntryPrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: normalizedAction === "BUY" ? "BUY" : "SELL",
+      state,
+    });
+
     positionSize = calculatePositionSize(
       state,
-      price,
+      executableEntryPrice,
       safeNum(riskPct, 0.01),
       boundedConfidence,
-      normalizedSlot
+      normalizedSlot,
+      effectiveStopLoss,
+      orderSideForSizing
     );
   }
 
@@ -814,10 +1088,17 @@ function executePaperOrder({
     if (pos) return null;
     if (positionSize <= 0) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: "BUY",
+      state,
+    });
+
     const result = openPosition({
       state,
       symbol,
-      price,
+      price: executablePrice,
       qty: positionSize,
       side: "LONG",
       stopLoss,
@@ -834,10 +1115,17 @@ function executePaperOrder({
     if (pos) return null;
     if (positionSize <= 0) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: "SELL",
+      state,
+    });
+
     const result = openPosition({
       state,
       symbol,
-      price,
+      price: executablePrice,
       qty: positionSize,
       side: "SHORT",
       stopLoss,
@@ -855,10 +1143,17 @@ function executePaperOrder({
     if (pos.symbol !== symbol) return null;
     if (positionSize <= 0) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: pos.side === "LONG" ? "BUY" : "SELL",
+      state,
+    });
+
     const result = addToPosition({
       state,
       symbol,
-      price,
+      price: executablePrice,
       qty: roundQty(positionSize * PYRAMID_SIZE_FACTOR),
       slot: normalizedSlot,
       ts,
@@ -872,11 +1167,18 @@ function executePaperOrder({
     if (!pos) return null;
     if (pos.symbol !== symbol) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      state,
+    });
+
     const result = partialClosePosition({
       tenantId,
       state,
       symbol,
-      price,
+      price: executablePrice,
       closePct,
       slot: normalizedSlot,
       ts,
@@ -891,11 +1193,18 @@ function executePaperOrder({
     if (!pos) return null;
     if (pos.symbol !== symbol) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      state,
+    });
+
     const result = closePosition({
       tenantId,
       state,
       symbol,
-      price,
+      price: executablePrice,
       slot: normalizedSlot,
       ts,
       reason: "STOP_LOSS",
@@ -909,11 +1218,18 @@ function executePaperOrder({
     if (!pos) return null;
     if (pos.symbol !== symbol) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      state,
+    });
+
     const result = closePosition({
       tenantId,
       state,
       symbol,
-      price,
+      price: executablePrice,
       slot: normalizedSlot,
       ts,
       reason: "TAKE_PROFIT",
@@ -927,11 +1243,18 @@ function executePaperOrder({
     if (!pos) return null;
     if (pos.symbol !== symbol) return null;
 
+    const executablePrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice,
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      state,
+    });
+
     const result = closePosition({
       tenantId,
       state,
       symbol,
-      price,
+      price: executablePrice,
       slot: normalizedSlot,
       ts,
       reason: "CLOSE",
@@ -946,7 +1269,7 @@ function executePaperOrder({
     normalizedAction === "WAIT" ||
     normalizedAction === ""
   ) {
-    syncAccountState(state, { [symbol]: price });
+    syncAccountState(state, { [symbol]: rawPrice });
     return null;
   }
 
@@ -955,6 +1278,7 @@ function executePaperOrder({
 
 /* =========================================================
 LIVE EXECUTION
+Still a stub. Keeps interface, adds safer request behavior.
 ========================================================= */
 
 async function executeLiveOrder({
@@ -993,6 +1317,7 @@ async function executeLiveOrder({
         quantity: safeNum(qty, 0),
       },
       {
+        timeout: 10000,
         headers: {
           "X-API-KEY": apiKey,
         },
@@ -1000,13 +1325,24 @@ async function executeLiveOrder({
     );
 
     return {
+      ok: true,
       result: {
         side: normalizedAction,
-        price,
+        price: safeNum(price, 0),
         qty: safeNum(qty, 0),
         live: true,
         exchangeId: response.data?.orderId || null,
+        raw: response.data || null,
       },
+      results: [
+        {
+          side: normalizedAction,
+          price: safeNum(price, 0),
+          qty: safeNum(qty, 0),
+          live: true,
+          exchangeId: response.data?.orderId || null,
+        },
+      ],
     };
   } catch (err) {
     console.error("Live execution failed:", err.message);
