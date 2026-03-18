@@ -1,6 +1,10 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v49.2 (Execution-Aligned + Snapshot Hardened + Live State Access)
+// VERSION: v49.2 (Execution-Aligned + Snapshot Hardened + Live State Accessor)
+// FIXES
+// - Added getState() for live engine mutation from paper.routes.js
+// - Kept snapshot as read-only response layer
+// - Preserved candle-related frontend-safe behavior by not touching it here
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -244,6 +248,12 @@ function load(tenantId) {
 
   const state = defaultState();
   STATES.set(tenantId, state);
+  return state;
+}
+
+function getState(tenantId) {
+  const state = load(tenantId);
+  ensureStateShape(state);
   return state;
 }
 
@@ -1841,16 +1851,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   } finally {
     state._locked = false;
   }
-}
-
-/* =========================================================
-LIVE STATE ACCESS
-========================================================= */
-
-function getState(tenantId) {
-  const state = load(tenantId);
-  ensureStateShape(state);
-  return state;
 }
 
 /* =========================================================
