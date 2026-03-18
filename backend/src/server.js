@@ -5,9 +5,12 @@
 // PURPOSE
 // Main backend runtime entry point.
 //
-// ADDED
-// - Real-time AI trade broadcasting for chart markers
-// - Allows frontend to display BUY/SELL instantly
+// FIXED
+// - Real tenant-safe websocket resolution
+// - Stable paper snapshot delivery
+// - Correct BTCUSDT fallback price source
+// - Heartbeat cleanup for dead sockets
+// - Snapshot normalization for frontend persistence
 // ==========================================================
 
 require("dotenv").config();
@@ -48,8 +51,8 @@ const tradingRoutes = require("./routes/trading.routes");
 SAFE BOOT CHECK
 ========================================================= */
 
-function requireEnv(name){
-  if(!process.env[name]){
+function requireEnv(name) {
+  if (!process.env[name]) {
     console.error(`[BOOT] Missing required env var: ${name}`);
     process.exit(1);
   }
@@ -72,7 +75,7 @@ EXPRESS SERVER
 ========================================================= */
 
 const app = express();
-app.set("trust proxy",1);
+app.set("trust proxy", 1);
 
 /* =========================================================
 STRIPE WEBHOOK
@@ -84,13 +87,15 @@ app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
 SECURITY MIDDLEWARE
 ========================================================= */
 
-app.use(cors({
-  origin:process.env.CORS_ORIGIN || false,
-  credentials:true
-}));
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || false,
+    credentials: true,
+  })
+);
 
 app.use(helmet());
-app.use(express.json({limit:"2mb"}));
+app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 app.use(rateLimiter);
 
@@ -104,16 +109,16 @@ app.use("/api/auth", require("./routes/auth.routes"));
 AUTHENTICATION
 ========================================================= */
 
-app.use("/api",(req,res,next)=>{
-  if(req.path.startsWith("/auth")) return next();
-  return authRequired(req,res,next);
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return authRequired(req, res, next);
 });
 
 /* =========================================================
 TENANT RESOLUTION
 ========================================================= */
 
-app.use("/api",tenantMiddleware);
+app.use("/api", tenantMiddleware);
 
 /* =========================================================
 CORE API ROUTES
@@ -142,21 +147,19 @@ app.use("/api/trading", tradingRoutes);
 ZERO TRUST LAYER
 ========================================================= */
 
-app.use("/api",(req,res,next)=>{
-
-  if(
+app.use("/api", (req, res, next) => {
+  if (
     req.path.startsWith("/auth") ||
     req.path.startsWith("/market") ||
     req.path.startsWith("/paper") ||
     req.path.startsWith("/trading") ||
     req.path.startsWith("/ai") ||
     req.path.startsWith("/admin")
-  ){
+  ) {
     return next();
   }
 
-  return zeroTrust(req,res,next);
-
+  return zeroTrust(req, res, next);
 });
 
 /* =========================================================
@@ -175,103 +178,104 @@ const ENGINE_START_TIME = Date.now();
 TENANT DISCOVERY
 ========================================================= */
 
-function getTenants(){
-
+function getTenants() {
   const db = readDb();
   const usersList = db.users || [];
 
   const tenants = new Set();
 
-  for(const u of usersList){
-
+  for (const u of usersList) {
     const tenantId = u.companyId || u.id;
-
-    if(tenantId)
-      tenants.add(tenantId);
-
+    if (tenantId !== undefined && tenantId !== null && tenantId !== "") {
+      tenants.add(String(tenantId));
+    }
   }
 
   return tenants;
-
 }
 
 /* =========================================================
 TENANT ENGINE BOOT
 ========================================================= */
 
-function bootTenants(){
-
-  try{
-
+function bootTenants() {
+  try {
     const tenants = getTenants();
 
-    for(const id of tenants){
-
+    for (const id of tenants) {
       marketEngine.registerTenant(id);
-
-      console.log("[AI] tenant initialized:",id);
-
+      console.log("[AI] tenant initialized:", id);
     }
-
-  }catch(err){
-
-    console.error("Tenant boot error:",err.message);
-
+  } catch (err) {
+    console.error("Tenant boot error:", err.message);
   }
-
 }
 
 bootTenants();
 
 /* =========================================================
+SNAPSHOT NORMALIZER
+========================================================= */
+
+function buildPaperSnapshot(tenantId) {
+  const base = paperTrader.snapshot(tenantId) || {};
+  const decisions = paperTrader.getDecisions(tenantId) || [];
+
+  const cashBalance = Number(base.cashBalance || 0);
+  const lockedCapital = Number(base.lockedCapital || 0);
+  const availableCapital = Number(
+    base.availableCapital != null ? base.availableCapital : cashBalance
+  );
+
+  return {
+    ...base,
+    decisions,
+    totalCapital: cashBalance + lockedCapital,
+    equity: cashBalance,
+    availableCapital,
+    lockedCapital,
+    lastPrice:
+      Number(base?.lastPriceBySymbol?.BTCUSDT) ||
+      Number(base?.lastPriceBySymbol?.BTCUSD) ||
+      null,
+  };
+}
+
+/* =========================================================
 AUTONOMOUS AI TRADING ENGINE
 ========================================================= */
 
-setInterval(()=>{
-
-  try{
-
+setInterval(() => {
+  try {
     const tenants = getTenants();
 
-    for(const tenantId of tenants){
+    for (const tenantId of tenants) {
+      const market = marketEngine.getMarketSnapshot(tenantId);
 
-      const market =
-        marketEngine.getMarketSnapshot(tenantId);
+      let price = market?.BTCUSDT?.price;
 
-      let price =
-        market?.BTCUSDT?.price;
-
-      if(!price){
-
+      if (!price) {
+        const snap = paperTrader.snapshot(tenantId) || {};
         const last =
-          paperTrader.snapshot(tenantId)?.lastPrice;
+          Number(snap?.lastPriceBySymbol?.BTCUSDT) ||
+          Number(snap?.lastPriceBySymbol?.BTCUSD) ||
+          0;
 
-        if(last && Number.isFinite(last))
+        if (Number.isFinite(last) && last > 0) {
           price = last;
-
+        }
       }
 
-      if(!price){
+      if (!price) {
         price = 60000;
       }
 
-      paperTrader.tick(
-        tenantId,
-        "BTCUSDT",
-        Number(price),
-        Date.now()
-      );
-
+      paperTrader.tick(tenantId, "BTCUSDT", Number(price), Date.now());
     }
-
+  } catch (err) {
+    console.error("AI engine error:", err.message);
   }
-  catch(err){
-
-    console.error("AI engine error:",err.message);
-
-  }
-
-},1000);
+}, 1000);
 
 /* =========================================================
 WEBSOCKET SERVER
@@ -279,177 +283,207 @@ WEBSOCKET SERVER
 
 const wss = new WebSocketServer({
   server,
-  path:"/ws"
+  path: "/ws",
 });
 
 /* =========================================================
 REAL TIME TRADE BROADCAST
 ========================================================= */
 
-function broadcastTrade(trade, tenantId){
+function broadcastTrade(trade, tenantId) {
+  const normalizedTenantId = String(tenantId);
 
-  wss.clients.forEach(ws=>{
+  wss.clients.forEach((ws) => {
+    if (ws.channel !== "paper") return;
+    if (String(ws.tenantId) !== normalizedTenantId) return;
+    if (ws.readyState !== ws.OPEN) return;
 
-    if(ws.channel !== "paper") return;
-    if(ws.tenantId !== tenantId) return;
-
-    try{
-
-      ws.send(JSON.stringify({
-
-        channel:"paper",
-        type:"trade",
-        trade,
-        ts:Date.now()
-
-      }));
-
-    }catch{}
-
+    try {
+      ws.send(
+        JSON.stringify({
+          channel: "paper",
+          type: "trade",
+          trade,
+          ts: Date.now(),
+        })
+      );
+    } catch {}
   });
-
 }
 
 /* expose globally so executionEngine can use it */
-
 global.broadcastTrade = broadcastTrade;
 
-function closeWs(ws){
-  try{ws.close()}catch{}
+function closeWs(ws) {
+  try {
+    ws.close();
+  } catch {}
+}
+
+/* =========================================================
+WEBSOCKET TENANT RESOLUTION
+========================================================= */
+
+function resolveSocketTenant(user, requestedTenantId) {
+  const userId = String(user?.id || "");
+  const companyId =
+    user?.companyId !== undefined && user?.companyId !== null
+      ? String(user.companyId)
+      : null;
+
+  if (!requestedTenantId) {
+    return companyId || userId;
+  }
+
+  const requested = String(requestedTenantId);
+
+  if (companyId && requested === companyId) {
+    return companyId;
+  }
+
+  if (requested === userId) {
+    return userId;
+  }
+
+  return companyId || userId;
 }
 
 /* =========================================================
 WEBSOCKET AUTHENTICATION
 ========================================================= */
 
-wss.on("connection",(ws,req)=>{
-
-  try{
-
-    const url = new URL(req.url,`http://${req.headers.host}`);
+wss.on("connection", (ws, req) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
 
     const token = url.searchParams.get("token");
     const channel = url.searchParams.get("channel") || "security";
+    const requestedTenantId = url.searchParams.get("companyId");
 
-    if(!token) return closeWs(ws);
+    if (!token) return closeWs(ws);
 
-    const payload = verify(token,"access");
+    const payload = verify(token, "access");
 
-    if(!payload?.id || !payload?.jti)
+    if (!payload?.id || !payload?.jti) {
       return closeWs(ws);
+    }
 
-    if(sessionAdapter.isRevoked(payload.jti))
+    if (sessionAdapter.isRevoked(payload.jti)) {
       return closeWs(ws);
+    }
 
     const db = readDb();
 
     const user = (db.users || []).find(
-      u => String(u.id) === String(payload.id)
+      (u) => String(u.id) === String(payload.id)
     );
 
-    if(!user) return closeWs(ws);
+    if (!user) return closeWs(ws);
 
-    const tenantId = user.companyId || user.id;
+    const tenantId = resolveSocketTenant(user, requestedTenantId);
 
     ws.channel = channel;
-    ws.tenantId = tenantId;
+    ws.tenantId = String(tenantId);
+    ws.userId = String(user.id);
     ws.isAlive = true;
 
-    marketEngine.registerTenant(tenantId);
+    marketEngine.registerTenant(ws.tenantId);
 
-    ws.on("pong",()=>{ws.isAlive=true});
-
-  }
-  catch{
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+  } catch {
     closeWs(ws);
   }
+});
 
+/* =========================================================
+WEBSOCKET HEARTBEAT
+========================================================= */
+
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      return closeWs(ws);
+    }
+
+    ws.isAlive = false;
+
+    try {
+      ws.ping();
+    } catch {
+      closeWs(ws);
+    }
+  });
+}, 30000);
+
+wss.on("close", () => {
+  clearInterval(heartbeatInterval);
 });
 
 /* =========================================================
 MARKET STREAM
 ========================================================= */
 
-setInterval(()=>{
-
+setInterval(() => {
   const cache = new Map();
 
-  wss.clients.forEach(ws=>{
+  wss.clients.forEach((ws) => {
+    if (ws.channel !== "market") return;
+    if (ws.readyState !== ws.OPEN) return;
 
-    if(ws.channel!=="market") return;
-
-    try{
-
+    try {
       let snapshot = cache.get(ws.tenantId);
 
-      if(!snapshot){
-
-        snapshot =
-          marketEngine.getMarketSnapshot(ws.tenantId);
-
-        cache.set(ws.tenantId,snapshot);
-
+      if (!snapshot) {
+        snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
+        cache.set(ws.tenantId, snapshot);
       }
 
-      ws.send(JSON.stringify({
-
-        channel:"market",
-        type:"snapshot",
-        data:snapshot,
-        ts:Date.now()
-
-      }));
-
-    }
-    catch{}
-
+      ws.send(
+        JSON.stringify({
+          channel: "market",
+          type: "snapshot",
+          data: snapshot,
+          ts: Date.now(),
+        })
+      );
+    } catch {}
   });
-
-},250);
+}, 250);
 
 /* =========================================================
 PAPER TRADING STREAM
 ========================================================= */
 
-setInterval(()=>{
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.channel !== "paper") return;
+    if (ws.readyState !== ws.OPEN) return;
 
-  wss.clients.forEach(ws=>{
-
-    if(ws.channel!=="paper") return;
-
-    try{
-
-      const snapshot =
-        paperTrader.snapshot(ws.tenantId);
-
-      const decisions =
-        paperTrader.getDecisions(ws.tenantId);
-
+    try {
+      const snapshot = buildPaperSnapshot(ws.tenantId);
       const stats = snapshot?.executionStats || {};
 
       const metrics = {
-        aiPerMin: stats.decisions || 0,
-        memMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
+        aiPerMin: Number(stats.decisions || 0),
+        memMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
       };
 
-      ws.send(JSON.stringify({
-
-        channel:"paper",
-        type:"engine",
-        snapshot,
-        decisions,
-        metrics,
-        engineStart:ENGINE_START_TIME,
-        ts:Date.now()
-
-      }));
-
-    }
-    catch{}
-
+      ws.send(
+        JSON.stringify({
+          channel: "paper",
+          type: "engine",
+          snapshot,
+          decisions: snapshot.decisions || [],
+          metrics,
+          engineStart: ENGINE_START_TIME,
+          ts: Date.now(),
+        })
+      );
+    } catch {}
   });
-
-},800);
+}, 800);
 
 /* =========================================================
 SERVER START
@@ -457,6 +491,6 @@ SERVER START
 
 const port = process.env.PORT || 5000;
 
-server.listen(port,()=>{
+server.listen(port, () => {
   console.log(`[BOOT] Backend running quietly on port ${port}`);
 });
