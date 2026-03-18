@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v44 (Auto Dual Mode + Smart Runner TP)
+// VERSION: v44.1 (Auto Dual Mode + Smart Runner TP + Confidence Sync Fix)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -687,6 +687,7 @@ function openTrade({
       action,
       price,
       riskPct:Number(plan.riskPct || 0.01),
+      confidence:Number(plan.confidence || 0.5),
       state,
       ts
     });
