@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v49.1 (Execution-Aligned + Snapshot Hardened)
+// VERSION: v49.2 (Execution-Aligned + Snapshot Hardened + Live State Access)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -1844,6 +1844,16 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 }
 
 /* =========================================================
+LIVE STATE ACCESS
+========================================================= */
+
+function getState(tenantId) {
+  const state = load(tenantId);
+  ensureStateShape(state);
+  return state;
+}
+
+/* =========================================================
 MANUAL RESET
 ========================================================= */
 
@@ -1861,4 +1871,5 @@ module.exports = {
   snapshot,
   getDecisions,
   hardReset,
+  getState,
 };
