@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v49.0 (Execution-Aligned + Safer Capital + Replay Clean)
+// VERSION: v49.1 (Execution-Aligned + Snapshot Hardened)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -332,6 +332,10 @@ function ensureStateShape(state) {
     };
   }
 
+  if (!state.executionConfig || typeof state.executionConfig !== "object") {
+    state.executionConfig = {};
+  }
+
   if (!Array.isArray(state.trades)) state.trades = [];
   if (!Array.isArray(state.decisions)) state.decisions = [];
   if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
@@ -343,12 +347,8 @@ function ensureStateShape(state) {
     safeNum(state.availableCapital, state.cashBalance)
   );
   state.lockedCapital = roundMoney(safeNum(state.lockedCapital, 0));
-  state.equity = roundMoney(
-    safeNum(state.equity, state.cashBalance)
-  );
-  state.peakEquity = roundMoney(
-    safeNum(state.peakEquity, state.equity)
-  );
+  state.equity = roundMoney(safeNum(state.equity, state.cashBalance));
+  state.peakEquity = roundMoney(safeNum(state.peakEquity, state.equity));
 
   state.position =
     state.positions.structure ||
@@ -408,6 +408,7 @@ function snapshot(tenantId) {
     cashBalance: safeNum(s.cashBalance),
     availableCapital: safeNum(s.availableCapital, safeNum(s.cashBalance)),
     lockedCapital: safeNum(s.lockedCapital),
+    totalCapital: safeNum(s.cashBalance) + safeNum(s.lockedCapital),
     equity: safeNum(s.equity, safeNum(s.cashBalance)),
     peakEquity: safeNum(s.peakEquity, safeNum(s.equity, s.cashBalance)),
     realized: {
@@ -442,6 +443,7 @@ function snapshot(tenantId) {
       decisions: safeNum(s.executionStats?.decisions),
       trades: safeNum(s.executionStats?.trades),
     },
+    executionConfig: { ...(s.executionConfig || {}) },
   };
 }
 
@@ -912,10 +914,10 @@ function buildQuickScalpPlan({ symbol, price, prices }) {
   const p2 = prices[prices.length - 3];
 
   const bounceStrength =
-    ((p0 - Math.min(p1, p2)) / Math.max(Math.min(p1, p2), 1e-12));
+    (p0 - Math.min(p1, p2)) / Math.max(Math.min(p1, p2), 1e-12);
 
   const dropStrength =
-    ((Math.max(p1, p2) - p0) / Math.max(Math.max(p1, p2), 1e-12));
+    (Math.max(p1, p2) - p0) / Math.max(Math.max(p1, p2), 1e-12);
 
   const bullishTurn = p1 <= p2 && p0 > p1;
   const bearishTurn = p1 >= p2 && p0 < p1;
@@ -1008,6 +1010,12 @@ function getExecutableClosePrice(state, symbol, side, rawPrice) {
   return roundMoney(price);
 }
 
+function normalizeExecResults(exec) {
+  if (Array.isArray(exec?.results)) return exec.results;
+  if (exec?.result) return [exec.result];
+  return [];
+}
+
 /* =========================================================
 CLOSE TRADE
 ========================================================= */
@@ -1030,17 +1038,12 @@ function closeTrade({ tenantId, state, symbol, slot, price, ts }) {
     ts,
   });
 
-  const closeResults = Array.isArray(closed?.results)
-    ? closed.results
-    : closed?.result
-      ? [closed.result]
-      : [];
-
+  const closeResults = normalizeExecResults(closed);
   if (!closeResults.length) return false;
 
-  const relevant = closeResults.find(
-    (x) => normalizeSlot(x.slot) === normalizedSlot
-  ) || closeResults[0];
+  const relevant =
+    closeResults.find((x) => normalizeSlot(x.slot) === normalizedSlot) ||
+    closeResults[0];
 
   const pnl = Number(relevant?.pnl || 0);
 
@@ -1216,7 +1219,7 @@ function shouldExitRunnerGiveback(pos, pnl) {
   if (pos.bestPnl < RUNNER_MIN_PROFIT) return false;
 
   const giveback = pos.bestPnl - pnl;
-  return giveback >= (pos.bestPnl * RUNNER_GIVEBACK_PCT);
+  return giveback >= pos.bestPnl * RUNNER_GIVEBACK_PCT;
 }
 
 function handleStructurePosition({
@@ -1479,7 +1482,7 @@ function computeDuration(confidence) {
 
   return Math.floor(
     MIN_TRADE_DURATION +
-    ratio * (MAX_TRADE_DURATION - MIN_TRADE_DURATION)
+      ratio * (MAX_TRADE_DURATION - MIN_TRADE_DURATION)
   );
 }
 
@@ -1518,43 +1521,49 @@ function openTrade({
     ts,
   });
 
-  if (exec?.result) {
-    state.executionStats.trades++;
-    state.limits.tradesToday++;
-    state.lastMode = mode;
-    state.lastTradeTime = ts;
-    state.lastTradeTimeBySlot[normalizedSlot] = ts;
-    state.lastDecisionTimeBySlot[normalizedSlot] = ts;
-
-    const pos = getPosition(state, normalizedSlot);
-
-    if (pos) {
-      pos.slot = normalizedSlot;
-      pos.mode = mode;
-      pos.bestPnl = 0;
-      pos.targetPrice = safeNum(plan.targetPrice, NaN);
-      pos.structureSupport = safeNum(plan.support, NaN);
-      pos.structureResistance = safeNum(plan.resistance, NaN);
-      pos.scalpBottom = safeNum(plan.scalpBottom, NaN);
-      pos.scalpTop = safeNum(plan.scalpTop, NaN);
-      pos.targetReached = false;
-      pos.runnerConfirmed = false;
-      pos.lockedProfitFloor = NaN;
-      pos.warningPrice = NaN;
-      pos.warningTouches = 0;
-      pos.takeProfitPct =
-        mode === "STRUCTURE" ? NaN : SCALP_TAKE_PROFIT;
-      pos.maxDuration =
-        mode === "STRUCTURE"
-          ? computeDuration(Math.max(0.85, safeNum(plan.confidence, 0.76)))
-          : computeDuration(plan.confidence);
-    }
-
-    updateCapitalView(state, { [symbol]: price });
-    return true;
+  const openResults = normalizeExecResults(exec);
+  if (!openResults.length) {
+    return false;
   }
 
-  return false;
+  const relevant =
+    openResults.find((x) => normalizeSlot(x.slot) === normalizedSlot) ||
+    openResults[0];
+
+  const pos = getPosition(state, normalizedSlot);
+  if (!relevant || !pos) {
+    return false;
+  }
+
+  state.executionStats.trades++;
+  state.limits.tradesToday++;
+  state.lastMode = mode;
+  state.lastTradeTime = ts;
+  state.lastTradeTimeBySlot[normalizedSlot] = ts;
+  state.lastDecisionTimeBySlot[normalizedSlot] = ts;
+
+  pos.slot = normalizedSlot;
+  pos.mode = mode;
+  pos.bestPnl = 0;
+  pos.targetPrice = safeNum(plan.targetPrice, NaN);
+  pos.structureSupport = safeNum(plan.support, NaN);
+  pos.structureResistance = safeNum(plan.resistance, NaN);
+  pos.scalpBottom = safeNum(plan.scalpBottom, NaN);
+  pos.scalpTop = safeNum(plan.scalpTop, NaN);
+  pos.targetReached = false;
+  pos.runnerConfirmed = false;
+  pos.lockedProfitFloor = NaN;
+  pos.warningPrice = NaN;
+  pos.warningTouches = 0;
+  pos.takeProfitPct =
+    mode === "STRUCTURE" ? NaN : SCALP_TAKE_PROFIT;
+  pos.maxDuration =
+    mode === "STRUCTURE"
+      ? computeDuration(Math.max(0.85, safeNum(plan.confidence, 0.76)))
+      : computeDuration(plan.confidence);
+
+  updateCapitalView(state, { [symbol]: price });
+  return true;
 }
 
 /* =========================================================
@@ -1627,9 +1636,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
     state.executionStats.ticks++;
 
-    /* -------------------------
-       Manage structure slot
-    ------------------------- */
     const structurePos = getPosition(state, "structure");
     if (structurePos && structurePos.symbol === symbol) {
       state.executionStats.decisions++;
@@ -1658,9 +1664,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       });
     }
 
-    /* -------------------------
-       Manage scalp slot
-    ------------------------- */
     const scalpPos = getPosition(state, "scalp");
     if (scalpPos && scalpPos.symbol === symbol) {
       state.executionStats.decisions++;
@@ -1704,9 +1707,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       return;
     }
 
-    /* -------------------------
-       Open structure slot
-    ------------------------- */
     const structureStillOpen = getPosition(state, "structure");
     if (!structureStillOpen) {
       const lastStructureTrade = safeNum(state.lastTradeTimeBySlot.structure, 0);
@@ -1773,9 +1773,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       }
     }
 
-    /* -------------------------
-       Open scalp slot
-    ------------------------- */
     const scalpStillOpen = getPosition(state, "scalp");
     if (!scalpStillOpen) {
       const lastScalpTrade = safeNum(state.lastTradeTimeBySlot.scalp, 0);
