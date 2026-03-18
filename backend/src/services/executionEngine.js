@@ -1,14 +1,12 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v24.0 (Safe Execution + SL/TP + Symbol Guard)
+// VERSION: v24.1 (Safe Execution + Correct Capital Ledger + SL/TP Guard)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
 
 /* =========================================================
 OPTIONAL AXIOS LOAD
-- Keeps server from crashing if axios is not installed yet
-- Live execution safely returns null until dependency/config exists
 ========================================================= */
 let axios = null;
 
@@ -41,30 +39,6 @@ function ensureTradeLog(state) {
   }
 }
 
-function ensureBalances(state) {
-  if (!state || typeof state !== "object") return;
-
-  if (state.availableCapital === undefined) {
-    state.availableCapital = safeNum(state.cashBalance, 0);
-  }
-
-  if (state.lockedCapital === undefined) {
-    state.lockedCapital = 0;
-  }
-
-  if (state.cashBalance === undefined) {
-    state.cashBalance =
-      safeNum(state.availableCapital, 0) +
-      safeNum(state.lockedCapital, 0);
-  }
-
-  state.availableCapital = Math.max(0, safeNum(state.availableCapital, 0));
-  state.lockedCapital = Math.max(0, safeNum(state.lockedCapital, 0));
-  state.cashBalance =
-    safeNum(state.availableCapital, 0) +
-    safeNum(state.lockedCapital, 0);
-}
-
 function ensureRealized(state) {
   if (!state.realized || typeof state.realized !== "object") {
     state.realized = { wins: 0, losses: 0, net: 0 };
@@ -75,40 +49,28 @@ function ensureRealized(state) {
   state.realized.net = safeNum(state.realized.net, 0);
 }
 
-function syncAccountState(state) {
-  ensureBalances(state);
-  ensureRealized(state);
+function ensureBalances(state) {
+  if (!state || typeof state !== "object") return;
 
-  if (state.position) {
-    state.position.qty = roundQty(state.position.qty);
-    state.position.capitalUsed = safeNum(state.position.capitalUsed, 0);
-    state.position.entry = safeNum(state.position.entry, 0);
-  }
+  const cash = safeNum(state.cashBalance, 0);
+  const available = safeNum(state.availableCapital, NaN);
+  const locked = safeNum(state.lockedCapital, NaN);
 
-  state.cashBalance =
-    Math.max(0, safeNum(state.availableCapital, 0)) +
-    Math.max(0, safeNum(state.lockedCapital, 0));
-
-  const lastPrice = safeNum(state.lastPrice, 0);
-
-  if (state.position && lastPrice > 0) {
-    const pos = state.position;
-
-    const unrealized =
-      pos.side === "LONG"
-        ? (lastPrice - pos.entry) * pos.qty
-        : (pos.entry - lastPrice) * pos.qty;
-
-    state.equity = state.cashBalance + unrealized;
+  if (!Number.isFinite(available) && !Number.isFinite(locked)) {
+    state.availableCapital = cash;
+    state.lockedCapital = 0;
+  } else if (!Number.isFinite(available)) {
+    state.lockedCapital = Math.max(0, locked);
+    state.availableCapital = Math.max(0, cash - state.lockedCapital);
+  } else if (!Number.isFinite(locked)) {
+    state.availableCapital = Math.max(0, available);
+    state.lockedCapital = Math.max(0, cash - state.availableCapital);
   } else {
-    state.equity = state.cashBalance;
+    state.availableCapital = Math.max(0, available);
+    state.lockedCapital = Math.max(0, locked);
   }
 
-  if (!Number.isFinite(state.peakEquity)) {
-    state.peakEquity = state.equity;
-  } else {
-    state.peakEquity = Math.max(state.peakEquity, state.equity);
-  }
+  state.cashBalance = state.availableCapital + state.lockedCapital;
 }
 
 function ensurePositionRuntime(position) {
@@ -130,13 +92,62 @@ function ensurePositionRuntime(position) {
   }
 }
 
+function syncAccountState(state, markPrice = null) {
+  ensureBalances(state);
+  ensureRealized(state);
+
+  const pos = state.position || null;
+  const price =
+    safeNum(markPrice, NaN) > 0
+      ? safeNum(markPrice, 0)
+      : safeNum(state.lastPrice, 0);
+
+  if (pos) {
+    ensurePositionRuntime(pos);
+
+    const unrealized =
+      price > 0
+        ? pos.side === "LONG"
+          ? (price - pos.entry) * pos.qty
+          : (pos.entry - price) * pos.qty
+        : 0;
+
+    state.cashBalance =
+      Math.max(0, safeNum(state.availableCapital, 0)) +
+      Math.max(0, safeNum(state.lockedCapital, 0));
+
+    state.equity = state.cashBalance + unrealized;
+  } else {
+    state.lockedCapital = 0;
+    state.cashBalance = Math.max(0, safeNum(state.availableCapital, 0));
+    state.equity = state.cashBalance;
+  }
+
+  if (!Number.isFinite(state.peakEquity)) {
+    state.peakEquity = state.equity;
+  } else {
+    state.peakEquity = Math.max(safeNum(state.peakEquity, state.equity), state.equity);
+  }
+}
+
+function applyRealizedPnl(state, pnl) {
+  ensureRealized(state);
+
+  pnl = safeNum(pnl, 0);
+
+  if (pnl > 0) state.realized.wins += 1;
+  else if (pnl < 0) state.realized.losses += 1;
+
+  state.realized.net += pnl;
+}
+
 /* =========================================================
 RISK CONFIGURATION
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.02; // max 2% equity deployed per new trade
-const HARD_ACCOUNT_RISK = 0.01;   // hard cap 1% equity sizing gate
-const MAX_TRADE_USD = 1000;       // company wanted safer starting paper/live behavior
+const MAX_EQUITY_EXPOSURE = 0.02;
+const HARD_ACCOUNT_RISK = 0.01;
+const MAX_TRADE_USD = 1000;
 const MIN_TRADE_USD = 100;
 
 const MAX_PYRAMIDS = 2;
@@ -328,7 +339,7 @@ function openPosition({
   };
 
   state.trades.push(trade);
-  syncAccountState(state);
+  syncAccountState(state, price);
 
   return { result: trade };
 }
@@ -370,11 +381,12 @@ function addToPosition({
   const cost = safeNum(qty * price, 0);
   if (cost <= 0 || cost > state.availableCapital) return null;
 
-  const newQty = roundQty(pos.qty + qty);
+  const oldQty = pos.qty;
+  const newQty = roundQty(oldQty + qty);
   if (newQty <= 0) return null;
 
   const newEntry =
-    ((pos.entry * pos.qty) + (price * qty)) / newQty;
+    ((pos.entry * oldQty) + (price * qty)) / newQty;
 
   pos.qty = newQty;
   pos.entry = safeNum(newEntry, price);
@@ -395,24 +407,9 @@ function addToPosition({
   };
 
   state.trades.push(trade);
-  syncAccountState(state);
+  syncAccountState(state, price);
 
   return { result: trade };
-}
-
-/* =========================================================
-REALIZED TRACKING
-========================================================= */
-
-function applyRealizedPnl(state, pnl) {
-  ensureRealized(state);
-
-  pnl = safeNum(pnl, 0);
-
-  if (pnl > 0) state.realized.wins += 1;
-  else if (pnl < 0) state.realized.losses += 1;
-
-  state.realized.net += pnl;
 }
 
 /* =========================================================
@@ -437,10 +434,15 @@ function partialClosePosition({
 
   closePct = clamp(safeNum(closePct, 0.25), 0.01, 1);
 
-  const qtyClose = roundQty(pos.qty * closePct);
-  if (qtyClose <= 0) return null;
+  const originalQty = safeNum(pos.qty, 0);
+  if (originalQty <= 0) return null;
 
-  const effectiveClosePct = qtyClose / pos.qty;
+  let qtyClose = roundQty(originalQty * closePct);
+
+  if (qtyClose <= 0) return null;
+  if (qtyClose > originalQty) qtyClose = originalQty;
+
+  const effectiveClosePct = qtyClose / originalQty;
   const releasedCost = pos.capitalUsed * effectiveClosePct;
 
   let pnl = 0;
@@ -454,7 +456,7 @@ function partialClosePosition({
   state.lockedCapital -= releasedCost;
   state.availableCapital += releasedCost + pnl;
 
-  pos.qty = roundQty(pos.qty - qtyClose);
+  pos.qty = roundQty(originalQty - qtyClose);
   pos.capitalUsed = Math.max(0, pos.capitalUsed - releasedCost);
   pos.peakProfit = 0;
 
@@ -487,7 +489,7 @@ function partialClosePosition({
     console.error("AI learning error:", err.message);
   }
 
-  syncAccountState(state);
+  syncAccountState(state, price);
 
   return { result: trade };
 }
@@ -552,14 +554,13 @@ function closePosition({
     console.error("AI learning error:", err.message);
   }
 
-  syncAccountState(state);
+  syncAccountState(state, price);
 
   return { result: trade };
 }
 
 /* =========================================================
 TRIGGER CHECKS
-- Lets caller send HOLD/WAIT and still have SL/TP protection
 ========================================================= */
 
 function evaluateProtectiveExit({
@@ -621,6 +622,7 @@ function executePaperOrder({
 
   ensureTradeLog(state);
   ensureBalances(state);
+  ensureRealized(state);
 
   price = safeNum(price, 0);
   if (price <= 0) return null;
@@ -631,13 +633,11 @@ function executePaperOrder({
   const normalizedAction = String(action || "").toUpperCase();
   const pos = state.position || null;
 
-  if (["BUY", "SELL", "ADD", "PARTIAL_CLOSE", "CLOSE"].includes(normalizedAction)) {
-    if (isCoolingDown(tenantId, symbol, now)) {
-      return null;
-    }
-  }
-
-  const boundedConfidence = clamp(safeNum(confidence, state.lastConfidence || 0.5), 0, 1);
+  const boundedConfidence = clamp(
+    safeNum(confidence, state.lastConfidence || 0.5),
+    0,
+    1
+  );
   state.lastConfidence = boundedConfidence;
 
   const protectiveExit = evaluateProtectiveExit({
@@ -651,6 +651,12 @@ function executePaperOrder({
   if (protectiveExit) {
     state.lastTradeTime = ts;
     return protectiveExit;
+  }
+
+  if (["BUY", "SELL", "ADD", "PARTIAL_CLOSE", "CLOSE", "STOP_LOSS", "TAKE_PROFIT"].includes(normalizedAction)) {
+    if (isCoolingDown(tenantId, symbol, now)) {
+      return null;
+    }
   }
 
   let positionSize = roundQty(safeNum(qty, 0));
@@ -789,7 +795,7 @@ function executePaperOrder({
   }
 
   if (normalizedAction === "HOLD" || normalizedAction === "WAIT" || normalizedAction === "") {
-    syncAccountState(state);
+    syncAccountState(state, price);
     return null;
   }
 
@@ -798,8 +804,6 @@ function executePaperOrder({
 
 /* =========================================================
 LIVE EXECUTION
-- Safe placeholder for now
-- Prevents app crash if live mode is selected before axios/config is ready
 ========================================================= */
 
 async function executeLiveOrder({
