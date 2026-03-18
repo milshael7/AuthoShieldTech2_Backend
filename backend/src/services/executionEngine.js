@@ -1,7 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// MODULE: Execution Engine
-// VERSION: v20 (Institutional Alpha Execution Engine)
+// VERSION: v21 (Adaptive Size + Confidence Scaling)
 // ==========================================================
 
 const outsideBrain =
@@ -25,24 +24,24 @@ function ensureTradeLog(state){
 }
 
 /* =========================================================
-RISK CONFIGURATION
+RISK CONFIGURATION (UPGRADED)
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.05;
+const MAX_EQUITY_EXPOSURE = 0.10;   // was 0.05
 const HARD_ACCOUNT_RISK   = 0.02;
 
-const MAX_TRADE_USD       = 2000;
-const MIN_TRADE_USD       = 25;
+const MAX_TRADE_USD       = 15000;  // was 2000
+const MIN_TRADE_USD       = 100;    // was 25
 
 const MAX_PYRAMIDS        = 3;
 
 /* ================= MICRO LOCK ================= */
 
 let LAST_EXECUTION_TIME = 0;
-const EXECUTION_COOLDOWN = 500;
+const EXECUTION_COOLDOWN = 400;
 
 /* =========================================================
-POSITION SIZE
+POSITION SIZE (UPGRADED)
 ========================================================= */
 
 function calculatePositionSize(state,price,riskPct){
@@ -55,8 +54,26 @@ function calculatePositionSize(state,price,riskPct){
   if(equity <= 0 || price <= 0)
     return 0;
 
-  const riskCapital =
+  /* BASE RISK */
+
+  let riskCapital =
     equity * safeNum(riskPct,0.01);
+
+  /* CONFIDENCE BOOST (NEW) */
+
+  const confidence =
+    safeNum(state?.lastConfidence,0.5);
+
+  let confidenceBoost = 1;
+
+  if(confidence > 0.85) confidenceBoost = 2.2;
+  else if(confidence > 0.70) confidenceBoost = 1.6;
+  else if(confidence > 0.55) confidenceBoost = 1.2;
+  else if(confidence < 0.40) confidenceBoost = 0.7;
+
+  riskCapital *= confidenceBoost;
+
+  /* HARD LIMITS */
 
   const exposureCap =
     equity * MAX_EQUITY_EXPOSURE;
@@ -157,7 +174,7 @@ function allowPyramid(pos,price){
       ? (price-pos.entry)/pos.entry
       : (pos.entry-price)/pos.entry;
 
-  return pnl > 0.002;
+  return pnl > 0.003; // slightly stricter
 
 }
 
@@ -333,19 +350,12 @@ function closePosition({
   state.position = null;
 
   try{
-
     outsideBrain.recordTradeOutcome({
       tenantId,
       pnl
     });
-
   }catch(err){
-
-    console.error(
-      "AI learning error:",
-      err.message
-    );
-
+    console.error("AI learning error:", err.message);
   }
 
   return { result: trade };
@@ -386,6 +396,11 @@ function executePaperOrder({
   LAST_EXECUTION_TIME = now;
 
   const pos = state.position;
+
+  /* STORE CONFIDENCE (NEW) */
+
+  state.lastConfidence =
+    safeNum(riskPct,0.01);
 
   let positionSize =
     safeNum(qty,0);
