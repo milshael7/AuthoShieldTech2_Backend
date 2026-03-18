@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v48 (Dual Slot Structure + Scalp + Pullback Quick Entries)
+// VERSION: v48.1 (Dual Slot Safer Tick Control + Replay Guard)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -142,6 +142,11 @@ const SCALP_PULLBACK_MIN_DROP =
 const SCALP_MID_RANGE_ALLOWED =
   String(process.env.TRADE_SCALP_MID_RANGE_ALLOWED || "true") === "true";
 
+/* REPLAY / DUPLICATE TICK GUARD */
+
+const DUPLICATE_TICK_WINDOW_MS =
+  Number(process.env.TRADE_DUPLICATE_TICK_WINDOW_MS || 250);
+
 /* =========================================================
 STATE
 ========================================================= */
@@ -167,6 +172,12 @@ function defaultState() {
       scalp: 0,
     },
     lastMode: "SCALP",
+    lastProcessedTickAtBySymbol: {},
+    lastProcessedPriceBySymbol: {},
+    lastDecisionTimeBySlot: {
+      structure: 0,
+      scalp: 0,
+    },
     limits: {
       tradesToday: 0,
       lossesToday: 0,
@@ -185,7 +196,9 @@ const STATES = new Map();
 
 function load(tenantId) {
   if (STATES.has(tenantId)) {
-    return STATES.get(tenantId);
+    const existing = STATES.get(tenantId);
+    ensureStateShape(existing);
+    return existing;
   }
 
   const state = defaultState();
@@ -221,6 +234,8 @@ function getDayKey(ts = Date.now()) {
 }
 
 function ensureStateShape(state) {
+  if (!state || typeof state !== "object") return;
+
   if (!state.positions || typeof state.positions !== "object") {
     state.positions = {
       structure: null,
@@ -246,6 +261,38 @@ function ensureStateShape(state) {
     state.lastTradeTimeBySlot.scalp = 0;
   }
 
+  if (
+    !state.lastProcessedTickAtBySymbol ||
+    typeof state.lastProcessedTickAtBySymbol !== "object"
+  ) {
+    state.lastProcessedTickAtBySymbol = {};
+  }
+
+  if (
+    !state.lastProcessedPriceBySymbol ||
+    typeof state.lastProcessedPriceBySymbol !== "object"
+  ) {
+    state.lastProcessedPriceBySymbol = {};
+  }
+
+  if (
+    !state.lastDecisionTimeBySlot ||
+    typeof state.lastDecisionTimeBySlot !== "object"
+  ) {
+    state.lastDecisionTimeBySlot = {
+      structure: 0,
+      scalp: 0,
+    };
+  }
+
+  if (!("structure" in state.lastDecisionTimeBySlot)) {
+    state.lastDecisionTimeBySlot.structure = 0;
+  }
+
+  if (!("scalp" in state.lastDecisionTimeBySlot)) {
+    state.lastDecisionTimeBySlot.scalp = 0;
+  }
+
   state.position =
     state.positions.structure ||
     state.positions.scalp ||
@@ -255,6 +302,15 @@ function ensureStateShape(state) {
 function getPosition(state, slot) {
   ensureStateShape(state);
   return state.positions[normalizeSlot(slot)] || null;
+}
+
+function setPosition(state, slot, pos) {
+  ensureStateShape(state);
+  state.positions[normalizeSlot(slot)] = pos || null;
+  state.position =
+    state.positions.structure ||
+    state.positions.scalp ||
+    null;
 }
 
 function getAllOpenPositions(state) {
@@ -374,6 +430,21 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
     state.positions.structure ||
     state.positions.scalp ||
     null;
+}
+
+function isDuplicateTick(state, symbol, price, ts) {
+  const lastTs = safeNum(state.lastProcessedTickAtBySymbol?.[symbol], 0);
+  const lastPrice = safeNum(state.lastProcessedPriceBySymbol?.[symbol], NaN);
+
+  if (!lastTs) return false;
+  if (!Number.isFinite(lastPrice)) return false;
+
+  return lastPrice === price && Math.abs(ts - lastTs) <= DUPLICATE_TICK_WINDOW_MS;
+}
+
+function rememberProcessedTick(state, symbol, price, ts) {
+  state.lastProcessedTickAtBySymbol[symbol] = ts;
+  state.lastProcessedPriceBySymbol[symbol] = price;
 }
 
 /* =========================================================
@@ -601,8 +672,8 @@ function buildStructurePlan({ price, zones, bias, symbol, prices }) {
     return {
       action: "WAIT",
       mode: "STRUCTURE",
-      slot: "structure",
       reason: "MID_ZONE_BLOCK",
+      slot: "structure",
       support: zones.support,
       resistance: zones.resistance,
     };
@@ -613,8 +684,8 @@ function buildStructurePlan({ price, zones, bias, symbol, prices }) {
       return {
         action: "WAIT",
         mode: "STRUCTURE",
-        slot: "structure",
         reason: "WAIT_REJECTION_CONFIRMATION",
+        slot: "structure",
         support: zones.support,
         resistance: zones.resistance,
       };
@@ -638,8 +709,8 @@ function buildStructurePlan({ price, zones, bias, symbol, prices }) {
       return {
         action: "WAIT",
         mode: "STRUCTURE",
-        slot: "structure",
         reason: "WAIT_BOUNCE_CONFIRMATION",
+        slot: "structure",
         support: zones.support,
         resistance: zones.resistance,
       };
@@ -661,8 +732,8 @@ function buildStructurePlan({ price, zones, bias, symbol, prices }) {
   return {
     action: "WAIT",
     mode: "STRUCTURE",
-    slot: "structure",
     reason: "ZONE_NOT_READY",
+    slot: "structure",
     support: zones.support,
     resistance: zones.resistance,
   };
@@ -737,7 +808,7 @@ function getMicroZones(prices) {
 function buildQuickScalpPlan({ symbol, price, prices }) {
   const micro = getMicroZones(prices);
 
-  if (!micro) {
+  if (!micro || prices.length < 3) {
     return {
       action: "WAIT",
       mode: "SCALP",
@@ -843,8 +914,12 @@ function closeTrade({ tenantId, state, symbol, slot, price, ts }) {
 
   state.lastTradeTime = ts;
   state.lastTradeTimeBySlot[normalizedSlot] = ts;
-  updateCapitalView(state, { [symbol]: price });
 
+  if (!getPosition(state, normalizedSlot)) {
+    setPosition(state, normalizedSlot, null);
+  }
+
+  updateCapitalView(state, { [symbol]: price });
   return true;
 }
 
@@ -1279,6 +1354,10 @@ function openTrade({
 }) {
   const normalizedSlot = normalizeSlot(slot);
 
+  if (getPosition(state, normalizedSlot)) {
+    return false;
+  }
+
   const exec = executionEngine.executePaperOrder({
     tenantId,
     symbol,
@@ -1297,6 +1376,7 @@ function openTrade({
     state.lastMode = mode;
     state.lastTradeTime = ts;
     state.lastTradeTimeBySlot[normalizedSlot] = ts;
+    state.lastDecisionTimeBySlot[normalizedSlot] = ts;
 
     const pos = getPosition(state, normalizedSlot);
 
@@ -1334,7 +1414,7 @@ PLAN BUILDING
 ========================================================= */
 
 function buildScalpPlan({ tenantId, symbol, price, state, prices }) {
-  let quickPlan = buildQuickScalpPlan({
+  const quickPlan = buildQuickScalpPlan({
     symbol,
     price,
     prices,
@@ -1372,6 +1452,10 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   if (!Number.isFinite(price) || price <= 0) return;
   if (state._locked) return;
 
+  if (isDuplicateTick(state, symbol, price, ts)) {
+    return;
+  }
+
   state._locked = true;
 
   try {
@@ -1379,6 +1463,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
     const prev = safeNum(state.lastPriceBySymbol?.[symbol], NaN);
     state.lastPriceBySymbol[symbol] = price;
+    rememberProcessedTick(state, symbol, price, ts);
 
     const prices = recordPrice(tenantId, symbol, price);
 
@@ -1476,8 +1561,12 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     const structureStillOpen = getPosition(state, "structure");
     if (!structureStillOpen) {
       const lastStructureTrade = safeNum(state.lastTradeTimeBySlot.structure, 0);
+      const lastStructureDecision = safeNum(state.lastDecisionTimeBySlot.structure, 0);
 
-      if (ts - lastStructureTrade >= cooldown) {
+      if (
+        ts - lastStructureTrade >= cooldown &&
+        ts !== lastStructureDecision
+      ) {
         const modePick = chooseTradeMode(prices);
         let structurePlan = { action: "WAIT", mode: "STRUCTURE", slot: "structure" };
 
@@ -1506,6 +1595,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
         }
 
         state.executionStats.decisions++;
+        state.lastDecisionTimeBySlot.structure = ts;
 
         recordDecision(
           state,
@@ -1540,9 +1630,13 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     const scalpStillOpen = getPosition(state, "scalp");
     if (!scalpStillOpen) {
       const lastScalpTrade = safeNum(state.lastTradeTimeBySlot.scalp, 0);
+      const lastScalpDecision = safeNum(state.lastDecisionTimeBySlot.scalp, 0);
       const scalpCooldown = Math.max(5000, Math.floor(cooldown * 0.35));
 
-      if (ts - lastScalpTrade >= scalpCooldown) {
+      if (
+        ts - lastScalpTrade >= scalpCooldown &&
+        ts !== lastScalpDecision
+      ) {
         let scalpPlan = buildScalpPlan({
           tenantId,
           symbol,
@@ -1568,6 +1662,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
         }
 
         state.executionStats.decisions++;
+        state.lastDecisionTimeBySlot.scalp = ts;
 
         recordDecision(
           state,
