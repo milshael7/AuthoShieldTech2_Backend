@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v43 (Auto Dual Mode: Scalp + Structure)
+// VERSION: v44 (Auto Dual Mode + Smart Runner TP)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -62,6 +62,20 @@ const LOSS_STREAK_SLOWDOWN =
 
 const EXTRA_COOLDOWN_ON_LOSS_STREAK =
   Number(process.env.TRADE_EXTRA_COOLDOWN_ON_LOSS_STREAK || 90000);
+
+/* SMART STRUCTURE EXIT */
+
+const STRUCTURE_TARGET_BUFFER =
+  Number(process.env.TRADE_STRUCTURE_TARGET_BUFFER || 0.0006);
+
+const STRUCTURE_PROFIT_LOCK =
+  Number(process.env.TRADE_STRUCTURE_PROFIT_LOCK || 0.45);
+
+const STRUCTURE_MIN_LOCK_PNL =
+  Number(process.env.TRADE_STRUCTURE_MIN_LOCK_PNL || 0.0015);
+
+const STRUCTURE_BREAK_EVEN_PNL =
+  Number(process.env.TRADE_STRUCTURE_BREAK_EVEN_PNL || 0.0020);
 
 /* =========================================================
 STATE
@@ -403,7 +417,17 @@ function handleStructurePosition({
 }){
 
   const strongTrend = detectTrendRun(prices,pos.side);
+  const momentumWeak = detectMomentumWeakening(prices);
   const hardBreak = detectHardMomentumBreak(prices,pos.side);
+
+  if(!Number.isFinite(pos.bestPnl))
+    pos.bestPnl = 0;
+
+  if(pnl > pos.bestPnl)
+    pos.bestPnl = pnl;
+
+  if(!Number.isFinite(pos.lockedProfitFloor))
+    pos.lockedProfitFloor = NaN;
 
   if(pnl <= HARD_STOP_LOSS)
     return closeTrade({tenantId,state,symbol,price,ts});
@@ -411,20 +435,106 @@ function handleStructurePosition({
   if(elapsed < MIN_HOLD_TIME)
     return false;
 
-  if(
-    Number.isFinite(pos.targetPrice) &&
-    pos.side === "LONG" &&
-    price >= pos.targetPrice
-  ){
-    return closeTrade({tenantId,state,symbol,price,ts});
-  }
+  const targetPrice = safeNum(pos.targetPrice,NaN);
 
   if(
-    Number.isFinite(pos.targetPrice) &&
-    pos.side === "SHORT" &&
-    price <= pos.targetPrice
+    Number.isFinite(targetPrice) &&
+    !pos.targetReached
   ){
-    return closeTrade({tenantId,state,symbol,price,ts});
+    const longHit =
+      pos.side === "LONG" &&
+      price >= targetPrice * (1 - STRUCTURE_TARGET_BUFFER);
+
+    const shortHit =
+      pos.side === "SHORT" &&
+      price <= targetPrice * (1 + STRUCTURE_TARGET_BUFFER);
+
+    if(longHit || shortHit){
+      pos.targetReached = true;
+      pos.maxDuration =
+        Math.min(
+          pos.maxDuration + 60000,
+          computeDuration(1) + MAX_EXTENSION_DURATION
+        );
+    }
+  }
+
+  if(pos.targetReached){
+
+    if(pos.bestPnl >= STRUCTURE_BREAK_EVEN_PNL){
+
+      const breakEvenFloor =
+        pos.side === "LONG"
+          ? pos.entry * 1.0002
+          : pos.entry * 0.9998;
+
+      if(pos.side === "LONG"){
+        pos.lockedProfitFloor =
+          Number.isFinite(pos.lockedProfitFloor)
+            ? Math.max(pos.lockedProfitFloor, breakEvenFloor)
+            : breakEvenFloor;
+      }else{
+        pos.lockedProfitFloor =
+          Number.isFinite(pos.lockedProfitFloor)
+            ? Math.min(pos.lockedProfitFloor, breakEvenFloor)
+            : breakEvenFloor;
+      }
+
+    }
+
+    if(pos.bestPnl >= STRUCTURE_MIN_LOCK_PNL){
+
+      const lockPct =
+        strongTrend ? 0.30 : STRUCTURE_PROFIT_LOCK;
+
+      const protectedPnl =
+        pos.bestPnl * lockPct;
+
+      const floorFromPnl =
+        pos.side === "LONG"
+          ? pos.entry * (1 + protectedPnl)
+          : pos.entry * (1 - protectedPnl);
+
+      if(pos.side === "LONG"){
+        pos.lockedProfitFloor =
+          Number.isFinite(pos.lockedProfitFloor)
+            ? Math.max(pos.lockedProfitFloor, floorFromPnl)
+            : floorFromPnl;
+      }else{
+        pos.lockedProfitFloor =
+          Number.isFinite(pos.lockedProfitFloor)
+            ? Math.min(pos.lockedProfitFloor, floorFromPnl)
+            : floorFromPnl;
+      }
+
+    }
+
+    if(Number.isFinite(pos.lockedProfitFloor)){
+      if(pos.side === "LONG" && price <= pos.lockedProfitFloor)
+        return closeTrade({tenantId,state,symbol,price,ts});
+
+      if(pos.side === "SHORT" && price >= pos.lockedProfitFloor)
+        return closeTrade({tenantId,state,symbol,price,ts});
+    }
+
+    if(pnl > 0 && hardBreak && !strongTrend)
+      return closeTrade({tenantId,state,symbol,price,ts});
+
+    if(pnl > 0 && momentumWeak && !strongTrend)
+      return closeTrade({tenantId,state,symbol,price,ts});
+
+    if(strongTrend && pnl > 0){
+      pos.maxDuration =
+        Math.min(
+          pos.maxDuration + 30000,
+          computeDuration(1) + MAX_EXTENSION_DURATION
+        );
+    }
+
+    if(elapsed >= pos.maxDuration)
+      return closeTrade({tenantId,state,symbol,price,ts});
+
+    return false;
   }
 
   if(pnl > 0 && hardBreak && !strongTrend)
@@ -597,6 +707,8 @@ function openTrade({
         safeNum(plan.support, NaN);
       state.position.structureResistance =
         safeNum(plan.resistance, NaN);
+      state.position.targetReached = false;
+      state.position.lockedProfitFloor = NaN;
       state.position.maxDuration =
         mode === "STRUCTURE"
           ? computeDuration(Math.max(0.85, safeNum(plan.confidence,0.72)))
