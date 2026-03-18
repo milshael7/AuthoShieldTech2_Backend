@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v21 (Adaptive Size + Confidence Scaling)
+// VERSION: v22 (Adaptive Size + True Confidence Scaling)
 // ==========================================================
 
 const outsideBrain =
@@ -24,14 +24,14 @@ function ensureTradeLog(state){
 }
 
 /* =========================================================
-RISK CONFIGURATION (UPGRADED)
+RISK CONFIGURATION
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.10;   // was 0.05
+const MAX_EQUITY_EXPOSURE = 0.10;
 const HARD_ACCOUNT_RISK   = 0.02;
 
-const MAX_TRADE_USD       = 15000;  // was 2000
-const MIN_TRADE_USD       = 100;    // was 25
+const MAX_TRADE_USD       = 15000;
+const MIN_TRADE_USD       = 100;
 
 const MAX_PYRAMIDS        = 3;
 
@@ -41,39 +41,35 @@ let LAST_EXECUTION_TIME = 0;
 const EXECUTION_COOLDOWN = 400;
 
 /* =========================================================
-POSITION SIZE (UPGRADED)
+POSITION SIZE
 ========================================================= */
 
 function calculatePositionSize(state,price,riskPct){
 
   const equity =
-    safeNum(state.equity,
+    safeNum(
+      state.equity,
       safeNum(state.cashBalance,0)
     );
 
   if(equity <= 0 || price <= 0)
     return 0;
 
-  /* BASE RISK */
-
   let riskCapital =
     equity * safeNum(riskPct,0.01);
-
-  /* CONFIDENCE BOOST (NEW) */
 
   const confidence =
     safeNum(state?.lastConfidence,0.5);
 
   let confidenceBoost = 1;
 
-  if(confidence > 0.85) confidenceBoost = 2.2;
-  else if(confidence > 0.70) confidenceBoost = 1.6;
-  else if(confidence > 0.55) confidenceBoost = 1.2;
-  else if(confidence < 0.40) confidenceBoost = 0.7;
+  if(confidence >= 0.90) confidenceBoost = 2.25;
+  else if(confidence >= 0.80) confidenceBoost = 1.85;
+  else if(confidence >= 0.70) confidenceBoost = 1.45;
+  else if(confidence >= 0.60) confidenceBoost = 1.15;
+  else if(confidence < 0.40) confidenceBoost = 0.70;
 
   riskCapital *= confidenceBoost;
-
-  /* HARD LIMITS */
 
   const exposureCap =
     equity * MAX_EQUITY_EXPOSURE;
@@ -86,7 +82,8 @@ function calculatePositionSize(state,price,riskPct){
       riskCapital,
       exposureCap,
       accountRiskLimit,
-      MAX_TRADE_USD
+      MAX_TRADE_USD,
+      safeNum(state.availableCapital,equity)
     );
 
   if(allowedCapital < MIN_TRADE_USD)
@@ -98,7 +95,6 @@ function calculatePositionSize(state,price,riskPct){
   qty = clamp(qty,0,1e9);
 
   return Number(qty.toFixed(6));
-
 }
 
 /* =========================================================
@@ -155,7 +151,6 @@ function openPosition({
   state.trades.push(trade);
 
   return { result: trade };
-
 }
 
 /* =========================================================
@@ -174,8 +169,7 @@ function allowPyramid(pos,price){
       ? (price-pos.entry)/pos.entry
       : (pos.entry-price)/pos.entry;
 
-  return pnl > 0.003; // slightly stricter
-
+  return pnl > 0.003;
 }
 
 /* =========================================================
@@ -229,7 +223,6 @@ function addToPosition({
   state.trades.push(trade);
 
   return { result: trade };
-
 }
 
 /* =========================================================
@@ -266,17 +259,16 @@ function partialClosePosition({
   if(pos.side === "SHORT")
     pnl = (pos.entry - price) * qtyClose;
 
-  const capitalReleased =
-    (pos.capitalUsed * closePct) + pnl;
-
-  state.lockedCapital -=
+  const lockedRelease =
     pos.capitalUsed * closePct;
 
-  state.availableCapital +=
-    capitalReleased;
+  const capitalReleased =
+    lockedRelease + pnl;
+
+  state.lockedCapital -= lockedRelease;
+  state.availableCapital += capitalReleased;
 
   pos.qty = remainingQty;
-
   pos.capitalUsed =
     pos.capitalUsed * (1 - closePct);
 
@@ -292,11 +284,12 @@ function partialClosePosition({
 
   state.trades.push(trade);
 
-  if(pos.qty <= 0.000001)
+  if(pos.qty <= 0.000001){
     state.position = null;
+    state.cashBalance = state.availableCapital;
+  }
 
   return { result: trade };
-
 }
 
 /* =========================================================
@@ -329,9 +322,7 @@ function closePosition({
 
   state.lockedCapital -= pos.capitalUsed;
   state.availableCapital += capitalReturn;
-
-  state.cashBalance =
-    state.availableCapital;
+  state.cashBalance = state.availableCapital;
 
   const trade = {
     side:"CLOSE",
@@ -359,7 +350,6 @@ function closePosition({
   }
 
   return { result: trade };
-
 }
 
 /* =========================================================
@@ -367,17 +357,16 @@ EXECUTION
 ========================================================= */
 
 function executePaperOrder({
-
   tenantId,
   symbol,
   action,
   price,
   riskPct,
+  confidence,
   qty,
   closePct,
   state,
   ts = Date.now()
-
 }){
 
   if(!state) return null;
@@ -397,30 +386,25 @@ function executePaperOrder({
 
   const pos = state.position;
 
-  /* STORE CONFIDENCE (NEW) */
-
   state.lastConfidence =
-    safeNum(riskPct,0.01);
+    clamp(safeNum(confidence, state.lastConfidence || 0.5),0,1);
 
   let positionSize =
     safeNum(qty,0);
 
   if(positionSize <= 0){
-
     positionSize =
       calculatePositionSize(
         state,
         price,
         riskPct || 0.01
       );
-
   }
-
-  if(positionSize <= 0)
-    return null;
 
   if(action === "BUY"){
     if(pos) return null;
+    if(positionSize <= 0) return null;
+
     return openPosition({
       state,
       symbol,
@@ -433,6 +417,8 @@ function executePaperOrder({
 
   if(action === "SELL"){
     if(pos) return null;
+    if(positionSize <= 0) return null;
+
     return openPosition({
       state,
       symbol,
@@ -445,6 +431,8 @@ function executePaperOrder({
 
   if(action === "ADD"){
     if(!pos) return null;
+    if(positionSize <= 0) return null;
+
     return addToPosition({
       state,
       price,
@@ -455,6 +443,7 @@ function executePaperOrder({
 
   if(action === "PARTIAL_CLOSE"){
     if(!pos) return null;
+
     return partialClosePosition({
       tenantId,
       state,
@@ -466,6 +455,7 @@ function executePaperOrder({
 
   if(action === "CLOSE"){
     if(!pos) return null;
+
     return closePosition({
       tenantId,
       state,
@@ -475,7 +465,6 @@ function executePaperOrder({
   }
 
   return null;
-
 }
 
 module.exports = {
