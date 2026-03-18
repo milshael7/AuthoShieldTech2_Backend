@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v24.1 (Safe Execution + Correct Capital Ledger + SL/TP Guard)
+// VERSION: v25.0 (Dual Slot Execution + Safe Ledger + SL/TP Guard)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -33,6 +33,11 @@ function roundQty(qty) {
   return Number(safeNum(qty, 0).toFixed(6));
 }
 
+function normalizeSlot(slot) {
+  const s = String(slot || "").toLowerCase();
+  return s === "structure" ? "structure" : "scalp";
+}
+
 function ensureTradeLog(state) {
   if (!Array.isArray(state.trades)) {
     state.trades = [];
@@ -49,8 +54,64 @@ function ensureRealized(state) {
   state.realized.net = safeNum(state.realized.net, 0);
 }
 
+function ensurePositionsShape(state) {
+  if (!state.positions || typeof state.positions !== "object") {
+    state.positions = {
+      structure: null,
+      scalp: null,
+    };
+  }
+
+  if (!("structure" in state.positions)) {
+    state.positions.structure = null;
+  }
+
+  if (!("scalp" in state.positions)) {
+    state.positions.scalp = null;
+  }
+
+  // backward compatibility:
+  // if legacy state.position exists, move it into scalp if both empty
+  if (
+    state.position &&
+    !state.positions.structure &&
+    !state.positions.scalp
+  ) {
+    state.positions.scalp = state.position;
+  }
+
+  state.position =
+    state.positions.structure ||
+    state.positions.scalp ||
+    null;
+}
+
+function getOpenPositions(state) {
+  ensurePositionsShape(state);
+
+  return ["structure", "scalp"]
+    .map((slot) => ({ slot, pos: state.positions[slot] }))
+    .filter((x) => !!x.pos);
+}
+
+function getPosition(state, slot) {
+  ensurePositionsShape(state);
+  return state.positions[normalizeSlot(slot)] || null;
+}
+
+function setPosition(state, slot, value) {
+  ensurePositionsShape(state);
+  state.positions[normalizeSlot(slot)] = value || null;
+  state.position =
+    state.positions.structure ||
+    state.positions.scalp ||
+    null;
+}
+
 function ensureBalances(state) {
   if (!state || typeof state !== "object") return;
+
+  ensurePositionsShape(state);
 
   const cash = safeNum(state.cashBalance, 0);
   const available = safeNum(state.availableCapital, NaN);
@@ -73,9 +134,10 @@ function ensureBalances(state) {
   state.cashBalance = state.availableCapital + state.lockedCapital;
 }
 
-function ensurePositionRuntime(position) {
+function ensurePositionRuntime(position, slot = "scalp") {
   if (!position || typeof position !== "object") return;
 
+  position.slot = normalizeSlot(position.slot || slot);
   position.qty = roundQty(position.qty);
   position.entry = safeNum(position.entry, 0);
   position.capitalUsed = safeNum(position.capitalUsed, 0);
@@ -92,42 +154,58 @@ function ensurePositionRuntime(position) {
   }
 }
 
-function syncAccountState(state, markPrice = null) {
+function syncAccountState(state, markPrices = {}) {
+  ensureTradeLog(state);
   ensureBalances(state);
   ensureRealized(state);
+  ensurePositionsShape(state);
 
-  const pos = state.position || null;
-  const price =
-    safeNum(markPrice, NaN) > 0
-      ? safeNum(markPrice, 0)
-      : safeNum(state.lastPrice, 0);
+  let lockedCapital = 0;
+  let unrealized = 0;
 
-  if (pos) {
-    ensurePositionRuntime(pos);
+  for (const { slot, pos } of getOpenPositions(state)) {
+    ensurePositionRuntime(pos, slot);
 
-    const unrealized =
-      price > 0
-        ? pos.side === "LONG"
+    lockedCapital += Math.max(0, safeNum(pos.capitalUsed, 0));
+
+    const explicitMark = safeNum(markPrices?.[pos.symbol], NaN);
+    const fallbackLast =
+      safeNum(state.lastPriceBySymbol?.[pos.symbol], NaN) > 0
+        ? safeNum(state.lastPriceBySymbol[pos.symbol], NaN)
+        : safeNum(state.lastPrice, NaN);
+
+    const price = Number.isFinite(explicitMark) && explicitMark > 0
+      ? explicitMark
+      : fallbackLast;
+
+    if (price > 0) {
+      unrealized +=
+        pos.side === "LONG"
           ? (price - pos.entry) * pos.qty
-          : (pos.entry - price) * pos.qty
-        : 0;
-
-    state.cashBalance =
-      Math.max(0, safeNum(state.availableCapital, 0)) +
-      Math.max(0, safeNum(state.lockedCapital, 0));
-
-    state.equity = state.cashBalance + unrealized;
-  } else {
-    state.lockedCapital = 0;
-    state.cashBalance = Math.max(0, safeNum(state.availableCapital, 0));
-    state.equity = state.cashBalance;
+          : (pos.entry - price) * pos.qty;
+    }
   }
+
+  state.lockedCapital = Math.max(0, lockedCapital);
+  state.availableCapital = Math.max(
+    0,
+    safeNum(state.cashBalance, 0) - state.lockedCapital
+  );
+  state.equity = safeNum(state.cashBalance, 0) + unrealized;
 
   if (!Number.isFinite(state.peakEquity)) {
     state.peakEquity = state.equity;
   } else {
-    state.peakEquity = Math.max(safeNum(state.peakEquity, state.equity), state.equity);
+    state.peakEquity = Math.max(
+      safeNum(state.peakEquity, state.equity),
+      state.equity
+    );
   }
+
+  state.position =
+    state.positions.structure ||
+    state.positions.scalp ||
+    null;
 }
 
 function applyRealizedPnl(state, pnl) {
@@ -145,10 +223,15 @@ function applyRealizedPnl(state, pnl) {
 RISK CONFIGURATION
 ========================================================= */
 
-const MAX_EQUITY_EXPOSURE = 0.02;
-const HARD_ACCOUNT_RISK = 0.01;
-const MAX_TRADE_USD = 1000;
+const MAX_EQUITY_EXPOSURE = 0.03;
+const HARD_ACCOUNT_RISK = 0.015;
+const MAX_TRADE_USD = 1500;
 const MIN_TRADE_USD = 100;
+
+const SLOT_CAPITAL_LIMITS = {
+  structure: 0.02,
+  scalp: 0.01,
+};
 
 const MAX_PYRAMIDS = 2;
 const PYRAMID_TRIGGER_PNL = 0.003;
@@ -161,12 +244,12 @@ EXECUTION COOLDOWN
 const EXECUTION_COOLDOWN_MS = 400;
 const LAST_EXECUTION_BY_KEY = new Map();
 
-function executionKey(tenantId, symbol) {
-  return `${tenantId || "__default__"}:${symbol || "__symbol__"}`;
+function executionKey(tenantId, symbol, slot) {
+  return `${tenantId || "__default__"}:${symbol || "__symbol__"}:${normalizeSlot(slot)}`;
 }
 
-function isCoolingDown(tenantId, symbol, now) {
-  const key = executionKey(tenantId, symbol);
+function isCoolingDown(tenantId, symbol, slot, now) {
+  const key = executionKey(tenantId, symbol, slot);
   const last = safeNum(LAST_EXECUTION_BY_KEY.get(key), 0);
 
   if (now - last < EXECUTION_COOLDOWN_MS) {
@@ -187,9 +270,11 @@ function isCoolingDown(tenantId, symbol, now) {
 POSITION SIZE
 ========================================================= */
 
-function calculatePositionSize(state, price, riskPct, confidence = 0.5) {
+function calculatePositionSize(state, price, riskPct, confidence = 0.5, slot = "scalp") {
   ensureBalances(state);
+  ensurePositionsShape(state);
 
+  const normalizedSlot = normalizeSlot(slot);
   const equity = safeNum(state.equity, safeNum(state.cashBalance, 0));
 
   if (equity <= 0 || price <= 0) {
@@ -205,6 +290,9 @@ function calculatePositionSize(state, price, riskPct, confidence = 0.5) {
   else if (boundedConfidence >= 0.8) confidenceScale = 1.05;
   else if (boundedConfidence < 0.4) confidenceScale = 0.75;
 
+  const slotExposureCap =
+    equity * safeNum(SLOT_CAPITAL_LIMITS[normalizedSlot], 0.01);
+
   const requestedRiskCapital = equity * boundedRiskPct * confidenceScale;
   const exposureCap = equity * MAX_EQUITY_EXPOSURE;
   const hardRiskCap = equity * HARD_ACCOUNT_RISK;
@@ -213,6 +301,7 @@ function calculatePositionSize(state, price, riskPct, confidence = 0.5) {
     requestedRiskCapital,
     exposureCap,
     hardRiskCap,
+    slotExposureCap,
     MAX_TRADE_USD,
     safeNum(state.availableCapital, 0)
   );
@@ -287,13 +376,17 @@ function openPosition({
   side,
   stopLoss = null,
   takeProfit = null,
+  slot = "scalp",
   ts,
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensurePositionsShape(state);
 
+  const normalizedSlot = normalizeSlot(slot);
   qty = roundQty(qty);
 
+  if (getPosition(state, normalizedSlot)) return null;
   if (qty <= 0) return null;
 
   const cost = safeNum(qty * price, 0);
@@ -310,7 +403,8 @@ function openPosition({
   state.availableCapital -= cost;
   state.lockedCapital += cost;
 
-  state.position = {
+  const position = {
+    slot: normalizedSlot,
     symbol,
     side,
     entry: price,
@@ -323,23 +417,25 @@ function openPosition({
     takeProfit: sltp.takeProfit,
   };
 
-  ensurePositionRuntime(state.position);
+  ensurePositionRuntime(position, normalizedSlot);
+  setPosition(state, normalizedSlot, position);
 
   const trade = {
     side,
+    slot: normalizedSlot,
     symbol,
     entry: price,
     price,
     qty,
     capitalUsed: cost,
-    stopLoss: state.position.stopLoss,
-    takeProfit: state.position.takeProfit,
+    stopLoss: position.stopLoss,
+    takeProfit: position.takeProfit,
     pnl: 0,
     time: ts,
   };
 
   state.trades.push(trade);
-  syncAccountState(state, price);
+  syncAccountState(state, { [symbol]: price });
 
   return { result: trade };
 }
@@ -365,12 +461,16 @@ function addToPosition({
   symbol,
   price,
   qty,
+  slot = "scalp",
   ts,
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensurePositionsShape(state);
 
-  const pos = state.position;
+  const normalizedSlot = normalizeSlot(slot);
+  const pos = getPosition(state, normalizedSlot);
+
   if (!pos) return null;
   if (pos.symbol !== symbol) return null;
   if (!allowPyramid(pos, price)) return null;
@@ -385,8 +485,7 @@ function addToPosition({
   const newQty = roundQty(oldQty + qty);
   if (newQty <= 0) return null;
 
-  const newEntry =
-    ((pos.entry * oldQty) + (price * qty)) / newQty;
+  const newEntry = ((pos.entry * oldQty) + (price * qty)) / newQty;
 
   pos.qty = newQty;
   pos.entry = safeNum(newEntry, price);
@@ -398,6 +497,7 @@ function addToPosition({
 
   const trade = {
     side: "ADD",
+    slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
     price,
@@ -407,7 +507,7 @@ function addToPosition({
   };
 
   state.trades.push(trade);
-  syncAccountState(state, price);
+  syncAccountState(state, { [symbol]: price });
 
   return { result: trade };
 }
@@ -422,13 +522,17 @@ function partialClosePosition({
   symbol,
   price,
   closePct,
+  slot = "scalp",
   ts,
   reason = "PARTIAL_CLOSE",
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensurePositionsShape(state);
 
-  const pos = state.position;
+  const normalizedSlot = normalizeSlot(slot);
+  const pos = getPosition(state, normalizedSlot);
+
   if (!pos) return null;
   if (pos.symbol !== symbol) return null;
 
@@ -462,6 +566,7 @@ function partialClosePosition({
 
   const trade = {
     side: reason,
+    slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
     price,
@@ -475,21 +580,23 @@ function partialClosePosition({
   applyRealizedPnl(state, pnl);
 
   if (pos.qty <= 0.000001 || pos.capitalUsed <= 0.01) {
-    state.position = null;
+    setPosition(state, normalizedSlot, null);
   } else {
-    ensurePositionRuntime(pos);
+    ensurePositionRuntime(pos, normalizedSlot);
   }
 
   try {
     outsideBrain.recordTradeOutcome({
       tenantId,
       pnl,
+      slot: normalizedSlot,
+      symbol,
     });
   } catch (err) {
     console.error("AI learning error:", err.message);
   }
 
-  syncAccountState(state, price);
+  syncAccountState(state, { [symbol]: price });
 
   return { result: trade };
 }
@@ -503,13 +610,17 @@ function closePosition({
   state,
   symbol,
   price,
+  slot = "scalp",
   ts,
   reason = "CLOSE",
 }) {
   ensureTradeLog(state);
   ensureBalances(state);
+  ensurePositionsShape(state);
 
-  const pos = state.position;
+  const normalizedSlot = normalizeSlot(slot);
+  const pos = getPosition(state, normalizedSlot);
+
   if (!pos) return null;
   if (pos.symbol !== symbol) return null;
 
@@ -528,6 +639,7 @@ function closePosition({
 
   const trade = {
     side: reason,
+    slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
     price,
@@ -541,7 +653,7 @@ function closePosition({
   };
 
   state.trades.push(trade);
-  state.position = null;
+  setPosition(state, normalizedSlot, null);
 
   applyRealizedPnl(state, pnl);
 
@@ -549,12 +661,14 @@ function closePosition({
     outsideBrain.recordTradeOutcome({
       tenantId,
       pnl,
+      slot: normalizedSlot,
+      symbol,
     });
   } catch (err) {
     console.error("AI learning error:", err.message);
   }
 
-  syncAccountState(state, price);
+  syncAccountState(state, { [symbol]: price });
 
   return { result: trade };
 }
@@ -568,32 +682,44 @@ function evaluateProtectiveExit({
   state,
   symbol,
   price,
+  slot = null,
   ts,
 }) {
-  const pos = state.position;
-  if (!pos) return null;
-  if (pos.symbol !== symbol) return null;
+  ensurePositionsShape(state);
 
-  if (stopLossHit(pos, price)) {
-    return closePosition({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      reason: "STOP_LOSS",
-    });
-  }
+  const slots = slot
+    ? [normalizeSlot(slot)]
+    : ["structure", "scalp"];
 
-  if (takeProfitHit(pos, price)) {
-    return closePosition({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      reason: "TAKE_PROFIT",
-    });
+  for (const currentSlot of slots) {
+    const pos = getPosition(state, currentSlot);
+
+    if (!pos) continue;
+    if (pos.symbol !== symbol) continue;
+
+    if (stopLossHit(pos, price)) {
+      return closePosition({
+        tenantId,
+        state,
+        symbol,
+        price,
+        slot: currentSlot,
+        ts,
+        reason: "STOP_LOSS",
+      });
+    }
+
+    if (takeProfitHit(pos, price)) {
+      return closePosition({
+        tenantId,
+        state,
+        symbol,
+        price,
+        slot: currentSlot,
+        ts,
+        reason: "TAKE_PROFIT",
+      });
+    }
   }
 
   return null;
@@ -614,6 +740,7 @@ function executePaperOrder({
   closePct,
   stopLoss,
   takeProfit,
+  slot = "scalp",
   state,
   ts = Date.now(),
 }) {
@@ -623,15 +750,23 @@ function executePaperOrder({
   ensureTradeLog(state);
   ensureBalances(state);
   ensureRealized(state);
+  ensurePositionsShape(state);
+
+  const normalizedSlot = normalizeSlot(slot);
 
   price = safeNum(price, 0);
   if (price <= 0) return null;
 
   state.lastPrice = price;
 
+  if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
+    state.lastPriceBySymbol = {};
+  }
+  state.lastPriceBySymbol[symbol] = price;
+
   const now = Date.now();
   const normalizedAction = String(action || "").toUpperCase();
-  const pos = state.position || null;
+  const pos = getPosition(state, normalizedSlot);
 
   const boundedConfidence = clamp(
     safeNum(confidence, state.lastConfidence || 0.5),
@@ -645,6 +780,7 @@ function executePaperOrder({
     state,
     symbol,
     price,
+    slot: normalizedSlot,
     ts,
   });
 
@@ -653,20 +789,24 @@ function executePaperOrder({
     return protectiveExit;
   }
 
-  if (["BUY", "SELL", "ADD", "PARTIAL_CLOSE", "CLOSE", "STOP_LOSS", "TAKE_PROFIT"].includes(normalizedAction)) {
-    if (isCoolingDown(tenantId, symbol, now)) {
+  if (
+    ["BUY", "SELL", "ADD", "PARTIAL_CLOSE", "CLOSE", "STOP_LOSS", "TAKE_PROFIT"]
+      .includes(normalizedAction)
+  ) {
+    if (isCoolingDown(tenantId, symbol, normalizedSlot, now)) {
       return null;
     }
   }
 
   let positionSize = roundQty(safeNum(qty, 0));
 
-  if (positionSize <= 0) {
+  if (positionSize <= 0 && ["BUY", "SELL", "ADD"].includes(normalizedAction)) {
     positionSize = calculatePositionSize(
       state,
       price,
       safeNum(riskPct, 0.01),
-      boundedConfidence
+      boundedConfidence,
+      normalizedSlot
     );
   }
 
@@ -682,6 +822,7 @@ function executePaperOrder({
       side: "LONG",
       stopLoss,
       takeProfit,
+      slot: normalizedSlot,
       ts,
     });
 
@@ -701,6 +842,7 @@ function executePaperOrder({
       side: "SHORT",
       stopLoss,
       takeProfit,
+      slot: normalizedSlot,
       ts,
     });
 
@@ -718,6 +860,7 @@ function executePaperOrder({
       symbol,
       price,
       qty: roundQty(positionSize * PYRAMID_SIZE_FACTOR),
+      slot: normalizedSlot,
       ts,
     });
 
@@ -735,6 +878,7 @@ function executePaperOrder({
       symbol,
       price,
       closePct,
+      slot: normalizedSlot,
       ts,
       reason: "PARTIAL_CLOSE",
     });
@@ -752,6 +896,7 @@ function executePaperOrder({
       state,
       symbol,
       price,
+      slot: normalizedSlot,
       ts,
       reason: "STOP_LOSS",
     });
@@ -769,6 +914,7 @@ function executePaperOrder({
       state,
       symbol,
       price,
+      slot: normalizedSlot,
       ts,
       reason: "TAKE_PROFIT",
     });
@@ -786,6 +932,7 @@ function executePaperOrder({
       state,
       symbol,
       price,
+      slot: normalizedSlot,
       ts,
       reason: "CLOSE",
     });
@@ -794,8 +941,12 @@ function executePaperOrder({
     return result;
   }
 
-  if (normalizedAction === "HOLD" || normalizedAction === "WAIT" || normalizedAction === "") {
-    syncAccountState(state, price);
+  if (
+    normalizedAction === "HOLD" ||
+    normalizedAction === "WAIT" ||
+    normalizedAction === ""
+  ) {
+    syncAccountState(state, { [symbol]: price });
     return null;
   }
 
