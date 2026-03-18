@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v22 (Adaptive Size + True Confidence Scaling)
+// VERSION: v23 (Adaptive Size + True Confidence Scaling)
 // ==========================================================
 
 const outsideBrain =
@@ -115,7 +115,7 @@ function openPosition({
   const cost = qty * price;
 
   if(state.availableCapital === undefined)
-    state.availableCapital = state.cashBalance;
+    state.availableCapital = safeNum(state.cashBalance,0);
 
   if(state.lockedCapital === undefined)
     state.lockedCapital = 0;
@@ -387,7 +387,11 @@ function executePaperOrder({
   const pos = state.position;
 
   state.lastConfidence =
-    clamp(safeNum(confidence, state.lastConfidence || 0.5),0,1);
+    clamp(
+      safeNum(confidence, state.lastConfidence || 0.5),
+      0,
+      1
+    );
 
   let positionSize =
     safeNum(qty,0);
