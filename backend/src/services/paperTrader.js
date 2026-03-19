@@ -1,7 +1,7 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v51.0 (Single-Trade Matched Controller + Manual Protection + Live State Accessor)
-// Matched to tradeBrain v22 + executionEngine v26
+// VERSION: v50.1 (Single-Trade Matched Controller + Manual Protection + Live State Access)
+// Matched to tradeBrain v22 + executionEngine v26 + paper.routes v5.1
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -96,6 +96,8 @@ function defaultState() {
     cashBalance: START_BAL,
     availableCapital: START_BAL,
     lockedCapital: 0,
+    equity: START_BAL,
+    peakEquity: START_BAL,
     position: null,
     positions: {
       structure: null,
@@ -103,6 +105,12 @@ function defaultState() {
     },
     trades: [],
     decisions: [],
+    realized: {
+      wins: 0,
+      losses: 0,
+      net: 0,
+      fees: 0,
+    },
     volatility: 0.003,
     lastPrice: 0,
     lastPriceBySymbol: {},
@@ -119,12 +127,6 @@ function defaultState() {
       ticks: 0,
       decisions: 0,
       trades: 0,
-    },
-    realized: {
-      wins: 0,
-      losses: 0,
-      net: 0,
-      fees: 0,
     },
     _locked: false,
   };
@@ -171,6 +173,16 @@ function ensureStateShape(state) {
 
   if (!Array.isArray(state.trades)) state.trades = [];
   if (!Array.isArray(state.decisions)) state.decisions = [];
+
+  if (!state.positions || typeof state.positions !== "object") {
+    state.positions = {
+      structure: null,
+      scalp: null,
+    };
+  }
+
+  if (!("structure" in state.positions)) state.positions.structure = null;
+  if (!("scalp" in state.positions)) state.positions.scalp = null;
 
   if (!state.lastPriceBySymbol || typeof state.lastPriceBySymbol !== "object") {
     state.lastPriceBySymbol = {};
@@ -219,29 +231,26 @@ function ensureStateShape(state) {
     };
   }
 
-  if (!state.positions || typeof state.positions !== "object") {
-    state.positions = {
-      structure: null,
-      scalp: null,
-    };
-  }
+  state.realized.wins = safeNum(state.realized.wins, 0);
+  state.realized.losses = safeNum(state.realized.losses, 0);
+  state.realized.net = safeNum(state.realized.net, 0);
+  state.realized.fees = safeNum(state.realized.fees, 0);
 
-  // backward compatibility with dual-slot state
-  if (!state.position && state.positions) {
-    state.position =
-      state.positions.scalp ||
-      state.positions.structure ||
-      null;
-  }
-
-  // forward compatibility if only single position exists
+  // backward compatibility with legacy single-position shape
   if (state.position && !state.positions.scalp && !state.positions.structure) {
     state.positions.scalp = state.position;
   }
 
-  state.position = state.position || null;
-  state.positions.structure = state.positions.structure || null;
-  state.positions.scalp = state.positions.scalp || null;
+  state.position =
+    state.positions.structure ||
+    state.positions.scalp ||
+    null;
+
+  state.cashBalance = safeNum(state.cashBalance, START_BAL);
+  state.availableCapital = safeNum(state.availableCapital, state.cashBalance);
+  state.lockedCapital = safeNum(state.lockedCapital, 0);
+  state.equity = safeNum(state.equity, state.cashBalance);
+  state.peakEquity = safeNum(state.peakEquity, state.equity);
 }
 
 function historyKey(tenantId, symbol) {
@@ -301,25 +310,25 @@ function rememberProcessedTick(state, symbol, price, ts) {
   state.lastProcessedPriceBySymbol[symbol] = price;
 }
 
-function syncSinglePositionToSlots(state) {
+function getActivePosition(state) {
   ensureStateShape(state);
+  return state.positions.structure || state.positions.scalp || state.position || null;
+}
 
-  if (state.position) {
-    state.positions.scalp = state.position;
-    state.positions.structure = null;
-  } else {
-    state.positions.scalp = null;
-    state.positions.structure = null;
-  }
+function syncMirrorPosition(state) {
+  ensureStateShape(state);
+  state.position = getActivePosition(state);
 }
 
 function updateCapitalView(state, currentPriceBySymbol = null) {
   ensureStateShape(state);
 
-  const pos = state.position;
+  const pos = getActivePosition(state);
   if (!pos) {
     state.lockedCapital = 0;
     state.availableCapital = Math.max(0, safeNum(state.cashBalance));
+    state.equity = safeNum(state.cashBalance);
+    syncMirrorPosition(state);
     return;
   }
 
@@ -344,8 +353,11 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
   state.lockedCapital = Math.max(0, capitalUsed);
   state.availableCapital = Math.max(
     0,
-    safeNum(state.cashBalance) - state.lockedCapital + Math.max(0, unrealized)
+    safeNum(state.cashBalance) - state.lockedCapital
   );
+  state.equity = safeNum(state.cashBalance) + safeNum(unrealized, 0);
+
+  syncMirrorPosition(state);
 }
 
 function resetProtection(state, note = "") {
@@ -356,43 +368,25 @@ function resetProtection(state, note = "") {
   };
 }
 
-function updateRealizedStatsFromTrade(state, closedResult) {
-  const pnl = safeNum(closedResult?.pnl, 0);
-  const fees = safeNum(closedResult?.fee, 0) + safeNum(closedResult?.fees, 0);
-
-  state.realized.net = safeNum(state.realized.net, 0) + pnl;
-  state.realized.fees = safeNum(state.realized.fees, 0) + fees;
-
-  if (pnl >= 0) state.realized.wins = safeNum(state.realized.wins, 0) + 1;
-  else state.realized.losses = safeNum(state.realized.losses, 0) + 1;
-}
-
 function snapshot(tenantId) {
   const s = load(tenantId);
   ensureStateShape(s);
-  syncSinglePositionToSlots(s);
-
-  const markPrice = s.position?.symbol
-    ? safeNum(s.lastPriceBySymbol?.[s.position.symbol], s.position.entry)
-    : 0;
-
-  const unrealized =
-    s.position && markPrice
-      ? s.position.side === "LONG"
-        ? (markPrice - safeNum(s.position.entry)) * safeNum(s.position.qty)
-        : (safeNum(s.position.entry) - markPrice) * safeNum(s.position.qty)
-      : 0;
-
-  const equity = safeNum(s.cashBalance) + unrealized;
-  const totalCapital = safeNum(s.cashBalance) + safeNum(s.lockedCapital);
 
   return {
     running: !!s.running,
-    equity,
-    totalCapital,
+    equity: safeNum(s.equity, safeNum(s.cashBalance)),
+    peakEquity: safeNum(s.peakEquity, safeNum(s.equity, s.cashBalance)),
     cashBalance: safeNum(s.cashBalance),
     availableCapital: safeNum(s.availableCapital, safeNum(s.cashBalance)),
     lockedCapital: safeNum(s.lockedCapital),
+    totalCapital:
+      safeNum(s.cashBalance) + safeNum(s.lockedCapital),
+    realized: {
+      wins: safeNum(s.realized?.wins),
+      losses: safeNum(s.realized?.losses),
+      net: safeNum(s.realized?.net),
+      fees: safeNum(s.realized?.fees),
+    },
     position: s.position ? { ...s.position } : null,
     positions: {
       structure: s.positions?.structure ? { ...s.positions.structure } : null,
@@ -408,12 +402,6 @@ function snapshot(tenantId) {
       ...defaultProtectionState(),
       ...(s.protection || {}),
     },
-    realized: {
-      wins: safeNum(s.realized?.wins),
-      losses: safeNum(s.realized?.losses),
-      net: safeNum(s.realized?.net),
-      fees: safeNum(s.realized?.fees),
-    },
     limits: {
       tradesToday: safeNum(s.limits?.tradesToday),
       lossesToday: safeNum(s.limits?.lossesToday),
@@ -427,15 +415,14 @@ function snapshot(tenantId) {
   };
 }
 
-function getDecisions(tenantId) {
-  return load(tenantId).decisions || [];
-}
-
 function getState(tenantId) {
   const state = load(tenantId);
   ensureStateShape(state);
-  syncSinglePositionToSlots(state);
   return state;
+}
+
+function getDecisions(tenantId) {
+  return load(tenantId).decisions || [];
 }
 
 /* =========================================================
@@ -443,6 +430,8 @@ POSITION MANAGEMENT
 ========================================================= */
 
 function initPositionRuntime(pos) {
+  if (!pos || typeof pos !== "object") return;
+
   if (!Number.isFinite(pos.bestPnl)) pos.bestPnl = 0;
   if (!Number.isFinite(pos.lockedProfitFloor)) pos.lockedProfitFloor = NaN;
   if (!Number.isFinite(pos.warningPrice)) pos.warningPrice = NaN;
@@ -665,13 +654,16 @@ function updateManualProtection(state, pos, price) {
 }
 
 function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
+  const pos = getActivePosition(state);
+  const slot = pos?.slot || "scalp";
+
   const closed = executionEngine.executePaperOrder({
     tenantId,
     symbol,
     action: "CLOSE",
     price,
     state,
-    slot: "scalp",
+    slot,
     ts,
   });
 
@@ -683,11 +675,8 @@ function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
     state.limits.lossesToday++;
   }
 
-  updateRealizedStatsFromTrade(state, closed.result);
-
+  syncMirrorPosition(state);
   state.lastTradeTime = ts;
-  state.position = null;
-  syncSinglePositionToSlots(state);
   resetProtection(state, `Closed: ${reason}`);
 
   recordDecision(
@@ -714,7 +703,7 @@ function handleOpenPosition({
   ts,
   prices,
 }) {
-  const pos = state.position;
+  const pos = getActivePosition(state);
 
   if (!pos) return false;
   if (pos.symbol !== symbol) return false;
@@ -733,11 +722,54 @@ function handleOpenPosition({
   pos.warningPrice = computeWarningPrice(pos);
   protectProfitFloor(pos, strongTrend);
 
-  // Note:
-  // If executionEngine stores stopLoss/takeProfit on the position but does not
-  // auto-close inside executePaperOrder, this controller is the layer that must
-  // enforce exits. That is why some trades can appear to "touch stop" visually
-  // without immediately closing unless this logic actually triggers a close.
+  // Let executionEngine protective SL/TP exist as first-class exits too.
+  if (Number.isFinite(pos.stopLoss)) {
+    if (pos.side === "LONG" && price <= pos.stopLoss) {
+      return closeTrade({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts,
+        reason: "STOP_LOSS",
+      });
+    }
+
+    if (pos.side === "SHORT" && price >= pos.stopLoss) {
+      return closeTrade({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts,
+        reason: "STOP_LOSS",
+      });
+    }
+  }
+
+  if (Number.isFinite(pos.takeProfit)) {
+    if (pos.side === "LONG" && price >= pos.takeProfit) {
+      return closeTrade({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts,
+        reason: "TAKE_PROFIT",
+      });
+    }
+
+    if (pos.side === "SHORT" && price <= pos.takeProfit) {
+      return closeTrade({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts,
+        reason: "TAKE_PROFIT",
+      });
+    }
+  }
 
   if (updateManualProtection(state, pos, price)) {
     return closeTrade({
@@ -751,21 +783,49 @@ function handleOpenPosition({
   }
 
   if (pnl <= HARD_STOP_LOSS) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "HARD_STOP" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "HARD_STOP",
+    });
   }
 
   if (elapsed < MIN_HOLD_TIME) return false;
 
   if (shouldExitByLockedFloor(pos, price)) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "LOCKED_FLOOR" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "LOCKED_FLOOR",
+    });
   }
 
   if (reachedTarget(pos, pnl, strongTrend)) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "TAKE_PROFIT" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "TAKE_PROFIT",
+    });
   }
 
   if (shouldExitRunnerGiveback(pos, pnl)) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "RUNNER_GIVEBACK" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "RUNNER_GIVEBACK",
+    });
   }
 
   if (strongTrend && pnl > 0) {
@@ -781,7 +841,14 @@ function handleOpenPosition({
     !strongTrend &&
     (momentumWeak || hardBreak || weakReversal)
   ) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "MOMENTUM_WEAKENING" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "MOMENTUM_WEAKENING",
+    });
   }
 
   if (
@@ -790,11 +857,25 @@ function handleOpenPosition({
     !strongTrend &&
     (hardBreak || weakReversal)
   ) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "WARNING_EXIT" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "WARNING_EXIT",
+    });
   }
 
   if (elapsed >= pos.maxDuration) {
-    return closeTrade({ tenantId, state, symbol, price, ts, reason: "TIME_EXIT" });
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "TIME_EXIT",
+    });
   }
 
   return false;
@@ -813,7 +894,7 @@ function openTrade({
   price,
   ts,
 }) {
-  if (state.position) {
+  if (getActivePosition(state)) {
     return false;
   }
 
@@ -824,6 +905,8 @@ function openTrade({
     price,
     riskPct: Number(plan.riskPct || 0.01),
     confidence: Number(plan.confidence || 0.5),
+    stopLoss: Number.isFinite(Number(plan.stopLoss)) ? Number(plan.stopLoss) : undefined,
+    takeProfit: Number.isFinite(Number(plan.takeProfit)) ? Number(plan.takeProfit) : undefined,
     state,
     slot: "scalp",
     ts,
@@ -854,7 +937,6 @@ function openTrade({
       pos.maxDuration = computeDuration(plan.confidence);
     }
 
-    syncSinglePositionToSlots(state);
     resetProtection(state, "Idle");
     updateCapitalView(state, { [symbol]: price });
     return true;
@@ -871,7 +953,7 @@ function manualClosePosition(tenantId, payload = {}) {
   const state = load(tenantId);
   ensureStateShape(state);
 
-  const pos = state.position;
+  const pos = getActivePosition(state);
   if (!pos) {
     return {
       ok: false,
@@ -907,7 +989,7 @@ function armProfitProtection(tenantId, payload = {}) {
   const state = load(tenantId);
   ensureStateShape(state);
 
-  const pos = state.position;
+  const pos = getActivePosition(state);
   if (!pos) {
     return {
       ok: false,
@@ -977,7 +1059,7 @@ function disarmProfitProtection(tenantId, payload = {}) {
 
   const symbol =
     payload.symbol ||
-    state.position?.symbol ||
+    getActivePosition(state)?.symbol ||
     "BTCUSDT";
 
   recordDecision(
@@ -987,7 +1069,7 @@ function disarmProfitProtection(tenantId, payload = {}) {
       mode: "MANUAL",
       symbol,
       price: safeNum(state.lastPriceBySymbol?.[symbol], 0),
-      slot: payload.slot || state.position?.slot || "scalp",
+      slot: payload.slot || getActivePosition(state)?.slot || "scalp",
     },
     Date.now()
   );
@@ -1040,7 +1122,9 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
     state.executionStats.ticks++;
 
-    if (state.position && state.position.symbol === symbol) {
+    const activePos = getActivePosition(state);
+
+    if (activePos && activePos.symbol === symbol) {
       state.executionStats.decisions++;
 
       recordDecision(
@@ -1080,7 +1164,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       return;
     }
 
-    if (!state.position && ts - safeNum(state.lastTradeTime, 0) >= cooldown) {
+    if (!getActivePosition(state) && ts - safeNum(state.lastTradeTime, 0) >= cooldown) {
       const plan =
         makeDecision({
           tenantId,
@@ -1114,7 +1198,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
           ts,
         });
       }
-    } else if (state.position) {
+    } else if (getActivePosition(state)) {
       const plan =
         makeDecision({
           tenantId,
@@ -1149,7 +1233,6 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       }
     }
 
-    syncSinglePositionToSlots(state);
     updateCapitalView(state, { [symbol]: price });
   } finally {
     state._locked = false;
@@ -1162,7 +1245,12 @@ MANUAL RESET
 
 function hardReset(tenantId) {
   STATES.set(tenantId, defaultState());
-  PRICE_HISTORY.delete(historyKey(tenantId, "BTCUSDT"));
+
+  for (const key of Array.from(PRICE_HISTORY.keys())) {
+    if (key.startsWith(`${tenantId || "__default__"}::`)) {
+      PRICE_HISTORY.delete(key);
+    }
+  }
 }
 
 /* =========================================================
@@ -1172,8 +1260,8 @@ EXPORTS
 module.exports = {
   tick,
   snapshot,
-  getDecisions,
   getState,
+  getDecisions,
   hardReset,
   manualClosePosition,
   armProfitProtection,
