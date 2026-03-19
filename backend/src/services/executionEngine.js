@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v26.1 (Deterministic + Risk-Based + Realistic Fills + Dual-Slot Protective Fix)
+// VERSION: v26.0 (Deterministic + Risk-Based + Realistic Fills)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -79,6 +79,8 @@ function ensurePositionsShape(state) {
     state.positions.scalp = null;
   }
 
+  // backward compatibility:
+  // if legacy state.position exists, move it into scalp if both empty
   if (
     state.position &&
     !state.positions.structure &&
@@ -301,9 +303,9 @@ const PYRAMID_SIZE_FACTOR = 0.35;
 EXECUTION REALISM
 ========================================================= */
 
-const DEFAULT_FEES_BPS = 5;
-const DEFAULT_SLIPPAGE_BPS = 3;
-const DEFAULT_SPREAD_BPS = 2;
+const DEFAULT_FEES_BPS = 5;      // 0.05%
+const DEFAULT_SLIPPAGE_BPS = 3;  // 0.03%
+const DEFAULT_SPREAD_BPS = 2;    // 0.02%
 
 function getExecutionConfig(state, symbol) {
   const globalConfig = state?.executionConfig || {};
@@ -397,7 +399,7 @@ function isCoolingDown(tenantId, symbol, slot, eventTs) {
 
 /* =========================================================
 POSITION SIZE
-FIX: Use direction-aware stop distance when stopLoss is valid
+FIX: Use stop distance when stopLoss is provided
 ========================================================= */
 
 function calculatePositionSize(
@@ -443,16 +445,9 @@ function calculatePositionSize(
     safeNum(state.availableCapital, 0)
   );
 
-  if (
-    Number.isFinite(stopLoss) &&
-    stopLoss > 0 &&
-    (
-      (side === "LONG" && stopLoss < price) ||
-      (side === "SHORT" && stopLoss > price)
-    )
-  ) {
+  // Risk sizing by stop distance when SL is valid
+  if (Number.isFinite(stopLoss) && stopLoss > 0) {
     const perUnitRisk = Math.abs(price - stopLoss);
-
     if (perUnitRisk > 0) {
       const riskBudget = Math.min(
         equity * boundedRiskPct * confidenceScale,
@@ -575,6 +570,8 @@ function openPosition({
     takeProfit: safeNum(takeProfit, NaN),
   });
 
+  // Synthetic margin model:
+  // reserve notional + pay fee from available capital immediately
   state.availableCapital = roundMoney(state.availableCapital - totalRequired);
   state.lockedCapital = roundMoney(state.lockedCapital + reservedNotional);
   state.cashBalance = roundMoney(state.cashBalance - openFee);
@@ -911,18 +908,18 @@ function closePosition({
 
 /* =========================================================
 TRIGGER CHECKS
-FIX: Each slot uses its own executable exit price
+FIX: Can close multiple slots in same tick
 ========================================================= */
 
 function evaluateProtectiveExit({
   tenantId,
   state,
   symbol,
+  price,
   slot = null,
   ts,
 }) {
   ensurePositionsShape(state);
-  ensureMarketState(state);
 
   const slots = slot
     ? [normalizeSlot(slot)]
@@ -936,26 +933,12 @@ function evaluateProtectiveExit({
     if (!pos) continue;
     if (pos.symbol !== symbol) continue;
 
-    const rawPrice = safeNum(
-      state.lastPriceBySymbol?.[symbol],
-      safeNum(state.lastPrice, 0)
-    );
-
-    if (rawPrice <= 0) continue;
-
-    const executableExitPrice = applyExecutionPriceModel({
-      symbol,
-      rawPrice,
-      side: pos.side === "LONG" ? "SELL" : "BUY",
-      state,
-    });
-
-    if (stopLossHit(pos, executableExitPrice)) {
+    if (stopLossHit(pos, price)) {
       const result = closePosition({
         tenantId,
         state,
         symbol,
-        price: executableExitPrice,
+        price,
         slot: currentSlot,
         ts,
         reason: "STOP_LOSS",
@@ -964,12 +947,12 @@ function evaluateProtectiveExit({
       continue;
     }
 
-    if (takeProfitHit(pos, executableExitPrice)) {
+    if (takeProfitHit(pos, price)) {
       const result = closePosition({
         tenantId,
         state,
         symbol,
-        price: executableExitPrice,
+        price,
         slot: currentSlot,
         ts,
         reason: "TAKE_PROFIT",
@@ -1032,10 +1015,30 @@ function executePaperOrder({
   );
   state.lastConfidence = boundedConfidence;
 
+  // Protective exits should use executable exit prices,
+  // not idealized raw price.
+  const worstCaseExitPriceForLong = applyExecutionPriceModel({
+    symbol,
+    rawPrice,
+    side: "SELL",
+    state,
+  });
+
+  const worstCaseExitPriceForShort = applyExecutionPriceModel({
+    symbol,
+    rawPrice,
+    side: "BUY",
+    state,
+  });
+
   const protectiveExit = evaluateProtectiveExit({
     tenantId,
     state,
     symbol,
+    price:
+      pos?.side === "SHORT"
+        ? worstCaseExitPriceForShort
+        : worstCaseExitPriceForLong,
     slot: null,
     ts,
   });
