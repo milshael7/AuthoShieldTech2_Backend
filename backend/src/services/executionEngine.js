@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v26.0 (Deterministic + Risk-Based + Realistic Fills)
+// VERSION: v26.1 (Deterministic + Risk-Based + Realistic Fills + Backward Safe)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -303,9 +303,9 @@ const PYRAMID_SIZE_FACTOR = 0.35;
 EXECUTION REALISM
 ========================================================= */
 
-const DEFAULT_FEES_BPS = 5;      // 0.05%
-const DEFAULT_SLIPPAGE_BPS = 3;  // 0.03%
-const DEFAULT_SPREAD_BPS = 2;    // 0.02%
+const DEFAULT_FEES_BPS = 5;
+const DEFAULT_SLIPPAGE_BPS = 3;
+const DEFAULT_SPREAD_BPS = 2;
 
 function getExecutionConfig(state, symbol) {
   const globalConfig = state?.executionConfig || {};
@@ -445,9 +445,16 @@ function calculatePositionSize(
     safeNum(state.availableCapital, 0)
   );
 
-  // Risk sizing by stop distance when SL is valid
-  if (Number.isFinite(stopLoss) && stopLoss > 0) {
+  if (
+    Number.isFinite(stopLoss) &&
+    stopLoss > 0 &&
+    (
+      (side === "LONG" && stopLoss < price) ||
+      (side === "SHORT" && stopLoss > price)
+    )
+  ) {
     const perUnitRisk = Math.abs(price - stopLoss);
+
     if (perUnitRisk > 0) {
       const riskBudget = Math.min(
         equity * boundedRiskPct * confidenceScale,
@@ -480,8 +487,8 @@ STOP LOSS / TAKE PROFIT HELPERS
 
 function normalizeStopLossTakeProfit({ side, price, stopLoss, takeProfit }) {
   const out = {
-    stopLoss: Number.isFinite(stopLoss) ? stopLoss : null,
-    takeProfit: Number.isFinite(takeProfit) ? takeProfit : null,
+    stopLoss: Number.isFinite(stopLoss) ? safeNum(stopLoss, NaN) : null,
+    takeProfit: Number.isFinite(takeProfit) ? safeNum(takeProfit, NaN) : null,
   };
 
   if (side === "LONG") {
@@ -570,8 +577,6 @@ function openPosition({
     takeProfit: safeNum(takeProfit, NaN),
   });
 
-  // Synthetic margin model:
-  // reserve notional + pay fee from available capital immediately
   state.availableCapital = roundMoney(state.availableCapital - totalRequired);
   state.lockedCapital = roundMoney(state.lockedCapital + reservedNotional);
   state.cashBalance = roundMoney(state.cashBalance - openFee);
@@ -915,30 +920,31 @@ function evaluateProtectiveExit({
   tenantId,
   state,
   symbol,
-  price,
-  slot = null,
   ts,
 }) {
   ensurePositionsShape(state);
 
-  const slots = slot
-    ? [normalizeSlot(slot)]
-    : ["structure", "scalp"];
-
   const outputs = [];
 
-  for (const currentSlot of slots) {
+  for (const currentSlot of ["structure", "scalp"]) {
     const pos = getPosition(state, currentSlot);
 
     if (!pos) continue;
     if (pos.symbol !== symbol) continue;
 
-    if (stopLossHit(pos, price)) {
+    const executableExitPrice = applyExecutionPriceModel({
+      symbol,
+      rawPrice: safeNum(state.lastPriceBySymbol?.[symbol], state.lastPrice),
+      side: pos.side === "LONG" ? "SELL" : "BUY",
+      state,
+    });
+
+    if (stopLossHit(pos, executableExitPrice)) {
       const result = closePosition({
         tenantId,
         state,
         symbol,
-        price,
+        price: executableExitPrice,
         slot: currentSlot,
         ts,
         reason: "STOP_LOSS",
@@ -947,12 +953,12 @@ function evaluateProtectiveExit({
       continue;
     }
 
-    if (takeProfitHit(pos, price)) {
+    if (takeProfitHit(pos, executableExitPrice)) {
       const result = closePosition({
         tenantId,
         state,
         symbol,
-        price,
+        price: executableExitPrice,
         slot: currentSlot,
         ts,
         reason: "TAKE_PROFIT",
@@ -1015,31 +1021,10 @@ function executePaperOrder({
   );
   state.lastConfidence = boundedConfidence;
 
-  // Protective exits should use executable exit prices,
-  // not idealized raw price.
-  const worstCaseExitPriceForLong = applyExecutionPriceModel({
-    symbol,
-    rawPrice,
-    side: "SELL",
-    state,
-  });
-
-  const worstCaseExitPriceForShort = applyExecutionPriceModel({
-    symbol,
-    rawPrice,
-    side: "BUY",
-    state,
-  });
-
   const protectiveExit = evaluateProtectiveExit({
     tenantId,
     state,
     symbol,
-    price:
-      pos?.side === "SHORT"
-        ? worstCaseExitPriceForShort
-        : worstCaseExitPriceForLong,
-    slot: null,
     ts,
   });
 
