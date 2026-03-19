@@ -1,10 +1,12 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v49.2 (Execution-Aligned + Snapshot Hardened + Live State Accessor)
+// VERSION: v49.2 (Live-State Accessor + Snapshot Hardened + Route Compatible)
 // FIXES
-// - Added getState() for live engine mutation from paper.routes.js
-// - Kept snapshot as read-only response layer
-// - Preserved candle-related frontend-safe behavior by not touching it here
+// - Added getState(tenantId) for live mutable engine access
+// - Keeps snapshot as read-only response layer
+// - Safe execution result normalization
+// - Preserves dual-slot structure/scalp engine behavior
+// - Frontend empty-candle crash is NOT in this file; fixed in TerminalChart.jsx
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
