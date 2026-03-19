@@ -1,11 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v46.0 (Matched to executionEngine v26.0)
-// PURPOSE:
-// - Compatible with slot-based execution engine
-// - Uses SCALP slot for quick trades
-// - Uses STRUCTURE slot for longer trades
-// - Prevents mismatch with legacy single-position logic
+// VERSION: v46.0 (Single-Trade Rollback + Matched to executionEngine v26)
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -48,7 +43,10 @@ const HARD_STOP_LOSS =
 const MIN_PROFIT_TO_TRAIL =
   Number(process.env.TRADE_MIN_PROFIT_TO_TRAIL || 0.0025);
 
-/* DUAL MODE */
+/* DUAL MODE LOGIC
+   NOTE: still supports STRUCTURE vs SCALP logic,
+   but only opens ONE live paper position at a time.
+*/
 
 const STRUCTURE_LOOKBACK =
   Number(process.env.TRADE_STRUCTURE_LOOKBACK || 30);
@@ -96,6 +94,10 @@ const RUNNER_CONFIRM_BARS =
 const ENTRY_CHASE_BLOCK_PCT =
   Number(process.env.TRADE_ENTRY_CHASE_BLOCK_PCT || 0.0022);
 
+/* FORCE SINGLE SLOT */
+
+const PAPER_SLOT = "scalp";
+
 /* =========================================================
 STATE
 ========================================================= */
@@ -106,32 +108,22 @@ function defaultState() {
     cashBalance: START_BAL,
     availableCapital: START_BAL,
     lockedCapital: 0,
-    equity: START_BAL,
-    peakEquity: START_BAL,
 
-    // new engine-compatible shape
+    // legacy single-position compatibility
+    position: null,
+
+    // executionEngine v26 compatibility
     positions: {
       structure: null,
       scalp: null,
     },
 
-    // legacy compatibility
-    position: null,
-
     trades: [],
     decisions: [],
     volatility: 0.003,
     lastPrice: 60000,
-    lastPriceBySymbol: {},
     lastTradeTime: 0,
     lastMode: "SCALP",
-
-    realized: {
-      wins: 0,
-      losses: 0,
-      net: 0,
-      fees: 0,
-    },
 
     limits: {
       tradesToday: 0,
@@ -144,6 +136,14 @@ function defaultState() {
       trades: 0,
     },
 
+    realized: {
+      wins: 0,
+      losses: 0,
+      net: 0,
+      fees: 0,
+    },
+
+    lastPriceBySymbol: {},
     _locked: false,
   };
 }
@@ -151,7 +151,11 @@ function defaultState() {
 const STATES = new Map();
 
 function load(tenantId) {
-  if (STATES.has(tenantId)) return STATES.get(tenantId);
+  if (STATES.has(tenantId)) {
+    const state = STATES.get(tenantId);
+    syncLegacyPosition(state);
+    return state;
+  }
 
   const state = defaultState();
   STATES.set(tenantId, state);
@@ -171,12 +175,7 @@ function safeNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function normalizeSlot(slot) {
-  const s = String(slot || "").toLowerCase();
-  return s === "structure" ? "structure" : "scalp";
-}
-
-function ensurePositionsShape(state) {
+function syncLegacyPosition(state) {
   if (!state.positions || typeof state.positions !== "object") {
     state.positions = {
       structure: null,
@@ -192,19 +191,21 @@ function ensurePositionsShape(state) {
     state.positions.scalp = null;
   }
 
-  state.position =
-    state.positions.structure ||
-    state.positions.scalp ||
-    null;
+  // force single-trade behavior: only scalp slot is used
+  if (state.positions.structure) {
+    state.positions.structure = null;
+  }
+
+  if (state.position && !state.positions.scalp) {
+    state.positions.scalp = state.position;
+  }
+
+  state.position = state.positions.scalp || null;
 }
 
-function getPosition(state, slot) {
-  ensurePositionsShape(state);
-  return state.positions[normalizeSlot(slot)] || null;
-}
-
-function hasOpenPosition(state, slot) {
-  return !!getPosition(state, slot);
+function getActivePosition(state) {
+  syncLegacyPosition(state);
+  return state.positions.scalp || null;
 }
 
 function recordDecision(state, plan) {
@@ -219,7 +220,9 @@ function recordDecision(state, plan) {
 }
 
 function snapshot(tenantId) {
-  return load(tenantId);
+  const state = load(tenantId);
+  syncLegacyPosition(state);
+  return state;
 }
 
 function getDecisions(tenantId) {
@@ -360,7 +363,12 @@ function chooseTradeMode(prices) {
 
   if (
     zones.swingPct >= STRUCTURE_MIN_SWING &&
-    ["up", "down", "up_soft", "down_soft"].includes(bias)
+    (
+      bias === "up" ||
+      bias === "down" ||
+      bias === "up_soft" ||
+      bias === "down_soft"
+    )
   ) {
     return { mode: "STRUCTURE", zones, bias };
   }
@@ -370,14 +378,20 @@ function chooseTradeMode(prices) {
 
 function buildStructurePlan({ price, zones, bias, symbol }) {
   if (!zones) {
-    return { action: "WAIT", mode: "STRUCTURE", slot: "structure", reason: "NO_ZONES" };
+    return { action: "WAIT", mode: "STRUCTURE", reason: "NO_ZONES" };
   }
 
-  const distToResistance = Math.abs(zones.resistance - price) / price;
-  const distToSupport = Math.abs(price - zones.support) / price;
+  const distToResistance =
+    Math.abs(zones.resistance - price) / price;
 
-  const nearResistance = distToResistance <= STRUCTURE_ENTRY_BUFFER;
-  const nearSupport = distToSupport <= STRUCTURE_ENTRY_BUFFER;
+  const distToSupport =
+    Math.abs(price - zones.support) / price;
+
+  const nearResistance =
+    distToResistance <= STRUCTURE_ENTRY_BUFFER;
+
+  const nearSupport =
+    distToSupport <= STRUCTURE_ENTRY_BUFFER;
 
   const inMiddle =
     price > (zones.support + zones.range * 0.3) &&
@@ -387,7 +401,6 @@ function buildStructurePlan({ price, zones, bias, symbol }) {
     return {
       action: "WAIT",
       mode: "STRUCTURE",
-      slot: "structure",
       reason: "MID_ZONE_BLOCK",
       support: zones.support,
       resistance: zones.resistance,
@@ -399,7 +412,6 @@ function buildStructurePlan({ price, zones, bias, symbol }) {
       symbol,
       action: "SELL",
       mode: "STRUCTURE",
-      slot: "structure",
       confidence: 0.72,
       riskPct: 0.01,
       targetPrice: zones.support,
@@ -413,7 +425,6 @@ function buildStructurePlan({ price, zones, bias, symbol }) {
       symbol,
       action: "BUY",
       mode: "STRUCTURE",
-      slot: "structure",
       confidence: 0.72,
       riskPct: 0.01,
       targetPrice: zones.resistance,
@@ -425,7 +436,6 @@ function buildStructurePlan({ price, zones, bias, symbol }) {
   return {
     action: "WAIT",
     mode: "STRUCTURE",
-    slot: "structure",
     reason: "ZONE_NOT_READY",
     support: zones.support,
     resistance: zones.resistance,
@@ -458,7 +468,39 @@ function isChasingMove(prices, action) {
 }
 
 /* =========================================================
-POSITION RUNTIME HELPERS
+CLOSE TRADE
+========================================================= */
+
+function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
+  const pos = getActivePosition(state);
+  if (!pos) return false;
+
+  const closed = executionEngine.executePaperOrder({
+    tenantId,
+    symbol,
+    action: reason,
+    price,
+    state,
+    ts,
+    slot: PAPER_SLOT,
+  });
+
+  if (!closed?.result) return false;
+
+  const pnl = Number(closed.result.pnl || 0);
+
+  if (pnl < 0) {
+    state.limits.lossesToday++;
+  }
+
+  state.lastTradeTime = ts;
+  syncLegacyPosition(state);
+
+  return true;
+}
+
+/* =========================================================
+POSITION MANAGEMENT
 ========================================================= */
 
 function initPositionRuntime(pos) {
@@ -471,6 +513,7 @@ function initPositionRuntime(pos) {
   if (!Number.isFinite(pos.maxDuration)) {
     pos.maxDuration = computeDuration(0.5);
   }
+  if (!pos.mode) pos.mode = "SCALP";
 }
 
 function updateBestPnl(pos, pnl) {
@@ -481,7 +524,7 @@ function updateBestPnl(pos, pnl) {
 
 function computeWarningPrice(pos) {
   const pullbackPct =
-    pos.slot === "structure"
+    pos.mode === "STRUCTURE"
       ? STRUCTURE_WARNING_PULLBACK_PCT
       : WARNING_PULLBACK_PCT;
 
@@ -549,49 +592,6 @@ function shouldExitByLockedFloor(pos, price) {
   return price >= pos.lockedProfitFloor;
 }
 
-/* =========================================================
-CLOSE TRADE
-========================================================= */
-
-function closeTrade({
-  tenantId,
-  state,
-  symbol,
-  price,
-  ts,
-  slot,
-  reason = "CLOSE",
-}) {
-  const closed = executionEngine.executePaperOrder({
-    tenantId,
-    symbol,
-    action: reason,
-    price,
-    state,
-    ts,
-    slot,
-  });
-
-  if (!closed?.result && !closed?.results?.length) return false;
-
-  const results = closed.results || [closed.result];
-
-  for (const trade of results) {
-    const pnl = Number(trade?.pnl || 0);
-    if (pnl < 0) {
-      state.limits.lossesToday++;
-    }
-  }
-
-  state.lastTradeTime = ts;
-
-  return true;
-}
-
-/* =========================================================
-POSITION MANAGEMENT
-========================================================= */
-
 function handleStructurePosition({
   tenantId,
   state,
@@ -599,14 +599,10 @@ function handleStructurePosition({
   price,
   ts,
   pos,
+  pnl,
   elapsed,
   prices,
 }) {
-  const pnl =
-    pos.side === "LONG"
-      ? (price - pos.entry) / pos.entry
-      : (pos.entry - price) / pos.entry;
-
   const strongTrend = detectTrendRun(prices, pos.side, 4);
   const momentumWeak = detectMomentumWeakening(prices);
   const hardBreak = detectHardMomentumBreak(prices, pos.side);
@@ -618,15 +614,7 @@ function handleStructurePosition({
   pos.warningPrice = computeWarningPrice(pos);
 
   if (pnl <= HARD_STOP_LOSS) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "structure",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "STOP_LOSS" });
   }
 
   if (elapsed < MIN_HOLD_TIME) return false;
@@ -664,15 +652,7 @@ function handleStructurePosition({
     protectProfitFloor(pos, strongTrend);
 
     if (shouldExitByLockedFloor(pos, price)) {
-      return closeTrade({
-        tenantId,
-        state,
-        symbol,
-        price,
-        ts,
-        slot: "structure",
-        reason: "CLOSE",
-      });
+      return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
     }
 
     if (isWarningTouched(pos, price) && !strongTrend) {
@@ -685,39 +665,15 @@ function handleStructurePosition({
       pos.warningTouches >= RUNNER_CONFIRM_BARS &&
       (hardBreak || weakReversal || momentumWeak)
     ) {
-      return closeTrade({
-        tenantId,
-        state,
-        symbol,
-        price,
-        ts,
-        slot: "structure",
-        reason: "CLOSE",
-      });
+      return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
     }
 
     if (pnl > 0 && hardBreak && !strongTrend) {
-      return closeTrade({
-        tenantId,
-        state,
-        symbol,
-        price,
-        ts,
-        slot: "structure",
-        reason: "CLOSE",
-      });
+      return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
     }
 
     if (elapsed >= pos.maxDuration) {
-      return closeTrade({
-        tenantId,
-        state,
-        symbol,
-        price,
-        ts,
-        slot: "structure",
-        reason: "CLOSE",
-      });
+      return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
     }
 
     return false;
@@ -729,16 +685,11 @@ function handleStructurePosition({
     pos.warningTouches = 0;
   }
 
-  if (pos.warningTouches >= RUNNER_CONFIRM_BARS && (hardBreak || weakReversal)) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "structure",
-      reason: "CLOSE",
-    });
+  if (
+    pos.warningTouches >= RUNNER_CONFIRM_BARS &&
+    (hardBreak || weakReversal)
+  ) {
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
   }
 
   if (strongTrend && pnl > 0) {
@@ -749,15 +700,7 @@ function handleStructurePosition({
   }
 
   if (elapsed >= pos.maxDuration) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "structure",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
   }
 
   return false;
@@ -770,14 +713,10 @@ function handleScalpPosition({
   price,
   ts,
   pos,
+  pnl,
   elapsed,
   prices,
 }) {
-  const pnl =
-    pos.side === "LONG"
-      ? (price - pos.entry) / pos.entry
-      : (pos.entry - price) / pos.entry;
-
   const strongTrend = detectTrendRun(prices, pos.side, 3);
   const momentumWeak = detectMomentumWeakening(prices);
   const hardBreak = detectHardMomentumBreak(prices, pos.side);
@@ -789,15 +728,7 @@ function handleScalpPosition({
   pos.warningPrice = computeWarningPrice(pos);
 
   if (pnl <= HARD_STOP_LOSS) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "scalp",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "STOP_LOSS" });
   }
 
   if (elapsed < MIN_HOLD_TIME) return false;
@@ -814,15 +745,7 @@ function handleScalpPosition({
     !strongTrend &&
     (momentumWeak || hardBreak || weakReversal)
   ) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "scalp",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
   }
 
   if (
@@ -830,75 +753,64 @@ function handleScalpPosition({
     !strongTrend &&
     (hardBreak || weakReversal)
   ) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "scalp",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
   }
 
   if (elapsed >= pos.maxDuration) {
-    return closeTrade({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      slot: "scalp",
-      reason: "CLOSE",
-    });
+    return closeTrade({ tenantId, state, symbol, price, ts, reason: "CLOSE" });
   }
 
   return false;
 }
 
-function handleOpenPositions({
+/* =========================================================
+OPEN POSITION
+========================================================= */
+
+function handleOpenPosition({
   tenantId,
   state,
   symbol,
   price,
   ts,
 }) {
-  let closedSomething = false;
+  const pos = getActivePosition(state);
+  if (!pos) return false;
+
+  const elapsed = ts - pos.time;
+
+  const pnl =
+    pos.side === "LONG"
+      ? (price - pos.entry) / pos.entry
+      : (pos.entry - price) / pos.entry;
+
   const prices = recordPrice(tenantId, price);
 
-  const structurePos = getPosition(state, "structure");
-  if (structurePos && structurePos.symbol === symbol) {
-    const elapsed = ts - structurePos.time;
-    const closed = handleStructurePosition({
+  if (pos.mode === "STRUCTURE") {
+    return handleStructurePosition({
       tenantId,
       state,
       symbol,
       price,
       ts,
-      pos: structurePos,
+      pos,
+      pnl,
       elapsed,
       prices,
     });
-    if (closed) closedSomething = true;
   }
 
-  const scalpPos = getPosition(state, "scalp");
-  if (scalpPos && scalpPos.symbol === symbol) {
-    const elapsed = ts - scalpPos.time;
-    const closed = handleScalpPosition({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-      pos: scalpPos,
-      elapsed,
-      prices,
-    });
-    if (closed) closedSomething = true;
-  }
-
-  return closedSomething;
+  return handleScalpPosition({
+    tenantId,
+    state,
+    symbol,
+    price,
+    ts,
+    pos,
+    pnl,
+    elapsed,
+    prices,
+  });
 }
 
 /* =========================================================
@@ -924,13 +836,10 @@ function openTrade({
   symbol,
   action,
   mode,
-  slot,
   plan,
   price,
   ts,
 }) {
-  const normalizedSlot = normalizeSlot(slot);
-
   const exec = executionEngine.executePaperOrder({
     tenantId,
     symbol,
@@ -938,11 +847,11 @@ function openTrade({
     price,
     riskPct: Number(plan.riskPct || 0.01),
     confidence: Number(plan.confidence || 0.5),
-    stopLoss: Number.isFinite(Number(plan.stopLoss)) ? Number(plan.stopLoss) : undefined,
-    takeProfit: Number.isFinite(Number(plan.takeProfit)) ? Number(plan.takeProfit) : undefined,
-    slot: normalizedSlot,
+    stopLoss: Number.isFinite(plan.stopLoss) ? Number(plan.stopLoss) : undefined,
+    takeProfit: Number.isFinite(plan.takeProfit) ? Number(plan.takeProfit) : undefined,
     state,
     ts,
+    slot: PAPER_SLOT,
   });
 
   if (exec?.result) {
@@ -950,22 +859,21 @@ function openTrade({
     state.limits.tradesToday++;
     state.lastMode = mode;
 
-    const pos = getPosition(state, normalizedSlot);
+    syncLegacyPosition(state);
 
-    if (pos) {
-      pos.mode = mode;
-      pos.slot = normalizedSlot;
-      pos.bestPnl = 0;
-      pos.targetPrice = safeNum(plan.targetPrice, NaN);
-      pos.structureSupport = safeNum(plan.support, NaN);
-      pos.structureResistance = safeNum(plan.resistance, NaN);
-      pos.targetReached = false;
-      pos.runnerConfirmed = false;
-      pos.lockedProfitFloor = NaN;
-      pos.warningPrice = NaN;
-      pos.warningTouches = 0;
-      pos.maxDuration =
-        normalizedSlot === "structure"
+    if (state.position) {
+      state.position.mode = mode;
+      state.position.bestPnl = 0;
+      state.position.targetPrice = safeNum(plan.targetPrice, NaN);
+      state.position.structureSupport = safeNum(plan.support, NaN);
+      state.position.structureResistance = safeNum(plan.resistance, NaN);
+      state.position.targetReached = false;
+      state.position.runnerConfirmed = false;
+      state.position.lockedProfitFloor = NaN;
+      state.position.warningPrice = NaN;
+      state.position.warningTouches = 0;
+      state.position.maxDuration =
+        mode === "STRUCTURE"
           ? computeDuration(Math.max(0.85, safeNum(plan.confidence, 0.72)))
           : computeDuration(plan.confidence);
     }
@@ -990,7 +898,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   state._locked = true;
 
   try {
-    ensurePositionsShape(state);
+    syncLegacyPosition(state);
 
     const prev = state.lastPrice;
     state.lastPrice = price;
@@ -1000,31 +908,27 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
     if (prev) {
       const change = Math.abs(price - prev) / prev;
-      state.volatility = Math.max(
-        0.0005,
-        state.volatility * 0.9 + change * 0.1
-      );
+
+      state.volatility =
+        Math.max(
+          0.0005,
+          state.volatility * 0.9 + change * 0.1
+        );
     }
 
     state.executionStats.ticks++;
 
-    // Let execution engine process protective exits on HOLD/WAIT sync as needed
-    executionEngine.executePaperOrder({
-      tenantId,
-      symbol,
-      action: "HOLD",
-      price,
-      state,
-      ts,
-    });
-
-    handleOpenPositions({
-      tenantId,
-      state,
-      symbol,
-      price,
-      ts,
-    });
+    if (getActivePosition(state)) {
+      handleOpenPosition({
+        tenantId,
+        state,
+        symbol,
+        price,
+        ts,
+      });
+      syncLegacyPosition(state);
+      return;
+    }
 
     let cooldown = COOLDOWN_AFTER_TRADE;
 
@@ -1043,9 +947,10 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
     const modePick = chooseTradeMode(prices);
 
-    let structurePlan = { action: "WAIT", mode: "STRUCTURE", slot: "structure" };
-    if (!hasOpenPosition(state, "structure") && modePick.mode === "STRUCTURE") {
-      structurePlan = buildStructurePlan({
+    let plan = { action: "WAIT" };
+
+    if (modePick.mode === "STRUCTURE") {
+      plan = buildStructurePlan({
         price,
         zones: modePick.zones,
         bias: modePick.bias,
@@ -1053,9 +958,8 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       });
     }
 
-    let scalpPlan = { action: "WAIT", mode: "SCALP", slot: "scalp" };
-    if (!hasOpenPosition(state, "scalp")) {
-      const brainPlan =
+    if (!["BUY", "SELL"].includes(plan.action)) {
+      const scalpPlan =
         makeDecision({
           tenantId,
           symbol,
@@ -1063,82 +967,43 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
           paper: state,
         }) || { action: "WAIT" };
 
-      scalpPlan = {
-        ...brainPlan,
-        mode: "SCALP",
-        slot: "scalp",
-      };
-    }
-
-    if (
-      ["BUY", "SELL"].includes(structurePlan.action) &&
-      isChasingMove(prices, structurePlan.action)
-    ) {
-      structurePlan = {
-        ...structurePlan,
-        action: "WAIT",
-        reason: "CHASE_BLOCKED",
-      };
-    }
-
-    if (
-      ["BUY", "SELL"].includes(scalpPlan.action) &&
-      isChasingMove(prices, scalpPlan.action)
-    ) {
-      scalpPlan = {
+      plan = {
         ...scalpPlan,
+        mode: "SCALP",
+      };
+    }
+
+    if (["BUY", "SELL"].includes(plan.action) && isChasingMove(prices, plan.action)) {
+      plan = {
+        ...plan,
         action: "WAIT",
         reason: "CHASE_BLOCKED",
       };
     }
 
-    state.executionStats.decisions += 2;
+    state.executionStats.decisions++;
 
     recordDecision(state, {
-      ...structurePlan,
+      ...plan,
+      mode: plan.mode || modePick.mode,
       price,
       volatility: state.volatility,
     });
 
-    recordDecision(state, {
-      ...scalpPlan,
+    if (!["BUY", "SELL"].includes(plan.action)) return;
+
+    openTrade({
+      tenantId,
+      state,
+      symbol,
+      action: plan.action,
+      mode: plan.mode || "SCALP",
+      plan,
       price,
-      volatility: state.volatility,
+      ts,
     });
 
-    if (
-      ["BUY", "SELL"].includes(structurePlan.action) &&
-      !hasOpenPosition(state, "structure")
-    ) {
-      openTrade({
-        tenantId,
-        state,
-        symbol,
-        action: structurePlan.action,
-        mode: "STRUCTURE",
-        slot: "structure",
-        plan: structurePlan,
-        price,
-        ts,
-      });
-    }
-
-    if (
-      ["BUY", "SELL"].includes(scalpPlan.action) &&
-      !hasOpenPosition(state, "scalp")
-    ) {
-      openTrade({
-        tenantId,
-        state,
-        symbol,
-        action: scalpPlan.action,
-        mode: "SCALP",
-        slot: "scalp",
-        plan: scalpPlan,
-        price,
-        ts,
-      });
-    }
+    syncLegacyPosition(state);
   } finally {
     state._locked = false;
   }
