@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v26.1 (Deterministic + Risk-Based + Realistic Fills + Backward Safe)
+// VERSION: v26.1 (Deterministic + Risk-Based + Realistic Fills + Dual-Slot Protective Fix)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -79,8 +79,6 @@ function ensurePositionsShape(state) {
     state.positions.scalp = null;
   }
 
-  // backward compatibility:
-  // if legacy state.position exists, move it into scalp if both empty
   if (
     state.position &&
     !state.positions.structure &&
@@ -399,7 +397,7 @@ function isCoolingDown(tenantId, symbol, slot, eventTs) {
 
 /* =========================================================
 POSITION SIZE
-FIX: Use stop distance when stopLoss is provided
+FIX: Use direction-aware stop distance when stopLoss is valid
 ========================================================= */
 
 function calculatePositionSize(
@@ -487,8 +485,8 @@ STOP LOSS / TAKE PROFIT HELPERS
 
 function normalizeStopLossTakeProfit({ side, price, stopLoss, takeProfit }) {
   const out = {
-    stopLoss: Number.isFinite(stopLoss) ? safeNum(stopLoss, NaN) : null,
-    takeProfit: Number.isFinite(takeProfit) ? safeNum(takeProfit, NaN) : null,
+    stopLoss: Number.isFinite(stopLoss) ? stopLoss : null,
+    takeProfit: Number.isFinite(takeProfit) ? takeProfit : null,
   };
 
   if (side === "LONG") {
@@ -913,28 +911,41 @@ function closePosition({
 
 /* =========================================================
 TRIGGER CHECKS
-FIX: Can close multiple slots in same tick
+FIX: Each slot uses its own executable exit price
 ========================================================= */
 
 function evaluateProtectiveExit({
   tenantId,
   state,
   symbol,
+  slot = null,
   ts,
 }) {
   ensurePositionsShape(state);
+  ensureMarketState(state);
+
+  const slots = slot
+    ? [normalizeSlot(slot)]
+    : ["structure", "scalp"];
 
   const outputs = [];
 
-  for (const currentSlot of ["structure", "scalp"]) {
+  for (const currentSlot of slots) {
     const pos = getPosition(state, currentSlot);
 
     if (!pos) continue;
     if (pos.symbol !== symbol) continue;
 
+    const rawPrice = safeNum(
+      state.lastPriceBySymbol?.[symbol],
+      safeNum(state.lastPrice, 0)
+    );
+
+    if (rawPrice <= 0) continue;
+
     const executableExitPrice = applyExecutionPriceModel({
       symbol,
-      rawPrice: safeNum(state.lastPriceBySymbol?.[symbol], state.lastPrice),
+      rawPrice,
       side: pos.side === "LONG" ? "SELL" : "BUY",
       state,
     });
@@ -1025,6 +1036,7 @@ function executePaperOrder({
     tenantId,
     state,
     symbol,
+    slot: null,
     ts,
   });
 
