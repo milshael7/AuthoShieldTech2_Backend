@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/routes/paper.routes.js
-// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5.1
 //
 // FIXES
 // - Manual orders mutate real live engine state
@@ -11,6 +11,7 @@
 // - Added manual close route
 // - Added profit protection arm/disarm routes
 // - Added protection exposure in status/account/positions
+// - Matched to paperTrader getState/manual protection methods
 // ==========================================================
 
 const express = require("express");
@@ -150,7 +151,8 @@ router.get("/account", (req, res) => {
         lockedCapital: Number(snapshot?.lockedCapital || 0),
         totalCapital:
           Number(snapshot?.totalCapital) ||
-          Number(snapshot?.cashBalance || 0) + Number(snapshot?.lockedCapital || 0),
+          Number(snapshot?.cashBalance || 0) +
+            Number(snapshot?.lockedCapital || 0),
         realized: snapshot?.realized || {
           wins: 0,
           losses: 0,
@@ -379,10 +381,18 @@ router.post("/order", (req, res) => {
       price: marketPrice,
       qty: Number(size || 0),
       slot,
-      riskPct: Number.isFinite(Number(riskPct)) ? Number(riskPct) : undefined,
-      confidence: Number.isFinite(Number(confidence)) ? Number(confidence) : undefined,
-      stopLoss: Number.isFinite(Number(stopLoss)) ? Number(stopLoss) : undefined,
-      takeProfit: Number.isFinite(Number(takeProfit)) ? Number(takeProfit) : undefined,
+      riskPct: Number.isFinite(Number(riskPct))
+        ? Number(riskPct)
+        : undefined,
+      confidence: Number.isFinite(Number(confidence))
+        ? Number(confidence)
+        : undefined,
+      stopLoss: Number.isFinite(Number(stopLoss))
+        ? Number(stopLoss)
+        : undefined,
+      takeProfit: Number.isFinite(Number(takeProfit))
+        ? Number(takeProfit)
+        : undefined,
       state: liveState,
       ts: Date.now(),
     });
@@ -482,7 +492,9 @@ router.post("/protect-profit", (req, res) => {
       symbol,
       slot,
       mode: mode || "TRAIL_RETRACE",
-      trailPct: Number.isFinite(Number(trailPct)) ? Number(trailPct) : undefined,
+      trailPct: Number.isFinite(Number(trailPct))
+        ? Number(trailPct)
+        : undefined,
     });
 
     if (!result?.ok) {
