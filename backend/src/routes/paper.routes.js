@@ -1,13 +1,13 @@
 // ==========================================================
 // FILE: backend/src/routes/paper.routes.js
-// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v4
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5
 //
-// FIXES
-// - Manual orders now mutate real live engine state
-// - Snapshot remains read-only response layer
-// - Normalized execution response shape
-// - Better tenant-safe config resolution
-// - Refresh/websocket/panel consistency improved
+// ADDED
+// - manual close route
+// - arm profit protection route
+// - disarm profit protection route
+// - protection status exposure
+// - safer live-state manual order integration
 // ==========================================================
 
 const express = require("express");
@@ -41,6 +41,15 @@ function getTenantTradingConfig(tenantId) {
   }
 
   return rawConfig || {};
+}
+
+function getMarketPrice(tenantId, symbol, fallbackPrice) {
+  const marketPrice =
+    marketEngine.getPrice?.(tenantId, symbol) ||
+    Number(fallbackPrice) ||
+    0;
+
+  return Number.isFinite(Number(marketPrice)) ? Number(marketPrice) : 0;
 }
 
 /* =========================================================
@@ -100,6 +109,7 @@ router.get("/status", (req, res) => {
       engineState,
       brainState,
       executionStats: snapshot.executionStats || {},
+      protection: snapshot?.protection || null,
       snapshot,
       time: new Date().toISOString(),
     });
@@ -145,6 +155,7 @@ router.get("/account", (req, res) => {
           fees: 0,
         },
       },
+      protection: snapshot?.protection || null,
       snapshot,
       time: new Date().toISOString(),
     });
@@ -188,6 +199,7 @@ router.get("/positions", (req, res) => {
       ok: true,
       position: snapshot?.position || null,
       positions,
+      protection: snapshot?.protection || null,
       openPositions,
       count: openPositions.length,
       time: new Date().toISOString(),
@@ -338,12 +350,9 @@ router.post("/order", (req, res) => {
       });
     }
 
-    const marketPrice =
-      marketEngine.getPrice?.(tenantId, symbol) ||
-      Number(price) ||
-      0;
+    const marketPrice = getMarketPrice(tenantId, symbol, price);
 
-    if (!marketPrice || !Number.isFinite(marketPrice)) {
+    if (!marketPrice) {
       return res.status(400).json({
         ok: false,
         error: "Market price unavailable",
@@ -388,6 +397,151 @@ router.post("/order", (req, res) => {
     return res.status(500).json({
       ok: false,
       error: err?.message || "Paper order failed",
+    });
+  }
+});
+
+/* =========================================================
+   MANUAL CLOSE NOW
+========================================================= */
+
+router.post("/close", (req, res) => {
+  try {
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
+    const { symbol, price, reason } = req.body || {};
+    const liveState = paperTrader.getState?.(tenantId);
+    const activeSymbol =
+      symbol ||
+      liveState?.position?.symbol ||
+      "BTCUSDT";
+
+    const marketPrice = getMarketPrice(tenantId, activeSymbol, price);
+
+    const result = paperTrader.manualClosePosition(tenantId, {
+      symbol: activeSymbol,
+      price: marketPrice || price,
+      reason: reason || "MANUAL_CLOSE_NOW",
+      ts: Date.now(),
+    });
+
+    if (!result?.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: result?.error || "Manual close failed",
+        snapshot: result?.snapshot || paperTrader.snapshot(tenantId),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      action: "CLOSE_NOW",
+      snapshot: result.snapshot,
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Manual close failed",
+    });
+  }
+});
+
+/* =========================================================
+   ARM PROFIT PROTECTION
+========================================================= */
+
+router.post("/protect-profit", (req, res) => {
+  try {
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
+    const { symbol, slot, mode, trailPct } = req.body || {};
+
+    const result = paperTrader.armProfitProtection(tenantId, {
+      symbol,
+      slot,
+      mode: mode || "TRAIL_RETRACE",
+      trailPct: Number.isFinite(Number(trailPct)) ? Number(trailPct) : undefined,
+    });
+
+    if (!result?.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: result?.error || "Protect profit failed",
+        snapshot: result?.snapshot || paperTrader.snapshot(tenantId),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      action: "PROTECT_PROFIT_ARM",
+      protection: result.protection || result.snapshot?.protection || null,
+      snapshot: result.snapshot,
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Protect profit failed",
+    });
+  }
+});
+
+/* =========================================================
+   DISARM PROFIT PROTECTION
+========================================================= */
+
+router.post("/protect-profit/disable", (req, res) => {
+  try {
+    const tenantId = resolveTenant(req);
+
+    if (!tenantId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing tenant context",
+      });
+    }
+
+    const { symbol, slot } = req.body || {};
+
+    const result = paperTrader.disarmProfitProtection(tenantId, {
+      symbol,
+      slot,
+    });
+
+    if (!result?.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: result?.error || "Disable protect profit failed",
+        snapshot: result?.snapshot || paperTrader.snapshot(tenantId),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      action: "PROTECT_PROFIT_DISARM",
+      protection: result.protection || result.snapshot?.protection || null,
+      snapshot: result.snapshot,
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Disable protect profit failed",
     });
   }
 });
