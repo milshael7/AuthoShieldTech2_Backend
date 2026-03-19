@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v49.0 (Single-Trade Matched Controller)
+// VERSION: v50.0 (Single-Trade Matched Controller + Manual Protection)
 // Matched to tradeBrain v22 + executionEngine v26
 // ==========================================================
 
@@ -67,9 +67,28 @@ const EXTRA_COOLDOWN_ON_LOSS_STREAK =
 const DUPLICATE_TICK_WINDOW_MS =
   Number(process.env.TRADE_DUPLICATE_TICK_WINDOW_MS || 250);
 
+const MANUAL_PROTECT_DEFAULT_TRAIL_PCT =
+  Number(process.env.TRADE_MANUAL_PROTECT_TRAIL_PCT || 0.0018);
+
 /* =========================================================
 STATE
 ========================================================= */
+
+function defaultProtectionState() {
+  return {
+    armed: false,
+    mode: "TRAIL_RETRACE",
+    trailPct: MANUAL_PROTECT_DEFAULT_TRAIL_PCT,
+    triggerPrice: null,
+    highestPrice: null,
+    lowestPrice: null,
+    slot: null,
+    side: null,
+    symbol: null,
+    note: "",
+    updatedAt: 0,
+  };
+}
 
 function defaultState() {
   return {
@@ -86,6 +105,7 @@ function defaultState() {
     lastTradeTime: 0,
     lastProcessedTickAtBySymbol: {},
     lastProcessedPriceBySymbol: {},
+    protection: defaultProtectionState(),
     limits: {
       tradesToday: 0,
       lossesToday: 0,
@@ -169,6 +189,9 @@ function ensureStateShape(state) {
       decisions: 0,
       trades: 0,
     };
+  }
+  if (!state.protection || typeof state.protection !== "object") {
+    state.protection = defaultProtectionState();
   }
 
   // backward compatibility with dual-slot state
@@ -274,6 +297,14 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
   );
 }
 
+function resetProtection(state, note = "") {
+  state.protection = {
+    ...defaultProtectionState(),
+    note,
+    updatedAt: Date.now(),
+  };
+}
+
 function snapshot(tenantId) {
   const s = load(tenantId);
   ensureStateShape(s);
@@ -290,6 +321,10 @@ function snapshot(tenantId) {
     lastPrice: safeNum(s.lastPrice),
     lastPriceBySymbol: { ...(s.lastPriceBySymbol || {}) },
     lastTradeTime: safeNum(s.lastTradeTime),
+    protection: {
+      ...defaultProtectionState(),
+      ...(s.protection || {}),
+    },
     limits: {
       tradesToday: safeNum(s.limits?.tradesToday),
       lossesToday: safeNum(s.limits?.lossesToday),
@@ -482,6 +517,53 @@ function shouldExitRunnerGiveback(pos, pnl) {
   return giveback >= (pos.bestPnl * RUNNER_GIVEBACK_PCT);
 }
 
+function updateManualProtection(state, pos, price) {
+  const protection = state.protection;
+  if (!protection?.armed) return false;
+  if (!pos) return false;
+  if (protection.symbol && protection.symbol !== pos.symbol) return false;
+  if (protection.slot && protection.slot !== (pos.slot || "scalp")) return false;
+
+  const trailPct = clamp(safeNum(protection.trailPct, MANUAL_PROTECT_DEFAULT_TRAIL_PCT), 0.0001, 0.25);
+
+  if (pos.side === "LONG") {
+    const highest = Math.max(
+      safeNum(protection.highestPrice, pos.entry),
+      safeNum(price, pos.entry)
+    );
+
+    protection.highestPrice = highest;
+    protection.lowestPrice = null;
+    protection.triggerPrice = highest * (1 - trailPct);
+    protection.side = pos.side;
+    protection.slot = pos.slot || "scalp";
+    protection.symbol = pos.symbol;
+    protection.updatedAt = Date.now();
+
+    return price <= protection.triggerPrice;
+  }
+
+  if (pos.side === "SHORT") {
+    const lowSeed = Number.isFinite(Number(protection.lowestPrice))
+      ? Number(protection.lowestPrice)
+      : pos.entry;
+
+    const lowest = Math.min(lowSeed, safeNum(price, pos.entry));
+
+    protection.lowestPrice = lowest;
+    protection.highestPrice = null;
+    protection.triggerPrice = lowest * (1 + trailPct);
+    protection.side = pos.side;
+    protection.slot = pos.slot || "scalp";
+    protection.symbol = pos.symbol;
+    protection.updatedAt = Date.now();
+
+    return price >= protection.triggerPrice;
+  }
+
+  return false;
+}
+
 function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
   const closed = executionEngine.executePaperOrder({
     tenantId,
@@ -503,6 +585,19 @@ function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
 
   state.lastTradeTime = ts;
   state.position = null;
+  resetProtection(state, `Closed: ${reason}`);
+
+  recordDecision(
+    state,
+    {
+      action: "CLOSE",
+      mode: "MANUAL_OR_ENGINE",
+      symbol,
+      price,
+      reason,
+    },
+    ts
+  );
 
   updateCapitalView(state, { [symbol]: price });
   return true;
@@ -534,6 +629,17 @@ function handleOpenPosition({
 
   pos.warningPrice = computeWarningPrice(pos);
   protectProfitFloor(pos, strongTrend);
+
+  if (updateManualProtection(state, pos, price)) {
+    return closeTrade({
+      tenantId,
+      state,
+      symbol,
+      price,
+      ts,
+      reason: "MANUAL_PROTECT_TRAIL_HIT",
+    });
+  }
 
   if (pnl <= HARD_STOP_LOSS) {
     return closeTrade({ tenantId, state, symbol, price, ts, reason: "HARD_STOP" });
@@ -639,11 +745,150 @@ function openTrade({
       pos.maxDuration = computeDuration(plan.confidence);
     }
 
+    resetProtection(state, "Idle");
     updateCapitalView(state, { [symbol]: price });
     return true;
   }
 
   return false;
+}
+
+/* =========================================================
+MANUAL ACTIONS
+========================================================= */
+
+function manualClosePosition(tenantId, payload = {}) {
+  const state = load(tenantId);
+  ensureStateShape(state);
+
+  const pos = state.position;
+  if (!pos) {
+    return {
+      ok: false,
+      error: "NO_OPEN_POSITION",
+      snapshot: snapshot(tenantId),
+    };
+  }
+
+  const symbol = payload.symbol || pos.symbol;
+  const price = safeNum(
+    payload.price,
+    safeNum(state.lastPriceBySymbol?.[symbol], pos.entry)
+  );
+  const ts = safeNum(payload.ts, Date.now());
+  const reason = payload.reason || "MANUAL_CLOSE_NOW";
+
+  const ok = closeTrade({
+    tenantId,
+    state,
+    symbol,
+    price,
+    ts,
+    reason,
+  });
+
+  return {
+    ok,
+    snapshot: snapshot(tenantId),
+  };
+}
+
+function armProfitProtection(tenantId, payload = {}) {
+  const state = load(tenantId);
+  ensureStateShape(state);
+
+  const pos = state.position;
+  if (!pos) {
+    return {
+      ok: false,
+      error: "NO_OPEN_POSITION",
+      snapshot: snapshot(tenantId),
+    };
+  }
+
+  const symbol = payload.symbol || pos.symbol;
+  const slot = payload.slot || pos.slot || "scalp";
+  const side = pos.side || null;
+  const currentPrice = safeNum(
+    state.lastPriceBySymbol?.[symbol],
+    pos.entry
+  );
+  const trailPct = clamp(
+    safeNum(payload.trailPct, MANUAL_PROTECT_DEFAULT_TRAIL_PCT),
+    0.0001,
+    0.25
+  );
+
+  const next = {
+    armed: true,
+    mode: payload.mode || "TRAIL_RETRACE",
+    trailPct,
+    triggerPrice: null,
+    highestPrice: side === "LONG" ? currentPrice : null,
+    lowestPrice: side === "SHORT" ? currentPrice : null,
+    slot,
+    side,
+    symbol,
+    note: "Profit protection armed",
+    updatedAt: Date.now(),
+  };
+
+  if (side === "LONG") {
+    next.triggerPrice = currentPrice * (1 - trailPct);
+  } else if (side === "SHORT") {
+    next.triggerPrice = currentPrice * (1 + trailPct);
+  }
+
+  state.protection = next;
+
+  recordDecision(
+    state,
+    {
+      action: "PROTECT_PROFIT_ARM",
+      mode: "MANUAL",
+      symbol,
+      price: currentPrice,
+      slot,
+      trailPct,
+    },
+    Date.now()
+  );
+
+  return {
+    ok: true,
+    protection: { ...state.protection },
+    snapshot: snapshot(tenantId),
+  };
+}
+
+function disarmProfitProtection(tenantId, payload = {}) {
+  const state = load(tenantId);
+  ensureStateShape(state);
+
+  const symbol =
+    payload.symbol ||
+    state.position?.symbol ||
+    "BTCUSDT";
+
+  recordDecision(
+    state,
+    {
+      action: "PROTECT_PROFIT_DISARM",
+      mode: "MANUAL",
+      symbol,
+      price: safeNum(state.lastPriceBySymbol?.[symbol], 0),
+      slot: payload.slot || state.position?.slot || "scalp",
+    },
+    Date.now()
+  );
+
+  resetProtection(state, "Profit protection disarmed");
+
+  return {
+    ok: true,
+    protection: { ...state.protection },
+    snapshot: snapshot(tenantId),
+  };
 }
 
 /* =========================================================
@@ -818,4 +1063,7 @@ module.exports = {
   snapshot,
   getDecisions,
   hardReset,
+  manualClosePosition,
+  armProfitProtection,
+  disarmProfitProtection,
 };
