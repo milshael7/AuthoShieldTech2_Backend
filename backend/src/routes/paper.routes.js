@@ -2,12 +2,15 @@
 // FILE: backend/src/routes/paper.routes.js
 // Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5
 //
-// ADDED
-// - manual close route
-// - arm profit protection route
-// - disarm profit protection route
-// - protection status exposure
-// - safer live-state manual order integration
+// FIXES
+// - Manual orders mutate real live engine state
+// - Snapshot remains read-only response layer
+// - Normalized execution response shape
+// - Better tenant-safe config resolution
+// - Refresh/websocket/panel consistency improved
+// - Added manual close route
+// - Added profit protection arm/disarm routes
+// - Added protection exposure in status/account/positions
 // ==========================================================
 
 const express = require("express");
@@ -183,6 +186,7 @@ router.get("/positions", (req, res) => {
     }
 
     const snapshot = paperTrader.snapshot(tenantId);
+
     const positions = snapshot?.positions || {
       structure: null,
       scalp: null,
@@ -350,19 +354,19 @@ router.post("/order", (req, res) => {
       });
     }
 
+    if (typeof paperTrader.getState !== "function") {
+      return res.status(500).json({
+        ok: false,
+        error: "Paper trader live state accessor missing",
+      });
+    }
+
     const marketPrice = getMarketPrice(tenantId, symbol, price);
 
     if (!marketPrice) {
       return res.status(400).json({
         ok: false,
         error: "Market price unavailable",
-      });
-    }
-
-    if (typeof paperTrader.getState !== "function") {
-      return res.status(500).json({
-        ok: false,
-        error: "Paper trader live state accessor missing",
       });
     }
 
@@ -416,19 +420,22 @@ router.post("/close", (req, res) => {
       });
     }
 
-    const { symbol, price, reason } = req.body || {};
     const liveState = paperTrader.getState?.(tenantId);
     const activeSymbol =
-      symbol ||
+      req.body?.symbol ||
       liveState?.position?.symbol ||
       "BTCUSDT";
 
-    const marketPrice = getMarketPrice(tenantId, activeSymbol, price);
+    const marketPrice = getMarketPrice(
+      tenantId,
+      activeSymbol,
+      req.body?.price
+    );
 
     const result = paperTrader.manualClosePosition(tenantId, {
       symbol: activeSymbol,
-      price: marketPrice || price,
-      reason: reason || "MANUAL_CLOSE_NOW",
+      price: marketPrice || req.body?.price,
+      reason: req.body?.reason || "MANUAL_CLOSE_NOW",
       ts: Date.now(),
     });
 
