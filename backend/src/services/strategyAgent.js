@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/strategyAgent.js
-// VERSION: v1.0 (Maintenance-Safe Strategy Agent)
+// VERSION: v2.0 (Maintenance-Safe Strategy Agent)
 // PURPOSE
 // - Bridge strategy discovery, training, and lab selection
 // - Give the AI a stable strategy manager layer
@@ -33,6 +33,21 @@ function normalizeTenantId(tenantId) {
   return String(tenantId || "__default__");
 }
 
+function normalizeResult(ok, payload = {}, fallbackError = "Unknown error") {
+  if (ok) {
+    return {
+      ok: true,
+      ...payload,
+    };
+  }
+
+  return {
+    ok: false,
+    error: payload?.error || fallbackError,
+    ...payload,
+  };
+}
+
 /* =========================================================
 ACTIVE STRATEGY ACCESS
 ========================================================= */
@@ -41,6 +56,10 @@ function getActiveStrategy(tenantId) {
   const key = normalizeTenantId(tenantId);
 
   try {
+    if (typeof strategyLab?.selectStrategy !== "function") {
+      return null;
+    }
+
     const selected = strategyLab.selectStrategy(key);
     return selected || null;
   } catch {
@@ -52,14 +71,20 @@ function getStrategySnapshot(tenantId) {
   const key = normalizeTenantId(tenantId);
 
   try {
-    if (typeof strategyLab.getSnapshot === "function") {
-      return strategyLab.getSnapshot(key);
+    if (typeof strategyLab?.getSnapshot === "function") {
+      const snapshot = strategyLab.getSnapshot(key);
+
+      if (snapshot && typeof snapshot === "object") {
+        return snapshot;
+      }
     }
   } catch {}
 
   return {
     createdAt: nowIso(),
     updatedAt: nowIso(),
+    lastEvaluationAt: null,
+    lastMutationAt: null,
     activeStrategies: [],
     strategies: [],
     stats: {
@@ -81,10 +106,11 @@ async function discover(tenantId, options = {}) {
   const key = normalizeTenantId(tenantId);
 
   if (typeof strategyDiscovery?.discoverStrategy !== "function") {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: "Strategy discovery engine unavailable",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 
   try {
@@ -94,16 +120,17 @@ async function discover(tenantId, options = {}) {
       variants: options.variants,
     });
 
-    return {
-      ok: true,
+    return normalizeResult(true, {
+      tenantId: key,
       discoveredAt: nowIso(),
-      result,
-    };
+      result: result || null,
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Strategy discovery failed",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 }
 
@@ -115,10 +142,11 @@ async function train(tenantId, options = {}) {
   const key = normalizeTenantId(tenantId);
 
   if (typeof trainingEngine?.runReplayTraining !== "function") {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: "Training engine unavailable",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 
   try {
@@ -126,19 +154,23 @@ async function train(tenantId, options = {}) {
       tenantId: key,
       symbol: options.symbol || "BTCUSDT",
       strategy: options.strategy || getActiveStrategy(key),
-      decisionBuilder: options.decisionBuilder || null,
+      decisionBuilder:
+        typeof options.decisionBuilder === "function"
+          ? options.decisionBuilder
+          : null,
     });
 
-    return {
-      ok: true,
+    return normalizeResult(true, {
+      tenantId: key,
       trainedAt: nowIso(),
-      result,
-    };
+      result: result || null,
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Strategy training failed",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 }
 
@@ -162,29 +194,50 @@ function recordTradeResult({
     }
 
     if (!resolvedStrategyId) {
-      return {
-        ok: false,
+      return normalizeResult(false, {
         error: "No active strategy available",
-      };
+        tenantId: key,
+        time: nowIso(),
+      });
     }
 
-    if (typeof strategyLab.recordTrade !== "function") {
-      return {
-        ok: false,
+    if (typeof strategyLab?.recordTrade !== "function") {
+      return normalizeResult(false, {
         error: "Strategy lab recordTrade unavailable",
-      };
+        tenantId: key,
+        strategyId: resolvedStrategyId,
+        time: nowIso(),
+      });
     }
 
-    return strategyLab.recordTrade({
+    const result = strategyLab.recordTrade({
       tenantId: key,
       strategyId: resolvedStrategyId,
       profit: safeNum(profit, 0),
     });
+
+    if (result?.ok) {
+      return normalizeResult(true, {
+        tenantId: key,
+        strategyId: resolvedStrategyId,
+        ...result,
+        time: nowIso(),
+      });
+    }
+
+    return normalizeResult(false, {
+      tenantId: key,
+      strategyId: resolvedStrategyId,
+      ...(result || {}),
+      time: nowIso(),
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Failed to record trade result",
-    };
+      tenantId: key,
+      strategyId: strategyId || null,
+      time: nowIso(),
+    });
   }
 }
 
@@ -196,19 +249,35 @@ function evaluate(tenantId) {
   const key = normalizeTenantId(tenantId);
 
   try {
-    if (typeof strategyLab.evaluateStrategies !== "function") {
-      return {
-        ok: false,
+    if (typeof strategyLab?.evaluateStrategies !== "function") {
+      return normalizeResult(false, {
         error: "Strategy lab evaluation unavailable",
-      };
+        tenantId: key,
+        time: nowIso(),
+      });
     }
 
-    return strategyLab.evaluateStrategies(key);
+    const result = strategyLab.evaluateStrategies(key);
+
+    if (result?.ok) {
+      return normalizeResult(true, {
+        tenantId: key,
+        ...result,
+        time: nowIso(),
+      });
+    }
+
+    return normalizeResult(false, {
+      tenantId: key,
+      ...(result || {}),
+      time: nowIso(),
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Strategy evaluation failed",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 }
 
@@ -219,29 +288,53 @@ function mutate(tenantId, parentStrategy = null) {
     const parent =
       parentStrategy ||
       getActiveStrategy(key) ||
-      asArray(strategyLab.listStrategies?.(key))[0] ||
+      asArray(
+        typeof strategyLab?.listStrategies === "function"
+          ? strategyLab.listStrategies(key)
+          : []
+      )[0] ||
       null;
 
     if (!parent) {
-      return {
-        ok: false,
+      return normalizeResult(false, {
         error: "No parent strategy available",
-      };
+        tenantId: key,
+        time: nowIso(),
+      });
     }
 
-    if (typeof strategyLab.mutateStrategy !== "function") {
-      return {
-        ok: false,
+    if (typeof strategyLab?.mutateStrategy !== "function") {
+      return normalizeResult(false, {
         error: "Strategy lab mutation unavailable",
-      };
+        tenantId: key,
+        parentStrategyId: parent?.id || null,
+        time: nowIso(),
+      });
     }
 
-    return strategyLab.mutateStrategy(key, parent);
+    const result = strategyLab.mutateStrategy(key, parent);
+
+    if (result?.ok) {
+      return normalizeResult(true, {
+        tenantId: key,
+        parentStrategyId: parent?.id || null,
+        ...result,
+        time: nowIso(),
+      });
+    }
+
+    return normalizeResult(false, {
+      tenantId: key,
+      parentStrategyId: parent?.id || null,
+      ...(result || {}),
+      time: nowIso(),
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Strategy mutation failed",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 }
 
@@ -253,19 +346,35 @@ function reset(tenantId) {
   const key = normalizeTenantId(tenantId);
 
   try {
-    if (typeof strategyLab.resetTenant !== "function") {
-      return {
-        ok: false,
+    if (typeof strategyLab?.resetTenant !== "function") {
+      return normalizeResult(false, {
         error: "Strategy lab reset unavailable",
-      };
+        tenantId: key,
+        time: nowIso(),
+      });
     }
 
-    return strategyLab.resetTenant(key);
+    const result = strategyLab.resetTenant(key);
+
+    if (result?.ok) {
+      return normalizeResult(true, {
+        tenantId: key,
+        ...result,
+        time: nowIso(),
+      });
+    }
+
+    return normalizeResult(false, {
+      tenantId: key,
+      ...(result || {}),
+      time: nowIso(),
+    });
   } catch (err) {
-    return {
-      ok: false,
+    return normalizeResult(false, {
       error: err?.message || "Strategy reset failed",
-    };
+      tenantId: key,
+      time: nowIso(),
+    });
   }
 }
 
@@ -277,8 +386,8 @@ function list(tenantId) {
   const key = normalizeTenantId(tenantId);
 
   try {
-    if (typeof strategyLab.listStrategies === "function") {
-      return strategyLab.listStrategies(key);
+    if (typeof strategyLab?.listStrategies === "function") {
+      return asArray(strategyLab.listStrategies(key));
     }
   } catch {}
 
