@@ -1,15 +1,18 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable + Real-Time Trade Broadcast
+// VERSION: Production Stable + Safer Route Loading +
+//          Reduced Market Loop Pressure + Faster Broadcasts
 // PURPOSE
 // Main backend runtime entry point.
 //
-// PATCHED
-// - Removed hard dependency on missing ./routes/tradingAnalytics
-// - Kept analytics memory store in place
-// - Kept wrapped analytics route mounted
-// - Preserved paper trading websocket + broadcast flow
+// FIXES
+// - tradingAnalytics route is optional-safe
+// - reduced repeated analytics sync pressure
+// - cached tenant discovery to avoid DB reads every second
+// - slower market broadcast loop to reduce socket churn
+// - paper snapshots no longer resync analytics on every socket send
+// - safer optional route mounting
 // ==========================================================
 
 require("dotenv").config();
@@ -46,6 +49,13 @@ const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
 const analyticsRoutes = require("./routes/analytics.routes");
+
+let tradingAnalyticsRoutes = null;
+try {
+  tradingAnalyticsRoutes = require("./routes/tradingAnalytics");
+} catch (err) {
+  console.warn("[BOOT] Optional route not loaded: ./routes/tradingAnalytics");
+}
 
 /* =========================================================
 SAFE BOOT CHECK
@@ -162,6 +172,10 @@ ANALYTICS API
 
 app.use("/api/analytics", analyticsRoutes);
 
+if (tradingAnalyticsRoutes) {
+  app.use("/api/analytics", tradingAnalyticsRoutes);
+}
+
 /* =========================================================
 ZERO TRUST LAYER
 ========================================================= */
@@ -195,46 +209,7 @@ AI ENGINE START TIME
 const ENGINE_START_TIME = Date.now();
 
 /* =========================================================
-TENANT DISCOVERY
-========================================================= */
-
-function getTenants() {
-  const db = readDb();
-  const usersList = db.users || [];
-
-  const tenants = new Set();
-
-  for (const u of usersList) {
-    const tenantId = u.companyId || u.id;
-    if (tenantId !== undefined && tenantId !== null && tenantId !== "") {
-      tenants.add(String(tenantId));
-    }
-  }
-
-  return tenants;
-}
-
-/* =========================================================
-TENANT ENGINE BOOT
-========================================================= */
-
-function bootTenants() {
-  try {
-    const tenants = getTenants();
-
-    for (const id of tenants) {
-      marketEngine.registerTenant(id);
-      console.log("[AI] tenant initialized:", id);
-    }
-  } catch (err) {
-    console.error("Tenant boot error:", err.message);
-  }
-}
-
-bootTenants();
-
-/* =========================================================
-ANALYTICS HELPERS
+UTIL
 ========================================================= */
 
 function safeNum(v, fallback = 0) {
@@ -286,10 +261,73 @@ function decisionKey(decision) {
   ].join("|");
 }
 
+/* =========================================================
+TENANT DISCOVERY CACHE
+========================================================= */
+
+let TENANT_CACHE = {
+  list: new Set(),
+  updatedAt: 0,
+};
+
+const TENANT_CACHE_MS =
+  Number(process.env.TENANT_CACHE_MS || 15000);
+
+function getTenants() {
+  const now = Date.now();
+
+  if (
+    TENANT_CACHE.updatedAt &&
+    now - TENANT_CACHE.updatedAt < TENANT_CACHE_MS
+  ) {
+    return TENANT_CACHE.list;
+  }
+
+  const db = readDb();
+  const usersList = db.users || [];
+  const tenants = new Set();
+
+  for (const u of usersList) {
+    const tenantId = u.companyId || u.id;
+    if (tenantId !== undefined && tenantId !== null && tenantId !== "") {
+      tenants.add(String(tenantId));
+    }
+  }
+
+  TENANT_CACHE = {
+    list: tenants,
+    updatedAt: now,
+  };
+
+  return tenants;
+}
+
+/* =========================================================
+TENANT ENGINE BOOT
+========================================================= */
+
+function bootTenants() {
+  try {
+    const tenants = getTenants();
+
+    for (const id of tenants) {
+      marketEngine.registerTenant(id);
+      console.log("[AI] tenant initialized:", id);
+    }
+  } catch (err) {
+    console.error("Tenant boot error:", err.message);
+  }
+}
+
+bootTenants();
+
+/* =========================================================
+ANALYTICS HELPERS
+========================================================= */
+
 function syncTenantAnalyticsMemory(tenantId) {
   try {
     const store = getAnalyticsStore();
-
     const snap = paperTrader.snapshot(tenantId) || {};
     const decisions = paperTrader.getDecisions(tenantId) || [];
     const trades = Array.isArray(snap?.trades) ? snap.trades : [];
@@ -386,6 +424,21 @@ if (typeof paperTrader.hardReset === "function" && !paperTrader.__analyticsPatch
 }
 
 /* =========================================================
+PERIODIC ANALYTICS SYNC
+========================================================= */
+
+setInterval(() => {
+  try {
+    const tenants = getTenants();
+    for (const tenantId of tenants) {
+      syncTenantAnalyticsMemory(tenantId);
+    }
+  } catch (err) {
+    console.error("Analytics sync error:", err.message);
+  }
+}, 5000);
+
+/* =========================================================
 AUTONOMOUS AI TRADING ENGINE
 ========================================================= */
 
@@ -414,7 +467,6 @@ setInterval(() => {
       }
 
       paperTrader.tick(tenantId, "BTCUSDT", Number(price), Date.now());
-      syncTenantAnalyticsMemory(tenantId);
     }
   } catch (err) {
     console.error("AI engine error:", err.message);
@@ -543,7 +595,6 @@ wss.on("connection", (ws, req) => {
 
     if (channel === "paper") {
       recordLoginEvent(user, tenantId);
-      syncTenantAnalyticsMemory(tenantId);
     }
 
     ws.on("pong", () => {
@@ -607,23 +658,28 @@ setInterval(() => {
       );
     } catch {}
   });
-}, 250);
+}, 500);
 
 /* =========================================================
 PAPER TRADING STREAM
 ========================================================= */
 
 setInterval(() => {
+  const cache = new Map();
+
   wss.clients.forEach((ws) => {
     if (ws.channel !== "paper") return;
     if (ws.readyState !== ws.OPEN) return;
 
     try {
-      const snapshot = buildPaperSnapshot(ws.tenantId);
+      let snapshot = cache.get(ws.tenantId);
+
+      if (!snapshot) {
+        snapshot = buildPaperSnapshot(ws.tenantId);
+        cache.set(ws.tenantId, snapshot);
+      }
+
       const stats = snapshot?.executionStats || {};
-
-      syncTenantAnalyticsMemory(ws.tenantId);
-
       const metrics = {
         aiPerMin: Number(stats.decisions || 0),
         memMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
@@ -642,7 +698,7 @@ setInterval(() => {
       );
     } catch {}
   });
-}, 800);
+}, 1000);
 
 /* =========================================================
 SERVER START
