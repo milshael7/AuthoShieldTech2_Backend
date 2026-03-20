@@ -1,7 +1,11 @@
 // ==========================================================
 // FILE: backend/src/services/paperTrader.js
-// VERSION: v50.1 (Single-Trade Matched Controller + Manual Protection + Live State Access)
-// Matched to tradeBrain v22 + executionEngine v26 + paper.routes v5.1
+// VERSION: v50.2 (Single-Trade Matched Controller + Manual Protection + Live State Access)
+// PURPOSE
+// - Single-position paper trading controller
+// - Matched to tradeBrain + executionEngine flow
+// - Safer state handling, snapshot access, and manual controls
+// - Maintenance-safe resets and runtime protection logic
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -74,6 +78,10 @@ const MANUAL_PROTECT_DEFAULT_TRAIL_PCT =
 STATE
 ========================================================= */
 
+function normalizeTenantId(tenantId) {
+  return String(tenantId || "__default__");
+}
+
 function defaultProtectionState() {
   return {
     armed: false,
@@ -136,14 +144,16 @@ const STATES = new Map();
 const PRICE_HISTORY = new Map();
 
 function load(tenantId) {
-  if (STATES.has(tenantId)) {
-    const state = STATES.get(tenantId);
+  const key = normalizeTenantId(tenantId);
+
+  if (STATES.has(key)) {
+    const state = STATES.get(key);
     ensureStateShape(state);
     return state;
   }
 
   const state = defaultState();
-  STATES.set(tenantId, state);
+  STATES.set(key, state);
   return state;
 }
 
@@ -236,7 +246,6 @@ function ensureStateShape(state) {
   state.realized.net = safeNum(state.realized.net, 0);
   state.realized.fees = safeNum(state.realized.fees, 0);
 
-  // backward compatibility with legacy single-position shape
   if (state.position && !state.positions.scalp && !state.positions.structure) {
     state.positions.scalp = state.position;
   }
@@ -250,11 +259,14 @@ function ensureStateShape(state) {
   state.availableCapital = safeNum(state.availableCapital, state.cashBalance);
   state.lockedCapital = safeNum(state.lockedCapital, 0);
   state.equity = safeNum(state.equity, state.cashBalance);
-  state.peakEquity = safeNum(state.peakEquity, state.equity);
+  state.peakEquity = Math.max(
+    safeNum(state.peakEquity, state.equity),
+    safeNum(state.equity, state.cashBalance)
+  );
 }
 
 function historyKey(tenantId, symbol) {
-  return `${tenantId || "__default__"}::${symbol || "__unknown__"}`;
+  return `${normalizeTenantId(tenantId)}::${String(symbol || "__unknown__").toUpperCase()}`;
 }
 
 function recordPrice(tenantId, symbol, price) {
@@ -296,8 +308,9 @@ function recordDecision(state, plan, ts = Date.now()) {
 }
 
 function isDuplicateTick(state, symbol, price, ts) {
-  const lastTs = safeNum(state.lastProcessedTickAtBySymbol?.[symbol], 0);
-  const lastPrice = safeNum(state.lastProcessedPriceBySymbol?.[symbol], NaN);
+  const key = String(symbol || "").toUpperCase();
+  const lastTs = safeNum(state.lastProcessedTickAtBySymbol?.[key], 0);
+  const lastPrice = safeNum(state.lastProcessedPriceBySymbol?.[key], NaN);
 
   if (!lastTs) return false;
   if (!Number.isFinite(lastPrice)) return false;
@@ -306,8 +319,9 @@ function isDuplicateTick(state, symbol, price, ts) {
 }
 
 function rememberProcessedTick(state, symbol, price, ts) {
-  state.lastProcessedTickAtBySymbol[symbol] = ts;
-  state.lastProcessedPriceBySymbol[symbol] = price;
+  const key = String(symbol || "").toUpperCase();
+  state.lastProcessedTickAtBySymbol[key] = ts;
+  state.lastProcessedPriceBySymbol[key] = price;
 }
 
 function getActivePosition(state) {
@@ -324,21 +338,25 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
   ensureStateShape(state);
 
   const pos = getActivePosition(state);
+
   if (!pos) {
     state.lockedCapital = 0;
     state.availableCapital = Math.max(0, safeNum(state.cashBalance));
     state.equity = safeNum(state.cashBalance);
+    state.peakEquity = Math.max(state.peakEquity, state.equity);
     syncMirrorPosition(state);
     return;
   }
 
+  const symbol = String(pos.symbol || "").toUpperCase();
+
   const markPrice =
     currentPriceBySymbol && typeof currentPriceBySymbol === "object"
       ? safeNum(
-          currentPriceBySymbol[pos.symbol],
-          safeNum(state.lastPriceBySymbol?.[pos.symbol], pos.entry)
+          currentPriceBySymbol[symbol],
+          safeNum(state.lastPriceBySymbol?.[symbol], pos.entry)
         )
-      : safeNum(state.lastPriceBySymbol?.[pos.symbol], pos.entry);
+      : safeNum(state.lastPriceBySymbol?.[symbol], pos.entry);
 
   const capitalUsed = safeNum(
     pos.capitalUsed,
@@ -356,6 +374,7 @@ function updateCapitalView(state, currentPriceBySymbol = null) {
     safeNum(state.cashBalance) - state.lockedCapital
   );
   state.equity = safeNum(state.cashBalance) + safeNum(unrealized, 0);
+  state.peakEquity = Math.max(state.peakEquity, state.equity);
 
   syncMirrorPosition(state);
 }
@@ -452,27 +471,31 @@ function computeDuration(confidence) {
 }
 
 function updateBestPnl(pos, pnl) {
-  if (pnl > pos.bestPnl) {
+  if (pnl > safeNum(pos.bestPnl, 0)) {
     pos.bestPnl = pnl;
   }
 }
 
 function getPnLPct(pos, price) {
+  if (!pos || !Number.isFinite(price) || !Number.isFinite(pos.entry) || pos.entry <= 0) {
+    return 0;
+  }
+
   return pos.side === "LONG"
     ? (price - pos.entry) / pos.entry
     : (pos.entry - price) / pos.entry;
 }
 
 function detectTrendRun(prices, side, minBars = 3) {
-  if (prices.length < minBars + 1) return false;
+  if (!Array.isArray(prices) || prices.length < minBars + 1) return false;
 
   let run = 0;
 
-  for (let i = prices.length - 1; i > 0; i--) {
+  for (let i = prices.length - 1; i > 0; i -= 1) {
     const move = prices[i] - prices[i - 1];
 
-    if (side === "LONG" && move > 0) run++;
-    else if (side === "SHORT" && move < 0) run++;
+    if (side === "LONG" && move > 0) run += 1;
+    else if (side === "SHORT" && move < 0) run += 1;
     else break;
 
     if (run >= minBars) return true;
@@ -482,7 +505,7 @@ function detectTrendRun(prices, side, minBars = 3) {
 }
 
 function detectMomentumWeakening(prices) {
-  if (prices.length < 5) return false;
+  if (!Array.isArray(prices) || prices.length < 5) return false;
 
   const m1 = prices[prices.length - 1] - prices[prices.length - 2];
   const m2 = prices[prices.length - 2] - prices[prices.length - 3];
@@ -492,7 +515,7 @@ function detectMomentumWeakening(prices) {
 }
 
 function detectHardMomentumBreak(prices, side) {
-  if (prices.length < 4) return false;
+  if (!Array.isArray(prices) || prices.length < 4) return false;
 
   const m1 = prices[prices.length - 1] - prices[prices.length - 2];
   const m2 = prices[prices.length - 2] - prices[prices.length - 3];
@@ -504,7 +527,7 @@ function detectHardMomentumBreak(prices, side) {
 }
 
 function detectWeakReversal(prices, side) {
-  if (prices.length < 4) return false;
+  if (!Array.isArray(prices) || prices.length < 4) return false;
 
   const m1 = prices[prices.length - 1] - prices[prices.length - 2];
   const m2 = prices[prices.length - 2] - prices[prices.length - 3];
@@ -516,10 +539,11 @@ function detectWeakReversal(prices, side) {
 }
 
 function computeWarningPrice(pos) {
-  if (pos.bestPnl > 0) {
+  if (safeNum(pos.bestPnl, 0) > 0) {
     if (pos.side === "LONG") {
       return pos.entry * (1 + Math.max(0, pos.bestPnl - WARNING_PULLBACK_PCT));
     }
+
     return pos.entry * (1 - Math.max(0, pos.bestPnl - WARNING_PULLBACK_PCT));
   }
 
@@ -534,7 +558,7 @@ function isWarningTouched(pos, price) {
 }
 
 function protectProfitFloor(pos, strongTrend) {
-  if (pos.bestPnl < BREAK_EVEN_TRIGGER) return;
+  if (safeNum(pos.bestPnl, 0) < BREAK_EVEN_TRIGGER) return;
 
   const breakEvenFloor =
     pos.side === "LONG"
@@ -551,7 +575,7 @@ function protectProfitFloor(pos, strongTrend) {
       : breakEvenFloor;
   }
 
-  if (pos.bestPnl >= MIN_PROFIT_TO_TRAIL) {
+  if (safeNum(pos.bestPnl, 0) >= MIN_PROFIT_TO_TRAIL) {
     const lockPct = strongTrend ? 0.25 : LOCKED_PROFIT_PCT;
     const protectedPnl = pos.bestPnl * lockPct;
 
@@ -596,7 +620,7 @@ function reachedTarget(pos, pnl, strongTrend) {
 
 function shouldExitRunnerGiveback(pos, pnl) {
   if (!pos.runnerConfirmed) return false;
-  if (pos.bestPnl < RUNNER_MIN_PROFIT) return false;
+  if (safeNum(pos.bestPnl, 0) < RUNNER_MIN_PROFIT) return false;
 
   const giveback = pos.bestPnl - pnl;
   return giveback >= (pos.bestPnl * RUNNER_GIVEBACK_PCT);
@@ -604,6 +628,7 @@ function shouldExitRunnerGiveback(pos, pnl) {
 
 function updateManualProtection(state, pos, price) {
   const protection = state.protection;
+
   if (!protection?.armed) return false;
   if (!pos) return false;
   if (protection.symbol && protection.symbol !== pos.symbol) return false;
@@ -653,13 +678,42 @@ function updateManualProtection(state, pos, price) {
   return false;
 }
 
+function applyClosedTradeAccounting(state, closedResult = null) {
+  const pnl = safeNum(closedResult?.pnl, 0);
+  const fee = safeNum(closedResult?.fee, 0);
+
+  state.realized.net += pnl;
+  state.realized.fees += fee;
+
+  if (pnl > 0) {
+    state.realized.wins += 1;
+  } else if (pnl < 0) {
+    state.realized.losses += 1;
+    state.limits.lossesToday += 1;
+  }
+}
+
+function appendTradeIfPresent(state, closedResult = null) {
+  if (!closedResult || typeof closedResult !== "object") return;
+
+  state.trades.push({
+    ...closedResult,
+    closedAt: closedResult.closedAt || Date.now(),
+  });
+
+  if (state.trades.length > 500) {
+    state.trades.shift();
+  }
+}
+
 function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
   const pos = getActivePosition(state);
   const slot = pos?.slot || "scalp";
+  const normalizedSymbol = String(symbol || pos?.symbol || "BTCUSDT").toUpperCase();
 
   const closed = executionEngine.executePaperOrder({
-    tenantId,
-    symbol,
+    tenantId: normalizeTenantId(tenantId),
+    symbol: normalizedSymbol,
     action: "CLOSE",
     price,
     state,
@@ -669,11 +723,8 @@ function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
 
   if (!closed?.result) return false;
 
-  const pnl = Number(closed.result.pnl || 0);
-
-  if (pnl < 0) {
-    state.limits.lossesToday++;
-  }
+  applyClosedTradeAccounting(state, closed.result);
+  appendTradeIfPresent(state, closed.result);
 
   syncMirrorPosition(state);
   state.lastTradeTime = ts;
@@ -684,14 +735,14 @@ function closeTrade({ tenantId, state, symbol, price, ts, reason = "CLOSE" }) {
     {
       action: "CLOSE",
       mode: "MANUAL_OR_ENGINE",
-      symbol,
+      symbol: normalizedSymbol,
       price,
       reason,
     },
     ts
   );
 
-  updateCapitalView(state, { [symbol]: price });
+  updateCapitalView(state, { [normalizedSymbol]: price });
   return true;
 }
 
@@ -708,7 +759,7 @@ function handleOpenPosition({
   if (!pos) return false;
   if (pos.symbol !== symbol) return false;
 
-  const elapsed = ts - pos.time;
+  const elapsed = ts - safeNum(pos.time, ts);
   const pnl = getPnLPct(pos, price);
 
   const strongTrend = detectTrendRun(prices, pos.side, 3);
@@ -722,7 +773,6 @@ function handleOpenPosition({
   pos.warningPrice = computeWarningPrice(pos);
   protectProfitFloor(pos, strongTrend);
 
-  // Let executionEngine protective SL/TP exist as first-class exits too.
   if (Number.isFinite(pos.stopLoss)) {
     if (pos.side === "LONG" && price <= pos.stopLoss) {
       return closeTrade({
@@ -830,7 +880,7 @@ function handleOpenPosition({
 
   if (strongTrend && pnl > 0) {
     pos.maxDuration = Math.min(
-      pos.maxDuration + 20000,
+      safeNum(pos.maxDuration, computeDuration(1)) + 20000,
       computeDuration(1) + MAX_EXTENSION_DURATION
     );
     return false;
@@ -867,7 +917,7 @@ function handleOpenPosition({
     });
   }
 
-  if (elapsed >= pos.maxDuration) {
+  if (elapsed >= safeNum(pos.maxDuration, MAX_TRADE_DURATION)) {
     return closeTrade({
       tenantId,
       state,
@@ -898,9 +948,11 @@ function openTrade({
     return false;
   }
 
+  const normalizedSymbol = String(symbol || "BTCUSDT").toUpperCase();
+
   const exec = executionEngine.executePaperOrder({
-    tenantId,
-    symbol,
+    tenantId: normalizeTenantId(tenantId),
+    symbol: normalizedSymbol,
     action,
     price,
     riskPct: Number(plan.riskPct || 0.01),
@@ -913,8 +965,8 @@ function openTrade({
   });
 
   if (exec?.result) {
-    state.executionStats.trades++;
-    state.limits.tradesToday++;
+    state.executionStats.trades += 1;
+    state.limits.tradesToday += 1;
     state.lastTradeTime = ts;
 
     const pos =
@@ -925,6 +977,7 @@ function openTrade({
 
     if (pos) {
       state.position = pos;
+      pos.symbol = normalizedSymbol;
       pos.slot = "scalp";
       pos.mode = "SINGLE";
       pos.bestPnl = 0;
@@ -938,7 +991,7 @@ function openTrade({
     }
 
     resetProtection(state, "Idle");
-    updateCapitalView(state, { [symbol]: price });
+    updateCapitalView(state, { [normalizedSymbol]: price });
     return true;
   }
 
@@ -954,6 +1007,7 @@ function manualClosePosition(tenantId, payload = {}) {
   ensureStateShape(state);
 
   const pos = getActivePosition(state);
+
   if (!pos) {
     return {
       ok: false,
@@ -962,7 +1016,7 @@ function manualClosePosition(tenantId, payload = {}) {
     };
   }
 
-  const symbol = payload.symbol || pos.symbol;
+  const symbol = String(payload.symbol || pos.symbol).toUpperCase();
   const price = safeNum(
     payload.price,
     safeNum(state.lastPriceBySymbol?.[symbol], pos.entry)
@@ -990,6 +1044,7 @@ function armProfitProtection(tenantId, payload = {}) {
   ensureStateShape(state);
 
   const pos = getActivePosition(state);
+
   if (!pos) {
     return {
       ok: false,
@@ -998,7 +1053,7 @@ function armProfitProtection(tenantId, payload = {}) {
     };
   }
 
-  const symbol = payload.symbol || pos.symbol;
+  const symbol = String(payload.symbol || pos.symbol).toUpperCase();
   const slot = payload.slot || pos.slot || "scalp";
   const side = pos.side || null;
   const currentPrice = safeNum(
@@ -1057,10 +1112,11 @@ function disarmProfitProtection(tenantId, payload = {}) {
   const state = load(tenantId);
   ensureStateShape(state);
 
-  const symbol =
+  const symbol = String(
     payload.symbol ||
     getActivePosition(state)?.symbol ||
-    "BTCUSDT";
+    "BTCUSDT"
+  ).toUpperCase();
 
   recordDecision(
     state,
@@ -1088,15 +1144,18 @@ TICK ENGINE
 ========================================================= */
 
 function tick(tenantId, symbol, price, ts = Date.now()) {
-  const state = load(tenantId);
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  const normalizedSymbol = String(symbol || "").toUpperCase();
+  const state = load(normalizedTenantId);
+
   ensureStateShape(state);
 
   if (!state.running) return;
-  if (!symbol) return;
+  if (!normalizedSymbol) return;
   if (!Number.isFinite(price) || price <= 0) return;
   if (state._locked) return;
 
-  if (isDuplicateTick(state, symbol, price, ts)) {
+  if (isDuplicateTick(state, normalizedSymbol, price, ts)) {
     return;
   }
 
@@ -1105,12 +1164,12 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
   try {
     resetDailyLimitsIfNeeded(state, ts);
 
-    const prev = safeNum(state.lastPriceBySymbol?.[symbol], NaN);
+    const prev = safeNum(state.lastPriceBySymbol?.[normalizedSymbol], NaN);
     state.lastPrice = price;
-    state.lastPriceBySymbol[symbol] = price;
-    rememberProcessedTick(state, symbol, price, ts);
+    state.lastPriceBySymbol[normalizedSymbol] = price;
+    rememberProcessedTick(state, normalizedSymbol, price, ts);
 
-    const prices = recordPrice(tenantId, symbol, price);
+    const prices = recordPrice(normalizedTenantId, normalizedSymbol, price);
 
     if (Number.isFinite(prev) && prev > 0) {
       const change = Math.abs(price - prev) / prev;
@@ -1120,19 +1179,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       );
     }
 
-    state.executionStats.ticks++;
+    state.executionStats.ticks += 1;
 
     const activePos = getActivePosition(state);
 
-    if (activePos && activePos.symbol === symbol) {
-      state.executionStats.decisions++;
+    if (activePos && activePos.symbol === normalizedSymbol) {
+      state.executionStats.decisions += 1;
 
       recordDecision(
         state,
         {
           action: "MANAGE",
           mode: "SINGLE",
-          symbol,
+          symbol: normalizedSymbol,
           price,
           volatility: state.volatility,
         },
@@ -1140,18 +1199,19 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       );
 
       handleOpenPosition({
-        tenantId,
+        tenantId: normalizedTenantId,
         state,
-        symbol,
+        symbol: normalizedSymbol,
         price,
         ts,
         prices,
       });
     }
 
-    updateCapitalView(state, { [symbol]: price });
+    updateCapitalView(state, { [normalizedSymbol]: price });
 
     let cooldown = COOLDOWN_AFTER_TRADE;
+
     if (state.limits.lossesToday >= LOSS_STREAK_SLOWDOWN) {
       cooldown += EXTRA_COOLDOWN_ON_LOSS_STREAK;
     }
@@ -1160,27 +1220,27 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       state.limits.tradesToday >= MAX_TRADES_PER_DAY ||
       state.limits.lossesToday >= MAX_DAILY_LOSSES
     ) {
-      updateCapitalView(state, { [symbol]: price });
+      updateCapitalView(state, { [normalizedSymbol]: price });
       return;
     }
 
     if (!getActivePosition(state) && ts - safeNum(state.lastTradeTime, 0) >= cooldown) {
       const plan =
         makeDecision({
-          tenantId,
-          symbol,
+          tenantId: normalizedTenantId,
+          symbol: normalizedSymbol,
           last: price,
           paper: state,
         }) || { action: "WAIT" };
 
-      state.executionStats.decisions++;
+      state.executionStats.decisions += 1;
 
       recordDecision(
         state,
         {
           ...plan,
           mode: "SINGLE",
-          symbol,
+          symbol: normalizedSymbol,
           price,
           volatility: state.volatility,
         },
@@ -1189,9 +1249,9 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
       if (plan.action === "BUY" || plan.action === "SELL") {
         openTrade({
-          tenantId,
+          tenantId: normalizedTenantId,
           state,
-          symbol,
+          symbol: normalizedSymbol,
           action: plan.action,
           plan,
           price,
@@ -1201,20 +1261,20 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
     } else if (getActivePosition(state)) {
       const plan =
         makeDecision({
-          tenantId,
-          symbol,
+          tenantId: normalizedTenantId,
+          symbol: normalizedSymbol,
           last: price,
           paper: state,
         }) || { action: "WAIT" };
 
-      state.executionStats.decisions++;
+      state.executionStats.decisions += 1;
 
       recordDecision(
         state,
         {
           ...plan,
           mode: "SINGLE",
-          symbol,
+          symbol: normalizedSymbol,
           price,
           volatility: state.volatility,
         },
@@ -1223,9 +1283,9 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
 
       if (plan.action === "CLOSE") {
         closeTrade({
-          tenantId,
+          tenantId: normalizedTenantId,
           state,
-          symbol,
+          symbol: normalizedSymbol,
           price,
           ts,
           reason: "BRAIN_CLOSE",
@@ -1233,7 +1293,7 @@ function tick(tenantId, symbol, price, ts = Date.now()) {
       }
     }
 
-    updateCapitalView(state, { [symbol]: price });
+    updateCapitalView(state, { [normalizedSymbol]: price });
   } finally {
     state._locked = false;
   }
@@ -1244,13 +1304,21 @@ MANUAL RESET
 ========================================================= */
 
 function hardReset(tenantId) {
-  STATES.set(tenantId, defaultState());
+  const key = normalizeTenantId(tenantId);
 
-  for (const key of Array.from(PRICE_HISTORY.keys())) {
-    if (key.startsWith(`${tenantId || "__default__"}::`)) {
-      PRICE_HISTORY.delete(key);
+  STATES.set(key, defaultState());
+
+  for (const historyEntryKey of Array.from(PRICE_HISTORY.keys())) {
+    if (historyEntryKey.startsWith(`${key}::`)) {
+      PRICE_HISTORY.delete(historyEntryKey);
     }
   }
+
+  return {
+    ok: true,
+    tenantId: key,
+    snapshot: snapshot(key),
+  };
 }
 
 /* =========================================================
