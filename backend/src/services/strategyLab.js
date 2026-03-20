@@ -1,11 +1,19 @@
 // ==========================================================
 // FILE: backend/src/services/strategyLab.js
-// VERSION: v2.0 (Maintenance-Safe Strategy Lab)
+// VERSION: v2.1 (Maintenance-Safe Strategy Lab)
 // PURPOSE
 // - Evolve and rank strategy profiles per tenant
 // - Keep strategy state inspectable and resettable
 // - Safer mutation and evaluation flow
 // - Stable helpers for strategyEngine / tradeBrain / admin panels
+//
+// FIXES
+// - Hardened tenant reset flow
+// - Safer config normalization
+// - Stable seed counts even if env values drift
+// - Active strategy list always deduplicated and repaired
+// - Parent mutation input normalized
+// - Ranking and maintenance helpers made more defensive
 // ==========================================================
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -14,35 +22,49 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 CONFIG
 ========================================================= */
 
-const MAX_STRATEGIES =
-  Number(process.env.STRATEGY_LAB_MAX_STRATEGIES || 20);
+const MAX_STRATEGIES = Math.max(
+  1,
+  Number(process.env.STRATEGY_LAB_MAX_STRATEGIES || 20)
+);
 
-const MAX_ACTIVE_STRATEGIES =
-  Number(process.env.STRATEGY_LAB_MAX_ACTIVE || 10);
+const MAX_ACTIVE_STRATEGIES = Math.max(
+  1,
+  Number(process.env.STRATEGY_LAB_MAX_ACTIVE || 10)
+);
 
-const MIN_TRADES_FOR_EVAL =
-  Number(process.env.STRATEGY_LAB_MIN_TRADES_FOR_EVAL || 15);
+const MIN_TRADES_FOR_EVAL = Math.max(
+  1,
+  Number(process.env.STRATEGY_LAB_MIN_TRADES_FOR_EVAL || 15)
+);
 
-const INITIAL_SEED_COUNT =
-  Number(process.env.STRATEGY_LAB_INITIAL_SEED_COUNT || 10);
+const INITIAL_SEED_COUNT = Math.max(
+  1,
+  Number(process.env.STRATEGY_LAB_INITIAL_SEED_COUNT || 10)
+);
 
-const MIN_EDGE_THRESHOLD =
-  Number(process.env.STRATEGY_LAB_MIN_EDGE_THRESHOLD || 0.0003);
+const MIN_EDGE_THRESHOLD = Number(
+  process.env.STRATEGY_LAB_MIN_EDGE_THRESHOLD || 0.0003
+);
 
-const MAX_EDGE_THRESHOLD =
-  Number(process.env.STRATEGY_LAB_MAX_EDGE_THRESHOLD || 0.003);
+const MAX_EDGE_THRESHOLD = Number(
+  process.env.STRATEGY_LAB_MAX_EDGE_THRESHOLD || 0.003
+);
 
-const MIN_CONFIDENCE_THRESHOLD =
-  Number(process.env.STRATEGY_LAB_MIN_CONFIDENCE_THRESHOLD || 0.5);
+const MIN_CONFIDENCE_THRESHOLD = Number(
+  process.env.STRATEGY_LAB_MIN_CONFIDENCE_THRESHOLD || 0.5
+);
 
-const MAX_CONFIDENCE_THRESHOLD =
-  Number(process.env.STRATEGY_LAB_MAX_CONFIDENCE_THRESHOLD || 0.85);
+const MAX_CONFIDENCE_THRESHOLD = Number(
+  process.env.STRATEGY_LAB_MAX_CONFIDENCE_THRESHOLD || 0.85
+);
 
-const MIN_RISK_MULTIPLIER =
-  Number(process.env.STRATEGY_LAB_MIN_RISK_MULTIPLIER || 0.5);
+const MIN_RISK_MULTIPLIER = Number(
+  process.env.STRATEGY_LAB_MIN_RISK_MULTIPLIER || 0.5
+);
 
-const MAX_RISK_MULTIPLIER =
-  Number(process.env.STRATEGY_LAB_MAX_RISK_MULTIPLIER || 2);
+const MAX_RISK_MULTIPLIER = Number(
+  process.env.STRATEGY_LAB_MAX_RISK_MULTIPLIER || 2
+);
 
 /* =========================================================
 STATE
@@ -64,7 +86,31 @@ function safeTenantKey(tenantId) {
 }
 
 function randomBetween(min, max) {
-  return Math.random() * (max - min) + min;
+  const a = safeNum(min, 0);
+  const b = safeNum(max, a);
+  return Math.random() * (b - a) + a;
+}
+
+function uniq(list) {
+  return Array.from(new Set(Array.isArray(list) ? list : []));
+}
+
+function getStrategyCountLimit() {
+  return Math.max(MAX_STRATEGIES, 1);
+}
+
+function getActiveCountLimit() {
+  return Math.min(
+    Math.max(MAX_ACTIVE_STRATEGIES, 1),
+    getStrategyCountLimit()
+  );
+}
+
+function getSeedCount() {
+  return Math.min(
+    Math.max(INITIAL_SEED_COUNT, 1),
+    getStrategyCountLimit()
+  );
 }
 
 function createEmptyState() {
@@ -92,6 +138,7 @@ function getState(tenantId) {
     seedStrategies(key);
   }
 
+  repairState(key);
   return LAB.get(key);
 }
 
@@ -105,8 +152,8 @@ function createStrategy(overrides = {}) {
       overrides.edgeThreshold,
       randomBetween(0.0005, 0.0025)
     ),
-    MIN_EDGE_THRESHOLD,
-    MAX_EDGE_THRESHOLD
+    Math.min(MIN_EDGE_THRESHOLD, MAX_EDGE_THRESHOLD),
+    Math.max(MIN_EDGE_THRESHOLD, MAX_EDGE_THRESHOLD)
   );
 
   const confidenceThreshold = clamp(
@@ -114,8 +161,8 @@ function createStrategy(overrides = {}) {
       overrides.confidenceThreshold,
       randomBetween(0.55, 0.75)
     ),
-    MIN_CONFIDENCE_THRESHOLD,
-    MAX_CONFIDENCE_THRESHOLD
+    Math.min(MIN_CONFIDENCE_THRESHOLD, MAX_CONFIDENCE_THRESHOLD),
+    Math.max(MIN_CONFIDENCE_THRESHOLD, MAX_CONFIDENCE_THRESHOLD)
   );
 
   const riskMultiplier = clamp(
@@ -123,8 +170,8 @@ function createStrategy(overrides = {}) {
       overrides.riskMultiplier,
       randomBetween(0.7, 1.8)
     ),
-    MIN_RISK_MULTIPLIER,
-    MAX_RISK_MULTIPLIER
+    Math.min(MIN_RISK_MULTIPLIER, MAX_RISK_MULTIPLIER),
+    Math.max(MIN_RISK_MULTIPLIER, MAX_RISK_MULTIPLIER)
   );
 
   return {
@@ -138,10 +185,10 @@ function createStrategy(overrides = {}) {
     confidenceThreshold,
     riskMultiplier,
 
-    trades: safeNum(overrides.trades, 0),
-    wins: safeNum(overrides.wins, 0),
-    losses: safeNum(overrides.losses, 0),
-    breakeven: safeNum(overrides.breakeven, 0),
+    trades: Math.max(0, safeNum(overrides.trades, 0)),
+    wins: Math.max(0, safeNum(overrides.wins, 0)),
+    losses: Math.max(0, safeNum(overrides.losses, 0)),
+    breakeven: Math.max(0, safeNum(overrides.breakeven, 0)),
     pnl: safeNum(overrides.pnl, 0),
 
     createdAt: overrides.createdAt || nowIso(),
@@ -151,23 +198,28 @@ function createStrategy(overrides = {}) {
 }
 
 function seedStrategies(tenantId) {
-  const state = LAB.get(safeTenantKey(tenantId));
+  const key = safeTenantKey(tenantId);
+  const state = LAB.get(key);
+
   if (!state) return;
 
-  for (let i = 0; i < INITIAL_SEED_COUNT; i += 1) {
+  const seedCount = getSeedCount();
+
+  for (let i = 0; i < seedCount; i += 1) {
     const strategy = createStrategy({
       id: `S${i}_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
       label: `seed-${i + 1}`,
     });
 
     state.strategies[strategy.id] = strategy;
-
-    if (state.activeStrategies.length < MAX_ACTIVE_STRATEGIES) {
-      state.activeStrategies.push(strategy.id);
-    }
   }
 
-  state.stats.totalSeeds += INITIAL_SEED_COUNT;
+  state.activeStrategies = Object.keys(state.strategies).slice(
+    0,
+    getActiveCountLimit()
+  );
+
+  state.stats.totalSeeds += seedCount;
   state.updatedAt = nowIso();
 }
 
@@ -216,6 +268,49 @@ function enrichStrategy(strategy) {
 }
 
 /* =========================================================
+STATE REPAIR
+========================================================= */
+
+function repairState(tenantId) {
+  const key = safeTenantKey(tenantId);
+  const state = LAB.get(key);
+
+  if (!state) return null;
+
+  state.strategies = state.strategies && typeof state.strategies === "object"
+    ? state.strategies
+    : {};
+
+  const validIds = new Set(Object.keys(state.strategies));
+
+  state.activeStrategies = uniq(state.activeStrategies)
+    .filter((id) => validIds.has(String(id)))
+    .map(String)
+    .slice(0, getActiveCountLimit());
+
+  if (
+    state.activeStrategies.length === 0 &&
+    Object.keys(state.strategies).length > 0
+  ) {
+    state.activeStrategies = Object.keys(state.strategies).slice(
+      0,
+      getActiveCountLimit()
+    );
+  }
+
+  state.stats = {
+    totalRecordedTrades: safeNum(state?.stats?.totalRecordedTrades, 0),
+    totalEvaluations: safeNum(state?.stats?.totalEvaluations, 0),
+    totalMutations: safeNum(state?.stats?.totalMutations, 0),
+    totalSeeds: safeNum(state?.stats?.totalSeeds, 0),
+  };
+
+  state.updatedAt = state.updatedAt || nowIso();
+
+  return state;
+}
+
+/* =========================================================
 READ HELPERS
 ========================================================= */
 
@@ -236,7 +331,7 @@ function getActiveStrategies(tenantId) {
   const state = getState(tenantId);
 
   return state.activeStrategies
-    .map((id) => state.strategies[id])
+    .map((id) => state.strategies[String(id)])
     .filter(Boolean)
     .map(enrichStrategy)
     .sort((a, b) => b.score - a.score);
@@ -265,7 +360,6 @@ SELECTION
 ========================================================= */
 
 function selectStrategy(tenantId) {
-  const state = getState(tenantId);
   const active = getActiveStrategies(tenantId);
 
   if (!active.length) return null;
@@ -278,7 +372,9 @@ function selectStrategy(tenantId) {
   const topHalf = pool.slice(0, Math.max(1, Math.ceil(pool.length / 2)));
 
   const picked =
-    topHalf[Math.floor(Math.random() * topHalf.length)] || pool[0] || null;
+    topHalf[Math.floor(Math.random() * topHalf.length)] ||
+    pool[0] ||
+    null;
 
   return picked ? { ...picked } : null;
 }
@@ -304,17 +400,17 @@ function recordTrade({
 
   const pnl = safeNum(profit, 0);
 
-  strategy.trades += 1;
-  strategy.pnl += pnl;
+  strategy.trades = Math.max(0, safeNum(strategy.trades, 0) + 1);
+  strategy.pnl = safeNum(strategy.pnl, 0) + pnl;
   strategy.updatedAt = nowIso();
   strategy.lastTradeAt = nowIso();
 
   if (pnl > 0) {
-    strategy.wins += 1;
+    strategy.wins = Math.max(0, safeNum(strategy.wins, 0) + 1);
   } else if (pnl < 0) {
-    strategy.losses += 1;
+    strategy.losses = Math.max(0, safeNum(strategy.losses, 0) + 1);
   } else {
-    strategy.breakeven += 1;
+    strategy.breakeven = Math.max(0, safeNum(strategy.breakeven, 0) + 1);
   }
 
   state.stats.totalRecordedTrades += 1;
@@ -342,7 +438,7 @@ function evaluateStrategies(tenantId) {
     .sort((a, b) => b.score - a.score);
 
   state.activeStrategies = ranked
-    .slice(0, MAX_ACTIVE_STRATEGIES)
+    .slice(0, getActiveCountLimit())
     .map((s) => s.id);
 
   state.lastEvaluationAt = nowIso();
@@ -351,10 +447,12 @@ function evaluateStrategies(tenantId) {
 
   if (
     ranked.length > 0 &&
-    Object.keys(state.strategies).length < MAX_STRATEGIES
+    Object.keys(state.strategies).length < getStrategyCountLimit()
   ) {
     mutateStrategy(tenantId, ranked[0]);
   }
+
+  repairState(tenantId);
 
   return {
     ok: true,
@@ -368,15 +466,19 @@ MUTATION
 
 function mutateStrategy(tenantId, parent) {
   const state = getState(tenantId);
+  const normalizedParent =
+    parent && typeof parent === "object"
+      ? parent
+      : null;
 
-  if (!parent) {
+  if (!normalizedParent) {
     return {
       ok: false,
       error: "Parent strategy missing",
     };
   }
 
-  if (Object.keys(state.strategies).length >= MAX_STRATEGIES) {
+  if (Object.keys(state.strategies).length >= getStrategyCountLimit()) {
     return {
       ok: false,
       error: "Max strategies reached",
@@ -384,38 +486,38 @@ function mutateStrategy(tenantId, parent) {
   }
 
   const child = createStrategy({
-    label: `mutant-from-${parent.id}`,
+    label: `mutant-from-${normalizedParent.id || "unknown"}`,
     edgeThreshold: clamp(
-      safeNum(parent.edgeThreshold, 0.001) * randomBetween(0.9, 1.1),
-      MIN_EDGE_THRESHOLD,
-      MAX_EDGE_THRESHOLD
+      safeNum(normalizedParent.edgeThreshold, 0.001) *
+        randomBetween(0.9, 1.1),
+      Math.min(MIN_EDGE_THRESHOLD, MAX_EDGE_THRESHOLD),
+      Math.max(MIN_EDGE_THRESHOLD, MAX_EDGE_THRESHOLD)
     ),
     confidenceThreshold: clamp(
-      safeNum(parent.confidenceThreshold, 0.6) * randomBetween(0.9, 1.1),
-      MIN_CONFIDENCE_THRESHOLD,
-      MAX_CONFIDENCE_THRESHOLD
+      safeNum(normalizedParent.confidenceThreshold, 0.6) *
+        randomBetween(0.9, 1.1),
+      Math.min(MIN_CONFIDENCE_THRESHOLD, MAX_CONFIDENCE_THRESHOLD),
+      Math.max(MIN_CONFIDENCE_THRESHOLD, MAX_CONFIDENCE_THRESHOLD)
     ),
     riskMultiplier: clamp(
-      safeNum(parent.riskMultiplier, 1) * randomBetween(0.9, 1.1),
-      MIN_RISK_MULTIPLIER,
-      MAX_RISK_MULTIPLIER
+      safeNum(normalizedParent.riskMultiplier, 1) *
+        randomBetween(0.9, 1.1),
+      Math.min(MIN_RISK_MULTIPLIER, MAX_RISK_MULTIPLIER),
+      Math.max(MIN_RISK_MULTIPLIER, MAX_RISK_MULTIPLIER)
     ),
   });
 
   state.strategies[child.id] = child;
-
-  if (!state.activeStrategies.includes(child.id)) {
-    state.activeStrategies.push(child.id);
-  }
-
-  state.activeStrategies = Array.from(new Set(state.activeStrategies)).slice(
+  state.activeStrategies = uniq([...state.activeStrategies, child.id]).slice(
     0,
-    MAX_ACTIVE_STRATEGIES
+    getActiveCountLimit()
   );
 
   state.lastMutationAt = nowIso();
   state.updatedAt = nowIso();
   state.stats.totalMutations += 1;
+
+  repairState(tenantId);
 
   return {
     ok: true,
@@ -429,8 +531,11 @@ MAINTENANCE
 
 function resetTenant(tenantId) {
   const key = safeTenantKey(tenantId);
+
   LAB.delete(key);
-  getState(key);
+  LAB.set(key, createEmptyState());
+  seedStrategies(key);
+  repairState(key);
 
   return {
     ok: true,
@@ -452,20 +557,19 @@ function removeStrategy(tenantId, strategyId) {
   delete state.strategies[id];
   state.activeStrategies = state.activeStrategies.filter((x) => x !== id);
 
-  if (
-    state.activeStrategies.length < Math.min(MAX_ACTIVE_STRATEGIES, Object.keys(state.strategies).length)
-  ) {
-    const refill = Object.values(state.strategies)
-      .map(enrichStrategy)
-      .sort((a, b) => b.score - a.score)
-      .map((s) => s.id);
+  const rankedIds = Object.values(state.strategies)
+    .map(enrichStrategy)
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.id);
 
-    state.activeStrategies = Array.from(
-      new Set([...state.activeStrategies, ...refill])
-    ).slice(0, MAX_ACTIVE_STRATEGIES);
-  }
+  state.activeStrategies = uniq([
+    ...state.activeStrategies,
+    ...rankedIds,
+  ]).slice(0, getActiveCountLimit());
 
   state.updatedAt = nowIso();
+
+  repairState(tenantId);
 
   return {
     ok: true,
