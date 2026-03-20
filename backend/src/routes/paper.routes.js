@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/routes/paper.routes.js
-// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5.1
+// Paper Engine API — FULL INSTITUTIONAL STATE EXPOSURE v5.2
 //
 // FIXES
 // - Manual orders mutate real live engine state
@@ -12,6 +12,7 @@
 // - Added profit protection arm/disarm routes
 // - Added protection exposure in status/account/positions
 // - Matched to paperTrader getState/manual protection methods
+// - Reset history now records into analytics memory
 // ==========================================================
 
 const express = require("express");
@@ -54,6 +55,32 @@ function getMarketPrice(tenantId, symbol, fallbackPrice) {
     0;
 
   return Number.isFinite(Number(marketPrice)) ? Number(marketPrice) : 0;
+}
+
+function getAnalyticsStore(req) {
+  return req.app?.locals?.tradingAnalytics || global.tradingAnalytics || null;
+}
+
+function pushRecentReset(req, tenantId, reason = "MANUAL_RESET") {
+  try {
+    const store = getAnalyticsStore(req);
+    if (!store || !Array.isArray(store.recentResets)) return;
+
+    store.recentResets.push({
+      type: "reset",
+      label: "Paper engine reset",
+      tenantId: String(tenantId),
+      userId: String(req.user?.id || ""),
+      email: req.user?.email || null,
+      role: req.user?.role || null,
+      reason,
+      time: new Date().toISOString(),
+    });
+
+    if (store.recentResets.length > 1000) {
+      store.recentResets.splice(0, store.recentResets.length - 1000);
+    }
+  } catch {}
 }
 
 /* =========================================================
@@ -296,6 +323,8 @@ router.post("/reset", (req, res) => {
         error: "Missing tenant context",
       });
     }
+
+    pushRecentReset(req, tenantId, req.body?.reason || "MANUAL_RESET");
 
     paperTrader.hardReset(tenantId);
 
