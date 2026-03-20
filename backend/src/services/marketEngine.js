@@ -1,13 +1,13 @@
 // ==========================================================
 // FILE: backend/src/services/marketEngine.js
 // MARKET ENGINE — Persistent Real-Time Exchange Simulator
-// INSTITUTIONAL STABLE VERSION v6
-//
-// FIXES
-// - Removed duplicate AI engine loop
-// - Server.js remains the single AI driver
-// - Prevents frozen AI stats and double ticks
-// - Stabilizes trading analytics panel
+// INSTITUTIONAL STABLE VERSION v7 (Fast Snapshot + Low-Overhead Persistence)
+// PURPOSE
+// - Keep server.js as the single AI driver
+// - Make market delivery much faster and lighter
+// - Reduce main-thread blocking from disk writes
+// - Cache snapshot output for websocket broadcasting
+// - Preserve persistence, candles, and multi-tenant behavior
 // ==========================================================
 
 const fs = require("fs");
@@ -17,34 +17,48 @@ const path = require("path");
 
 const STATE_DIR =
   process.env.MARKET_STATE_DIR ||
-  path.join("/tmp","market_engine");
+  path.join("/tmp", "market_engine");
 
-function ensureDir(){
-  if(!fs.existsSync(STATE_DIR))
-    fs.mkdirSync(STATE_DIR,{recursive:true});
+function ensureDir() {
+  if (!fs.existsSync(STATE_DIR)) {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+  }
 }
 
-function stateFile(tenantId){
+function stateFile(tenantId) {
   ensureDir();
-  return path.join(STATE_DIR,`market_${tenantId}.json`);
+  return path.join(STATE_DIR, `market_${tenantId}.json`);
 }
 
 /* ================= CONFIG ================= */
 
-const SYMBOLS = {
-  BTCUSDT:{start:65000,vol:0.0025},
-  ETHUSDT:{start:3500,vol:0.003},
-  SOLUSDT:{start:150,vol:0.004},
-  EURUSD:{start:1.08,vol:0.0004},
-  GBPUSD:{start:1.27,vol:0.0004},
-  SPX:{start:5100,vol:0.0007},
-  NASDAQ:{start:17800,vol:0.0008},
-  GOLD:{start:2050,vol:0.0006}
-};
+const SYMBOLS = Object.freeze({
+  BTCUSDT: { start: 65000, vol: 0.0025 },
+  ETHUSDT: { start: 3500, vol: 0.003 },
+  SOLUSDT: { start: 150, vol: 0.004 },
+  EURUSD: { start: 1.08, vol: 0.0004 },
+  GBPUSD: { start: 1.27, vol: 0.0004 },
+  SPX: { start: 5100, vol: 0.0007 },
+  NASDAQ: { start: 17800, vol: 0.0008 },
+  GOLD: { start: 2050, vol: 0.0006 },
+});
 
-const MARKET_TICK_MS = 200;
-const CANDLE_MS = 60000;
-const MAX_CANDLES = 2000;
+const SYMBOL_LIST = Object.keys(SYMBOLS);
+
+const MARKET_TICK_MS =
+  Number(process.env.MARKET_TICK_MS || 200);
+
+const CANDLE_MS =
+  Number(process.env.MARKET_CANDLE_MS || 60000);
+
+const MAX_CANDLES =
+  Number(process.env.MARKET_MAX_CANDLES || 2000);
+
+const SAVE_INTERVAL_MS =
+  Number(process.env.MARKET_SAVE_INTERVAL_MS || 3000);
+
+const SAVE_COOLDOWN_MS =
+  Number(process.env.MARKET_SAVE_COOLDOWN_MS || 2500);
 
 /* ================= TENANTS ================= */
 
@@ -53,45 +67,131 @@ const DIRTY = new Set();
 
 /* ================= UTIL ================= */
 
-function clamp(n,min,max){
-  return Math.max(min,Math.min(max,n));
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function safeNum(v,fallback=0){
+function safeNum(v, fallback = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function simulate(price,vol){
+function normalizeTenantId(tenantId) {
+  return String(tenantId || "__default__");
+}
 
-  const drift = (Math.random()-0.5) * vol;
-  const trend = (Math.random()-0.5) * vol * 0.3;
+function simulate(price, vol) {
+  const drift = (Math.random() - 0.5) * vol;
+  const trend = (Math.random() - 0.5) * vol * 0.3;
 
-  const next =
-    price * (1 + drift + trend);
+  const next = price * (1 + drift + trend);
 
   return Number(
-    clamp(next,0.0000001,1e12).toFixed(8)
+    clamp(next, 0.0000001, 1e12).toFixed(8)
   );
+}
+
+/* ================= STATE BUILDERS ================= */
+
+function buildInitialState() {
+  const now = Date.now();
+
+  const state = {
+    prices: {},
+    candles: {},
+    snapshot: {},
+    dirty: false,
+    lastTickAt: now,
+    lastSaveAt: 0,
+  };
+
+  for (const sym of SYMBOL_LIST) {
+    const start = safeNum(SYMBOLS[sym].start, 1);
+
+    state.prices[sym] = start;
+
+    state.candles[sym] = [
+      {
+        t: now,
+        o: start,
+        h: start,
+        l: start,
+        c: start,
+      },
+    ];
+
+    state.snapshot[sym] = { price: start };
+  }
+
+  return state;
+}
+
+function sanitizeLoadedState(raw) {
+  const now = Date.now();
+  const state = {
+    prices: {},
+    candles: {},
+    snapshot: {},
+    dirty: false,
+    lastTickAt: now,
+    lastSaveAt: 0,
+  };
+
+  for (const sym of SYMBOL_LIST) {
+    const def = safeNum(SYMBOLS[sym].start, 1);
+    const loadedPrice = safeNum(raw?.prices?.[sym], def);
+
+    state.prices[sym] = loadedPrice;
+    state.snapshot[sym] = { price: loadedPrice };
+
+    const loadedCandles = Array.isArray(raw?.candles?.[sym])
+      ? raw.candles[sym]
+      : [];
+
+    const cleaned = loadedCandles
+      .filter((c) => c && typeof c === "object")
+      .map((c) => ({
+        t: safeNum(c.t, now),
+        o: safeNum(c.o, loadedPrice),
+        h: safeNum(c.h, loadedPrice),
+        l: safeNum(c.l, loadedPrice),
+        c: safeNum(c.c, loadedPrice),
+      }))
+      .slice(-MAX_CANDLES);
+
+    state.candles[sym] =
+      cleaned.length > 0
+        ? cleaned
+        : [
+            {
+              t: now,
+              o: loadedPrice,
+              h: loadedPrice,
+              l: loadedPrice,
+              c: loadedPrice,
+            },
+          ];
+  }
+
+  return state;
 }
 
 /* ================= LOAD ================= */
 
-function loadState(tenantId){
-
+function loadState(tenantId) {
   const file = stateFile(tenantId);
 
-  if(!fs.existsSync(file))
+  if (!fs.existsSync(file)) {
     return null;
+  }
 
-  try{
-
-    return JSON.parse(
-      fs.readFileSync(file,"utf-8")
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(file, "utf-8")
     );
 
-  }catch{
-
+    return sanitizeLoadedState(parsed);
+  } catch {
     console.warn(
       "marketEngine corrupted state reset:",
       tenantId
@@ -99,246 +199,227 @@ function loadState(tenantId){
 
     return null;
   }
-
 }
 
 /* ================= SAVE ================= */
 
-function saveState(tenantId,state){
+function buildPersistedState(state) {
+  return {
+    prices: state.prices,
+    candles: state.candles,
+  };
+}
 
-  try{
-
+function saveState(tenantId, state) {
+  try {
     const file = stateFile(tenantId);
     const tmp = `${file}.tmp`;
 
-    fs.writeFileSync(tmp,JSON.stringify(state));
-    fs.renameSync(tmp,file);
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify(buildPersistedState(state))
+    );
 
-  }catch(err){
+    fs.renameSync(tmp, file);
 
+    state.lastSaveAt = Date.now();
+    state.dirty = false;
+  } catch (err) {
     console.warn(
       "marketEngine save failed:",
       err.message
     );
-
   }
-
 }
 
 /* ================= REGISTER ================= */
 
-function registerTenant(tenantId){
+function registerTenant(tenantId) {
+  const key = normalizeTenantId(tenantId);
 
-  if(!tenantId) return;
-
-  if(TENANTS.has(tenantId))
+  if (TENANTS.has(key)) {
     return;
-
-  const persisted = loadState(tenantId);
-
-  if(persisted){
-
-    TENANTS.set(tenantId,persisted);
-    return;
-
   }
 
-  const state = {
-    prices:{},
-    candles:{}
-  };
+  const persisted = loadState(key);
 
-  for(const sym of Object.keys(SYMBOLS)){
-
-    const start = SYMBOLS[sym].start;
-
-    state.prices[sym] = start;
-
-    state.candles[sym] = [{
-      t:Date.now(),
-      o:start,
-      h:start,
-      l:start,
-      c:start
-    }];
-
+  if (persisted) {
+    TENANTS.set(key, persisted);
+    return;
   }
 
-  TENANTS.set(tenantId,state);
-
+  TENANTS.set(key, buildInitialState());
 }
 
 /* ================= SAFE ACCESS ================= */
 
-function ensureTenant(tenantId){
+function ensureTenant(tenantId) {
+  const key = normalizeTenantId(tenantId);
 
-  if(!TENANTS.has(tenantId))
-    registerTenant(tenantId);
+  if (!TENANTS.has(key)) {
+    registerTenant(key);
+  }
 
+  return key;
 }
 
 /* ================= GET PRICE ================= */
 
-function getPrice(tenantId,symbol){
+function getPrice(tenantId, symbol) {
+  const key = ensureTenant(tenantId);
+  const sym = String(symbol || "").toUpperCase();
+  const state = TENANTS.get(key);
 
-  ensureTenant(tenantId);
-
-  const state = TENANTS.get(tenantId);
-
-  return state?.prices?.[symbol] ?? null;
-
+  return state?.prices?.[sym] ?? null;
 }
 
 /* ================= CANDLE UPDATE ================= */
 
-function updateCandle(state,symbol,price){
-
-  if(!state.candles[symbol])
+function updateCandle(state, symbol, price, now) {
+  if (!state.candles[symbol]) {
     state.candles[symbol] = [];
+  }
 
   const arr = state.candles[symbol];
 
-  const now = Date.now();
-
-  if(arr.length===0){
-
+  if (arr.length === 0) {
     arr.push({
-      t:now,
-      o:price,
-      h:price,
-      l:price,
-      c:price
+      t: now,
+      o: price,
+      h: price,
+      l: price,
+      c: price,
     });
 
     return;
   }
 
-  const last = arr[arr.length-1];
+  const last = arr[arr.length - 1];
 
-  if(now-last.t >= CANDLE_MS){
-
+  if (now - safeNum(last.t, now) >= CANDLE_MS) {
     arr.push({
-      t:now,
-      o:price,
-      h:price,
-      l:price,
-      c:price
+      t: now,
+      o: price,
+      h: price,
+      l: price,
+      c: price,
     });
 
-    if(arr.length > MAX_CANDLES)
-      arr.splice(0,arr.length-MAX_CANDLES);
+    if (arr.length > MAX_CANDLES) {
+      arr.splice(0, arr.length - MAX_CANDLES);
+    }
 
+    return;
   }
 
-  const cur = arr[arr.length-1];
-
-  cur.o = safeNum(cur.o,price);
-  cur.h = Math.max(safeNum(cur.h,price),price);
-  cur.l = Math.min(safeNum(cur.l,price),price);
-  cur.c = safeNum(price,cur.c);
-
+  last.h = Math.max(safeNum(last.h, price), price);
+  last.l = Math.min(safeNum(last.l, price), price);
+  last.c = price;
 }
 
 /* ================= MARKET TICK ================= */
 
-function tickTenant(tenantId){
+function tickTenant(tenantId) {
+  const key = ensureTenant(tenantId);
+  const state = TENANTS.get(key);
 
-  ensureTenant(tenantId);
+  if (!state) return;
 
-  const state = TENANTS.get(tenantId);
+  const now = Date.now();
 
-  for(const sym of Object.keys(SYMBOLS)){
+  for (const sym of SYMBOL_LIST) {
+    const prev = safeNum(
+      state.prices[sym],
+      safeNum(SYMBOLS[sym]?.start, 1)
+    );
 
-    const prev = state.prices[sym];
-
-    const next =
-      simulate(prev,SYMBOLS[sym].vol);
+    const next = simulate(prev, safeNum(SYMBOLS[sym]?.vol, 0.001));
 
     state.prices[sym] = next;
 
-    updateCandle(state,sym,next);
+    // cached websocket snapshot object
+    if (!state.snapshot[sym]) {
+      state.snapshot[sym] = { price: next };
+    } else {
+      state.snapshot[sym].price = next;
+    }
 
+    updateCandle(state, sym, next, now);
   }
 
-  DIRTY.add(tenantId);
-
+  state.lastTickAt = now;
+  state.dirty = true;
+  DIRTY.add(key);
 }
 
 /* ================= SNAPSHOT ================= */
 
-function getMarketSnapshot(tenantId){
+function getMarketSnapshot(tenantId) {
+  const key = ensureTenant(tenantId);
+  const state = TENANTS.get(key);
 
-  ensureTenant(tenantId);
-
-  const state = TENANTS.get(tenantId);
-
-  const out = {};
-
-  for(const sym of Object.keys(state.prices))
-    out[sym] = {price:state.prices[sym]};
-
-  return out;
-
+  return state?.snapshot || {};
 }
 
 /* ================= CANDLES ================= */
 
-function getCandles(tenantId,symbol,limit=200){
+function getCandles(tenantId, symbol, limit = 200) {
+  const key = ensureTenant(tenantId);
+  const sym = String(symbol || "").toUpperCase();
+  const state = TENANTS.get(key);
 
-  ensureTenant(tenantId);
+  const cappedLimit = clamp(safeNum(limit, 200), 1, MAX_CANDLES);
+  const arr = state?.candles?.[sym] || [];
 
-  const state = TENANTS.get(tenantId);
-
-  const arr = state.candles?.[symbol] || [];
-
-  return arr.slice(-limit).map(c=>({
-
-    time:Math.floor(c.t/1000),
-    open:safeNum(c.o),
-    high:safeNum(c.h),
-    low:safeNum(c.l),
-    close:safeNum(c.c)
-
+  return arr.slice(-cappedLimit).map((c) => ({
+    time: Math.floor(safeNum(c.t, 0) / 1000),
+    open: safeNum(c.o),
+    high: safeNum(c.h),
+    low: safeNum(c.l),
+    close: safeNum(c.c),
   }));
-
 }
 
 /* ================= ENGINE LOOP ================= */
 
-setInterval(()=>{
-
-  for(const tenantId of TENANTS.keys()){
-
-    try{
+setInterval(() => {
+  for (const tenantId of TENANTS.keys()) {
+    try {
       tickTenant(tenantId);
-    }catch{}
-
+    } catch {}
   }
+}, MARKET_TICK_MS);
 
-},MARKET_TICK_MS);
+setInterval(() => {
+  const now = Date.now();
 
-setInterval(()=>{
-
-  for(const tenantId of DIRTY){
-
+  for (const tenantId of DIRTY) {
     const state = TENANTS.get(tenantId);
 
-    if(state)
-      saveState(tenantId,state);
+    if (!state) {
+      DIRTY.delete(tenantId);
+      continue;
+    }
 
+    if (!state.dirty) {
+      DIRTY.delete(tenantId);
+      continue;
+    }
+
+    if (now - safeNum(state.lastSaveAt, 0) < SAVE_COOLDOWN_MS) {
+      continue;
+    }
+
+    saveState(tenantId, state);
+    DIRTY.delete(tenantId);
   }
-
-  DIRTY.clear();
-
-},3000);
+}, SAVE_INTERVAL_MS);
 
 /* ================= EXPORT ================= */
 
 module.exports = {
-
   registerTenant,
   getMarketSnapshot,
   getCandles,
-  getPrice
-
+  getPrice,
 };
