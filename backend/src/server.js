@@ -1,7 +1,8 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable + Real-Time Trade Broadcast
+// VERSION: Production Stable + Real-Time Trade Broadcast +
+//          Wrapped Analytics + Trading Analytics Separation
 // PURPOSE
 // Main backend runtime entry point.
 //
@@ -12,7 +13,9 @@
 // - Heartbeat cleanup for dead sockets
 // - Snapshot normalization for frontend persistence
 // - Trading analytics memory route mounted
+// - Wrapped site analytics route mounted
 // - Analytics memory store initialized
+// - Reset events recorded for trading analytics
 // ==========================================================
 
 require("dotenv").config();
@@ -49,6 +52,7 @@ const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
 const tradingAnalyticsRoutes = require("./routes/tradingAnalytics");
+const analyticsRoutes = require("./routes/analytics.routes");
 
 /* =========================================================
 SAFE BOOT CHECK
@@ -168,6 +172,19 @@ app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 app.use("/api/ai", tradingRoutes);
 app.use("/api/trading", tradingRoutes);
+
+/* =========================================================
+ANALYTICS API
+---------------------------------------------------------
+/api/analytics/trading        -> trading performance memory
+/api/analytics/summary        -> wrapped website analytics
+/api/analytics/reports        -> wrapped website analytics
+/api/analytics/event          -> website event intake
+/api/analytics/state          -> maintenance/raw analytics state
+/api/analytics/maintenance/*  -> maintenance actions
+========================================================= */
+
+app.use("/api/analytics", analyticsRoutes);
 app.use("/api/analytics", tradingAnalyticsRoutes);
 
 /* =========================================================
@@ -258,8 +275,8 @@ function appendUniqueByKey(list, item, keyBuilder, max = 1000) {
   if (!Array.isArray(list) || !item) return list;
 
   const nextKey = keyBuilder(item);
-
   const exists = list.some((entry) => keyBuilder(entry) === nextKey);
+
   if (!exists) {
     list.push(item);
   }
@@ -332,6 +349,23 @@ function recordLoginEvent(user, tenantId) {
   } catch {}
 }
 
+function recordResetEvent(tenantId, label = "Manual reset") {
+  try {
+    const store = getAnalyticsStore();
+
+    store.recentResets.push({
+      type: "reset",
+      label,
+      tenantId: String(tenantId || ""),
+      time: new Date().toISOString(),
+    });
+
+    if (store.recentResets.length > 1000) {
+      store.recentResets.splice(0, store.recentResets.length - 1000);
+    }
+  } catch {}
+}
+
 /* =========================================================
 SNAPSHOT NORMALIZER
 ========================================================= */
@@ -361,6 +395,25 @@ function buildPaperSnapshot(tenantId) {
 }
 
 /* =========================================================
+PATCH PAPER RESET TO RECORD ANALYTICS
+---------------------------------------------------------
+This keeps trading analytics aware of manual resets without
+having to rewrite paper.routes.js right now.
+========================================================= */
+
+if (typeof paperTrader.hardReset === "function" && !paperTrader.__analyticsPatched) {
+  const originalHardReset = paperTrader.hardReset.bind(paperTrader);
+
+  paperTrader.hardReset = function patchedHardReset(tenantId, ...args) {
+    const result = originalHardReset(tenantId, ...args);
+    recordResetEvent(tenantId, "Paper engine reset");
+    return result;
+  };
+
+  paperTrader.__analyticsPatched = true;
+}
+
+/* =========================================================
 AUTONOMOUS AI TRADING ENGINE
 ========================================================= */
 
@@ -370,7 +423,6 @@ setInterval(() => {
 
     for (const tenantId of tenants) {
       const market = marketEngine.getMarketSnapshot(tenantId);
-
       let price = market?.BTCUSDT?.price;
 
       if (!price) {
@@ -442,7 +494,6 @@ function broadcastTrade(trade, tenantId) {
   });
 }
 
-/* expose globally so executionEngine can use it */
 global.broadcastTrade = broadcastTrade;
 
 function closeWs(ws) {
