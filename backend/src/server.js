@@ -1,18 +1,18 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable + Safer Route Loading +
-//          Reduced Market Loop Pressure + Faster Broadcasts
+// VERSION: Production Stable + Optional Route Safety +
+//          Faster Market Broadcast + Reduced Loop Pressure
 // PURPOSE
 // Main backend runtime entry point.
 //
 // FIXES
 // - tradingAnalytics route is optional-safe
-// - reduced repeated analytics sync pressure
-// - cached tenant discovery to avoid DB reads every second
-// - slower market broadcast loop to reduce socket churn
-// - paper snapshots no longer resync analytics on every socket send
-// - safer optional route mounting
+// - cached tenant discovery avoids DB reads every second
+// - analytics sync moved off websocket hot path
+// - faster market websocket broadcast
+// - cached per-tenant snapshot fanout
+// - safer optional route mounting without breaking deploy
 // ==========================================================
 
 require("dotenv").config();
@@ -209,6 +209,25 @@ AI ENGINE START TIME
 const ENGINE_START_TIME = Date.now();
 
 /* =========================================================
+TUNABLE TIMERS
+========================================================= */
+
+const TENANT_CACHE_MS =
+  Number(process.env.TENANT_CACHE_MS || 15000);
+
+const ANALYTICS_SYNC_MS =
+  Number(process.env.ANALYTICS_SYNC_MS || 5000);
+
+const AI_TICK_MS =
+  Number(process.env.AI_TICK_MS || 1000);
+
+const MARKET_BROADCAST_MS =
+  Number(process.env.MARKET_BROADCAST_MS || 200);
+
+const PAPER_BROADCAST_MS =
+  Number(process.env.PAPER_BROADCAST_MS || 1000);
+
+/* =========================================================
 UTIL
 ========================================================= */
 
@@ -269,9 +288,6 @@ let TENANT_CACHE = {
   list: new Set(),
   updatedAt: 0,
 };
-
-const TENANT_CACHE_MS =
-  Number(process.env.TENANT_CACHE_MS || 15000);
 
 function getTenants() {
   const now = Date.now();
@@ -411,7 +427,10 @@ function buildPaperSnapshot(tenantId) {
 PATCH PAPER RESET TO RECORD ANALYTICS
 ========================================================= */
 
-if (typeof paperTrader.hardReset === "function" && !paperTrader.__analyticsPatched) {
+if (
+  typeof paperTrader.hardReset === "function" &&
+  !paperTrader.__analyticsPatched
+) {
   const originalHardReset = paperTrader.hardReset.bind(paperTrader);
 
   paperTrader.hardReset = function patchedHardReset(tenantId, ...args) {
@@ -430,13 +449,14 @@ PERIODIC ANALYTICS SYNC
 setInterval(() => {
   try {
     const tenants = getTenants();
+
     for (const tenantId of tenants) {
       syncTenantAnalyticsMemory(tenantId);
     }
   } catch (err) {
     console.error("Analytics sync error:", err.message);
   }
-}, 5000);
+}, ANALYTICS_SYNC_MS);
 
 /* =========================================================
 AUTONOMOUS AI TRADING ENGINE
@@ -445,6 +465,7 @@ AUTONOMOUS AI TRADING ENGINE
 setInterval(() => {
   try {
     const tenants = getTenants();
+    const now = Date.now();
 
     for (const tenantId of tenants) {
       const market = marketEngine.getMarketSnapshot(tenantId);
@@ -466,12 +487,12 @@ setInterval(() => {
         price = 60000;
       }
 
-      paperTrader.tick(tenantId, "BTCUSDT", Number(price), Date.now());
+      paperTrader.tick(tenantId, "BTCUSDT", Number(price), now);
     }
   } catch (err) {
     console.error("AI engine error:", err.message);
   }
-}, 1000);
+}, AI_TICK_MS);
 
 /* =========================================================
 WEBSOCKET SERVER
@@ -488,6 +509,12 @@ REAL TIME TRADE BROADCAST
 
 function broadcastTrade(trade, tenantId) {
   const normalizedTenantId = String(tenantId);
+  const payload = JSON.stringify({
+    channel: "paper",
+    type: "trade",
+    trade,
+    ts: Date.now(),
+  });
 
   try {
     appendUniqueByKey(
@@ -504,14 +531,7 @@ function broadcastTrade(trade, tenantId) {
     if (ws.readyState !== ws.OPEN) return;
 
     try {
-      ws.send(
-        JSON.stringify({
-          channel: "paper",
-          type: "trade",
-          trade,
-          ts: Date.now(),
-        })
-      );
+      ws.send(payload);
     } catch {}
   });
 }
@@ -635,30 +655,30 @@ MARKET STREAM
 
 setInterval(() => {
   const cache = new Map();
+  const now = Date.now();
 
   wss.clients.forEach((ws) => {
     if (ws.channel !== "market") return;
     if (ws.readyState !== ws.OPEN) return;
 
     try {
-      let snapshot = cache.get(ws.tenantId);
+      let payload = cache.get(ws.tenantId);
 
-      if (!snapshot) {
-        snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
-        cache.set(ws.tenantId, snapshot);
-      }
-
-      ws.send(
-        JSON.stringify({
+      if (!payload) {
+        const snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
+        payload = JSON.stringify({
           channel: "market",
           type: "snapshot",
           data: snapshot,
-          ts: Date.now(),
-        })
-      );
+          ts: now,
+        });
+        cache.set(ws.tenantId, payload);
+      }
+
+      ws.send(payload);
     } catch {}
   });
-}, 500);
+}, MARKET_BROADCAST_MS);
 
 /* =========================================================
 PAPER TRADING STREAM
@@ -666,39 +686,41 @@ PAPER TRADING STREAM
 
 setInterval(() => {
   const cache = new Map();
+  const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  const now = Date.now();
 
   wss.clients.forEach((ws) => {
     if (ws.channel !== "paper") return;
     if (ws.readyState !== ws.OPEN) return;
 
     try {
-      let snapshot = cache.get(ws.tenantId);
+      let payload = cache.get(ws.tenantId);
 
-      if (!snapshot) {
-        snapshot = buildPaperSnapshot(ws.tenantId);
-        cache.set(ws.tenantId, snapshot);
-      }
+      if (!payload) {
+        const snapshot = buildPaperSnapshot(ws.tenantId);
+        const stats = snapshot?.executionStats || {};
+        const metrics = {
+          aiPerMin: Number(stats.decisions || 0),
+          memMb,
+        };
 
-      const stats = snapshot?.executionStats || {};
-      const metrics = {
-        aiPerMin: Number(stats.decisions || 0),
-        memMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      };
-
-      ws.send(
-        JSON.stringify({
+        payload = JSON.stringify({
           channel: "paper",
           type: "engine",
           snapshot,
           decisions: snapshot.decisions || [],
           metrics,
           engineStart: ENGINE_START_TIME,
-          ts: Date.now(),
-        })
-      );
+          ts: now,
+        });
+
+        cache.set(ws.tenantId, payload);
+      }
+
+      ws.send(payload);
     } catch {}
   });
-}, 1000);
+}, PAPER_BROADCAST_MS);
 
 /* =========================================================
 SERVER START
