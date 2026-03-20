@@ -1,29 +1,32 @@
 const express = require("express");
 const router = express.Router();
 
+const {
+  recordVisit,
+  getSummary,
+} = require("../services/analyticsEngine");
+
 /* =========================================================
-TRADING ANALYTICS MEMORY ROUTE
+ANALYTICS ROUTES
 PURPOSE
 ---------------------------------------------------------
-Provides persistent trading analytics memory for:
-- today
-- week
-- month
-- year
-- all-time
-- reset history
-- login history
-- trade archive
-- decision archive
+Website/page analytics route layer.
 
-IMPORTANT
----------------------------------------------------------
-This route is designed to be tolerant of backend drift.
-It attempts to read from common globals / services if they
-exist, and falls back safely if they do not.
+This is NOT trading analytics.
+This route is for wrapped site analytics such as:
+- page visits
+- live activity
+- daily totals
+- weekly totals
+- monthly totals
+- yearly totals
+- referrers
+- countries
+- pages
 
-You should later connect this to your real persistence
-layer or database.
+It stays compatible with your existing analyticsEngine
+(recordVisit + getSummary), while also returning a more
+structured wrapped response for the frontend.
 ========================================================= */
 
 /* =========================================================
@@ -39,14 +42,27 @@ function asArray(v) {
   return Array.isArray(v) ? v : [];
 }
 
-function getItemTime(item) {
+function normalizeEntry(entry = {}) {
+  return {
+    path: entry.path || "/",
+    duration: safeNum(entry.duration, 0),
+    country: entry.country || "Unknown",
+    referrer: entry.referrer || "Direct",
+    userAgent: entry.userAgent || null,
+    createdAt:
+      entry.createdAt ||
+      entry.time ||
+      entry.timestamp ||
+      new Date().toISOString(),
+  };
+}
+
+function getEntryTime(entry) {
   const raw =
-    item?.closedAt ??
-    item?.time ??
-    item?.createdAt ??
-    item?.updatedAt ??
-    item?.timestamp ??
-    item?.date ??
+    entry?.createdAt ??
+    entry?.time ??
+    entry?.timestamp ??
+    entry?.date ??
     null;
 
   if (!raw) return null;
@@ -83,271 +99,278 @@ function startOfYear(date) {
   return new Date(date.getFullYear(), 0, 1);
 }
 
-function emptyPeriod() {
+function emptyBucket(label = null) {
   return {
-    wins: 0,
-    losses: 0,
-    breakeven: 0,
-    trades: 0,
-    closedTrades: 0,
-    pnl: 0,
-    grossWinPnl: 0,
-    grossLossPnl: 0,
-    avgPnl: 0,
-    winRate: 0,
-    profitFactor: 0,
-    resets: 0,
-    logins: 0,
+    label,
+    visits: 0,
+    uniquePages: 0,
+    avgDuration: 0,
+    totalDuration: 0,
+    topPages: [],
+    topCountries: [],
+    topReferrers: [],
   };
 }
 
-function finalizePeriod(period) {
-  const closedTrades = safeNum(period.closedTrades, 0);
-  const grossWinPnl = safeNum(period.grossWinPnl, 0);
-  const grossLossPnlAbs = Math.abs(safeNum(period.grossLossPnl, 0));
+function buildBreakdown(entries) {
+  const pageMap = new Map();
+  const countryMap = new Map();
+  const referrerMap = new Map();
+
+  let totalDuration = 0;
+
+  for (const raw of entries) {
+    const entry = normalizeEntry(raw);
+
+    totalDuration += safeNum(entry.duration, 0);
+
+    pageMap.set(entry.path, (pageMap.get(entry.path) || 0) + 1);
+    countryMap.set(entry.country, (countryMap.get(entry.country) || 0) + 1);
+    referrerMap.set(entry.referrer, (referrerMap.get(entry.referrer) || 0) + 1);
+  }
+
+  const sortMap = (map) =>
+    Array.from(map.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count);
 
   return {
-    ...period,
-    avgPnl: closedTrades > 0 ? safeNum(period.pnl, 0) / closedTrades : 0,
-    winRate:
-      closedTrades > 0 ? (safeNum(period.wins, 0) / closedTrades) * 100 : 0,
-    profitFactor:
-      grossLossPnlAbs > 0
-        ? grossWinPnl / grossLossPnlAbs
-        : grossWinPnl > 0
-          ? grossWinPnl
-          : 0,
+    visits: entries.length,
+    uniquePages: pageMap.size,
+    avgDuration: entries.length ? totalDuration / entries.length : 0,
+    totalDuration,
+    topPages: sortMap(pageMap).slice(0, 20),
+    topCountries: sortMap(countryMap).slice(0, 20),
+    topReferrers: sortMap(referrerMap).slice(0, 20),
   };
 }
 
-function isTradeClosed(trade) {
-  if (!trade || typeof trade !== "object") return false;
-
-  if (trade.pnl !== undefined && trade.pnl !== null) return true;
-
-  const status = String(trade.status || trade.state || "").toUpperCase();
-  if (["CLOSED", "FILLED", "EXITED", "COMPLETED", "SETTLED"].includes(status)) {
-    return true;
-  }
-
-  const action = String(
-    trade.action || trade.type || trade.event || ""
-  ).toUpperCase();
-
-  if (action.includes("CLOSE") || action.includes("EXIT")) {
-    return true;
-  }
-
-  return false;
+function finalizeBucket(bucket) {
+  return {
+    ...bucket,
+    visits: safeNum(bucket.visits, 0),
+    uniquePages: safeNum(bucket.uniquePages, 0),
+    avgDuration: safeNum(bucket.avgDuration, 0),
+    totalDuration: safeNum(bucket.totalDuration, 0),
+    topPages: asArray(bucket.topPages),
+    topCountries: asArray(bucket.topCountries),
+    topReferrers: asArray(bucket.topReferrers),
+  };
 }
 
-function classifyTradeOutcome(trade) {
-  const pnl = safeNum(trade?.pnl, 0);
-  if (pnl > 0) return "win";
-  if (pnl < 0) return "loss";
-  return "breakeven";
-}
-
-function addTradeToBucket(bucket, trade) {
-  bucket.trades += 1;
-
-  if (!isTradeClosed(trade)) return;
-
-  const pnl = safeNum(trade?.pnl, 0);
-  bucket.closedTrades += 1;
-  bucket.pnl += pnl;
-
-  const outcome = classifyTradeOutcome(trade);
-
-  if (outcome === "win") {
-    bucket.wins += 1;
-    bucket.grossWinPnl += pnl;
-  } else if (outcome === "loss") {
-    bucket.losses += 1;
-    bucket.grossLossPnl += pnl;
-  } else {
-    bucket.breakeven += 1;
-  }
-}
-
-function buildTradeHistory(tradesInput, resetsInput = [], loginsInput = []) {
-  const trades = asArray(tradesInput);
-  const resets = asArray(resetsInput);
-  const logins = asArray(loginsInput);
-
+function buildWrappedAnalytics(entriesInput) {
+  const entries = asArray(entriesInput).map(normalizeEntry);
   const now = new Date();
+
   const todayStart = startOfDay(now);
   const weekStart = startOfWeek(now);
   const monthStart = startOfMonth(now);
   const yearStart = startOfYear(now);
 
-  const today = emptyPeriod();
-  const week = emptyPeriod();
-  const month = emptyPeriod();
-  const year = emptyPeriod();
-  const allTime = emptyPeriod();
+  const todayEntries = [];
+  const weekEntries = [];
+  const monthEntries = [];
+  const yearEntries = [];
 
   const dailyMap = new Map();
   const weeklyMap = new Map();
   const monthlyMap = new Map();
 
-  for (const trade of trades) {
-    const tradeDate = getItemTime(trade);
+  for (const entry of entries) {
+    const d = getEntryTime(entry);
+    if (!d) continue;
 
-    addTradeToBucket(allTime, trade);
+    if (d >= todayStart) todayEntries.push(entry);
+    if (d >= weekStart) weekEntries.push(entry);
+    if (d >= monthStart) monthEntries.push(entry);
+    if (d >= yearStart) yearEntries.push(entry);
 
-    if (!tradeDate) continue;
+    const dayKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
-    const dayKey = `${tradeDate.getFullYear()}-${String(
-      tradeDate.getMonth() + 1
-    ).padStart(2, "0")}-${String(tradeDate.getDate()).padStart(2, "0")}`;
+    const weekBase = startOfWeek(d);
+    const weekKey = `${weekBase.getFullYear()}-${String(weekBase.getMonth() + 1).padStart(2, "0")}-${String(weekBase.getDate()).padStart(2, "0")}`;
 
-    const monthKey = `${tradeDate.getFullYear()}-${String(
-      tradeDate.getMonth() + 1
-    ).padStart(2, "0")}`;
+    const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 
-    const weekBase = startOfWeek(tradeDate);
-    const weekKey = `${weekBase.getFullYear()}-${String(
-      weekBase.getMonth() + 1
-    ).padStart(2, "0")}-${String(weekBase.getDate()).padStart(2, "0")}`;
+    if (!dailyMap.has(dayKey)) dailyMap.set(dayKey, []);
+    if (!weeklyMap.has(weekKey)) weeklyMap.set(weekKey, []);
+    if (!monthlyMap.has(monthKey)) monthlyMap.set(monthKey, []);
 
-    const dailyBucket = dailyMap.get(dayKey) || {
-      date: dayKey,
-      ...emptyPeriod(),
-    };
-    addTradeToBucket(dailyBucket, trade);
-    dailyMap.set(dayKey, dailyBucket);
-
-    const weeklyBucket = weeklyMap.get(weekKey) || {
-      date: weekKey,
-      ...emptyPeriod(),
-    };
-    addTradeToBucket(weeklyBucket, trade);
-    weeklyMap.set(weekKey, weeklyBucket);
-
-    const monthlyBucket = monthlyMap.get(monthKey) || {
-      date: monthKey,
-      ...emptyPeriod(),
-    };
-    addTradeToBucket(monthlyBucket, trade);
-    monthlyMap.set(monthKey, monthlyBucket);
-
-    if (tradeDate >= todayStart) addTradeToBucket(today, trade);
-    if (tradeDate >= weekStart) addTradeToBucket(week, trade);
-    if (tradeDate >= monthStart) addTradeToBucket(month, trade);
-    if (tradeDate >= yearStart) addTradeToBucket(year, trade);
+    dailyMap.get(dayKey).push(entry);
+    weeklyMap.get(weekKey).push(entry);
+    monthlyMap.get(monthKey).push(entry);
   }
 
-  function countEventsInRange(events, rangeStart) {
-    return events.filter((item) => {
-      const d = getItemTime(item);
-      return d && d >= rangeStart;
-    }).length;
-  }
+  const today = finalizeBucket({
+    label: "today",
+    ...buildBreakdown(todayEntries),
+  });
 
-  today.resets = countEventsInRange(resets, todayStart);
-  today.logins = countEventsInRange(logins, todayStart);
+  const week = finalizeBucket({
+    label: "week",
+    ...buildBreakdown(weekEntries),
+  });
 
-  week.resets = countEventsInRange(resets, weekStart);
-  week.logins = countEventsInRange(logins, weekStart);
+  const month = finalizeBucket({
+    label: "month",
+    ...buildBreakdown(monthEntries),
+  });
 
-  month.resets = countEventsInRange(resets, monthStart);
-  month.logins = countEventsInRange(logins, monthStart);
+  const year = finalizeBucket({
+    label: "year",
+    ...buildBreakdown(yearEntries),
+  });
 
-  year.resets = countEventsInRange(resets, yearStart);
-  year.logins = countEventsInRange(logins, yearStart);
+  const allTime = finalizeBucket({
+    label: "all-time",
+    ...buildBreakdown(entries),
+  });
 
-  allTime.resets = resets.length;
-  allTime.logins = logins.length;
+  const daily = Array.from(dailyMap.entries())
+    .map(([date, list]) =>
+      finalizeBucket({
+        date,
+        ...buildBreakdown(list),
+      })
+    )
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-35);
+
+  const weekly = Array.from(weeklyMap.entries())
+    .map(([date, list]) =>
+      finalizeBucket({
+        date,
+        ...buildBreakdown(list),
+      })
+    )
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-20);
+
+  const monthly = Array.from(monthlyMap.entries())
+    .map(([date, list]) =>
+      finalizeBucket({
+        date,
+        ...buildBreakdown(list),
+      })
+    )
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-12);
 
   return {
-    today: finalizePeriod(today),
-    week: finalizePeriod(week),
-    month: finalizePeriod(month),
-    year: finalizePeriod(year),
-    allTime: finalizePeriod(allTime),
-    daily: Array.from(dailyMap.values())
-      .map(finalizePeriod)
-      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
-      .slice(-30),
-    weekly: Array.from(weeklyMap.values())
-      .map(finalizePeriod)
-      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
-      .slice(-16),
-    monthly: Array.from(monthlyMap.values())
-      .map(finalizePeriod)
-      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
-      .slice(-12),
+    today,
+    week,
+    month,
+    year,
+    allTime,
+    daily,
+    weekly,
+    monthly,
+    live: {
+      online: entries
+        .filter((entry) => {
+          const d = getEntryTime(entry);
+          return d && Date.now() - d.getTime() <= 5 * 60 * 1000;
+        })
+        .length,
+      updatedAt: new Date().toISOString(),
+    },
   };
 }
 
 /* =========================================================
-MEMORY ACCESS
----------------------------------------------------------
-These are safe fallbacks.
-Later you should replace these with your real DB/service.
+RECORD WEBSITE EVENT
 ========================================================= */
 
-function getTradingMemory(req) {
-  const app = req.app;
-
-  const paperState = app?.locals?.paperState || global.paperState || {};
-
-  const analyticsStore =
-    app?.locals?.tradingAnalytics || global.tradingAnalytics || {};
-
-  const tradeArchive = asArray(analyticsStore.tradeArchive).length
-    ? asArray(analyticsStore.tradeArchive)
-    : asArray(paperState.trades);
-
-  const decisionArchive = asArray(analyticsStore.decisionArchive).length
-    ? asArray(analyticsStore.decisionArchive)
-    : asArray(paperState.decisions);
-
-  const recentResets = asArray(analyticsStore.recentResets);
-  const recentLogins = asArray(analyticsStore.recentLogins);
-
-  return {
-    tradeArchive,
-    decisionArchive,
-    recentResets,
-    recentLogins,
-  };
-}
-
-/* =========================================================
-GET /api/analytics/trading
-========================================================= */
-
-router.get("/trading", (req, res) => {
+router.post("/event", (req, res) => {
   try {
-    const {
-      tradeArchive,
-      decisionArchive,
-      recentResets,
-      recentLogins,
-    } = getTradingMemory(req);
+    const { path, duration, country, referrer } = req.body || {};
 
-    const periods = buildTradeHistory(
-      tradeArchive,
-      recentResets,
-      recentLogins
-    );
+    const entry = recordVisit({
+      path,
+      duration,
+      country,
+      referrer,
+      userAgent: req.headers["user-agent"],
+    });
 
     return res.json({
       ok: true,
-      history: {
-        ...periods,
-        recentResets: recentResets.slice().reverse().slice(0, 50),
-        recentLogins: recentLogins.slice().reverse().slice(0, 50),
-        tradeArchive: tradeArchive.slice().reverse().slice(0, 1000),
-        decisionArchive: decisionArchive.slice().reverse().slice(0, 500),
-      },
+      entry: normalizeEntry(entry),
+      time: new Date().toISOString(),
     });
-  } catch (e) {
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: e.message || "Failed to build trading analytics history",
+      error: err.message || "Failed to record analytics event",
+    });
+  }
+});
+
+/* =========================================================
+GET WRAPPED SUMMARY
+========================================================= */
+
+router.get("/summary", (req, res) => {
+  try {
+    const summary = getSummary() || {};
+
+    const rawEntries =
+      asArray(summary.entries).length
+        ? asArray(summary.entries)
+        : asArray(summary.visits).length
+          ? asArray(summary.visits)
+          : asArray(summary.events);
+
+    const wrapped = buildWrappedAnalytics(rawEntries);
+
+    return res.json({
+      ok: true,
+      summary: {
+        raw: summary,
+        wrapped,
+      },
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to build analytics summary",
+    });
+  }
+});
+
+/* =========================================================
+GET REPORTS
+---------------------------------------------------------
+Same analytics source, but easier frontend access for:
+- /api/analytics/reports
+========================================================= */
+
+router.get("/reports", (req, res) => {
+  try {
+    const summary = getSummary() || {};
+
+    const rawEntries =
+      asArray(summary.entries).length
+        ? asArray(summary.entries)
+        : asArray(summary.visits).length
+          ? asArray(summary.visits)
+          : asArray(summary.events);
+
+    const wrapped = buildWrappedAnalytics(rawEntries);
+
+    return res.json({
+      ok: true,
+      reports: wrapped,
+      archive: {
+        recent: rawEntries.slice().reverse().slice(0, 500),
+      },
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to build analytics reports",
     });
   }
 });
