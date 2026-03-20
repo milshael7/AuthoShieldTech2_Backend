@@ -4,6 +4,8 @@ const router = express.Router();
 const {
   recordVisit,
   getSummary,
+  getRawState,
+  clearAnalytics,
 } = require("../services/analyticsEngine");
 
 /* =========================================================
@@ -24,9 +26,12 @@ This route is for wrapped site analytics such as:
 - countries
 - pages
 
-It stays compatible with your existing analyticsEngine
-(recordVisit + getSummary), while also returning a more
-structured wrapped response for the frontend.
+MAINTENANCE SAFE
+---------------------------------------------------------
+- Compatible with upgraded analyticsEngine
+- Returns raw + wrapped analytics
+- Safe fallback parsing
+- Maintenance endpoints included
 ========================================================= */
 
 /* =========================================================
@@ -38,19 +43,34 @@ function safeNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function safeText(v, fallback = "") {
+  if (v === undefined || v === null) return fallback;
+  const s = String(v).trim();
+  return s || fallback;
+}
+
 function asArray(v) {
   return Array.isArray(v) ? v : [];
 }
 
 function normalizeEntry(entry = {}) {
   return {
-    path: entry.path || "/",
+    id: entry.id || null,
+    path: safeText(entry.path, "/"),
     duration: safeNum(entry.duration, 0),
-    country: entry.country || "Unknown",
-    referrer: entry.referrer || "Direct",
+    country: safeText(entry.country, "Unknown"),
+    referrer: safeText(entry.referrer, "Direct"),
     userAgent: entry.userAgent || null,
+    ip: entry.ip || "",
+    source: safeText(entry.source, "web"),
+    type: safeText(entry.type, "visit"),
+    ts: safeNum(entry.ts, Date.now()),
+    iso:
+      safeText(entry.iso) ||
+      new Date(safeNum(entry.ts, Date.now())).toISOString(),
     createdAt:
       entry.createdAt ||
+      entry.iso ||
       entry.time ||
       entry.timestamp ||
       new Date().toISOString(),
@@ -59,13 +79,15 @@ function normalizeEntry(entry = {}) {
 
 function getEntryTime(entry) {
   const raw =
+    entry?.ts ??
     entry?.createdAt ??
+    entry?.iso ??
     entry?.time ??
     entry?.timestamp ??
     entry?.date ??
     null;
 
-  if (!raw) return null;
+  if (raw === null || raw === undefined) return null;
 
   const d = new Date(raw);
   if (!Number.isNaN(d.getTime())) return d;
@@ -99,6 +121,13 @@ function startOfYear(date) {
   return new Date(date.getFullYear(), 0, 1);
 }
 
+function finalizeList(list, limit = 20) {
+  return asArray(list)
+    .slice()
+    .sort((a, b) => safeNum(b.count, 0) - safeNum(a.count, 0))
+    .slice(0, limit);
+}
+
 function emptyBucket(label = null) {
   return {
     label,
@@ -109,6 +138,7 @@ function emptyBucket(label = null) {
     topPages: [],
     topCountries: [],
     topReferrers: [],
+    topTypes: [],
   };
 }
 
@@ -116,6 +146,7 @@ function buildBreakdown(entries) {
   const pageMap = new Map();
   const countryMap = new Map();
   const referrerMap = new Map();
+  const typeMap = new Map();
 
   let totalDuration = 0;
 
@@ -127,12 +158,16 @@ function buildBreakdown(entries) {
     pageMap.set(entry.path, (pageMap.get(entry.path) || 0) + 1);
     countryMap.set(entry.country, (countryMap.get(entry.country) || 0) + 1);
     referrerMap.set(entry.referrer, (referrerMap.get(entry.referrer) || 0) + 1);
+    typeMap.set(entry.type, (typeMap.get(entry.type) || 0) + 1);
   }
 
   const sortMap = (map) =>
     Array.from(map.entries())
       .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count);
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return String(a.name).localeCompare(String(b.name));
+      });
 
   return {
     visits: entries.length,
@@ -142,6 +177,7 @@ function buildBreakdown(entries) {
     topPages: sortMap(pageMap).slice(0, 20),
     topCountries: sortMap(countryMap).slice(0, 20),
     topReferrers: sortMap(referrerMap).slice(0, 20),
+    topTypes: sortMap(typeMap).slice(0, 20),
   };
 }
 
@@ -152,10 +188,25 @@ function finalizeBucket(bucket) {
     uniquePages: safeNum(bucket.uniquePages, 0),
     avgDuration: safeNum(bucket.avgDuration, 0),
     totalDuration: safeNum(bucket.totalDuration, 0),
-    topPages: asArray(bucket.topPages),
-    topCountries: asArray(bucket.topCountries),
-    topReferrers: asArray(bucket.topReferrers),
+    topPages: finalizeList(bucket.topPages),
+    topCountries: finalizeList(bucket.topCountries),
+    topReferrers: finalizeList(bucket.topReferrers),
+    topTypes: finalizeList(bucket.topTypes),
   };
+}
+
+function extractEntriesFromSummary(summary) {
+  if (!summary || typeof summary !== "object") return [];
+
+  if (Array.isArray(summary.recentVisits)) return summary.recentVisits;
+  if (Array.isArray(summary.entries)) return summary.entries;
+  if (Array.isArray(summary.visits)) return summary.visits;
+  if (Array.isArray(summary.events)) return summary.events;
+
+  const rawState = getRawState?.();
+  if (Array.isArray(rawState?.visitors)) return rawState.visitors;
+
+  return [];
 }
 
 function buildWrappedAnalytics(entriesInput) {
@@ -266,12 +317,10 @@ function buildWrappedAnalytics(entriesInput) {
     weekly,
     monthly,
     live: {
-      online: entries
-        .filter((entry) => {
-          const d = getEntryTime(entry);
-          return d && Date.now() - d.getTime() <= 5 * 60 * 1000;
-        })
-        .length,
+      online: entries.filter((entry) => {
+        const d = getEntryTime(entry);
+        return d && Date.now() - d.getTime() <= 5 * 60 * 1000;
+      }).length,
       updatedAt: new Date().toISOString(),
     },
   };
@@ -283,13 +332,28 @@ RECORD WEBSITE EVENT
 
 router.post("/event", (req, res) => {
   try {
-    const { path, duration, country, referrer } = req.body || {};
+    const {
+      path,
+      duration,
+      country,
+      referrer,
+      source,
+      type,
+      ip,
+    } = req.body || {};
 
     const entry = recordVisit({
       path,
       duration,
       country,
       referrer,
+      source,
+      type,
+      ip:
+        ip ||
+        req.headers["x-forwarded-for"] ||
+        req.socket?.remoteAddress ||
+        "",
       userAgent: req.headers["user-agent"],
     });
 
@@ -313,14 +377,7 @@ GET WRAPPED SUMMARY
 router.get("/summary", (req, res) => {
   try {
     const summary = getSummary() || {};
-
-    const rawEntries =
-      asArray(summary.entries).length
-        ? asArray(summary.entries)
-        : asArray(summary.visits).length
-          ? asArray(summary.visits)
-          : asArray(summary.events);
-
+    const rawEntries = extractEntriesFromSummary(summary);
     const wrapped = buildWrappedAnalytics(rawEntries);
 
     return res.json({
@@ -349,14 +406,7 @@ Same analytics source, but easier frontend access for:
 router.get("/reports", (req, res) => {
   try {
     const summary = getSummary() || {};
-
-    const rawEntries =
-      asArray(summary.entries).length
-        ? asArray(summary.entries)
-        : asArray(summary.visits).length
-          ? asArray(summary.visits)
-          : asArray(summary.events);
-
+    const rawEntries = extractEntriesFromSummary(summary);
     const wrapped = buildWrappedAnalytics(rawEntries);
 
     return res.json({
@@ -371,6 +421,54 @@ router.get("/reports", (req, res) => {
     return res.status(500).json({
       ok: false,
       error: err.message || "Failed to build analytics reports",
+    });
+  }
+});
+
+/* =========================================================
+RAW STATE
+---------------------------------------------------------
+Helpful for maintenance inspection
+========================================================= */
+
+router.get("/state", (req, res) => {
+  try {
+    const state = getRawState ? getRawState() : { visitors: [] };
+
+    return res.json({
+      ok: true,
+      state,
+      count: Array.isArray(state?.visitors) ? state.visitors.length : 0,
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to read analytics state",
+    });
+  }
+});
+
+/* =========================================================
+MAINTENANCE CLEAR
+---------------------------------------------------------
+Use carefully. Clears website analytics memory/file.
+========================================================= */
+
+router.post("/maintenance/clear", (req, res) => {
+  try {
+    const cleared = clearAnalytics ? clearAnalytics() : { visitors: [] };
+
+    return res.json({
+      ok: true,
+      action: "ANALYTICS_CLEARED",
+      state: cleared,
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to clear analytics state",
     });
   }
 });
