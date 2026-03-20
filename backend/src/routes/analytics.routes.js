@@ -109,7 +109,8 @@ function finalizePeriod(period) {
   return {
     ...period,
     avgPnl: closedTrades > 0 ? safeNum(period.pnl, 0) / closedTrades : 0,
-    winRate: closedTrades > 0 ? (safeNum(period.wins, 0) / closedTrades) * 100 : 0,
+    winRate:
+      closedTrades > 0 ? (safeNum(period.wins, 0) / closedTrades) * 100 : 0,
     profitFactor:
       grossLossPnlAbs > 0
         ? grossWinPnl / grossLossPnlAbs
@@ -129,7 +130,10 @@ function isTradeClosed(trade) {
     return true;
   }
 
-  const action = String(trade.action || trade.type || trade.event || "").toUpperCase();
+  const action = String(
+    trade.action || trade.type || trade.event || ""
+  ).toUpperCase();
+
   if (action.includes("CLOSE") || action.includes("EXIT")) {
     return true;
   }
@@ -194,20 +198,37 @@ function buildTradeHistory(tradesInput, resetsInput = [], loginsInput = []) {
 
     if (!tradeDate) continue;
 
-    const dayKey = `${tradeDate.getFullYear()}-${String(tradeDate.getMonth() + 1).padStart(2, "0")}-${String(tradeDate.getDate()).padStart(2, "0")}`;
-    const monthKey = `${tradeDate.getFullYear()}-${String(tradeDate.getMonth() + 1).padStart(2, "0")}`;
-    const weekBase = startOfWeek(tradeDate);
-    const weekKey = `${weekBase.getFullYear()}-${String(weekBase.getMonth() + 1).padStart(2, "0")}-${String(weekBase.getDate()).padStart(2, "0")}`;
+    const dayKey = `${tradeDate.getFullYear()}-${String(
+      tradeDate.getMonth() + 1
+    ).padStart(2, "0")}-${String(tradeDate.getDate()).padStart(2, "0")}`;
 
-    const dailyBucket = dailyMap.get(dayKey) || { date: dayKey, ...emptyPeriod() };
+    const monthKey = `${tradeDate.getFullYear()}-${String(
+      tradeDate.getMonth() + 1
+    ).padStart(2, "0")}`;
+
+    const weekBase = startOfWeek(tradeDate);
+    const weekKey = `${weekBase.getFullYear()}-${String(
+      weekBase.getMonth() + 1
+    ).padStart(2, "0")}-${String(weekBase.getDate()).padStart(2, "0")}`;
+
+    const dailyBucket = dailyMap.get(dayKey) || {
+      date: dayKey,
+      ...emptyPeriod(),
+    };
     addTradeToBucket(dailyBucket, trade);
     dailyMap.set(dayKey, dailyBucket);
 
-    const weeklyBucket = weeklyMap.get(weekKey) || { date: weekKey, ...emptyPeriod() };
+    const weeklyBucket = weeklyMap.get(weekKey) || {
+      date: weekKey,
+      ...emptyPeriod(),
+    };
     addTradeToBucket(weeklyBucket, trade);
     weeklyMap.set(weekKey, weeklyBucket);
 
-    const monthlyBucket = monthlyMap.get(monthKey) || { date: monthKey, ...emptyPeriod() };
+    const monthlyBucket = monthlyMap.get(monthKey) || {
+      date: monthKey,
+      ...emptyPeriod(),
+    };
     addTradeToBucket(monthlyBucket, trade);
     monthlyMap.set(monthKey, monthlyBucket);
 
@@ -226,6 +247,15 @@ function buildTradeHistory(tradesInput, resetsInput = [], loginsInput = []) {
 
   today.resets = countEventsInRange(resets, todayStart);
   today.logins = countEventsInRange(logins, todayStart);
+
+  week.resets = countEventsInRange(resets, weekStart);
+  week.logins = countEventsInRange(logins, weekStart);
+
+  month.resets = countEventsInRange(resets, monthStart);
+  month.logins = countEventsInRange(logins, monthStart);
+
+  year.resets = countEventsInRange(resets, yearStart);
+  year.logins = countEventsInRange(logins, yearStart);
 
   allTime.resets = resets.length;
   allTime.logins = logins.length;
@@ -261,25 +291,18 @@ Later you should replace these with your real DB/service.
 function getTradingMemory(req) {
   const app = req.app;
 
-  const paperState =
-    app?.locals?.paperState ||
-    global.paperState ||
-    {};
+  const paperState = app?.locals?.paperState || global.paperState || {};
 
   const analyticsStore =
-    app?.locals?.tradingAnalytics ||
-    global.tradingAnalytics ||
-    {};
+    app?.locals?.tradingAnalytics || global.tradingAnalytics || {};
 
-  const tradeArchive =
-    asArray(analyticsStore.tradeArchive).length
-      ? asArray(analyticsStore.tradeArchive)
-      : asArray(paperState.trades);
+  const tradeArchive = asArray(analyticsStore.tradeArchive).length
+    ? asArray(analyticsStore.tradeArchive)
+    : asArray(paperState.trades);
 
-  const decisionArchive =
-    asArray(analyticsStore.decisionArchive).length
-      ? asArray(analyticsStore.decisionArchive)
-      : asArray(paperState.decisions);
+  const decisionArchive = asArray(analyticsStore.decisionArchive).length
+    ? asArray(analyticsStore.decisionArchive)
+    : asArray(paperState.decisions);
 
   const recentResets = asArray(analyticsStore.recentResets);
   const recentLogins = asArray(analyticsStore.recentLogins);
