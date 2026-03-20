@@ -1,21 +1,15 @@
 // ==========================================================
 // FILE: backend/src/server.js
 // MODULE: Core Backend Server
-// VERSION: Production Stable + Real-Time Trade Broadcast +
-//          Wrapped Analytics + Trading Analytics Separation
+// VERSION: Production Stable + Real-Time Trade Broadcast
 // PURPOSE
 // Main backend runtime entry point.
 //
-// FIXED
-// - Real tenant-safe websocket resolution
-// - Stable paper snapshot delivery
-// - Correct BTCUSDT fallback price source
-// - Heartbeat cleanup for dead sockets
-// - Snapshot normalization for frontend persistence
-// - Trading analytics memory route mounted
-// - Wrapped site analytics route mounted
-// - Analytics memory store initialized
-// - Reset events recorded for trading analytics
+// PATCHED
+// - Removed hard dependency on missing ./routes/tradingAnalytics
+// - Kept analytics memory store in place
+// - Kept wrapped analytics route mounted
+// - Preserved paper trading websocket + broadcast flow
 // ==========================================================
 
 require("dotenv").config();
@@ -51,7 +45,6 @@ API ROUTES
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
-const tradingAnalyticsRoutes = require("./routes/tradingAnalytics");
 const analyticsRoutes = require("./routes/analytics.routes");
 
 /* =========================================================
@@ -86,16 +79,6 @@ app.set("trust proxy", 1);
 
 /* =========================================================
 ANALYTICS MEMORY STORE
----------------------------------------------------------
-This keeps platform trading analytics memory available to
-/api/analytics/trading.
-
-IMPORTANT
----------------------------------------------------------
-This is process memory only.
-If the server restarts, this memory resets.
-
-Later, move this to real DB/file persistence.
 ========================================================= */
 
 app.locals.tradingAnalytics = {
@@ -175,17 +158,9 @@ app.use("/api/trading", tradingRoutes);
 
 /* =========================================================
 ANALYTICS API
----------------------------------------------------------
-/api/analytics/trading        -> trading performance memory
-/api/analytics/summary        -> wrapped website analytics
-/api/analytics/reports        -> wrapped website analytics
-/api/analytics/event          -> website event intake
-/api/analytics/state          -> maintenance/raw analytics state
-/api/analytics/maintenance/*  -> maintenance actions
 ========================================================= */
 
 app.use("/api/analytics", analyticsRoutes);
-app.use("/api/analytics", tradingAnalyticsRoutes);
 
 /* =========================================================
 ZERO TRUST LAYER
@@ -396,9 +371,6 @@ function buildPaperSnapshot(tenantId) {
 
 /* =========================================================
 PATCH PAPER RESET TO RECORD ANALYTICS
----------------------------------------------------------
-This keeps trading analytics aware of manual resets without
-having to rewrite paper.routes.js right now.
 ========================================================= */
 
 if (typeof paperTrader.hardReset === "function" && !paperTrader.__analyticsPatched) {
@@ -442,8 +414,6 @@ setInterval(() => {
       }
 
       paperTrader.tick(tenantId, "BTCUSDT", Number(price), Date.now());
-
-      /* keep analytics memory warm */
       syncTenantAnalyticsMemory(tenantId);
     }
   } catch (err) {
