@@ -1,7 +1,11 @@
 // -----------------------------------------------------------
 // FILE: backend/src/services/tradeBrain.js
-// VERSION: v23.0 (Reversal Weakness Brain + Single-Trade Matched)
-// Matched to single-position paperTrader + executionEngine v26
+// VERSION: v24.0 (Maintenance-Safe Reversal Brain + Single-Trade Matched)
+// PURPOSE
+// - Single-position trade brain aligned to strategyEngine
+// - Prefers weak-top / weak-bottom reversal behavior
+// - Safe fallbacks for AI overlay drift
+// - Stable stop / tp forwarding for execution layer
 // -----------------------------------------------------------
 
 const aiBrain = require("../../brain/aiBrain");
@@ -33,8 +37,11 @@ const EDGE_MEMORY_DECAY =
 const MIN_CONFIDENCE_TO_TRADE =
   Number(process.env.TRADE_MIN_CONFIDENCE || 0.58);
 
-const MAX_RISK = 0.06;
-const MIN_RISK = 0.001;
+const MAX_RISK =
+  Number(process.env.TRADE_MAX_RISK || 0.06);
+
+const MIN_RISK =
+  Number(process.env.TRADE_MIN_RISK || 0.001);
 
 const TRADE_COOLDOWN_MS =
   Number(process.env.TRADE_COOLDOWN_MS || 20000);
@@ -69,7 +76,7 @@ const HARD_FAIL_PNL_PCT =
   Number(process.env.TRADE_HARD_FAIL_PNL_PCT || -0.0045);
 
 const SOFT_FAIL_CONFIDENCE =
-  Number(process.env.TRADE_SOFT_FAIL_CONFIDENCE || 0.40);
+  Number(process.env.TRADE_SOFT_FAIL_CONFIDENCE || 0.4);
 
 const EXPLORATION_RATE =
   Number(process.env.TRADE_EXPLORATION_RATE || 0);
@@ -82,8 +89,12 @@ const ACTIONS = new Set(["WAIT", "BUY", "SELL", "CLOSE"]);
 
 const BRAIN_STATE = new Map();
 
+function normalizeTenantKey(tenantId) {
+  return String(tenantId || "__default__");
+}
+
 function getBrainState(tenantId) {
-  const key = tenantId || "__default__";
+  const key = normalizeTenantKey(tenantId);
 
   if (!BRAIN_STATE.has(key)) {
     BRAIN_STATE.set(key, {
@@ -115,12 +126,26 @@ function clamp(n, min, max) {
 
 function avg(nums) {
   if (!Array.isArray(nums) || nums.length === 0) return 0;
-  return nums.reduce((a, b) => a + safeNum(b, 0), 0) / nums.length;
+
+  const valid = nums
+    .map((n) => safeNum(n, NaN))
+    .filter((n) => Number.isFinite(n));
+
+  if (!valid.length) return 0;
+
+  return valid.reduce((a, b) => a + b, 0) / valid.length;
 }
 
 function sum(nums) {
   if (!Array.isArray(nums) || nums.length === 0) return 0;
-  return nums.reduce((a, b) => a + safeNum(b, 0), 0);
+
+  const valid = nums
+    .map((n) => safeNum(n, NaN))
+    .filter((n) => Number.isFinite(n));
+
+  if (!valid.length) return 0;
+
+  return valid.reduce((a, b) => a + b, 0);
 }
 
 function getSingleActivePosition(paper = {}) {
@@ -128,6 +153,11 @@ function getSingleActivePosition(paper = {}) {
   if (paper?.positions?.scalp) return paper.positions.scalp;
   if (paper?.positions?.structure) return paper.positions.structure;
   return null;
+}
+
+function normalizeAction(action) {
+  const value = String(action || "WAIT").toUpperCase();
+  return ACTIONS.has(value) ? value : "WAIT";
 }
 
 /* ================= PRICE MEMORY ================= */
@@ -144,14 +174,19 @@ function updatePriceMemory(brain, price) {
 
 function getRecentPrices(prices, size = REVERSAL_LOOKBACK) {
   if (!Array.isArray(prices)) return [];
-  return prices.slice(-Math.max(3, size));
+  return prices.slice(-Math.max(3, safeNum(size, REVERSAL_LOOKBACK)));
 }
 
 function getMoves(prices) {
   const moves = [];
 
-  for (let i = 1; i < prices.length; i++) {
-    moves.push(safeNum(prices[i], 0) - safeNum(prices[i - 1], 0));
+  for (let i = 1; i < prices.length; i += 1) {
+    const prev = safeNum(prices[i - 1], NaN);
+    const next = safeNum(prices[i], NaN);
+
+    if (Number.isFinite(prev) && Number.isFinite(next)) {
+      moves.push(next - prev);
+    }
   }
 
   return moves;
@@ -161,8 +196,8 @@ function countDirectionalMoves(moves, side, noiseBand = 0) {
   let count = 0;
 
   for (const move of moves) {
-    if (side === "UP" && move > noiseBand) count++;
-    if (side === "DOWN" && move < -noiseBand) count++;
+    if (side === "UP" && move > noiseBand) count += 1;
+    if (side === "DOWN" && move < -noiseBand) count += 1;
   }
 
   return count;
@@ -171,16 +206,16 @@ function countDirectionalMoves(moves, side, noiseBand = 0) {
 function getRunLength(moves, side, noiseBand = 0) {
   let run = 0;
 
-  for (let i = moves.length - 1; i >= 0; i--) {
-    const move = moves[i];
+  for (let i = moves.length - 1; i >= 0; i -= 1) {
+    const move = safeNum(moves[i], 0);
 
     if (side === "UP" && move > noiseBand) {
-      run++;
+      run += 1;
       continue;
     }
 
     if (side === "DOWN" && move < -noiseBand) {
-      run++;
+      run += 1;
       continue;
     }
 
@@ -204,10 +239,10 @@ function getSessionBoost() {
 /* ================= EXECUTION ALPHA ================= */
 
 function detectExecutionAlpha(prices) {
-  if (prices.length < 4) return 1;
+  if (!Array.isArray(prices) || prices.length < 4) return 1;
 
-  const m1 = prices[prices.length - 1] - prices[prices.length - 2];
-  const m2 = prices[prices.length - 2] - prices[prices.length - 3];
+  const m1 = safeNum(prices[prices.length - 1], 0) - safeNum(prices[prices.length - 2], 0);
+  const m2 = safeNum(prices[prices.length - 2], 0) - safeNum(prices[prices.length - 3], 0);
 
   if (Math.abs(m1) > Math.abs(m2) * 1.3) return 1.05;
 
@@ -217,10 +252,10 @@ function detectExecutionAlpha(prices) {
 /* ================= CRASH DETECTION ================= */
 
 function detectCrash(prices) {
-  if (prices.length < 5) return false;
+  if (!Array.isArray(prices) || prices.length < 5) return false;
 
-  const first = prices[prices.length - 5];
-  const last = prices[prices.length - 1];
+  const first = safeNum(prices[prices.length - 5], NaN);
+  const last = safeNum(prices[prices.length - 1], NaN);
 
   if (!Number.isFinite(first) || !Number.isFinite(last) || first <= 0) {
     return false;
@@ -234,14 +269,16 @@ function detectCrash(prices) {
 
 function getOpenPnlPct(position, price) {
   if (!position || !Number.isFinite(price) || price <= 0) return 0;
-  if (!Number.isFinite(position.entry) || position.entry <= 0) return 0;
+
+  const entry = safeNum(position.entry, NaN);
+  if (!Number.isFinite(entry) || entry <= 0) return 0;
 
   if (position.side === "LONG") {
-    return (price - position.entry) / position.entry;
+    return (price - entry) / entry;
   }
 
   if (position.side === "SHORT") {
-    return (position.entry - price) / position.entry;
+    return (entry - price) / entry;
   }
 
   return 0;
@@ -270,9 +307,11 @@ function analyzeReversal(prices, volatility = 0) {
   }
 
   const moves = getMoves(recent);
+  const lastPrice = safeNum(recent[recent.length - 1], 0);
+
   const noiseBand = Math.max(
-    safeNum(recent[recent.length - 1], 0) * NOISE_BAND_PCT,
-    safeNum(recent[recent.length - 1], 0) * volatility * 0.05,
+    lastPrice * NOISE_BAND_PCT,
+    lastPrice * safeNum(volatility, 0) * 0.05,
     0
   );
 
@@ -284,22 +323,20 @@ function analyzeReversal(prices, volatility = 0) {
 
   const high = Math.max(...recent);
   const low = Math.min(...recent);
-  const last = recent[recent.length - 1];
-  const prev = recent[recent.length - 2];
+  const last = safeNum(recent[recent.length - 1], 0);
+  const prev = safeNum(recent[recent.length - 2], last);
   const range = Math.max(high - low, last * 0.0005);
 
-  const nearHigh = high > 0
-    ? ((high - last) / high) <= EXTREME_NEARNESS_PCT
-    : false;
+  const nearHigh =
+    high > 0 ? (high - last) / high <= EXTREME_NEARNESS_PCT : false;
 
-  const nearLow = low > 0
-    ? ((last - low) / low) <= EXTREME_NEARNESS_PCT
-    : false;
+  const nearLow =
+    low > 0 ? (last - low) / low <= EXTREME_NEARNESS_PCT : false;
 
+  const last2 = moves.slice(-ENTRY_CONFIRM_BARS);
   const last3 = moves.slice(-3);
-  const last2 = moves.slice(-2);
-
   const prior3 = moves.slice(-6, -3);
+
   const recentUpEnergy = sum(last3.filter((x) => x > 0));
   const recentDownEnergyAbs = Math.abs(sum(last3.filter((x) => x < 0)));
 
@@ -326,11 +363,8 @@ function analyzeReversal(prices, volatility = 0) {
     last2.length >= ENTRY_CONFIRM_BARS &&
     last2.every((m) => m > noiseBand);
 
-  const rejectionDown =
-    safeNum(last - prev, 0) < -noiseBand;
-
-  const rejectionUp =
-    safeNum(last - prev, 0) > noiseBand;
+  const rejectionDown = last - prev < -noiseBand;
+  const rejectionUp = last - prev > noiseBand;
 
   const topWeakening =
     nearHigh &&
@@ -430,7 +464,8 @@ function shouldForceCloseOpenTrade({
 }) {
   if (!position) return false;
 
-  const openMs = now - safeNum(position.time, now);
+  const openedAt = safeNum(position.time, now);
+  const openMs = now - openedAt;
   const pnlPct = getOpenPnlPct(position, price);
 
   if (pnlPct <= HARD_FAIL_PNL_PCT) {
@@ -477,11 +512,10 @@ function riskGovernor({
   volatility,
   prices,
 }) {
-  const equity =
-    safeNum(
-      paper.equity,
-      safeNum(paper.cashBalance, 0)
-    );
+  const equity = safeNum(
+    paper?.equity,
+    safeNum(paper?.cashBalance, 0)
+  );
 
   if (!brain.peakEquity) {
     brain.peakEquity = equity;
@@ -498,7 +532,7 @@ function riskGovernor({
 
   if (drawdown > MAX_DRAWDOWN) return "DRAWDOWN_LIMIT";
   if (brain.lossStreak >= MAX_LOSS_STREAK) return "LOSS_STREAK";
-  if (volatility > VOLATILITY_SHUTDOWN) return "VOLATILITY_SPIKE";
+  if (safeNum(volatility, 0) > VOLATILITY_SHUTDOWN) return "VOLATILITY_SPIKE";
   if (detectCrash(prices)) return "CRASH_DETECTED";
 
   if (safeNum(paper?.limits?.tradesToday, 0) >= MAX_TRADES_PER_DAY) {
@@ -506,6 +540,30 @@ function riskGovernor({
   }
 
   return null;
+}
+
+/* ================= AI OVERLAY ================= */
+
+function getAiOverlay({ tenantId, symbol, last, paper }) {
+  try {
+    if (typeof aiBrain?.decide !== "function") {
+      return { confidence: 0, edge: 0 };
+    }
+
+    const ai = aiBrain.decide({
+      tenantId,
+      symbol,
+      last,
+      paper,
+    }) || {};
+
+    return {
+      confidence: safeNum(ai.confidence, 0),
+      edge: safeNum(ai.edge, 0),
+    };
+  } catch {
+    return { confidence: 0, edge: 0 };
+  }
 }
 
 /* ================= DECISION ================= */
@@ -522,10 +580,34 @@ function makeDecision(context = {}) {
   const price = safeNum(last, NaN);
   const now = Date.now();
 
+  if (!Number.isFinite(price) || price <= 0) {
+    return {
+      symbol,
+      action: "WAIT",
+      confidence: 0,
+      edge: 0,
+      riskPct: 0,
+      reason: "INVALID_PRICE",
+      stopLoss: null,
+      takeProfit: null,
+      reversal: {
+        bias: "NONE",
+        confidence: 0,
+        nearHigh: false,
+        nearLow: false,
+        topWeakening: false,
+        bottomWeakening: false,
+        reversalUpScore: 0,
+        reversalDownScore: 0,
+      },
+      ts: now,
+    };
+  }
+
   updatePriceMemory(brain, price);
 
   const prices = brain.priceMemory;
-  const volatility = safeNum(paper.volatility, 0);
+  const volatility = safeNum(paper?.volatility, 0);
   const activePosition = getSingleActivePosition(paper);
 
   const riskStop = riskGovernor({
@@ -543,6 +625,18 @@ function makeDecision(context = {}) {
       edge: 0,
       riskPct: 0,
       reason: riskStop,
+      stopLoss: null,
+      takeProfit: null,
+      reversal: {
+        bias: "NONE",
+        confidence: 0,
+        nearHigh: false,
+        nearLow: false,
+        topWeakening: false,
+        bottomWeakening: false,
+        reversalUpScore: 0,
+        reversalDownScore: 0,
+      },
       ts: now,
     };
   }
@@ -555,7 +649,7 @@ function makeDecision(context = {}) {
         tenantId,
         symbol,
         price,
-        lastPrice: paper.lastPrice,
+        lastPrice: paper?.lastPrice,
         volatility,
         paperState: paper,
       }) || {};
@@ -567,10 +661,16 @@ function makeDecision(context = {}) {
   brain.lastReversalBias = reversal.bias;
 
   let action = "WAIT";
-  let confidence = safeNum(strategy.confidence, 0.25);
-  let edge = safeNum(strategy.edge, 0);
-  let riskPct = safeNum(strategy.riskPct, 0.01);
+  let confidence = safeNum(strategy?.confidence, 0.25);
+  let edge = safeNum(strategy?.edge, 0);
+  let riskPct = safeNum(strategy?.riskPct, 0.01);
   let reason = reversal.reason || "WAIT";
+
+  let stopLoss =
+    Number.isFinite(strategy?.stopLoss) ? Number(strategy.stopLoss) : null;
+
+  let takeProfit =
+    Number.isFinite(strategy?.takeProfit) ? Number(strategy.takeProfit) : null;
 
   if (reversal.bias === "SHORT") {
     action = "SELL";
@@ -583,58 +683,46 @@ function makeDecision(context = {}) {
     edge = Math.max(edge, safeNum(reversal.edge, MIN_MOMENTUM_EDGE));
     reason = reversal.reason;
   } else {
-    action = strategy.action || "WAIT";
-    reason = strategy.reason || reason;
-  }
-
-  if (!ACTIONS.has(action)) {
-    action = "WAIT";
+    action = normalizeAction(strategy?.action || "WAIT");
+    reason = strategy?.reason || reason;
   }
 
   if (Math.abs(edge) < MIN_MOMENTUM_EDGE && (action === "BUY" || action === "SELL")) {
     action = "WAIT";
   }
 
-  /* ================= AI OVERLAY ================= */
+  const aiOverlay = getAiOverlay({
+    tenantId,
+    symbol,
+    last,
+    paper,
+  });
 
-  try {
-    const ai =
-      aiBrain.decide({
-        tenantId,
-        symbol,
-        last,
-        paper,
-      }) || {};
+  confidence = clamp(
+    confidence * 0.78 + aiOverlay.confidence * 0.22,
+    0,
+    1
+  );
 
-    const aiConfidence = safeNum(ai.confidence, 0);
-    const aiEdge = safeNum(ai.edge, 0);
-
-    confidence = clamp(
-      (confidence * 0.78) + (aiConfidence * 0.22),
-      0,
+  if (action === "BUY") {
+    edge = clamp(
+      Math.max(edge, edge * 0.82 + aiOverlay.edge * 0.18),
+      -1,
       1
     );
-
-    if (action === "BUY") {
-      edge = clamp(
-        Math.max(edge, (edge * 0.82) + (aiEdge * 0.18)),
-        -1,
-        1
-      );
-    } else if (action === "SELL") {
-      edge = clamp(
-        Math.min(edge, (edge * 0.82) + (aiEdge * 0.18)),
-        -1,
-        1
-      );
-    } else {
-      edge = clamp(
-        (edge * 0.78) + (aiEdge * 0.22),
-        -1,
-        1
-      );
-    }
-  } catch {}
+  } else if (action === "SELL") {
+    edge = clamp(
+      Math.min(edge, edge * 0.82 + aiOverlay.edge * 0.18),
+      -1,
+      1
+    );
+  } else {
+    edge = clamp(
+      edge * 0.78 + aiOverlay.edge * 0.22,
+      -1,
+      1
+    );
+  }
 
   confidence *= getSessionBoost();
   confidence *= detectExecutionAlpha(prices);
@@ -660,12 +748,11 @@ function makeDecision(context = {}) {
 
   if (
     (action === "BUY" || action === "SELL") &&
+    reversal.bias !== "NONE" &&
     confidence < MIN_REVERSAL_CONFIDENCE
   ) {
     action = "WAIT";
   }
-
-  /* ================= OPTIONAL EXPLORATION ================= */
 
   if (
     !activePosition &&
@@ -680,19 +767,15 @@ function makeDecision(context = {}) {
     reason = "EXPLORATION_ENTRY";
   }
 
-  /* ================= RISK SCALING ================= */
-
-  if (confidence > 0.90) riskPct *= 1.55;
-  else if (confidence > 0.80) riskPct *= 1.2;
-  else if (confidence < 0.50) riskPct *= 0.5;
+  if (confidence > 0.9) riskPct *= 1.55;
+  else if (confidence > 0.8) riskPct *= 1.2;
+  else if (confidence < 0.5) riskPct *= 0.5;
 
   if (reversal.bias !== "NONE") {
     riskPct *= 1.1;
   }
 
   riskPct = clamp(riskPct, MIN_RISK, MAX_RISK);
-
-  /* ================= SINGLE-TRADE ENFORCEMENT ================= */
 
   if (activePosition) {
     if (action === "BUY" || action === "SELL") {
@@ -711,9 +794,13 @@ function makeDecision(context = {}) {
     ) {
       action = "CLOSE";
       riskPct = 0;
+      stopLoss = null;
+      takeProfit = null;
       reason = "REVERSAL_FAILED_OR_SIGNAL_FLIPPED";
     } else if (action !== "CLOSE") {
       action = "WAIT";
+      stopLoss = null;
+      takeProfit = null;
     }
   } else {
     if (action === "CLOSE") {
@@ -723,41 +810,43 @@ function makeDecision(context = {}) {
     if (now - safeNum(brain.lastTradeTime, 0) < TRADE_COOLDOWN_MS) {
       if (action === "BUY" || action === "SELL") {
         action = "WAIT";
+        stopLoss = null;
+        takeProfit = null;
       }
     }
   }
 
-  /* ================= AUTO STOP / TP PLANNING ================= */
-
-  let stopLoss;
-  let takeProfit;
-
   if (!activePosition && (action === "BUY" || action === "SELL") && price > 0) {
-    const stopDistancePct = clamp(
-      Math.max(
-        volatility * 1.35,
-        NOISE_BAND_PCT * 3,
-        0.0016
-      ),
-      0.0016,
-      0.0085
-    );
+    if (!Number.isFinite(stopLoss) || !Number.isFinite(takeProfit)) {
+      const stopDistancePct = clamp(
+        Math.max(
+          volatility * 1.35,
+          NOISE_BAND_PCT * 3,
+          0.0016
+        ),
+        0.0016,
+        0.0085
+      );
 
-    const tpDistancePct = clamp(
-      stopDistancePct * 1.6,
-      0.0024,
-      0.014
-    );
+      const tpDistancePct = clamp(
+        stopDistancePct * 1.6,
+        0.0024,
+        0.014
+      );
 
-    if (action === "BUY") {
-      stopLoss = price * (1 - stopDistancePct);
-      takeProfit = price * (1 + tpDistancePct);
+      if (action === "BUY") {
+        stopLoss = price * (1 - stopDistancePct);
+        takeProfit = price * (1 + tpDistancePct);
+      }
+
+      if (action === "SELL") {
+        stopLoss = price * (1 + stopDistancePct);
+        takeProfit = price * (1 - tpDistancePct);
+      }
     }
-
-    if (action === "SELL") {
-      stopLoss = price * (1 + stopDistancePct);
-      takeProfit = price * (1 - tpDistancePct);
-    }
+  } else if (action !== "BUY" && action !== "SELL") {
+    stopLoss = null;
+    takeProfit = null;
   }
 
   if (action === "BUY" || action === "SELL") {
@@ -773,8 +862,8 @@ function makeDecision(context = {}) {
     confidence,
     edge,
     riskPct,
-    stopLoss,
-    takeProfit,
+    stopLoss: Number.isFinite(stopLoss) ? stopLoss : null,
+    takeProfit: Number.isFinite(takeProfit) ? takeProfit : null,
     reason,
     reversal: {
       bias: reversal.bias,
@@ -806,7 +895,13 @@ function recordTradeOutcome({
 }
 
 function resetTenant(tenantId) {
-  BRAIN_STATE.delete(tenantId);
+  const key = normalizeTenantKey(tenantId);
+  BRAIN_STATE.delete(key);
+
+  return {
+    ok: true,
+    tenantId: key,
+  };
 }
 
 module.exports = {
