@@ -11,6 +11,8 @@
 // - Correct BTCUSDT fallback price source
 // - Heartbeat cleanup for dead sockets
 // - Snapshot normalization for frontend persistence
+// - Trading analytics memory route mounted
+// - Analytics memory store initialized
 // ==========================================================
 
 require("dotenv").config();
@@ -46,6 +48,7 @@ API ROUTES
 const paperRoutes = require("./routes/paper.routes");
 const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
+const tradingAnalyticsRoutes = require("./routes/tradingAnalytics");
 
 /* =========================================================
 SAFE BOOT CHECK
@@ -76,6 +79,29 @@ EXPRESS SERVER
 
 const app = express();
 app.set("trust proxy", 1);
+
+/* =========================================================
+ANALYTICS MEMORY STORE
+---------------------------------------------------------
+This keeps platform trading analytics memory available to
+/api/analytics/trading.
+
+IMPORTANT
+---------------------------------------------------------
+This is process memory only.
+If the server restarts, this memory resets.
+
+Later, move this to real DB/file persistence.
+========================================================= */
+
+app.locals.tradingAnalytics = {
+  tradeArchive: [],
+  decisionArchive: [],
+  recentResets: [],
+  recentLogins: [],
+};
+
+global.tradingAnalytics = app.locals.tradingAnalytics;
 
 /* =========================================================
 STRIPE WEBHOOK
@@ -142,6 +168,7 @@ app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
 app.use("/api/ai", tradingRoutes);
 app.use("/api/trading", tradingRoutes);
+app.use("/api/analytics", tradingAnalyticsRoutes);
 
 /* =========================================================
 ZERO TRUST LAYER
@@ -154,6 +181,7 @@ app.use("/api", (req, res, next) => {
     req.path.startsWith("/paper") ||
     req.path.startsWith("/trading") ||
     req.path.startsWith("/ai") ||
+    req.path.startsWith("/analytics") ||
     req.path.startsWith("/admin")
   ) {
     return next();
@@ -214,6 +242,97 @@ function bootTenants() {
 bootTenants();
 
 /* =========================================================
+ANALYTICS HELPERS
+========================================================= */
+
+function safeNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getAnalyticsStore() {
+  return app.locals.tradingAnalytics;
+}
+
+function appendUniqueByKey(list, item, keyBuilder, max = 1000) {
+  if (!Array.isArray(list) || !item) return list;
+
+  const nextKey = keyBuilder(item);
+
+  const exists = list.some((entry) => keyBuilder(entry) === nextKey);
+  if (!exists) {
+    list.push(item);
+  }
+
+  if (list.length > max) {
+    list.splice(0, list.length - max);
+  }
+
+  return list;
+}
+
+function tradeKey(trade) {
+  return [
+    trade?.time ?? trade?.createdAt ?? "na",
+    trade?.symbol ?? "na",
+    trade?.slot ?? "na",
+    trade?.side ?? "na",
+    trade?.price ?? trade?.entry ?? "na",
+    trade?.qty ?? "na",
+    trade?.pnl ?? "na",
+  ].join("|");
+}
+
+function decisionKey(decision) {
+  return [
+    decision?.time ?? decision?.createdAt ?? "na",
+    decision?.symbol ?? "na",
+    decision?.slot ?? "na",
+    decision?.mode ?? "na",
+    decision?.action ?? "na",
+    decision?.reason ?? "na",
+  ].join("|");
+}
+
+function syncTenantAnalyticsMemory(tenantId) {
+  try {
+    const store = getAnalyticsStore();
+
+    const snap = paperTrader.snapshot(tenantId) || {};
+    const decisions = paperTrader.getDecisions(tenantId) || [];
+    const trades = Array.isArray(snap?.trades) ? snap.trades : [];
+
+    for (const trade of trades) {
+      appendUniqueByKey(store.tradeArchive, trade, tradeKey, 5000);
+    }
+
+    for (const decision of decisions) {
+      appendUniqueByKey(store.decisionArchive, decision, decisionKey, 3000);
+    }
+  } catch {}
+}
+
+function recordLoginEvent(user, tenantId) {
+  try {
+    const store = getAnalyticsStore();
+
+    store.recentLogins.push({
+      type: "login",
+      label: "User login",
+      userId: String(user?.id || ""),
+      email: user?.email || null,
+      role: user?.role || null,
+      tenantId: String(tenantId || user?.companyId || user?.id || ""),
+      time: new Date().toISOString(),
+    });
+
+    if (store.recentLogins.length > 1000) {
+      store.recentLogins.splice(0, store.recentLogins.length - 1000);
+    }
+  } catch {}
+}
+
+/* =========================================================
 SNAPSHOT NORMALIZER
 ========================================================= */
 
@@ -231,7 +350,7 @@ function buildPaperSnapshot(tenantId) {
     ...base,
     decisions,
     totalCapital: cashBalance + lockedCapital,
-    equity: cashBalance,
+    equity: safeNum(base?.equity, cashBalance),
     availableCapital,
     lockedCapital,
     lastPrice:
@@ -271,6 +390,9 @@ setInterval(() => {
       }
 
       paperTrader.tick(tenantId, "BTCUSDT", Number(price), Date.now());
+
+      /* keep analytics memory warm */
+      syncTenantAnalyticsMemory(tenantId);
     }
   } catch (err) {
     console.error("AI engine error:", err.message);
@@ -292,6 +414,15 @@ REAL TIME TRADE BROADCAST
 
 function broadcastTrade(trade, tenantId) {
   const normalizedTenantId = String(tenantId);
+
+  try {
+    appendUniqueByKey(
+      getAnalyticsStore().tradeArchive,
+      trade,
+      tradeKey,
+      5000
+    );
+  } catch {}
 
   wss.clients.forEach((ws) => {
     if (ws.channel !== "paper") return;
@@ -389,6 +520,11 @@ wss.on("connection", (ws, req) => {
 
     marketEngine.registerTenant(ws.tenantId);
 
+    if (channel === "paper") {
+      recordLoginEvent(user, tenantId);
+      syncTenantAnalyticsMemory(tenantId);
+    }
+
     ws.on("pong", () => {
       ws.isAlive = true;
     });
@@ -464,6 +600,8 @@ setInterval(() => {
     try {
       const snapshot = buildPaperSnapshot(ws.tenantId);
       const stats = snapshot?.executionStats || {};
+
+      syncTenantAnalyticsMemory(ws.tenantId);
 
       const metrics = {
         aiPerMin: Number(stats.decisions || 0),
