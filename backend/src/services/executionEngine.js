@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v26.0 (Deterministic + Risk-Based + Realistic Fills)
+// VERSION: v26.1 (Deterministic + Risk-Based + Realistic Fills + Fixed Closed Trade Shape)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -79,8 +79,6 @@ function ensurePositionsShape(state) {
     state.positions.scalp = null;
   }
 
-  // backward compatibility:
-  // if legacy state.position exists, move it into scalp if both empty
   if (
     state.position &&
     !state.positions.structure &&
@@ -279,10 +277,6 @@ function applyRealizedPnl(state, pnl, fees = 0) {
 
 /* =========================================================
 RISK CONFIGURATION
-Synthetic margin model:
-- LONG and SHORT both reserve notional capital in paper mode
-- capitalUsed represents reserved margin/notional budget
-- this keeps ledger deterministic and capital-constrained
 ========================================================= */
 
 const MAX_EQUITY_EXPOSURE = 0.03;
@@ -303,9 +297,9 @@ const PYRAMID_SIZE_FACTOR = 0.35;
 EXECUTION REALISM
 ========================================================= */
 
-const DEFAULT_FEES_BPS = 5;      // 0.05%
-const DEFAULT_SLIPPAGE_BPS = 3;  // 0.03%
-const DEFAULT_SPREAD_BPS = 2;    // 0.02%
+const DEFAULT_FEES_BPS = 5;
+const DEFAULT_SLIPPAGE_BPS = 3;
+const DEFAULT_SPREAD_BPS = 2;
 
 function getExecutionConfig(state, symbol) {
   const globalConfig = state?.executionConfig || {};
@@ -368,7 +362,6 @@ function calculateFee({
 
 /* =========================================================
 EXECUTION COOLDOWN
-FIX: Use event time, not wall clock
 ========================================================= */
 
 const EXECUTION_COOLDOWN_MS = 400;
@@ -399,7 +392,6 @@ function isCoolingDown(tenantId, symbol, slot, eventTs) {
 
 /* =========================================================
 POSITION SIZE
-FIX: Use stop distance when stopLoss is provided
 ========================================================= */
 
 function calculatePositionSize(
@@ -445,7 +437,6 @@ function calculatePositionSize(
     safeNum(state.availableCapital, 0)
   );
 
-  // Risk sizing by stop distance when SL is valid
   if (Number.isFinite(stopLoss) && stopLoss > 0) {
     const perUnitRisk = Math.abs(price - stopLoss);
     if (perUnitRisk > 0) {
@@ -570,8 +561,6 @@ function openPosition({
     takeProfit: safeNum(takeProfit, NaN),
   });
 
-  // Synthetic margin model:
-  // reserve notional + pay fee from available capital immediately
   state.availableCapital = roundMoney(state.availableCapital - totalRequired);
   state.lockedCapital = roundMoney(state.lockedCapital + reservedNotional);
   state.cashBalance = roundMoney(state.cashBalance - openFee);
@@ -595,7 +584,10 @@ function openPosition({
   setPosition(state, normalizedSlot, position);
 
   const trade = {
+    event: "OPEN",
+    status: "OPEN",
     side,
+    direction: side,
     slot: normalizedSlot,
     symbol,
     entry: price,
@@ -603,14 +595,18 @@ function openPosition({
     qty,
     capitalUsed: reservedNotional,
     fee: openFee,
+    openFee,
+    closeFee: 0,
     stopLoss: position.stopLoss,
     takeProfit: position.takeProfit,
     pnl: 0,
+    grossPnl: 0,
+    realized: false,
     time: ts,
+    openedAt: ts,
   };
 
   state.trades.push(trade);
-  applyRealizedPnl(state, 0, openFee);
   syncAccountState(state, { [symbol]: price });
 
   return {
@@ -686,7 +682,11 @@ function addToPosition({
   state.cashBalance = roundMoney(state.cashBalance - addFee);
 
   const trade = {
-    side: "ADD",
+    event: "ADD",
+    status: "OPEN",
+    side: pos.side,
+    direction: pos.side,
+    action: "ADD",
     slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
@@ -694,11 +694,16 @@ function addToPosition({
     qty,
     capitalUsed: reservedNotional,
     fee: addFee,
+    openFee: addFee,
+    closeFee: 0,
+    pnl: 0,
+    grossPnl: 0,
+    realized: false,
     time: ts,
+    openedAt: ts,
   };
 
   state.trades.push(trade);
-  applyRealizedPnl(state, 0, addFee);
   syncAccountState(state, { [symbol]: price });
 
   return {
@@ -762,11 +767,11 @@ function partialClosePosition({
     state,
   });
 
-  const pnl = roundMoney(grossPnl - closeFee);
+  const pnl = roundMoney(grossPnl - closeFee - allocatedOpenFee);
 
   state.lockedCapital = roundMoney(state.lockedCapital - releasedCost);
-  state.availableCapital = roundMoney(state.availableCapital + releasedCost + pnl);
-  state.cashBalance = roundMoney(state.cashBalance - closeFee + grossPnl);
+  state.availableCapital = roundMoney(state.availableCapital + releasedCost + grossPnl - closeFee);
+  state.cashBalance = roundMoney(state.cashBalance + grossPnl - closeFee);
 
   pos.qty = roundQty(originalQty - qtyClose);
   pos.capitalUsed = roundMoney(Math.max(0, pos.capitalUsed - releasedCost));
@@ -774,17 +779,31 @@ function partialClosePosition({
   pos.peakProfit = 0;
 
   const trade = {
-    side: reason,
+    event: "CLOSE",
+    status: pnl < 0 ? "LOSS" : pnl > 0 ? "WIN" : "FLAT",
+    side: pos.side,
+    direction: pos.side,
+    action: "PARTIAL_CLOSE",
+    closeReason: reason,
     slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
     price,
+    exit: price,
     qty: qtyClose,
     grossPnl: roundMoney(grossPnl),
-    fee: closeFee,
+    fee: roundMoney(closeFee + allocatedOpenFee),
+    openFee: allocatedOpenFee,
+    closeFee,
     pnl,
+    realized: true,
     closePct: effectiveClosePct,
     time: ts,
+    openedAt: pos.time,
+    closedAt: ts,
+    duration: ts - pos.time,
+    stopLoss: pos.stopLoss,
+    takeProfit: pos.takeProfit,
   };
 
   state.trades.push(trade);
@@ -849,6 +868,8 @@ function closePosition({
     grossPnl = (pos.entry - price) * pos.qty;
   }
 
+  const allocatedOpenFee = roundMoney(safeNum(pos.openFee, 0));
+
   const closeNotional = roundMoney(pos.qty * price);
   const closeFee = calculateFee({
     symbol,
@@ -856,28 +877,39 @@ function closePosition({
     state,
   });
 
-  const pnl = roundMoney(grossPnl - closeFee);
-  const capitalReturn = roundMoney(pos.capitalUsed + pnl);
+  const pnl = roundMoney(grossPnl - closeFee - allocatedOpenFee);
+  const capitalReturn = roundMoney(pos.capitalUsed + grossPnl - closeFee);
 
   state.lockedCapital = roundMoney(state.lockedCapital - pos.capitalUsed);
   state.availableCapital = roundMoney(state.availableCapital + capitalReturn);
-  state.cashBalance = roundMoney(state.cashBalance - closeFee + grossPnl);
+  state.cashBalance = roundMoney(state.cashBalance + grossPnl - closeFee);
 
   const trade = {
-    side: reason,
+    event: "CLOSE",
+    status: pnl < 0 ? "LOSS" : pnl > 0 ? "WIN" : "FLAT",
+    side: pos.side,
+    direction: pos.side,
+    action: "CLOSE",
+    closeReason: reason,
     slot: normalizedSlot,
     symbol: pos.symbol,
     entry: pos.entry,
     price,
+    exit: price,
     qty: pos.qty,
     grossPnl: roundMoney(grossPnl),
-    fee: closeFee,
+    fee: roundMoney(closeFee + allocatedOpenFee),
+    openFee: allocatedOpenFee,
+    closeFee,
     pnl,
+    realized: true,
     duration: ts - pos.time,
     pyramids: safeNum(pos.pyramidCount, 0),
     stopLoss: pos.stopLoss,
     takeProfit: pos.takeProfit,
     time: ts,
+    openedAt: pos.time,
+    closedAt: ts,
   };
 
   state.trades.push(trade);
@@ -908,7 +940,6 @@ function closePosition({
 
 /* =========================================================
 TRIGGER CHECKS
-FIX: Can close multiple slots in same tick
 ========================================================= */
 
 function evaluateProtectiveExit({
@@ -1015,8 +1046,6 @@ function executePaperOrder({
   );
   state.lastConfidence = boundedConfidence;
 
-  // Protective exits should use executable exit prices,
-  // not idealized raw price.
   const worstCaseExitPriceForLong = applyExecutionPriceModel({
     symbol,
     rawPrice,
@@ -1278,7 +1307,6 @@ function executePaperOrder({
 
 /* =========================================================
 LIVE EXECUTION
-Still a stub. Keeps interface, adds safer request behavior.
 ========================================================= */
 
 async function executeLiveOrder({
