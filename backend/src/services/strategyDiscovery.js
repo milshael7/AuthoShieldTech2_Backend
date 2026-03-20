@@ -1,16 +1,17 @@
 // ==========================================================
 // FILE: backend/src/services/strategyDiscovery.js
-// VERSION: v2.0 (Maintenance-Safe Discovery + Weakness-Aligned)
+// VERSION: v2.1 (Maintenance-Safe Discovery + Weakness-Aligned)
 // PURPOSE
 // Discover candidate strategy profiles, validate them on replay,
 // and keep the output aligned with the live execution model.
 //
 // FIXES
-// - No more random-only blind discovery
-// - Scores strategies against your actual weak-top / weak-bottom idea
-// - Safe fallbacks if training/replay engines drift
-// - Maintenance-friendly helpers and normalized outputs
-// - Produces build-ready strategy profile objects for later use
+// - Fixed mutable style assignment bug
+// - Added stronger input guards and normalization
+// - Prevented invalid numeric drift from env/config
+// - Hardened weak-top / weak-bottom signal checks
+// - Normalized training response shape
+// - Maintenance-friendly exports and helper flow
 // ==========================================================
 
 const trainingEngine = require("./trainingEngine");
@@ -21,6 +22,7 @@ CONFIG
 ========================================================= */
 
 const DEFAULT_SYMBOL = "BTCUSDT";
+
 const DEFAULT_DISCOVERY_VARIANTS = Number(
   process.env.STRATEGY_DISCOVERY_VARIANTS || 24
 );
@@ -73,6 +75,9 @@ function asArray(v) {
 function randomBetween(min, max) {
   const a = safeNum(min, 0);
   const b = safeNum(max, a);
+
+  if (b <= a) return a;
+
   return Math.random() * (b - a) + a;
 }
 
@@ -86,27 +91,51 @@ function round(v, digits = 6) {
   return Number(safeNum(v, 0).toFixed(digits));
 }
 
+function normalizeSymbol(symbol) {
+  const value = String(symbol || DEFAULT_SYMBOL).trim().toUpperCase();
+  return value || DEFAULT_SYMBOL;
+}
+
 function normalizeCandle(candle = {}) {
   const open = safeNum(candle.open, safeNum(candle.o, 0));
-  const high = safeNum(candle.high, safeNum(candle.h, open));
-  const low = safeNum(candle.low, safeNum(candle.l, open));
   const close = safeNum(candle.close, safeNum(candle.c, open));
+
+  const rawHigh = safeNum(candle.high, safeNum(candle.h, Math.max(open, close)));
+  const rawLow = safeNum(candle.low, safeNum(candle.l, Math.min(open, close)));
+
+  const high = Math.max(rawHigh, open, close);
+  const low = Math.min(rawLow, open, close);
+
   const volume = safeNum(candle.volume, safeNum(candle.v, 0));
+
   const time =
     candle.time ??
     candle.ts ??
     candle.timestamp ??
     candle.openTime ??
+    candle.closeTime ??
     Date.now();
 
   return {
     open,
-    high: Math.max(high, open, close),
-    low: Math.min(low, open, close),
+    high,
+    low,
     close,
     volume,
     time,
   };
+}
+
+function isValidCandle(candle) {
+  return (
+    candle &&
+    Number.isFinite(candle.open) &&
+    Number.isFinite(candle.high) &&
+    Number.isFinite(candle.low) &&
+    Number.isFinite(candle.close) &&
+    candle.close > 0 &&
+    candle.high >= candle.low
+  );
 }
 
 function getCandleClose(candle) {
@@ -116,7 +145,9 @@ function getCandleClose(candle) {
 function getCandlesSafe(symbol) {
   try {
     const raw = replayEngine?.replayCandles?.({ symbol });
-    return asArray(raw).map(normalizeCandle).filter((c) => c.close > 0);
+    return asArray(raw)
+      .map(normalizeCandle)
+      .filter(isValidCandle);
   } catch {
     return [];
   }
@@ -125,25 +156,41 @@ function getCandlesSafe(symbol) {
 /* =========================================================
 WEAKNESS / REVERSAL DISCOVERY MODEL
 ---------------------------------------------------------
-This tries to match what you described:
+This tries to match your idea:
 - market pushes up, gets weaker at the top -> look for SELL
 - market pushes down, gets weaker at the bottom -> look for BUY
-- we do not want random mid-move chasing
+- avoid random mid-move chasing
 ========================================================= */
 
 function isRising(seq) {
   if (seq.length < 3) return false;
+
   for (let i = 1; i < seq.length; i += 1) {
-    if (!(seq[i] >= seq[i - 1])) return false;
+    if (!Number.isFinite(seq[i]) || !Number.isFinite(seq[i - 1])) {
+      return false;
+    }
+
+    if (seq[i] < seq[i - 1]) {
+      return false;
+    }
   }
+
   return true;
 }
 
 function isFalling(seq) {
   if (seq.length < 3) return false;
+
   for (let i = 1; i < seq.length; i += 1) {
-    if (!(seq[i] <= seq[i - 1])) return false;
+    if (!Number.isFinite(seq[i]) || !Number.isFinite(seq[i - 1])) {
+      return false;
+    }
+
+    if (seq[i] > seq[i - 1]) {
+      return false;
+    }
   }
+
   return true;
 }
 
@@ -158,13 +205,16 @@ function detectWeakTop(prices) {
   const f = prices[prices.length - 1];
 
   const leadIn = [a, b, c, d];
-  const topZone = [d, e, f];
-
   const risingIntoTop = isRising(leadIn);
+
+  const move1 = d - c;
+  const move2 = e - d;
+  const move3 = f - e;
+
   const losingMomentum =
-    (d - c) >= 0 &&
-    (e - d) <= (d - c) &&
-    (f - e) <= (e - d);
+    move1 >= 0 &&
+    move2 <= move1 &&
+    move3 <= move2;
 
   const rollover = f < e || (f <= e && e <= d);
   const localPeak = d >= c && d >= e;
@@ -192,13 +242,16 @@ function detectWeakBottom(prices) {
   const f = prices[prices.length - 1];
 
   const leadIn = [a, b, c, d];
-  const bottomZone = [d, e, f];
-
   const fallingIntoBottom = isFalling(leadIn);
+
+  const move1 = c - d;
+  const move2 = d - e;
+  const move3 = e - f;
+
   const losingMomentum =
-    (c - d) >= 0 &&
-    (d - e) <= (c - d) &&
-    (e - f) <= (d - e);
+    move1 >= 0 &&
+    move2 <= move1 &&
+    move3 <= move2;
 
   const rebound = f > e || (f >= e && e >= d);
   const localLow = d <= c && d <= e;
@@ -216,7 +269,13 @@ function detectWeakBottom(prices) {
 }
 
 function detectDiscoverySignal(candles, lookback = DEFAULT_LOOKBACK) {
-  const closes = candles.slice(-Math.max(lookback, 6)).map(getCandleClose);
+  const normalizedLookback = Math.max(6, safeNum(lookback, DEFAULT_LOOKBACK));
+  const closes = asArray(candles)
+    .slice(-normalizedLookback)
+    .map(getCandleClose)
+    .filter((v) => Number.isFinite(v) && v > 0);
+
+  if (closes.length < 6) return null;
 
   const weakTop = detectWeakTop(closes);
   if (weakTop) return weakTop;
@@ -232,17 +291,25 @@ STRATEGY PROFILE GENERATION
 ========================================================= */
 
 function generateStrategyProfile(seed = {}) {
-  const style = pickOne(
+  let style = pickOne(
     ["reversal_precision", "reversal_confirmed", "reversal_aggressive"],
     "reversal_confirmed"
   );
+
+  if (seed && typeof seed === "object" && seed.style) {
+    style = String(seed.style);
+  }
 
   let confidenceThreshold = randomBetween(
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_MAX_CONFIDENCE
   );
 
-  let edgeThreshold = randomBetween(DEFAULT_MIN_EDGE, DEFAULT_MAX_EDGE);
+  let edgeThreshold = randomBetween(
+    DEFAULT_MIN_EDGE,
+    DEFAULT_MAX_EDGE
+  );
+
   let riskMultiplier = randomBetween(
     DEFAULT_MIN_RISK_MULTIPLIER,
     DEFAULT_MAX_RISK_MULTIPLIER
@@ -256,7 +323,10 @@ function generateStrategyProfile(seed = {}) {
   );
   let trailingRetracePct = pickOne([0.18, 0.22, 0.25, 0.3], 0.22);
   let maxHoldBars = pickOne([4, 6, 8, 10], 6);
-  let entryMode = pickOne(["WEAKNESS_EDGE", "CONFIRM_AFTER_STALL"], "WEAKNESS_EDGE");
+  let entryMode = pickOne(
+    ["WEAKNESS_EDGE", "CONFIRM_AFTER_STALL"],
+    "WEAKNESS_EDGE"
+  );
 
   if (style === "reversal_precision") {
     confidenceThreshold = Math.max(confidenceThreshold, 0.68);
@@ -276,12 +346,16 @@ function generateStrategyProfile(seed = {}) {
     maxHoldBars = 4;
   }
 
-  if (seed && typeof seed === "object") {
-    if (seed.style) style = String(seed.style);
-  }
+  confidenceThreshold = clamp(confidenceThreshold, 0.4, 0.98);
+  edgeThreshold = clamp(edgeThreshold, 0.0001, 0.02);
+  riskMultiplier = clamp(riskMultiplier, 0.1, 3);
+  confirmBars = Math.max(1, Math.floor(safeNum(confirmBars, 2)));
+  stopBufferPct = clamp(stopBufferPct, 0.0005, 0.02);
+  trailingRetracePct = clamp(trailingRetracePct, 0.05, 0.8);
+  maxHoldBars = Math.max(1, Math.floor(safeNum(maxHoldBars, 6)));
 
   return {
-    version: "discovery-v2",
+    version: "discovery-v2.1",
     family: "weakness-reversal",
     style,
     entryMode,
@@ -302,6 +376,7 @@ PROFILE SCORING
 
 function scoreStrategyProfile(profile, candles) {
   const list = asArray(candles);
+
   if (list.length < 12) {
     return {
       score: 0,
@@ -325,30 +400,33 @@ function scoreStrategyProfile(profile, candles) {
 
     let strength = 1;
 
-    if (profile.style === "reversal_precision" && profile.confirmBars >= 2) {
+    if (profile?.style === "reversal_precision" && safeNum(profile?.confirmBars, 0) >= 2) {
       strength += 0.2;
     }
 
-    if (profile.entryMode === "CONFIRM_AFTER_STALL") {
+    if (profile?.entryMode === "CONFIRM_AFTER_STALL") {
       strength += 0.1;
     }
 
-    if (profile.trailingMode === "TRAIL_RETRACE") {
+    if (profile?.trailingMode === "TRAIL_RETRACE") {
       strength += 0.1;
     }
 
-    if (profile.maxHoldBars <= 6) {
+    if (safeNum(profile?.maxHoldBars, 999) <= 6) {
       strength += 0.08;
     }
 
     if (
-      profile.confidenceThreshold >= 0.6 &&
-      profile.confidenceThreshold <= 0.8
+      safeNum(profile?.confidenceThreshold, 0) >= 0.6 &&
+      safeNum(profile?.confidenceThreshold, 0) <= 0.8
     ) {
       strength += 0.08;
     }
 
-    if (profile.edgeThreshold >= 0.0008 && profile.edgeThreshold <= 0.0035) {
+    if (
+      safeNum(profile?.edgeThreshold, 0) >= 0.0008 &&
+      safeNum(profile?.edgeThreshold, 0) <= 0.0035
+    ) {
       strength += 0.08;
     }
 
@@ -357,7 +435,9 @@ function scoreStrategyProfile(profile, candles) {
   }
 
   const baseScore =
-    signals > 0 ? (alignedSignals / signals) * (totalStrength / signals) : 0;
+    signals > 0
+      ? (alignedSignals / signals) * (totalStrength / signals)
+      : 0;
 
   const sampleBonus = Math.min(signals / 25, 1) * 0.35;
   const score = round(baseScore + sampleBonus, 6);
@@ -367,10 +447,13 @@ function scoreStrategyProfile(profile, candles) {
     signals,
     alignedSignals,
     quality:
-      score >= 1.2 ? "strong" :
-      score >= 0.8 ? "good" :
-      score > 0 ? "weak" :
-      "no_signal",
+      score >= 1.2
+        ? "strong"
+        : score >= 0.8
+          ? "good"
+          : score > 0
+            ? "weak"
+            : "no_signal",
   };
 }
 
@@ -390,6 +473,7 @@ async function runTrainingSafe({
         ok: false,
         skipped: true,
         reason: "training_engine_missing",
+        result: null,
       };
     }
 
@@ -403,13 +487,16 @@ async function runTrainingSafe({
     return {
       ok: true,
       skipped: false,
+      reason: null,
       result: result || null,
     };
   } catch (err) {
     return {
       ok: false,
       skipped: false,
+      reason: "training_failed",
       error: err?.message || "training_failed",
+      result: null,
     };
   }
 }
@@ -423,10 +510,14 @@ async function discoverStrategy({
   symbol = DEFAULT_SYMBOL,
   variants = DEFAULT_DISCOVERY_VARIANTS,
 } = {}) {
-  const normalizedSymbol = String(symbol || DEFAULT_SYMBOL).toUpperCase();
+  const normalizedSymbol = normalizeSymbol(symbol);
   const candles = getCandlesSafe(normalizedSymbol);
 
-  const candidateCount = clamp(safeNum(variants, DEFAULT_DISCOVERY_VARIANTS), 3, 100);
+  const candidateCount = clamp(
+    Math.floor(safeNum(variants, DEFAULT_DISCOVERY_VARIANTS)),
+    3,
+    100
+  );
 
   const candidates = [];
 
@@ -440,17 +531,20 @@ async function discoverStrategy({
     });
   }
 
-  candidates.sort((a, b) => safeNum(b?.scoring?.score, 0) - safeNum(a?.scoring?.score, 0));
+  candidates.sort(
+    (a, b) => safeNum(b?.scoring?.score, 0) - safeNum(a?.scoring?.score, 0)
+  );
 
-  const best = candidates[0] || {
-    strategy: generateStrategyProfile(),
-    scoring: {
-      score: 0,
-      signals: 0,
-      alignedSignals: 0,
-      quality: "fallback",
-    },
-  };
+  const best =
+    candidates[0] || {
+      strategy: generateStrategyProfile(),
+      scoring: {
+        score: 0,
+        signals: 0,
+        alignedSignals: 0,
+        quality: "fallback",
+      },
+    };
 
   const training = await runTrainingSafe({
     tenantId,
@@ -469,8 +563,9 @@ async function discoverStrategy({
     topCandidates: candidates.slice(0, 5),
     trainingResult: training.result || null,
     trainingMeta: {
-      ok: training.ok,
-      skipped: training.skipped,
+      ok: Boolean(training.ok),
+      skipped: Boolean(training.skipped),
+      reason: training.reason || null,
       error: training.error || null,
     },
   };
