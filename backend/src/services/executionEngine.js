@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v28.0 (AI Learning + Full Trade Lifecycle FIXED)
+// VERSION: v29.0 (Broadcast + Smart Close + AI Stable)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -70,7 +70,8 @@ function executePaperOrder({
   state,
   ts = Date.now(),
   plan = {},
-  decisionMeta = {}, // 🔥 NEW (pattern/setup/confidence)
+  decisionMeta = {},
+  reason = "SIGNAL", // 🔥 NEW
 }) {
   if (!state || !symbol) return null;
 
@@ -86,7 +87,9 @@ function executePaperOrder({
 
   let pos = state.positions[normalizedSlot];
 
-  /* ================= OPEN ================= */
+  /* =========================================================
+  OPEN
+  ========================================================= */
 
   if (normalizedAction === "BUY" || normalizedAction === "SELL") {
     if (pos) return null;
@@ -105,7 +108,7 @@ function executePaperOrder({
       slot: normalizedSlot,
       bestPnl: 0,
 
-      // 🔥 STORE AI CONTEXT
+      // AI CONTEXT
       confidence: safeNum(decisionMeta.confidence, 0),
       pattern: decisionMeta.pattern || "unknown",
       setup: decisionMeta.setup || "unknown",
@@ -115,6 +118,17 @@ function executePaperOrder({
 
     state.positions[normalizedSlot] = position;
     state.position = position;
+
+    const trade = {
+      side: normalizedAction,
+      price: px,
+      time: ts,
+    };
+
+    // 🔥 BROADCAST OPEN
+    if (global.broadcastTrade) {
+      global.broadcastTrade(trade, tenantId);
+    }
 
     return {
       ok: true,
@@ -129,7 +143,9 @@ function executePaperOrder({
     };
   }
 
-  /* ================= CLOSE ================= */
+  /* =========================================================
+  CLOSE
+  ========================================================= */
 
   if (normalizedAction === "CLOSE") {
     if (!pos) return null;
@@ -141,7 +157,8 @@ function executePaperOrder({
 
     const duration = ts - pos.time;
 
-    /* ================= AI LEARNING FIX ================= */
+    /* ================= AI LEARNING ================= */
+
     try {
       outsideBrain.recordTradeOutcome({
         tenantId,
@@ -160,10 +177,23 @@ function executePaperOrder({
     state.positions[normalizedSlot] = null;
     state.position = null;
 
+    const trade = {
+      side: reason, // 🔥 IMPORTANT
+      price: px,
+      time: ts,
+      pnl,
+    };
+
+    // 🔥 BROADCAST CLOSE
+    if (global.broadcastTrade) {
+      global.broadcastTrade(trade, tenantId);
+    }
+
     return {
       ok: true,
       result: {
         event: "CLOSE",
+        reason,
         price: px,
         exit: px,
         pnl,
