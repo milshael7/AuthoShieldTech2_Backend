@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/routes/trading.routes.js
-// FIXED: FULL ENGINE + AI + ANALYTICS BRIDGE (v10)
+// VERSION: v11 (FULLY CONNECTED + AI STATUS FIX)
 // ==========================================================
 
 const express = require("express");
@@ -11,8 +11,6 @@ const { authRequired, requireRole } = require("../middleware/auth");
 const executionEngine = require("../services/executionEngine");
 const marketEngine = require("../services/marketEngine");
 const engineCore = require("../engine/engineCore");
-
-const { readDb, writeDb } = require("../lib/db");
 
 /* ================= ROLES ================= */
 
@@ -39,175 +37,227 @@ AUTH
 router.use(authRequired);
 
 /* =========================================================
-🔥 AI SNAPSHOT (FIXED)
+🔥 AI SNAPSHOT
 ========================================================= */
 
-router.get(
-  "/ai/snapshot",
-  requireRole(ADMIN, MANAGER),
-  (req, res) => {
-    try {
-      const tenantId = getTenantId(req);
-      const state = engineCore.getState(tenantId) || {};
+router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const state = engineCore.getState(tenantId) || {};
 
-      const trades = state.trades || [];
-      const last = trades[trades.length - 1];
+    const trades = state.trades || [];
+    const last = trades[trades.length - 1];
 
-      return res.json({
-        ok: true,
-        data: {
-          action: last?.side || "WAIT",
-          confidence: last?.confidence || 0.5,
-          edge: 0,
-          regime: "live",
-          reason: "engine_live",
-        },
-      });
-    } catch (err) {
-      return res.json({ ok: false, error: err.message });
-    }
+    return res.json({
+      ok: true,
+      data: {
+        action: last?.side || "WAIT",
+        confidence: last?.confidence || 0.5,
+        edge: 0,
+        regime: "live",
+        reason: "engine_live",
+      },
+    });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
   }
-);
+});
 
 /* =========================================================
-🔥 AI BRAIN STATS (FIXED)
+🔥 AI BRAIN STATS
 ========================================================= */
 
-router.get(
-  "/ai/brain/stats",
-  requireRole(ADMIN, MANAGER),
-  (req, res) => {
-    try {
-      const tenantId = getTenantId(req);
-      const state = engineCore.getState(tenantId) || {};
-      const trades = state.trades || [];
+router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const state = engineCore.getState(tenantId) || {};
+    const trades = state.trades || [];
 
-      const totalTrades = trades.length;
-      let wins = 0;
-      let pnl = 0;
+    const totalTrades = trades.length;
+    let wins = 0;
+    let pnl = 0;
 
-      for (const t of trades) {
-        if (t.pnl > 0) wins++;
-        pnl += safeNum(t.pnl);
-      }
-
-      return res.json({
-        ok: true,
-        data: {
-          totalTrades,
-          winRate: totalTrades > 0 ? wins / totalTrades : 0,
-          netPnL: pnl,
-          memoryDepth: trades.length,
-        },
-      });
-    } catch (err) {
-      return res.json({ ok: false, error: err.message });
+    for (const t of trades) {
+      if (t.pnl > 0) wins++;
+      pnl += safeNum(t.pnl);
     }
+
+    return res.json({
+      ok: true,
+      data: {
+        totalTrades,
+        winRate: totalTrades > 0 ? wins / totalTrades : 0,
+        netPnL: pnl,
+        memoryDepth: trades.length,
+      },
+    });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
   }
-);
+});
 
 /* =========================================================
-🔥 PERFORMANCE SUMMARY (FIXED)
+🔥 PERFORMANCE
 ========================================================= */
 
-router.get(
-  "/performance/summary",
-  requireRole(ADMIN, MANAGER),
-  (req, res) => {
-    try {
-      const tenantId = getTenantId(req);
-      const state = engineCore.getState(tenantId) || {};
-      const trades = state.trades || [];
+router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const state = engineCore.getState(tenantId) || {};
+    const trades = state.trades || [];
 
-      const totalTrades = trades.length;
+    const totalTrades = trades.length;
 
-      let wins = 0;
-      let pnl = 0;
+    let wins = 0;
+    let pnl = 0;
 
-      for (const t of trades) {
-        if (t.pnl > 0) wins++;
-        pnl += safeNum(t.pnl);
-      }
-
-      return res.json({
-        ok: true,
-        data: {
-          totalTrades,
-          winRate: totalTrades > 0 ? wins / totalTrades : 0,
-          netPnL: pnl,
-        },
-      });
-    } catch (err) {
-      return res.json({ ok: false, error: err.message });
+    for (const t of trades) {
+      if (t.pnl > 0) wins++;
+      pnl += safeNum(t.pnl);
     }
+
+    return res.json({
+      ok: true,
+      data: {
+        totalTrades,
+        winRate: totalTrades > 0 ? wins / totalTrades : 0,
+        netPnL: pnl,
+      },
+    });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
   }
-);
+});
+
+/* =========================================================
+🔥 STATUS (THIS FIXES YOUR DASHBOARD)
+========================================================= */
+
+router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+
+    const state = engineCore.getState(tenantId) || {};
+    const stats = state.executionStats || {};
+    const trades = state.trades || [];
+    const decisions = state.decisions || [];
+
+    /* ================= AI RATE ================= */
+    const now = Date.now();
+    const lastMinute = now - 60000;
+
+    const recentDecisions = decisions.filter(
+      (d) => d.time > lastMinute
+    ).length;
+
+    /* ================= CONFIDENCE ================= */
+    const avgConfidence =
+      decisions.length > 0
+        ? decisions.reduce(
+            (sum, d) => sum + (d.confidence || 0),
+            0
+          ) / decisions.length
+        : 0;
+
+    /* ================= VOLATILITY ================= */
+    let volatility = 0;
+
+    if (trades.length > 5) {
+      const pnls = trades.map((t) => t.pnl || 0);
+
+      const avg =
+        pnls.reduce((a, b) => a + b, 0) / pnls.length;
+
+      const variance =
+        pnls.reduce((sum, p) => sum + Math.pow(p - avg, 2), 0) /
+        pnls.length;
+
+      volatility = Math.sqrt(variance);
+    }
+
+    return res.json({
+      ok: true,
+      engine: "RUNNING",
+
+      telemetry: {
+        ticks: stats.ticks || 0,
+        decisions: stats.decisions || 0,
+        trades: stats.trades || 0,
+        memoryMb: Math.round(
+          process.memoryUsage().rss / 1024 / 1024
+        ),
+      },
+
+      ai: {
+        rate: recentDecisions,
+        confidence: avgConfidence,
+        volatility,
+      },
+    });
+  } catch (err) {
+    return res.json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
 
 /* =========================================================
 PRICE
 ========================================================= */
 
-router.get(
-  "/price",
-  requireRole(ADMIN, MANAGER),
-  (req, res) => {
-    const tenantId = getTenantId(req);
+router.get("/price", requireRole(ADMIN, MANAGER), (req, res) => {
+  const tenantId = getTenantId(req);
 
+  marketEngine.registerTenant(tenantId);
+
+  const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+
+  return res.json({
+    ok: true,
+    price: Number(price || 0),
+  });
+});
+
+/* =========================================================
+MANUAL ORDER
+========================================================= */
+
+router.post("/order", requireRole(ADMIN, MANAGER), (req, res) => {
+  const tenantId = getTenantId(req);
+
+  const { symbol, side, qty, stopLoss, takeProfit } = req.body || {};
+
+  try {
     marketEngine.registerTenant(tenantId);
 
-    const price = marketEngine.getPrice(tenantId, "BTCUSDT");
+    const price = marketEngine.getPrice(tenantId, symbol) || 0;
+
+    const state = engineCore.getState(tenantId);
+
+    const result = executionEngine.executePaperOrder({
+      tenantId,
+      symbol,
+      action: side,
+      price,
+      qty,
+      stopLoss,
+      takeProfit,
+      state,
+      ts: Date.now(),
+    });
 
     return res.json({
       ok: true,
-      price: Number(price || 0),
+      result,
+    });
+  } catch (err) {
+    return res.json({
+      ok: false,
+      error: err.message,
     });
   }
-);
-
-/* =========================================================
-MANUAL ORDER (CONNECTED TO ENGINE)
-========================================================= */
-
-router.post(
-  "/order",
-  requireRole(ADMIN, MANAGER),
-  (req, res) => {
-    const tenantId = getTenantId(req);
-
-    const { symbol, side, qty, stopLoss, takeProfit } = req.body || {};
-
-    try {
-      marketEngine.registerTenant(tenantId);
-
-      const price =
-        marketEngine.getPrice(tenantId, symbol) || 0;
-
-      const state = engineCore.getState(tenantId);
-
-      const result = executionEngine.executePaperOrder({
-        tenantId,
-        symbol,
-        action: side,
-        price,
-        qty,
-        stopLoss,
-        takeProfit,
-        state,
-        ts: Date.now(),
-      });
-
-      return res.json({
-        ok: true,
-        result,
-      });
-    } catch (err) {
-      return res.json({
-        ok: false,
-        error: err.message,
-      });
-    }
-  }
-);
+});
 
 /* ========================================================= */
 
