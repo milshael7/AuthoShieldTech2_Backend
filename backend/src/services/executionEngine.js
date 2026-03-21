@@ -1,21 +1,9 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v27.0 (Execution Intelligence Integrated)
+// VERSION: v27.0 (Institutional + AI Timing + Metrics Ready)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
-const { executeWithMetrics } = require("./executionMetrics");
-
-/* =========================================================
-OPTIONAL AXIOS LOAD
-========================================================= */
-let axios = null;
-
-try {
-  axios = require("axios");
-} catch {
-  axios = null;
-}
 
 /* =========================================================
 UTIL
@@ -44,86 +32,92 @@ function normalizeSlot(slot) {
 }
 
 /* =========================================================
-EXECUTION WRAPPER (NEW CORE)
+AI TIMING DEFAULTS
 ========================================================= */
 
-function getExecutedPrice({ symbol, rawPrice, side }) {
-  const exec = executeWithMetrics({
-    exchange: "paper",
-    side,
-    price: rawPrice,
-  });
+const MIN_DURATION = 60 * 1000;
+const MAX_DURATION = 20 * 60 * 1000;
 
-  return exec?.executedPrice || rawPrice;
+/* =========================================================
+POSITION HELPERS
+========================================================= */
+
+function enrichPositionWithTiming(pos, plan = {}) {
+  const expectedDuration = clamp(
+    safeNum(plan.expectedDuration, 3 * 60 * 1000),
+    MIN_DURATION,
+    MAX_DURATION
+  );
+
+  pos.expectedDuration = expectedDuration;
+  pos.timeConfidence = clamp(safeNum(plan.timeConfidence, 0.5), 0, 1);
+  pos.exitWindow = expectedDuration * (0.6 + pos.timeConfidence * 0.6);
 }
 
 /* =========================================================
-EXISTING ENGINE (UNCHANGED LOGIC, UPDATED EXECUTION CALLS)
+EXECUTION CORE
 ========================================================= */
-
-// NOTE: Only execution price calls were replaced
-// Everything else is preserved for safety
 
 function executePaperOrder({
   tenantId,
   symbol,
   action,
   price,
-  riskPct,
-  confidence,
   qty,
-  closePct,
   stopLoss,
   takeProfit,
   slot = "scalp",
   state,
   ts = Date.now(),
+  plan = {},
 }) {
   if (!state || !symbol) return null;
 
+  const normalizedSlot = normalizeSlot(slot);
   const normalizedAction = String(action || "").toUpperCase();
-  const rawPrice = safeNum(price, 0);
-  if (rawPrice <= 0) return null;
+  const px = safeNum(price, 0);
 
-  /* ================= PRICE EXECUTION ================= */
+  if (px <= 0) return null;
 
-  const buyPrice = getExecutedPrice({
-    symbol,
-    rawPrice,
-    side: "BUY",
-  });
+  if (!state.positions) {
+    state.positions = { structure: null, scalp: null };
+  }
 
-  const sellPrice = getExecutedPrice({
-    symbol,
-    rawPrice,
-    side: "SELL",
-  });
+  let pos = state.positions[normalizedSlot];
 
   /* ================= OPEN ================= */
 
-  if (normalizedAction === "BUY") {
-    return {
-      ok: true,
-      result: {
-        event: "OPEN",
-        side: "LONG",
-        price: buyPrice,
-        entry: buyPrice,
-        qty: qty || 1,
-        time: ts,
-      },
-    };
-  }
+  if (normalizedAction === "BUY" || normalizedAction === "SELL") {
+    if (pos) return null;
 
-  if (normalizedAction === "SELL") {
+    const side = normalizedAction === "BUY" ? "LONG" : "SHORT";
+
+    const position = {
+      symbol,
+      side,
+      entry: px,
+      qty: roundQty(qty || 1),
+      capitalUsed: roundMoney(px * (qty || 1)),
+      time: ts,
+      stopLoss,
+      takeProfit,
+      slot: normalizedSlot,
+      bestPnl: 0,
+    };
+
+    enrichPositionWithTiming(position, plan);
+
+    state.positions[normalizedSlot] = position;
+    state.position = position;
+
     return {
       ok: true,
       result: {
         event: "OPEN",
-        side: "SHORT",
-        price: sellPrice,
-        entry: sellPrice,
-        qty: qty || 1,
+        side,
+        price: px,
+        entry: px,
+        qty: position.qty,
         time: ts,
       },
     };
@@ -132,13 +126,41 @@ function executePaperOrder({
   /* ================= CLOSE ================= */
 
   if (normalizedAction === "CLOSE") {
+    if (!pos) return null;
+
+    const pnl =
+      pos.side === "LONG"
+        ? (px - pos.entry) * pos.qty
+        : (pos.entry - px) * pos.qty;
+
+    const duration = ts - pos.time;
+
+    try {
+      outsideBrain.recordTradeOutcome({
+        tenantId,
+        pnl,
+        duration,
+        expectedDuration: pos.expectedDuration,
+        confidence: pos.confidence || 0,
+        timeConfidence: pos.timeConfidence,
+        reason: "ENGINE_CLOSE",
+      });
+    } catch {}
+
+    state.positions[normalizedSlot] = null;
+    state.position = null;
+
     return {
       ok: true,
       result: {
         event: "CLOSE",
-        price: sellPrice,
-        exit: sellPrice,
-        qty: qty || 1,
+        price: px,
+        exit: px,
+        pnl,
+        qty: pos.qty,
+        duration,
+        expectedDuration: pos.expectedDuration,
+        timeEfficiency: duration / pos.expectedDuration,
         time: ts,
       },
     };
@@ -148,50 +170,9 @@ function executePaperOrder({
 }
 
 /* =========================================================
-LIVE EXECUTION (UNCHANGED)
-========================================================= */
-
-async function executeLiveOrder({
-  symbol,
-  action,
-  price,
-  qty,
-}) {
-  try {
-    if (!axios) return null;
-
-    const apiKey = process.env.EXCHANGE_API_KEY;
-    const endpoint = process.env.EXCHANGE_ORDER_ENDPOINT;
-
-    if (!apiKey || !endpoint) return null;
-
-    const response = await axios.post(
-      endpoint,
-      {
-        symbol,
-        side: action,
-        type: "MARKET",
-        quantity: qty,
-      },
-      {
-        headers: { "X-API-KEY": apiKey },
-      }
-    );
-
-    return {
-      ok: true,
-      result: response.data,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/* =========================================================
 EXPORTS
 ========================================================= */
 
 module.exports = {
   executePaperOrder,
-  executeLiveOrder,
 };
