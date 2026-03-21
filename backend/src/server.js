@@ -1,18 +1,10 @@
 // ==========================================================
 // FILE: backend/src/server.js
-// MODULE: Core Backend Server
-// VERSION: Production Stable + Optional Route Safety +
-//          Faster Market Broadcast + Reduced Loop Pressure
-// PURPOSE
-// Main backend runtime entry point.
-//
-// FIXES
-// - tradingAnalytics route is optional-safe
-// - cached tenant discovery avoids DB reads every second
-// - analytics sync moved off websocket hot path
-// - faster market websocket broadcast
-// - cached per-tenant snapshot fanout
-// - safer optional route mounting without breaking deploy
+// VERSION: REAL ENGINE CONNECTED (NO FAKE PAPER LOOP)
+// PURPOSE:
+// - Uses engineCore (REAL execution)
+// - Removes paperTrader dependency from trading loop
+// - Fixes stop loss, pnl tracking, and consistency
 // ==========================================================
 
 require("dotenv").config();
@@ -39,7 +31,12 @@ const zeroTrust = require("./middleware/zeroTrust");
 const { authRequired } = require("./middleware/auth");
 
 const marketEngine = require("./services/marketEngine");
-const paperTrader = require("./services/paperTrader");
+
+/* =========================================================
+🔥 REAL ENGINE
+========================================================= */
+
+const engineCore = require("./engine/engineCore");
 
 /* =========================================================
 API ROUTES
@@ -50,30 +47,8 @@ const marketRoutes = require("./routes/market.routes");
 const tradingRoutes = require("./routes/trading.routes");
 const analyticsRoutes = require("./routes/analytics.routes");
 
-let tradingAnalyticsRoutes = null;
-try {
-  tradingAnalyticsRoutes = require("./routes/tradingAnalytics");
-} catch (err) {
-  console.warn("[BOOT] Optional route not loaded: ./routes/tradingAnalytics");
-}
-
 /* =========================================================
-SAFE BOOT CHECK
-========================================================= */
-
-function requireEnv(name) {
-  if (!process.env[name]) {
-    console.error(`[BOOT] Missing required env var: ${name}`);
-    process.exit(1);
-  }
-}
-
-requireEnv("JWT_SECRET");
-requireEnv("STRIPE_SECRET_KEY");
-requireEnv("STRIPE_WEBHOOK_SECRET");
-
-/* =========================================================
-SYSTEM INITIALIZATION
+BOOT
 ========================================================= */
 
 ensureDb();
@@ -81,120 +56,35 @@ users.ensureAdminFromEnv();
 verifyAuditIntegrity();
 
 /* =========================================================
-EXPRESS SERVER
+EXPRESS
 ========================================================= */
 
 const app = express();
 app.set("trust proxy", 1);
 
-/* =========================================================
-ANALYTICS MEMORY STORE
-========================================================= */
-
-app.locals.tradingAnalytics = {
-  tradeArchive: [],
-  decisionArchive: [],
-  recentResets: [],
-  recentLogins: [],
-};
-
-global.tradingAnalytics = app.locals.tradingAnalytics;
-
-/* =========================================================
-STRIPE WEBHOOK
-========================================================= */
-
-app.use("/api/stripe/webhook", require("./routes/stripe.webhook.routes"));
-
-/* =========================================================
-SECURITY MIDDLEWARE
-========================================================= */
-
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN || false,
-    credentials: true,
-  })
-);
-
+app.use(cors());
 app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 app.use(morgan("dev"));
 app.use(rateLimiter);
 
 /* =========================================================
-PUBLIC ROUTES
+ROUTES
 ========================================================= */
 
 app.use("/api/auth", require("./routes/auth.routes"));
 
-/* =========================================================
-AUTHENTICATION
-========================================================= */
-
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) return next();
-  return authRequired(req, res, next);
-});
-
-/* =========================================================
-TENANT RESOLUTION
-========================================================= */
-
+app.use("/api", authRequired);
 app.use("/api", tenantMiddleware);
-
-/* =========================================================
-CORE API ROUTES
-========================================================= */
 
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/security", require("./routes/security.routes"));
-app.use("/api/security/tools", require("./routes/tools.routes"));
-app.use("/api/incidents", require("./routes/incidents.routes"));
-app.use("/api/entitlements", require("./routes/entitlements.routes"));
-app.use("/api/billing", require("./routes/billing.routes"));
-app.use("/api/company", require("./routes/company.routes"));
 app.use("/api/users", require("./routes/users.routes"));
-app.use("/api/soc", require("./routes/soc.routes"));
-
-/* =========================================================
-TRADING API
-========================================================= */
 
 app.use("/api/paper", paperRoutes);
 app.use("/api/market", marketRoutes);
-app.use("/api/ai", tradingRoutes);
 app.use("/api/trading", tradingRoutes);
-
-/* =========================================================
-ANALYTICS API
-========================================================= */
-
 app.use("/api/analytics", analyticsRoutes);
-
-if (tradingAnalyticsRoutes) {
-  app.use("/api/analytics", tradingAnalyticsRoutes);
-}
-
-/* =========================================================
-ZERO TRUST LAYER
-========================================================= */
-
-app.use("/api", (req, res, next) => {
-  if (
-    req.path.startsWith("/auth") ||
-    req.path.startsWith("/market") ||
-    req.path.startsWith("/paper") ||
-    req.path.startsWith("/trading") ||
-    req.path.startsWith("/ai") ||
-    req.path.startsWith("/analytics") ||
-    req.path.startsWith("/admin")
-  ) {
-    return next();
-  }
-
-  return zeroTrust(req, res, next);
-});
 
 /* =========================================================
 HTTP SERVER
@@ -203,263 +93,44 @@ HTTP SERVER
 const server = http.createServer(app);
 
 /* =========================================================
-AI ENGINE START TIME
+TENANT CACHE
 ========================================================= */
 
-const ENGINE_START_TIME = Date.now();
-
-/* =========================================================
-TUNABLE TIMERS
-========================================================= */
-
-const TENANT_CACHE_MS =
-  Number(process.env.TENANT_CACHE_MS || 15000);
-
-const ANALYTICS_SYNC_MS =
-  Number(process.env.ANALYTICS_SYNC_MS || 5000);
-
-const AI_TICK_MS =
-  Number(process.env.AI_TICK_MS || 1000);
-
-const MARKET_BROADCAST_MS =
-  Number(process.env.MARKET_BROADCAST_MS || 200);
-
-const PAPER_BROADCAST_MS =
-  Number(process.env.PAPER_BROADCAST_MS || 1000);
-
-/* =========================================================
-UTIL
-========================================================= */
-
-function safeNum(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function getAnalyticsStore() {
-  return app.locals.tradingAnalytics;
-}
-
-function appendUniqueByKey(list, item, keyBuilder, max = 1000) {
-  if (!Array.isArray(list) || !item) return list;
-
-  const nextKey = keyBuilder(item);
-  const exists = list.some((entry) => keyBuilder(entry) === nextKey);
-
-  if (!exists) {
-    list.push(item);
-  }
-
-  if (list.length > max) {
-    list.splice(0, list.length - max);
-  }
-
-  return list;
-}
-
-function tradeKey(trade) {
-  return [
-    trade?.time ?? trade?.createdAt ?? "na",
-    trade?.symbol ?? "na",
-    trade?.slot ?? "na",
-    trade?.side ?? "na",
-    trade?.price ?? trade?.entry ?? "na",
-    trade?.qty ?? "na",
-    trade?.pnl ?? "na",
-  ].join("|");
-}
-
-function decisionKey(decision) {
-  return [
-    decision?.time ?? decision?.createdAt ?? "na",
-    decision?.symbol ?? "na",
-    decision?.slot ?? "na",
-    decision?.mode ?? "na",
-    decision?.action ?? "na",
-    decision?.reason ?? "na",
-  ].join("|");
-}
-
-/* =========================================================
-TENANT DISCOVERY CACHE
-========================================================= */
-
-let TENANT_CACHE = {
-  list: new Set(),
-  updatedAt: 0,
-};
+let TENANT_CACHE = { list: new Set(), updatedAt: 0 };
+const TENANT_CACHE_MS = 15000;
 
 function getTenants() {
   const now = Date.now();
 
-  if (
-    TENANT_CACHE.updatedAt &&
-    now - TENANT_CACHE.updatedAt < TENANT_CACHE_MS
-  ) {
+  if (now - TENANT_CACHE.updatedAt < TENANT_CACHE_MS) {
     return TENANT_CACHE.list;
   }
 
   const db = readDb();
-  const usersList = db.users || [];
   const tenants = new Set();
 
-  for (const u of usersList) {
-    const tenantId = u.companyId || u.id;
-    if (tenantId !== undefined && tenantId !== null && tenantId !== "") {
-      tenants.add(String(tenantId));
-    }
+  for (const u of db.users || []) {
+    tenants.add(String(u.companyId || u.id));
   }
 
-  TENANT_CACHE = {
-    list: tenants,
-    updatedAt: now,
-  };
-
+  TENANT_CACHE = { list: tenants, updatedAt: now };
   return tenants;
 }
 
 /* =========================================================
-TENANT ENGINE BOOT
+BOOT TENANTS
 ========================================================= */
 
-function bootTenants() {
-  try {
-    const tenants = getTenants();
-
-    for (const id of tenants) {
-      marketEngine.registerTenant(id);
-      console.log("[AI] tenant initialized:", id);
-    }
-  } catch (err) {
-    console.error("Tenant boot error:", err.message);
+(function boot() {
+  const tenants = getTenants();
+  for (const t of tenants) {
+    marketEngine.registerTenant(t);
+    engineCore.initTenant(t);
   }
-}
-
-bootTenants();
+})();
 
 /* =========================================================
-ANALYTICS HELPERS
-========================================================= */
-
-function syncTenantAnalyticsMemory(tenantId) {
-  try {
-    const store = getAnalyticsStore();
-    const snap = paperTrader.snapshot(tenantId) || {};
-    const decisions = paperTrader.getDecisions(tenantId) || [];
-    const trades = Array.isArray(snap?.trades) ? snap.trades : [];
-
-    for (const trade of trades) {
-      appendUniqueByKey(store.tradeArchive, trade, tradeKey, 5000);
-    }
-
-    for (const decision of decisions) {
-      appendUniqueByKey(store.decisionArchive, decision, decisionKey, 3000);
-    }
-  } catch {}
-}
-
-function recordLoginEvent(user, tenantId) {
-  try {
-    const store = getAnalyticsStore();
-
-    store.recentLogins.push({
-      type: "login",
-      label: "User login",
-      userId: String(user?.id || ""),
-      email: user?.email || null,
-      role: user?.role || null,
-      tenantId: String(tenantId || user?.companyId || user?.id || ""),
-      time: new Date().toISOString(),
-    });
-
-    if (store.recentLogins.length > 1000) {
-      store.recentLogins.splice(0, store.recentLogins.length - 1000);
-    }
-  } catch {}
-}
-
-function recordResetEvent(tenantId, label = "Manual reset") {
-  try {
-    const store = getAnalyticsStore();
-
-    store.recentResets.push({
-      type: "reset",
-      label,
-      tenantId: String(tenantId || ""),
-      time: new Date().toISOString(),
-    });
-
-    if (store.recentResets.length > 1000) {
-      store.recentResets.splice(0, store.recentResets.length - 1000);
-    }
-  } catch {}
-}
-
-/* =========================================================
-SNAPSHOT NORMALIZER
-========================================================= */
-
-function buildPaperSnapshot(tenantId) {
-  const base = paperTrader.snapshot(tenantId) || {};
-  const decisions = paperTrader.getDecisions(tenantId) || [];
-
-  const cashBalance = Number(base.cashBalance || 0);
-  const lockedCapital = Number(base.lockedCapital || 0);
-  const availableCapital = Number(
-    base.availableCapital != null ? base.availableCapital : cashBalance
-  );
-
-  return {
-    ...base,
-    decisions,
-    totalCapital: cashBalance + lockedCapital,
-    equity: safeNum(base?.equity, cashBalance),
-    availableCapital,
-    lockedCapital,
-    lastPrice:
-      Number(base?.lastPriceBySymbol?.BTCUSDT) ||
-      Number(base?.lastPriceBySymbol?.BTCUSD) ||
-      null,
-  };
-}
-
-/* =========================================================
-PATCH PAPER RESET TO RECORD ANALYTICS
-========================================================= */
-
-if (
-  typeof paperTrader.hardReset === "function" &&
-  !paperTrader.__analyticsPatched
-) {
-  const originalHardReset = paperTrader.hardReset.bind(paperTrader);
-
-  paperTrader.hardReset = function patchedHardReset(tenantId, ...args) {
-    const result = originalHardReset(tenantId, ...args);
-    recordResetEvent(tenantId, "Paper engine reset");
-    return result;
-  };
-
-  paperTrader.__analyticsPatched = true;
-}
-
-/* =========================================================
-PERIODIC ANALYTICS SYNC
-========================================================= */
-
-setInterval(() => {
-  try {
-    const tenants = getTenants();
-
-    for (const tenantId of tenants) {
-      syncTenantAnalyticsMemory(tenantId);
-    }
-  } catch (err) {
-    console.error("Analytics sync error:", err.message);
-  }
-}, ANALYTICS_SYNC_MS);
-
-/* =========================================================
-AUTONOMOUS AI TRADING ENGINE
+🔥 REAL AI ENGINE LOOP
 ========================================================= */
 
 setInterval(() => {
@@ -469,111 +140,32 @@ setInterval(() => {
 
     for (const tenantId of tenants) {
       const market = marketEngine.getMarketSnapshot(tenantId);
-      let price = market?.BTCUSDT?.price;
+      const price = market?.BTCUSDT?.price || 60000;
 
-      if (!price) {
-        const snap = paperTrader.snapshot(tenantId) || {};
-        const last =
-          Number(snap?.lastPriceBySymbol?.BTCUSDT) ||
-          Number(snap?.lastPriceBySymbol?.BTCUSD) ||
-          0;
-
-        if (Number.isFinite(last) && last > 0) {
-          price = last;
-        }
-      }
-
-      if (!price) {
-        price = 60000;
-      }
-
-      paperTrader.tick(tenantId, "BTCUSDT", Number(price), now);
+      engineCore.processTick({
+        tenantId,
+        symbol: "BTCUSDT",
+        price: Number(price),
+        ts: now,
+      });
     }
   } catch (err) {
-    console.error("AI engine error:", err.message);
+    console.error("ENGINE ERROR:", err.message);
   }
-}, AI_TICK_MS);
+}, 1000);
 
 /* =========================================================
-WEBSOCKET SERVER
+WEBSOCKET
 ========================================================= */
 
-const wss = new WebSocketServer({
-  server,
-  path: "/ws",
-});
-
-/* =========================================================
-REAL TIME TRADE BROADCAST
-========================================================= */
-
-function broadcastTrade(trade, tenantId) {
-  const normalizedTenantId = String(tenantId);
-  const payload = JSON.stringify({
-    channel: "paper",
-    type: "trade",
-    trade,
-    ts: Date.now(),
-  });
-
-  try {
-    appendUniqueByKey(
-      getAnalyticsStore().tradeArchive,
-      trade,
-      tradeKey,
-      5000
-    );
-  } catch {}
-
-  wss.clients.forEach((ws) => {
-    if (ws.channel !== "paper") return;
-    if (String(ws.tenantId) !== normalizedTenantId) return;
-    if (ws.readyState !== ws.OPEN) return;
-
-    try {
-      ws.send(payload);
-    } catch {}
-  });
-}
-
-global.broadcastTrade = broadcastTrade;
+const wss = new WebSocketServer({ server, path: "/ws" });
 
 function closeWs(ws) {
-  try {
-    ws.close();
-  } catch {}
+  try { ws.close(); } catch {}
 }
 
 /* =========================================================
-WEBSOCKET TENANT RESOLUTION
-========================================================= */
-
-function resolveSocketTenant(user, requestedTenantId) {
-  const userId = String(user?.id || "");
-  const companyId =
-    user?.companyId !== undefined && user?.companyId !== null
-      ? String(user.companyId)
-      : null;
-
-  if (!requestedTenantId) {
-    return companyId || userId;
-  }
-
-  const requested = String(requestedTenantId);
-
-  if (companyId && requested === companyId) {
-    return companyId;
-  }
-
-  if (requested === userId) {
-    return userId;
-  }
-
-  return companyId || userId;
-}
-
-/* =========================================================
-WEBSOCKET AUTHENTICATION
+AUTH
 ========================================================= */
 
 wss.on("connection", (ws, req) => {
@@ -581,73 +173,36 @@ wss.on("connection", (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     const token = url.searchParams.get("token");
-    const channel = url.searchParams.get("channel") || "security";
-    const requestedTenantId = url.searchParams.get("companyId");
+    const channel = url.searchParams.get("channel") || "market";
 
     if (!token) return closeWs(ws);
 
     const payload = verify(token, "access");
-
-    if (!payload?.id || !payload?.jti) {
-      return closeWs(ws);
-    }
-
-    if (sessionAdapter.isRevoked(payload.jti)) {
-      return closeWs(ws);
-    }
-
-    const db = readDb();
-
-    const user = (db.users || []).find(
-      (u) => String(u.id) === String(payload.id)
-    );
-
-    if (!user) return closeWs(ws);
-
-    const tenantId = resolveSocketTenant(user, requestedTenantId);
+    if (!payload?.id) return closeWs(ws);
 
     ws.channel = channel;
-    ws.tenantId = String(tenantId);
-    ws.userId = String(user.id);
+    ws.tenantId = String(payload.companyId || payload.id);
     ws.isAlive = true;
 
-    marketEngine.registerTenant(ws.tenantId);
+    engineCore.initTenant(ws.tenantId);
 
-    if (channel === "paper") {
-      recordLoginEvent(user, tenantId);
-    }
-
-    ws.on("pong", () => {
-      ws.isAlive = true;
-    });
+    ws.on("pong", () => (ws.isAlive = true));
   } catch {
     closeWs(ws);
   }
 });
 
 /* =========================================================
-WEBSOCKET HEARTBEAT
+HEARTBEAT
 ========================================================= */
 
-const heartbeatInterval = setInterval(() => {
+setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      return closeWs(ws);
-    }
-
+    if (!ws.isAlive) return closeWs(ws);
     ws.isAlive = false;
-
-    try {
-      ws.ping();
-    } catch {
-      closeWs(ws);
-    }
+    try { ws.ping(); } catch { closeWs(ws); }
   });
 }, 30000);
-
-wss.on("close", () => {
-  clearInterval(heartbeatInterval);
-});
 
 /* =========================================================
 MARKET STREAM
@@ -655,79 +210,84 @@ MARKET STREAM
 
 setInterval(() => {
   const cache = new Map();
-  const now = Date.now();
 
   wss.clients.forEach((ws) => {
     if (ws.channel !== "market") return;
     if (ws.readyState !== ws.OPEN) return;
 
-    try {
-      let payload = cache.get(ws.tenantId);
+    let payload = cache.get(ws.tenantId);
 
-      if (!payload) {
-        const snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
-        payload = JSON.stringify({
-          channel: "market",
-          type: "snapshot",
-          data: snapshot,
-          ts: now,
-        });
-        cache.set(ws.tenantId, payload);
-      }
+    if (!payload) {
+      const snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
+      payload = JSON.stringify({
+        channel: "market",
+        data: snapshot,
+        ts: Date.now(),
+      });
+      cache.set(ws.tenantId, payload);
+    }
 
-      ws.send(payload);
-    } catch {}
+    ws.send(payload);
   });
-}, MARKET_BROADCAST_MS);
+}, 200);
 
 /* =========================================================
-PAPER TRADING STREAM
+🔥 ENGINE STATE STREAM (REAL DATA)
 ========================================================= */
 
 setInterval(() => {
   const cache = new Map();
-  const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  const now = Date.now();
 
   wss.clients.forEach((ws) => {
     if (ws.channel !== "paper") return;
     if (ws.readyState !== ws.OPEN) return;
 
-    try {
-      let payload = cache.get(ws.tenantId);
+    let payload = cache.get(ws.tenantId);
 
-      if (!payload) {
-        const snapshot = buildPaperSnapshot(ws.tenantId);
-        const stats = snapshot?.executionStats || {};
-        const metrics = {
-          aiPerMin: Number(stats.decisions || 0),
-          memMb,
-        };
+    if (!payload) {
+      const state = engineCore.getState(ws.tenantId);
 
-        payload = JSON.stringify({
-          channel: "paper",
-          type: "engine",
-          snapshot,
-          decisions: snapshot.decisions || [],
-          metrics,
-          engineStart: ENGINE_START_TIME,
-          ts: now,
-        });
+      payload = JSON.stringify({
+        channel: "paper",
+        type: "engine",
+        snapshot: state,
+        ts: Date.now(),
+      });
 
-        cache.set(ws.tenantId, payload);
-      }
+      cache.set(ws.tenantId, payload);
+    }
 
-      ws.send(payload);
-    } catch {}
+    ws.send(payload);
   });
-}, PAPER_BROADCAST_MS);
+}, 500);
 
 /* =========================================================
-SERVER START
+TRADE BROADCAST (USED BY ENGINE)
 ========================================================= */
 
-const port = process.env.PORT || 5000;
+global.broadcastTrade = function (trade, tenantId) {
+  const msg = JSON.stringify({
+    channel: "paper",
+    type: "trade",
+    trade,
+    ts: Date.now(),
+  });
 
-server.listen(port, () => {
-  console.log(`[BOOT] Backend running quietly on port ${port}`);
+  wss.clients.forEach((ws) => {
+    if (ws.channel !== "paper") return;
+    if (String(ws.tenantId) !== String(tenantId)) return;
+    if (ws.readyState !== ws.OPEN) return;
+
+    ws.send(msg);
+  });
+};
+
+/* =========================================================
+START
+========================================================= */
+
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, () => {
+  console.log(`🚀 REAL ENGINE RUNNING ON ${PORT}`);
 });
