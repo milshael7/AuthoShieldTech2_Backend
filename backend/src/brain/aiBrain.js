@@ -1,116 +1,92 @@
 // ==========================================================
 // FILE: backend/src/brain/aiBrain.js
-// VERSION: v1.0 (Adaptive Learning AI Layer)
-// PURPOSE:
-// - Learn from trade outcomes
-// - Adjust confidence + edge dynamically
-// - Provide AI overlay to tradeBrain
+// VERSION: v2.0 (Institutional Adaptive Intelligence Core)
 // ==========================================================
 
-const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+const {
+  recordTrade,
+  readBrain,
+} = require("./brain.store");
+
+const {
+  reasonTradeContext,
+} = require("./brain.reasoner");
 
 /* =========================================================
 STATE
 ========================================================= */
 
-const AI_STATE = new Map();
-
-function getState(tenantId) {
-  const key = String(tenantId || "__default__");
-
-  if (!AI_STATE.has(key)) {
-    AI_STATE.set(key, {
-      totalTrades: 0,
-      wins: 0,
-      losses: 0,
-      netPnl: 0,
-
-      symbolStats: {},
-
-      confidenceBias: 0,
-      edgeBias: 0,
-
-      lastUpdated: Date.now(),
-    });
-  }
-
-  return AI_STATE.get(key);
-}
+const LOCAL_STATE = new Map();
 
 /* =========================================================
 UTIL
 ========================================================= */
 
-function safeNum(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+function safe(n, f = 0) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : f;
 }
 
-/* =========================================================
-LEARNING ENGINE
-========================================================= */
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
-function recordTradeOutcome({
-  tenantId,
-  symbol,
-  pnl,
-}) {
-  const state = getState(tenantId);
+function getState(id) {
+  const key = String(id || "__default__");
 
-  const profit = safeNum(pnl, 0);
-
-  state.totalTrades += 1;
-  state.netPnl += profit;
-
-  if (profit > 0) state.wins += 1;
-  else state.losses += 1;
-
-  const sym = String(symbol || "UNKNOWN").toUpperCase();
-
-  if (!state.symbolStats[sym]) {
-    state.symbolStats[sym] = {
-      trades: 0,
-      wins: 0,
-      losses: 0,
-      net: 0,
-    };
+  if (!LOCAL_STATE.has(key)) {
+    LOCAL_STATE.set(key, {
+      lastRegime: "neutral",
+      confidenceDrift: 0,
+      performanceBias: 0,
+    });
   }
 
-  const s = state.symbolStats[sym];
-
-  s.trades += 1;
-  s.net += profit;
-
-  if (profit > 0) s.wins += 1;
-  else s.losses += 1;
-
-  /* ================= ADAPTATION ================= */
-
-  const winRate =
-    state.totalTrades > 0 ? state.wins / state.totalTrades : 0.5;
-
-  const symbolWinRate =
-    s.trades > 0 ? s.wins / s.trades : 0.5;
-
-  // 🔥 Adjust confidence bias
-  state.confidenceBias = clamp(
-    (winRate - 0.5) * 0.6 + (symbolWinRate - 0.5) * 0.4,
-    -0.25,
-    0.25
-  );
-
-  // 🔥 Adjust edge bias
-  state.edgeBias = clamp(
-    state.netPnl / Math.max(1, state.totalTrades * 1000),
-    -0.15,
-    0.15
-  );
-
-  state.lastUpdated = Date.now();
+  return LOCAL_STATE.get(key);
 }
 
 /* =========================================================
-AI DECISION OVERLAY
+REGIME DETECTION
+========================================================= */
+
+function detectRegime(volatility, trendStrength = 0) {
+  if (volatility > 0.02) return "volatile";
+  if (trendStrength > 0.003) return "trend";
+  if (trendStrength < 0.001) return "range";
+  return "neutral";
+}
+
+/* =========================================================
+CONFIDENCE CALIBRATION
+========================================================= */
+
+function calibrateConfidence(base, brainStats) {
+  const winRate =
+    brainStats.totalTrades > 0
+      ? brainStats.wins / brainStats.totalTrades
+      : 0.5;
+
+  let drift = 0;
+
+  if (winRate > 0.6) drift += 0.05;
+  if (winRate < 0.4) drift -= 0.05;
+
+  return clamp(base + drift, 0, 1);
+}
+
+/* =========================================================
+PERFORMANCE BIAS
+========================================================= */
+
+function computePerformanceBias(brainStats) {
+  const net = safe(brainStats.netPnL, 0);
+  const trades = safe(brainStats.totalTrades, 1);
+
+  return clamp(net / (trades * 1000), -0.15, 0.15);
+}
+
+/* =========================================================
+MAIN DECISION OVERLAY
 ========================================================= */
 
 function decide({
@@ -118,83 +94,115 @@ function decide({
   symbol,
   last,
   paper,
+  baseConfidence = 0,
+  baseEdge = 0,
+  pattern = "unknown",
+  setup = "unknown",
 }) {
   const state = getState(tenantId);
+  const brain = readBrain();
 
-  const sym = String(symbol || "UNKNOWN").toUpperCase();
-  const symStats = state.symbolStats[sym] || null;
+  const volatility = safe(paper?.volatility, 0);
+  const trendStrength = Math.abs(safe(baseEdge, 0));
 
-  let confidenceBoost = 0;
-  let edgeBoost = 0;
+  const regime = detectRegime(volatility, trendStrength);
+  state.lastRegime = regime;
 
-  /* ================= GLOBAL PERFORMANCE ================= */
+  /* ================= REASONER ================= */
 
-  const globalWinRate =
-    state.totalTrades > 0
-      ? state.wins / state.totalTrades
-      : 0.5;
+  const reasoning = reasonTradeContext({
+    symbol,
+    pattern,
+    setup,
+    confidence: baseConfidence,
+  });
 
-  if (globalWinRate > 0.55) {
-    confidenceBoost += 0.05;
-    edgeBoost += 0.02;
+  /* ================= PERFORMANCE ================= */
+
+  const perfBias = computePerformanceBias(brain.stats);
+  state.performanceBias = perfBias;
+
+  /* ================= CONFIDENCE ================= */
+
+  let confidence =
+    baseConfidence +
+    reasoning.confidenceAdjustment +
+    perfBias;
+
+  confidence = calibrateConfidence(confidence, brain.stats);
+
+  /* ================= EDGE ================= */
+
+  let edge =
+    baseEdge +
+    reasoning.edgeAdjustment +
+    perfBias * 0.5;
+
+  /* ================= REGIME ADAPTATION ================= */
+
+  if (regime === "volatile") {
+    confidence *= 0.85;
+    edge *= 0.8;
   }
 
-  if (globalWinRate < 0.45) {
-    confidenceBoost -= 0.05;
-    edgeBoost -= 0.02;
+  if (regime === "range") {
+    edge *= 0.75;
   }
 
-  /* ================= SYMBOL PERFORMANCE ================= */
-
-  if (symStats && symStats.trades > 5) {
-    const winRate = symStats.wins / symStats.trades;
-
-    if (winRate > 0.6) {
-      confidenceBoost += 0.06;
-      edgeBoost += 0.025;
-    }
-
-    if (winRate < 0.4) {
-      confidenceBoost -= 0.06;
-      edgeBoost -= 0.025;
-    }
+  if (regime === "trend") {
+    confidence *= 1.05;
+    edge *= 1.1;
   }
 
-  /* ================= DRAW DOWN PROTECTION ================= */
+  /* ================= DRAWDOWN PROTECTION ================= */
 
-  const equity = safeNum(
-    paper?.equity,
-    safeNum(paper?.cashBalance, 0)
-  );
-
-  const peak = safeNum(paper?.peakEquity, equity);
+  const equity = safe(paper?.equity, 0);
+  const peak = safe(paper?.peakEquity, equity);
 
   const drawdown =
     peak > 0 ? (peak - equity) / peak : 0;
 
   if (drawdown > 0.05) {
-    confidenceBoost *= 0.6;
-    edgeBoost *= 0.5;
+    confidence *= 0.7;
+    edge *= 0.6;
   }
 
-  /* ================= FINAL OUTPUT ================= */
-
-  const finalConfidence = clamp(
-    confidenceBoost + state.confidenceBias,
-    -0.3,
-    0.3
-  );
-
-  const finalEdge = clamp(
-    edgeBoost + state.edgeBias,
-    -0.2,
-    0.2
-  );
+  /* ================= FINAL ================= */
 
   return {
-    confidence: finalConfidence,
-    edge: finalEdge,
+    confidence: clamp(confidence, 0, 1),
+    edge: clamp(edge, -1, 1),
+    regime,
+    score: reasoning.score,
   };
+}
+
+/* =========================================================
+LEARNING (TRADE OUTCOME)
+========================================================= */
+
+function recordTradeOutcome({
+  tenantId,
+  symbol,
+  pnl,
+  pattern = "unknown",
+  setup = "unknown",
+  confidence = 0,
+}) {
+  try {
+    recordTrade({
+      symbol,
+      pnl,
+      pattern,
+      setup,
+      confidence,
+    });
+
+    return { ok: true };
+  } catch (err) {
+    console.error("AI learning error:", err.message);
+    return { ok: false };
+  }
 }
 
 /* =========================================================
@@ -202,10 +210,8 @@ RESET
 ========================================================= */
 
 function resetTenant(tenantId) {
-  const key = String(tenantId || "__default__");
-  AI_STATE.delete(key);
-
-  return { ok: true, tenantId: key };
+  LOCAL_STATE.delete(String(tenantId || "__default__"));
+  return { ok: true };
 }
 
 /* =========================================================
