@@ -1,10 +1,6 @@
 // ==========================================================
 // FILE: backend/src/server.js
-// VERSION: REAL ENGINE CONNECTED (NO FAKE PAPER LOOP)
-// PURPOSE:
-// - Uses engineCore (REAL execution)
-// - Removes paperTrader dependency from trading loop
-// - Fixes stop loss, pnl tracking, and consistency
+// VERSION: v28.0 (Stable Engine + No initTenant + Production Safe)
 // ==========================================================
 
 require("dotenv").config();
@@ -118,14 +114,26 @@ function getTenants() {
 }
 
 /* =========================================================
-BOOT TENANTS
+BOOT TENANTS (SAFE)
 ========================================================= */
 
 (function boot() {
   const tenants = getTenants();
+
   for (const t of tenants) {
-    marketEngine.registerTenant(t);
-    engineCore.initTenant(t);
+    try {
+      marketEngine.registerTenant(t);
+
+      // 🔥 REMOVED initTenant — handled internally now
+
+      // Warm engine state safely
+      if (typeof engineCore?.getState === "function") {
+        engineCore.getState(t);
+      }
+
+    } catch (err) {
+      console.error("Tenant boot error:", err.message);
+    }
   }
 })();
 
@@ -142,12 +150,14 @@ setInterval(() => {
       const market = marketEngine.getMarketSnapshot(tenantId);
       const price = market?.BTCUSDT?.price || 60000;
 
-      engineCore.processTick({
-        tenantId,
-        symbol: "BTCUSDT",
-        price: Number(price),
-        ts: now,
-      });
+      if (typeof engineCore?.processTick === "function") {
+        engineCore.processTick({
+          tenantId,
+          symbol: "BTCUSDT",
+          price: Number(price),
+          ts: now,
+        });
+      }
     }
   } catch (err) {
     console.error("ENGINE ERROR:", err.message);
@@ -184,9 +194,15 @@ wss.on("connection", (ws, req) => {
     ws.tenantId = String(payload.companyId || payload.id);
     ws.isAlive = true;
 
-    engineCore.initTenant(ws.tenantId);
+    // 🔥 NO initTenant — engine auto handles state
+
+    // Warm state safely
+    if (typeof engineCore?.getState === "function") {
+      engineCore.getState(ws.tenantId);
+    }
 
     ws.on("pong", () => (ws.isAlive = true));
+
   } catch {
     closeWs(ws);
   }
@@ -219,11 +235,13 @@ setInterval(() => {
 
     if (!payload) {
       const snapshot = marketEngine.getMarketSnapshot(ws.tenantId);
+
       payload = JSON.stringify({
         channel: "market",
         data: snapshot,
         ts: Date.now(),
       });
+
       cache.set(ws.tenantId, payload);
     }
 
@@ -232,7 +250,7 @@ setInterval(() => {
 }, 200);
 
 /* =========================================================
-🔥 ENGINE STATE STREAM (REAL DATA)
+🔥 ENGINE STATE STREAM
 ========================================================= */
 
 setInterval(() => {
@@ -245,7 +263,10 @@ setInterval(() => {
     let payload = cache.get(ws.tenantId);
 
     if (!payload) {
-      const state = engineCore.getState(ws.tenantId);
+      const state =
+        typeof engineCore?.getState === "function"
+          ? engineCore.getState(ws.tenantId)
+          : {};
 
       payload = JSON.stringify({
         channel: "paper",
@@ -262,7 +283,7 @@ setInterval(() => {
 }, 500);
 
 /* =========================================================
-TRADE BROADCAST (USED BY ENGINE)
+TRADE BROADCAST
 ========================================================= */
 
 global.broadcastTrade = function (trade, tenantId) {
@@ -289,5 +310,5 @@ START
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 REAL ENGINE RUNNING ON ${PORT}`);
+  console.log(`🚀 ENGINE RUNNING ON PORT ${PORT}`);
 });
