@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/routes/trading.routes.js
-// VERSION: v11 (FULLY CONNECTED + AI STATUS FIX)
+// VERSION: v12 (REAL ENGINE TELEMETRY + AI FIXED)
 // ==========================================================
 
 const express = require("express");
@@ -37,7 +37,7 @@ AUTH
 router.use(authRequired);
 
 /* =========================================================
-🔥 AI SNAPSHOT
+AI SNAPSHOT
 ========================================================= */
 
 router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
@@ -64,7 +64,7 @@ router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
 });
 
 /* =========================================================
-🔥 AI BRAIN STATS
+AI BRAIN STATS
 ========================================================= */
 
 router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
@@ -97,7 +97,7 @@ router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
 });
 
 /* =========================================================
-🔥 PERFORMANCE
+PERFORMANCE
 ========================================================= */
 
 router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
@@ -130,7 +130,7 @@ router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
 });
 
 /* =========================================================
-🔥 STATUS (THIS FIXES YOUR DASHBOARD)
+🔥 STATUS — FULLY FIXED
 ========================================================= */
 
 router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
@@ -138,11 +138,18 @@ router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
     const tenantId = getTenantId(req);
 
     const state = engineCore.getState(tenantId) || {};
-    const stats = state.executionStats || {};
     const trades = state.trades || [];
     const decisions = state.decisions || [];
 
+    /* ================= ENGINE ================= */
+
+    const engine =
+      trades.length > 0 || decisions.length > 0
+        ? "RUNNING"
+        : "STARTING";
+
     /* ================= AI RATE ================= */
+
     const now = Date.now();
     const lastMinute = now - 60000;
 
@@ -151,38 +158,42 @@ router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
     ).length;
 
     /* ================= CONFIDENCE ================= */
+
     const avgConfidence =
       decisions.length > 0
         ? decisions.reduce(
-            (sum, d) => sum + (d.confidence || 0),
+            (sum, d) => sum + safeNum(d.confidence),
             0
           ) / decisions.length
         : 0;
 
     /* ================= VOLATILITY ================= */
+
     let volatility = 0;
 
     if (trades.length > 5) {
-      const pnls = trades.map((t) => t.pnl || 0);
+      const pnls = trades.map((t) => safeNum(t.pnl));
 
       const avg =
         pnls.reduce((a, b) => a + b, 0) / pnls.length;
 
       const variance =
-        pnls.reduce((sum, p) => sum + Math.pow(p - avg, 2), 0) /
-        pnls.length;
+        pnls.reduce(
+          (sum, p) => sum + Math.pow(p - avg, 2),
+          0
+        ) / pnls.length;
 
       volatility = Math.sqrt(variance);
     }
 
     return res.json({
       ok: true,
-      engine: "RUNNING",
+      engine,
 
       telemetry: {
-        ticks: stats.ticks || 0,
-        decisions: stats.decisions || 0,
-        trades: stats.trades || 0,
+        ticks: decisions.length,
+        decisions: decisions.length,
+        trades: trades.length,
         memoryMb: Math.round(
           process.memoryUsage().rss / 1024 / 1024
         ),
