@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v29.0 (Broadcast + Smart Close + AI Stable)
+// VERSION: v30.0 (Analytics Enabled + Stable AI + Broadcast)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -55,6 +55,15 @@ function enrichPositionWithTiming(pos, plan = {}) {
 }
 
 /* =========================================================
+STATE HELPERS (🔥 NEW)
+========================================================= */
+
+function ensureAnalyticsState(state) {
+  if (!state.trades) state.trades = [];
+  if (!state.decisions) state.decisions = [];
+}
+
+/* =========================================================
 EXECUTION CORE
 ========================================================= */
 
@@ -71,9 +80,11 @@ function executePaperOrder({
   ts = Date.now(),
   plan = {},
   decisionMeta = {},
-  reason = "SIGNAL", // 🔥 NEW
+  reason = "SIGNAL",
 }) {
   if (!state || !symbol) return null;
+
+  ensureAnalyticsState(state); // 🔥 IMPORTANT
 
   const normalizedSlot = normalizeSlot(slot);
   const normalizedAction = String(action || "").toUpperCase();
@@ -119,13 +130,20 @@ function executePaperOrder({
     state.positions[normalizedSlot] = position;
     state.position = position;
 
+    /* 🔥 SAVE DECISION (for analytics) */
+    state.decisions.push({
+      action: normalizedAction,
+      confidence: position.confidence,
+      time: ts,
+      symbol,
+    });
+
     const trade = {
       side: normalizedAction,
       price: px,
       time: ts,
     };
 
-    // 🔥 BROADCAST OPEN
     if (global.broadcastTrade) {
       global.broadcastTrade(trade, tenantId);
     }
@@ -172,19 +190,32 @@ function executePaperOrder({
       console.error("AI record error:", err.message);
     }
 
+    /* 🔥 SAVE TRADE (for analytics) */
+    state.trades.push({
+      symbol: pos.symbol,
+      side: pos.side,
+      entry: pos.entry,
+      exit: px,
+      qty: pos.qty,
+      pnl,
+      win: pnl > 0,
+      duration,
+      confidence: pos.confidence || 0,
+      time: ts,
+    });
+
     /* ================= RESET ================= */
 
     state.positions[normalizedSlot] = null;
     state.position = null;
 
     const trade = {
-      side: reason, // 🔥 IMPORTANT
+      side: reason,
       price: px,
       time: ts,
       pnl,
     };
 
-    // 🔥 BROADCAST CLOSE
     if (global.broadcastTrade) {
       global.broadcastTrade(trade, tenantId);
     }
