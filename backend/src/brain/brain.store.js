@@ -1,69 +1,112 @@
 // ==========================================================
 // FILE: backend/src/brain/brain.store.js
-// VERSION: v2.0 (Adaptive Memory Engine)
+// VERSION: v2.1 (Hardened Memory Engine)
 // PURPOSE:
 // - Persistent AI memory
-// - Track performance by pattern, symbol, and setup
+// - Safe, atomic, corruption-resistant storage
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
 
 const BRAIN_PATH = path.join(__dirname, "brain.memory.json");
+const TMP_PATH = path.join(__dirname, "brain.memory.tmp.json");
+
+/* =========================================================
+UTIL
+========================================================= */
+
+function safeNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/* =========================================================
+DEFAULT STRUCTURE
+========================================================= */
+
+function defaultBrain() {
+  return {
+    createdAt: Date.now(),
+    lastUpdated: Date.now(),
+
+    stats: {
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      totalWinUSD: 0,
+      totalLossUSD: 0,
+      netPnL: 0,
+      maxBalance: 0,
+    },
+
+    symbols: {},
+    patterns: {},
+    setups: {},
+
+    history: [],
+  };
+}
 
 /* =========================================================
 INIT
 ========================================================= */
 
 function ensureBrain() {
-  if (!fs.existsSync(BRAIN_PATH)) {
-    fs.writeFileSync(
-      BRAIN_PATH,
-      JSON.stringify(
-        {
-          createdAt: Date.now(),
-          lastUpdated: Date.now(),
-
-          stats: {
-            totalTrades: 0,
-            wins: 0,
-            losses: 0,
-            totalWinUSD: 0,
-            totalLossUSD: 0,
-            netPnL: 0,
-            maxBalance: 0,
-          },
-
-          // 🔥 NEW
-          symbols: {},
-
-          // 🔥 NEW
-          patterns: {},
-
-          // 🔥 NEW
-          setups: {},
-
-          history: [],
-        },
-        null,
-        2
-      )
-    );
+  try {
+    if (!fs.existsSync(BRAIN_PATH)) {
+      fs.writeFileSync(
+        BRAIN_PATH,
+        JSON.stringify(defaultBrain(), null, 2)
+      );
+    }
+  } catch (err) {
+    console.error("Brain init error:", err.message);
   }
 }
 
 /* =========================================================
-READ / WRITE
+SAFE READ
 ========================================================= */
 
 function readBrain() {
   ensureBrain();
-  return JSON.parse(fs.readFileSync(BRAIN_PATH, "utf-8"));
+
+  try {
+    const raw = fs.readFileSync(BRAIN_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    // minimal shape validation
+    if (!parsed.stats || !parsed.history) {
+      throw new Error("Invalid brain structure");
+    }
+
+    return parsed;
+  } catch (err) {
+    console.error("Brain read failed, rebuilding:", err.message);
+
+    const fresh = defaultBrain();
+    writeBrain(fresh);
+    return fresh;
+  }
 }
 
+/* =========================================================
+SAFE WRITE (ATOMIC)
+========================================================= */
+
 function writeBrain(brain) {
-  brain.lastUpdated = Date.now();
-  fs.writeFileSync(BRAIN_PATH, JSON.stringify(brain, null, 2));
+  try {
+    brain.lastUpdated = Date.now();
+
+    // write temp first
+    fs.writeFileSync(TMP_PATH, JSON.stringify(brain, null, 2));
+
+    // then replace original
+    fs.renameSync(TMP_PATH, BRAIN_PATH);
+  } catch (err) {
+    console.error("Brain write error:", err.message);
+  }
 }
 
 /* =========================================================
@@ -79,8 +122,10 @@ function recordTrade({
 }) {
   const brain = readBrain();
 
-  const profit = Number(pnl) || 0;
+  const profit = safeNum(pnl, 0);
   const sym = String(symbol || "UNKNOWN").toUpperCase();
+  const pat = String(pattern || "unknown");
+  const set = String(setup || "unknown");
 
   /* ================= GLOBAL ================= */
 
@@ -96,7 +141,7 @@ function recordTrade({
 
   brain.stats.netPnL += profit;
 
-  /* ================= SYMBOL TRACKING ================= */
+  /* ================= SYMBOL ================= */
 
   if (!brain.symbols[sym]) {
     brain.symbols[sym] = {
@@ -111,14 +156,12 @@ function recordTrade({
 
   s.trades++;
   s.net += profit;
+  profit > 0 ? s.wins++ : s.losses++;
 
-  if (profit > 0) s.wins++;
-  else s.losses++;
+  /* ================= PATTERN ================= */
 
-  /* ================= PATTERN TRACKING ================= */
-
-  if (!brain.patterns[pattern]) {
-    brain.patterns[pattern] = {
+  if (!brain.patterns[pat]) {
+    brain.patterns[pat] = {
       trades: 0,
       wins: 0,
       losses: 0,
@@ -126,18 +169,16 @@ function recordTrade({
     };
   }
 
-  const p = brain.patterns[pattern];
+  const p = brain.patterns[pat];
 
   p.trades++;
   p.net += profit;
+  profit > 0 ? p.wins++ : p.losses++;
 
-  if (profit > 0) p.wins++;
-  else p.losses++;
+  /* ================= SETUP ================= */
 
-  /* ================= SETUP TRACKING ================= */
-
-  if (!brain.setups[setup]) {
-    brain.setups[setup] = {
+  if (!brain.setups[set]) {
+    brain.setups[set] = {
       trades: 0,
       wins: 0,
       losses: 0,
@@ -146,17 +187,16 @@ function recordTrade({
     };
   }
 
-  const st = brain.setups[setup];
+  const st = brain.setups[set];
 
   st.trades++;
   st.net += profit;
+  profit > 0 ? st.wins++ : st.losses++;
 
-  if (profit > 0) st.wins++;
-  else st.losses++;
-
-  // rolling confidence avg
   st.avgConfidence =
-    (st.avgConfidence * (st.trades - 1) + confidence) / st.trades;
+    (safeNum(st.avgConfidence) * (st.trades - 1) +
+      safeNum(confidence)) /
+    st.trades;
 
   /* ================= HISTORY ================= */
 
@@ -164,9 +204,9 @@ function recordTrade({
     ts: Date.now(),
     symbol: sym,
     pnl: profit,
-    pattern,
-    setup,
-    confidence,
+    pattern: pat,
+    setup: set,
+    confidence: safeNum(confidence),
   });
 
   if (brain.history.length > 1000) {
@@ -200,13 +240,16 @@ RESET
 ========================================================= */
 
 function resetBrain() {
-  if (fs.existsSync(BRAIN_PATH)) {
-    fs.unlinkSync(BRAIN_PATH);
+  try {
+    if (fs.existsSync(BRAIN_PATH)) {
+      fs.unlinkSync(BRAIN_PATH);
+    }
+
+    ensureBrain();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
   }
-
-  ensureBrain();
-
-  return { ok: true };
 }
 
 /* =========================================================
