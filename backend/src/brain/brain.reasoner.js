@@ -1,17 +1,6 @@
 // ==========================================================
 // FILE: backend/src/brain/brain.reasoner.js
-// VERSION: v1.0 (Adaptive Reasoning Layer)
-// PURPOSE:
-// - Read persistent brain memory
-// - Score symbols / patterns / setups
-// - Provide safe confidence + edge adjustments
-// - Help AI adapt over time without over-tightening
-//
-// RULES:
-// 1. This file does NOT place trades
-// 2. This file does NOT execute orders
-// 3. This file only reasons over stored memory
-// 4. Sparse data must produce weak adjustments, not strong ones
+// VERSION: v2.0 (Institutional Reasoning Engine)
 // ==========================================================
 
 const {
@@ -34,6 +23,10 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/* =========================================================
+WIN RATE / NET
+========================================================= */
+
 function safeWinRate(stats) {
   const trades = safeNum(stats?.trades, 0);
   const wins = safeNum(stats?.wins, 0);
@@ -51,53 +44,61 @@ function safeNetPerTrade(stats) {
 }
 
 /* =========================================================
-SAMPLE STRENGTH
----------------------------------------------------------
-Small sample sizes should not dominate the system.
+SAMPLE STRENGTH (ANTI-OVERFITTING)
 ========================================================= */
 
 function getSampleStrength(trades) {
   const t = safeNum(trades, 0);
 
   if (t <= 0) return 0;
-  if (t >= 50) return 1;
+  if (t >= 60) return 1;
 
-  return clamp(t / 50, 0, 1);
+  return clamp(t / 60, 0, 1);
 }
 
 /* =========================================================
-GLOBAL MEMORY VIEW
+RECENT PERFORMANCE (FAST LEARNING)
 ========================================================= */
 
-function getGlobalStats() {
-  try {
-    const brain = readBrain();
-    return brain?.stats || null;
-  } catch {
-    return null;
-  }
-}
+function getRecentPerformance(brain) {
+  const history = Array.isArray(brain?.history)
+    ? brain.history.slice(-30)
+    : [];
 
-function getGlobalWinRate() {
-  const stats = getGlobalStats();
-  const totalTrades = safeNum(stats?.totalTrades, 0);
-  const wins = safeNum(stats?.wins, 0);
+  if (!history.length) return 0;
 
-  if (totalTrades <= 0) return 0.5;
-  return clamp(wins / totalTrades, 0, 1);
-}
+  const pnlSum = history.reduce((a, b) => a + safeNum(b.pnl, 0), 0);
 
-function getGlobalNetPerTrade() {
-  const stats = getGlobalStats();
-  const totalTrades = safeNum(stats?.totalTrades, 0);
-  const netPnL = safeNum(stats?.netPnL, 0);
-
-  if (totalTrades <= 0) return 0;
-  return netPnL / totalTrades;
+  return clamp(pnlSum / (history.length * 100), -0.2, 0.2);
 }
 
 /* =========================================================
-CORE SCORERS
+FAILURE DETECTION
+========================================================= */
+
+function detectFailureCluster(brain, setup) {
+  const history = Array.isArray(brain?.history)
+    ? brain.history.slice(-25)
+    : [];
+
+  if (!history.length) return 0;
+
+  const recentSetup = history.filter((h) => h.setup === setup);
+
+  if (recentSetup.length < 5) return 0;
+
+  const losses = recentSetup.filter((h) => safeNum(h.pnl, 0) < 0).length;
+  const lossRate = losses / recentSetup.length;
+
+  if (lossRate > 0.7) {
+    return clamp((lossRate - 0.5) * 0.3, 0, 0.2);
+  }
+
+  return 0;
+}
+
+/* =========================================================
+SCORING CORE
 ========================================================= */
 
 function scoreStats(stats) {
@@ -106,83 +107,48 @@ function scoreStats(stats) {
   const netPerTrade = safeNetPerTrade(stats);
   const strength = getSampleStrength(trades);
 
-  // Win rate contribution: centered around 50%
-  const winComponent = (winRate - 0.5) * 2; // -1 to +1
+  const winComponent = (winRate - 0.5) * 2;
+  const netComponent = clamp(netPerTrade / 40, -1, 1);
 
-  // Net contribution: softly normalized
-  const netComponent = clamp(netPerTrade / 50, -1, 1);
-
-  // Weighted blend
   const raw = winComponent * 0.65 + netComponent * 0.35;
 
-  // Sparse data weakens influence
   return clamp(raw * strength, -1, 1);
 }
 
+/* =========================================================
+ENTITY SCORERS
+========================================================= */
+
 function scoreSymbol(symbol) {
-  try {
-    const stats = getSymbolStats(String(symbol || "").toUpperCase());
-    return {
-      score: scoreStats(stats),
-      trades: safeNum(stats?.trades, 0),
-      winRate: safeWinRate(stats),
-      netPerTrade: safeNetPerTrade(stats),
-    };
-  } catch {
-    return {
-      score: 0,
-      trades: 0,
-      winRate: 0.5,
-      netPerTrade: 0,
-    };
-  }
+  const stats = getSymbolStats(String(symbol || "").toUpperCase());
+  return {
+    score: scoreStats(stats),
+    trades: safeNum(stats?.trades, 0),
+    winRate: safeWinRate(stats),
+  };
 }
 
 function scorePattern(pattern) {
-  try {
-    const stats = getPatternStats(String(pattern || "unknown"));
-    return {
-      score: scoreStats(stats),
-      trades: safeNum(stats?.trades, 0),
-      winRate: safeWinRate(stats),
-      netPerTrade: safeNetPerTrade(stats),
-    };
-  } catch {
-    return {
-      score: 0,
-      trades: 0,
-      winRate: 0.5,
-      netPerTrade: 0,
-    };
-  }
+  const stats = getPatternStats(String(pattern || "unknown"));
+  return {
+    score: scoreStats(stats),
+    trades: safeNum(stats?.trades, 0),
+    winRate: safeWinRate(stats),
+  };
 }
 
 function scoreSetup(setup) {
-  try {
-    const stats = getSetupStats(String(setup || "unknown"));
-    return {
-      score: scoreStats(stats),
-      trades: safeNum(stats?.trades, 0),
-      winRate: safeWinRate(stats),
-      netPerTrade: safeNetPerTrade(stats),
-      avgConfidence: safeNum(stats?.avgConfidence, 0),
-    };
-  } catch {
-    return {
-      score: 0,
-      trades: 0,
-      winRate: 0.5,
-      netPerTrade: 0,
-      avgConfidence: 0,
-    };
-  }
+  const stats = getSetupStats(String(setup || "unknown"));
+  return {
+    score: scoreStats(stats),
+    trades: safeNum(stats?.trades, 0),
+    winRate: safeWinRate(stats),
+    avgConfidence: safeNum(stats?.avgConfidence, 0),
+  };
 }
 
 /* =========================================================
-REASONING OUTPUT
----------------------------------------------------------
-This is the main function other modules should use.
-It returns soft boosts/penalties, not hard commands.
+MAIN REASONING
 ========================================================= */
 
 function reasonTradeContext({
@@ -191,97 +157,89 @@ function reasonTradeContext({
   setup = "unknown",
   confidence = 0,
 }) {
-  const globalWinRate = getGlobalWinRate();
-  const globalNetPerTrade = getGlobalNetPerTrade();
+  const brain = readBrain();
 
   const symbolView = scoreSymbol(symbol);
   const patternView = scorePattern(pattern);
   const setupView = scoreSetup(setup);
 
-  // Global score
+  const recentBias = getRecentPerformance(brain);
+  const failurePenalty = detectFailureCluster(brain, setup);
+
+  /* ================= WEIGHTING ================= */
+
+  const symbolWeight = 0.32;
+  const patternWeight = 0.22;
+  const setupWeight = 0.30;
+  const globalWeight = 0.16;
+
   const globalScore = clamp(
-    ((globalWinRate - 0.5) * 2) * 0.7 +
-      clamp(globalNetPerTrade / 50, -1, 1) * 0.3,
+    ((safeWinRate(brain.stats) - 0.5) * 2) * 0.7 +
+      clamp(safeNum(brain.stats?.netPnL, 0) / 5000, -1, 1) * 0.3,
     -1,
     1
   );
 
-  // Final blended score
   const compositeScore = clamp(
-    globalScore * 0.25 +
-      symbolView.score * 0.30 +
-      patternView.score * 0.20 +
-      setupView.score * 0.25,
+    symbolView.score * symbolWeight +
+      patternView.score * patternWeight +
+      setupView.score * setupWeight +
+      globalScore * globalWeight +
+      recentBias,
     -1,
     1
   );
 
-  // Confidence boost is deliberately soft
-  const confidenceAdjustment = clamp(compositeScore * 0.12, -0.12, 0.12);
+  /* ================= CONFIDENCE ================= */
 
-  // Edge boost is a bit smaller than confidence
-  const edgeAdjustment = clamp(compositeScore * 0.05, -0.05, 0.05);
+  let confidenceAdjustment = compositeScore * 0.14;
 
-  // Risk adjustment remains conservative
-  const riskAdjustment = clamp(compositeScore * 0.15, -0.15, 0.15);
-
-  // If setup historically underperforms at similar confidence, dampen it
-  let confidencePenalty = 0;
+  // Overconfidence penalty
   if (
-    setupView.trades >= 10 &&
-    safeNum(setupView.avgConfidence, 0) > 0 &&
-    confidence >= setupView.avgConfidence &&
+    setupView.trades >= 12 &&
+    confidence > setupView.avgConfidence &&
     setupView.score < 0
   ) {
-    confidencePenalty = Math.abs(setupView.score) * 0.04;
+    confidenceAdjustment -= Math.abs(setupView.score) * 0.05;
   }
+
+  // Failure cluster penalty
+  confidenceAdjustment -= failurePenalty;
+
+  /* ================= EDGE ================= */
+
+  let edgeAdjustment = compositeScore * 0.06;
+
+  /* ================= FINAL ================= */
 
   return {
     score: compositeScore,
-    confidenceAdjustment: clamp(
-      confidenceAdjustment - confidencePenalty,
-      -0.15,
-      0.15
-    ),
-    edgeAdjustment,
-    riskAdjustment,
+    confidenceAdjustment: clamp(confidenceAdjustment, -0.2, 0.2),
+    edgeAdjustment: clamp(edgeAdjustment, -0.08, 0.08),
+    riskAdjustment: clamp(compositeScore * 0.18, -0.2, 0.2),
+
     diagnostics: {
-      global: {
-        winRate: globalWinRate,
-        netPerTrade: globalNetPerTrade,
-        score: globalScore,
-      },
       symbol: symbolView,
       pattern: patternView,
       setup: setupView,
+      recentBias,
+      failurePenalty,
+      globalScore,
     },
   };
 }
 
 /* =========================================================
-SIMPLE BOOST API
----------------------------------------------------------
-For older modules that only want a quick multiplier.
+BOOST API
 ========================================================= */
 
-function getReasoningBoost({
-  symbol,
-  pattern = "unknown",
-  setup = "unknown",
-  confidence = 0,
-}) {
-  const result = reasonTradeContext({
-    symbol,
-    pattern,
-    setup,
-    confidence,
-  });
-
-  return clamp(1 + result.confidenceAdjustment, 0.85, 1.15);
+function getReasoningBoost(params) {
+  const result = reasonTradeContext(params);
+  return clamp(1 + result.confidenceAdjustment, 0.8, 1.2);
 }
 
 /* =========================================================
-HEALTH CHECK
+STATUS
 ========================================================= */
 
 function getReasonerStatus() {
@@ -290,12 +248,12 @@ function getReasonerStatus() {
     return {
       ok: true,
       totalTrades: safeNum(brain?.stats?.totalTrades, 0),
-      lastUpdated: safeNum(brain?.lastUpdated, 0),
+      memoryDepth: safeNum(brain?.history?.length, 0),
     };
   } catch (err) {
     return {
       ok: false,
-      error: err?.message || "reasoner_unavailable",
+      error: err?.message || "reasoner_error",
     };
   }
 }
