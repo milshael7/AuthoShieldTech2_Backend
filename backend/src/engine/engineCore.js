@@ -1,5 +1,5 @@
 // ==========================================================
-// ENGINE CORE v3.0 (FULLY TRACKED + UI CONNECTED)
+// ENGINE CORE v3.1 (STABLE + AI TRACKING FIXED)
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
@@ -52,15 +52,26 @@ function simpleDecision(tenantId, price) {
   mem.push(price);
   if (mem.length > 5) mem.shift();
 
-  if (mem.length < 3) return { action: "WAIT" };
+  if (mem.length < 3) return { action: "WAIT", confidence: 0 };
 
   const last = mem[mem.length - 1];
   const prev = mem[mem.length - 2];
 
-  if (last > prev) return { action: "BUY", confidence: 0.6 };
-  if (last < prev) return { action: "SELL", confidence: 0.6 };
+  if (last > prev) {
+    return {
+      action: "BUY",
+      confidence: 0.6 + Math.random() * 0.2, // slight realism
+    };
+  }
 
-  return { action: "WAIT" };
+  if (last < prev) {
+    return {
+      action: "SELL",
+      confidence: 0.6 + Math.random() * 0.2,
+    };
+  }
+
+  return { action: "WAIT", confidence: 0 };
 }
 
 /* =========================================================
@@ -92,15 +103,17 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
 
   const state = getState(tenantId);
 
-  /* ================= TRACK TICKS ================= */
+  /* ================= TICK ================= */
   state.executionStats.ticks++;
 
-  /* ================= UPDATE PRICE ================= */
+  /* ================= PRICE ================= */
   updatePrice(tenantId, symbol, price);
 
   const currentPos = state.positions.scalp;
 
-  /* ================= CLOSE ================= */
+  /* =========================================================
+  CLOSE
+  ========================================================= */
 
   if (currentPos) {
     const closeReason = checkClose(currentPos, price);
@@ -136,22 +149,33 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
     }
   }
 
-  /* ================= DECISION ================= */
+  /* =========================================================
+  DECISION
+  ========================================================= */
 
   const decision = simpleDecision(tenantId, price);
 
-  state.executionStats.decisions++;
+  // 🔥 ONLY TRACK REAL DECISIONS
+  if (decision.action !== "WAIT") {
+    state.executionStats.decisions++;
 
-  state.decisions.push({
-    ...decision,
-    time: ts,
-  });
+    state.decisions.push({
+      ...decision,
+      time: ts,
+    });
+
+    // cap memory
+    if (state.decisions.length > 500) {
+      state.decisions.shift();
+    }
+  }
 
   if (decision.action === "WAIT") return;
-
   if (state.positions.scalp) return;
 
-  /* ================= OPEN ================= */
+  /* =========================================================
+  OPEN
+  ========================================================= */
 
   const res = executePaperOrder({
     tenantId,
@@ -174,6 +198,14 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
 
   if (res?.result) {
     state.executionStats.trades++;
+
+    // 🔥 PUSH OPEN TRADE INTO STATE
+    state.trades.push({
+      side: decision.action,
+      price,
+      time: ts,
+      confidence: decision.confidence,
+    });
 
     if (global.broadcastTrade) {
       global.broadcastTrade(
