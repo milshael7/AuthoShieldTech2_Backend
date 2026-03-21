@@ -1,31 +1,32 @@
 // ==========================================================
-// 🔒 PROTECTED CORE FILE — DO NOT MODIFY WITHOUT AUTHORIZATION
-// MODULE: ENGINE CORE (ORCHESTRATOR)
-// VERSION: v1.0 (CONTROL LAYER)
-//
-// PURPOSE:
-// - Central brain loop
-// - Connects market → decision → execution → state
-//
-// RULES:
-// 1. NO direct state mutation
-// 2. NO execution logic here
-// 3. ONLY orchestrates flow
-// 4. Deterministic input → output
-//
+// ENGINE CORE v2.0 (FULL EXECUTION LOOP)
 // ==========================================================
 
-const { execute } = require("./executionEngine");
+const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
 
-/* ================= SIMPLE DECISION ENGINE ================= */
-/*
-  TEMPORARY — This will later be replaced by your AI (tradeBrain)
+/* =========================================================
+STATE
+========================================================= */
 
-  Right now we use simple logic so system behaves REAL:
-  - If price momentum up → BUY
-  - If price momentum down → SELL
-*/
+const ENGINE_STATE = new Map();
+
+function getState(tenantId) {
+  const key = String(tenantId || "__default__");
+
+  if (!ENGINE_STATE.has(key)) {
+    ENGINE_STATE.set(key, {
+      positions: { scalp: null },
+      trades: [],
+    });
+  }
+
+  return ENGINE_STATE.get(key);
+}
+
+/* =========================================================
+SIMPLE DECISION (TEMP)
+========================================================= */
 
 const PRICE_MEMORY = new Map();
 
@@ -43,36 +44,42 @@ function simpleDecision(tenantId, price) {
   const mem = getMemory(tenantId);
 
   mem.push(price);
+  if (mem.length > 5) mem.shift();
 
-  if (mem.length > 5) {
-    mem.shift();
-  }
-
-  if (mem.length < 3) {
-    return { action: "WAIT" };
-  }
+  if (mem.length < 3) return { action: "WAIT" };
 
   const last = mem[mem.length - 1];
   const prev = mem[mem.length - 2];
 
-  if (last > prev) {
-    return {
-      action: "BUY",
-      confidence: 0.6,
-    };
-  }
-
-  if (last < prev) {
-    return {
-      action: "SELL",
-      confidence: 0.6,
-    };
-  }
+  if (last > prev) return { action: "BUY", confidence: 0.6 };
+  if (last < prev) return { action: "SELL", confidence: 0.6 };
 
   return { action: "WAIT" };
 }
 
-/* ================= ENGINE TICK ================= */
+/* =========================================================
+POSITION MANAGEMENT
+========================================================= */
+
+function checkClose(position, price) {
+  if (!position) return null;
+
+  if (position.side === "LONG") {
+    if (price <= position.stopLoss) return "STOP_LOSS";
+    if (price >= position.takeProfit) return "TAKE_PROFIT";
+  }
+
+  if (position.side === "SHORT") {
+    if (price >= position.stopLoss) return "STOP_LOSS";
+    if (price <= position.takeProfit) return "TAKE_PROFIT";
+  }
+
+  return null;
+}
+
+/* =========================================================
+ENGINE TICK
+========================================================= */
 
 function processTick({
   tenantId,
@@ -82,42 +89,99 @@ function processTick({
 }) {
   if (!tenantId || !symbol || !price) return null;
 
-  // 1. Update price in state
+  const state = getState(tenantId);
+
+  // 1. Update price
   updatePrice(tenantId, symbol, price);
 
-  // 2. Get decision (TEMP logic)
+  const currentPos = state.positions.scalp;
+
+  /* ================= CLOSE LOGIC ================= */
+
+  if (currentPos) {
+    const closeReason = checkClose(currentPos, price);
+
+    if (closeReason) {
+      const res = executePaperOrder({
+        tenantId,
+        symbol,
+        action: "CLOSE",
+        price,
+        state,
+        ts,
+      });
+
+      if (res?.result) {
+        const trade = {
+          side: closeReason,
+          price,
+          time: ts,
+        };
+
+        state.trades.push(trade);
+
+        if (global.broadcastTrade) {
+          global.broadcastTrade(trade, tenantId);
+        }
+      }
+
+      return;
+    }
+  }
+
+  /* ================= DECISION ================= */
+
   const decision = simpleDecision(tenantId, price);
 
-  // 3. Execute decision
-  const result = execute({
+  if (decision.action === "WAIT") return;
+
+  if (state.positions.scalp) return; // no stacking
+
+  /* ================= OPEN ================= */
+
+  const res = executePaperOrder({
     tenantId,
-    action: decision.action,
     symbol,
+    action: decision.action,
     price,
-    qty: 0.01, // fixed size for now
+    qty: 0.01,
     stopLoss:
       decision.action === "BUY"
         ? price * 0.995
-        : decision.action === "SELL"
-        ? price * 1.005
-        : null,
+        : price * 1.005,
     takeProfit:
       decision.action === "BUY"
         ? price * 1.005
-        : decision.action === "SELL"
-        ? price * 0.995
-        : null,
+        : price * 0.995,
+    state,
     ts,
   });
 
+  if (res?.result) {
+    const trade = {
+      side: decision.action,
+      price,
+      time: ts,
+    };
+
+    state.trades.push(trade);
+
+    if (global.broadcastTrade) {
+      global.broadcastTrade(trade, tenantId);
+    }
+  }
+
   return {
     decision,
-    result,
+    result: res,
   };
 }
 
-/* ================= EXPORT ================= */
+/* =========================================================
+EXPORTS
+========================================================= */
 
 module.exports = {
   processTick,
+  getState,
 };
