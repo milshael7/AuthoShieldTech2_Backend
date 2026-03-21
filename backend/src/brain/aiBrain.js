@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/brain/aiBrain.js
-// VERSION: v2.0 (Institutional Adaptive Intelligence Core)
+// VERSION: v3.0 (Institutional Adaptive Intelligence Core)
 // ==========================================================
 
 const {
@@ -39,6 +39,8 @@ function getState(id) {
       lastRegime: "neutral",
       confidenceDrift: 0,
       performanceBias: 0,
+      recentPnL: [],
+      aggression: 1,
     });
   }
 
@@ -50,10 +52,66 @@ REGIME DETECTION
 ========================================================= */
 
 function detectRegime(volatility, trendStrength = 0) {
-  if (volatility > 0.02) return "volatile";
-  if (trendStrength > 0.003) return "trend";
+  if (volatility > 0.025) return "volatile";
+  if (trendStrength > 0.004) return "trend";
   if (trendStrength < 0.001) return "range";
   return "neutral";
+}
+
+/* =========================================================
+LEARNING HELPERS
+========================================================= */
+
+function getSymbolEdge(symbol, brain) {
+  const s = brain.symbols?.[symbol];
+  if (!s || s.trades < 5) return 0;
+
+  const winRate = s.wins / Math.max(1, s.trades);
+  return clamp((winRate - 0.5) * 0.4, -0.2, 0.2);
+}
+
+function getPatternEdge(pattern, brain) {
+  const p = brain.patterns?.[pattern];
+  if (!p || p.trades < 5) return 0;
+
+  const winRate = p.wins / Math.max(1, p.trades);
+  return clamp((winRate - 0.5) * 0.5, -0.25, 0.25);
+}
+
+function getSetupEdge(setup, brain) {
+  const s = brain.setups?.[setup];
+  if (!s || s.trades < 5) return 0;
+
+  const winRate = s.wins / Math.max(1, s.trades);
+  return clamp((winRate - 0.5) * 0.6, -0.3, 0.3);
+}
+
+function computePerformanceBias(brainStats) {
+  const net = safe(brainStats.netPnL, 0);
+  const trades = safe(brainStats.totalTrades, 1);
+
+  return clamp(net / (trades * 500), -0.2, 0.2);
+}
+
+/* =========================================================
+RECENT MEMORY (FAST LEARNING)
+========================================================= */
+
+function updateRecentPnL(state, pnl) {
+  if (!Number.isFinite(pnl)) return;
+
+  state.recentPnL.push(pnl);
+
+  if (state.recentPnL.length > 20) {
+    state.recentPnL.shift();
+  }
+}
+
+function getRecentBias(state) {
+  if (!state.recentPnL.length) return 0;
+
+  const sum = state.recentPnL.reduce((a, b) => a + b, 0);
+  return clamp(sum / (state.recentPnL.length * 200), -0.15, 0.15);
 }
 
 /* =========================================================
@@ -68,21 +126,10 @@ function calibrateConfidence(base, brainStats) {
 
   let drift = 0;
 
-  if (winRate > 0.6) drift += 0.05;
-  if (winRate < 0.4) drift -= 0.05;
+  if (winRate > 0.65) drift += 0.06;
+  if (winRate < 0.4) drift -= 0.08;
 
   return clamp(base + drift, 0, 1);
-}
-
-/* =========================================================
-PERFORMANCE BIAS
-========================================================= */
-
-function computePerformanceBias(brainStats) {
-  const net = safe(brainStats.netPnL, 0);
-  const trades = safe(brainStats.totalTrades, 1);
-
-  return clamp(net / (trades * 1000), -0.15, 0.15);
 }
 
 /* =========================================================
@@ -117,9 +164,15 @@ function decide({
     confidence: baseConfidence,
   });
 
-  /* ================= PERFORMANCE ================= */
+  /* ================= LEARNING LAYERS ================= */
+
+  const symbolEdge = getSymbolEdge(symbol, brain);
+  const patternEdge = getPatternEdge(pattern, brain);
+  const setupEdge = getSetupEdge(setup, brain);
 
   const perfBias = computePerformanceBias(brain.stats);
+  const recentBias = getRecentBias(state);
+
   state.performanceBias = perfBias;
 
   /* ================= CONFIDENCE ================= */
@@ -127,7 +180,11 @@ function decide({
   let confidence =
     baseConfidence +
     reasoning.confidenceAdjustment +
-    perfBias;
+    symbolEdge +
+    patternEdge +
+    setupEdge +
+    perfBias +
+    recentBias;
 
   confidence = calibrateConfidence(confidence, brain.stats);
 
@@ -136,22 +193,26 @@ function decide({
   let edge =
     baseEdge +
     reasoning.edgeAdjustment +
-    perfBias * 0.5;
+    symbolEdge +
+    patternEdge +
+    setupEdge +
+    perfBias * 0.5 +
+    recentBias;
 
   /* ================= REGIME ADAPTATION ================= */
 
   if (regime === "volatile") {
-    confidence *= 0.85;
-    edge *= 0.8;
-  }
-
-  if (regime === "range") {
+    confidence *= 0.82;
     edge *= 0.75;
   }
 
+  if (regime === "range") {
+    edge *= 0.7;
+  }
+
   if (regime === "trend") {
-    confidence *= 1.05;
-    edge *= 1.1;
+    confidence *= 1.08;
+    edge *= 1.15;
   }
 
   /* ================= DRAWDOWN PROTECTION ================= */
@@ -163,8 +224,20 @@ function decide({
     peak > 0 ? (peak - equity) / peak : 0;
 
   if (drawdown > 0.05) {
-    confidence *= 0.7;
+    confidence *= 0.65;
     edge *= 0.6;
+  }
+
+  /* ================= ADAPTIVE AGGRESSION ================= */
+
+  if (recentBias > 0.05) {
+    confidence *= 1.05;
+    edge *= 1.05;
+  }
+
+  if (recentBias < -0.05) {
+    confidence *= 0.85;
+    edge *= 0.8;
   }
 
   /* ================= FINAL ================= */
@@ -174,6 +247,13 @@ function decide({
     edge: clamp(edge, -1, 1),
     regime,
     score: reasoning.score,
+    components: {
+      symbolEdge,
+      patternEdge,
+      setupEdge,
+      perfBias,
+      recentBias,
+    },
   };
 }
 
@@ -190,6 +270,10 @@ function recordTradeOutcome({
   confidence = 0,
 }) {
   try {
+    const state = getState(tenantId);
+
+    updateRecentPnL(state, pnl);
+
     recordTrade({
       symbol,
       pnl,
