@@ -1,10 +1,9 @@
 // ==========================================================
-// ENGINE CORE v3.0 (AI DRIVEN EXECUTION LOOP)
+// ENGINE CORE v3.0 (FULLY TRACKED + UI CONNECTED)
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
-const aiBrain = require("../brain/aiBrain");
 
 /* =========================================================
 STATE
@@ -19,7 +18,12 @@ function getState(tenantId) {
     ENGINE_STATE.set(key, {
       positions: { scalp: null },
       trades: [],
-      lastPrice: null,
+      decisions: [],
+      executionStats: {
+        ticks: 0,
+        decisions: 0,
+        trades: 0,
+      },
     });
   }
 
@@ -27,7 +31,40 @@ function getState(tenantId) {
 }
 
 /* =========================================================
-POSITION MANAGEMENT
+DECISION MEMORY
+========================================================= */
+
+const PRICE_MEMORY = new Map();
+
+function getMemory(tenantId) {
+  const key = String(tenantId || "__default__");
+
+  if (!PRICE_MEMORY.has(key)) {
+    PRICE_MEMORY.set(key, []);
+  }
+
+  return PRICE_MEMORY.get(key);
+}
+
+function simpleDecision(tenantId, price) {
+  const mem = getMemory(tenantId);
+
+  mem.push(price);
+  if (mem.length > 5) mem.shift();
+
+  if (mem.length < 3) return { action: "WAIT" };
+
+  const last = mem[mem.length - 1];
+  const prev = mem[mem.length - 2];
+
+  if (last > prev) return { action: "BUY", confidence: 0.6 };
+  if (last < prev) return { action: "SELL", confidence: 0.6 };
+
+  return { action: "WAIT" };
+}
+
+/* =========================================================
+CLOSE LOGIC
 ========================================================= */
 
 function checkClose(position, price) {
@@ -47,44 +84,23 @@ function checkClose(position, price) {
 }
 
 /* =========================================================
-AI DECISION FILTER
-========================================================= */
-
-function interpretDecision(ai) {
-  const confidence = ai.confidence || 0;
-  const edge = ai.edge || 0;
-
-  if (confidence < 0.55) return "WAIT";
-
-  if (edge > 0.001) return "BUY";
-  if (edge < -0.001) return "SELL";
-
-  return "WAIT";
-}
-
-/* =========================================================
 ENGINE TICK
 ========================================================= */
 
-function processTick({
-  tenantId,
-  symbol,
-  price,
-  ts = Date.now(),
-}) {
+function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   if (!tenantId || !symbol || !price) return null;
 
   const state = getState(tenantId);
 
-  const lastPrice = state.lastPrice || price;
-  state.lastPrice = price;
+  /* ================= TRACK TICKS ================= */
+  state.executionStats.ticks++;
 
-  // 1. Update price
+  /* ================= UPDATE PRICE ================= */
   updatePrice(tenantId, symbol, price);
 
   const currentPos = state.positions.scalp;
 
-  /* ================= CLOSE LOGIC ================= */
+  /* ================= CLOSE ================= */
 
   if (currentPos) {
     const closeReason = checkClose(currentPos, price);
@@ -97,19 +113,22 @@ function processTick({
         price,
         state,
         ts,
+        reason: closeReason,
       });
 
       if (res?.result) {
-        const trade = {
-          side: closeReason,
-          price,
-          time: ts,
-        };
-
-        state.trades.push(trade);
+        state.executionStats.trades++;
 
         if (global.broadcastTrade) {
-          global.broadcastTrade(trade, tenantId);
+          global.broadcastTrade(
+            {
+              side: closeReason,
+              price,
+              time: ts,
+              pnl: res.result.pnl,
+            },
+            tenantId
+          );
         }
       }
 
@@ -117,74 +136,59 @@ function processTick({
     }
   }
 
-  /* ================= AI DECISION ================= */
+  /* ================= DECISION ================= */
 
-  const ai = aiBrain.decide({
-    tenantId,
-    symbol,
-    last: lastPrice,
-    paper: {
-      volatility: Math.abs(price - lastPrice) / Math.max(lastPrice, 1),
-      equity: 10000,
-      peakEquity: 10000,
-    },
-    baseConfidence: 0.5,
-    baseEdge: (price - lastPrice) / Math.max(lastPrice, 1),
-    pattern: "auto",
-    setup: "scalp",
+  const decision = simpleDecision(tenantId, price);
+
+  state.executionStats.decisions++;
+
+  state.decisions.push({
+    ...decision,
+    time: ts,
   });
 
-  const action = interpretDecision(ai);
+  if (decision.action === "WAIT") return;
 
-  if (action === "WAIT") return;
-
-  if (state.positions.scalp) return; // no stacking
+  if (state.positions.scalp) return;
 
   /* ================= OPEN ================= */
-
-  const stopLoss =
-    action === "BUY"
-      ? price * 0.995
-      : price * 1.005;
-
-  const takeProfit =
-    action === "BUY"
-      ? price * 1.006
-      : price * 0.994;
 
   const res = executePaperOrder({
     tenantId,
     symbol,
-    action,
+    action: decision.action,
     price,
     qty: 0.01,
-    stopLoss,
-    takeProfit,
+    stopLoss:
+      decision.action === "BUY"
+        ? price * 0.995
+        : price * 1.005,
+    takeProfit:
+      decision.action === "BUY"
+        ? price * 1.005
+        : price * 0.995,
     state,
     ts,
-    decisionMeta: {
-      confidence: ai.confidence,
-      pattern: "auto",
-      setup: "scalp",
-    },
+    decisionMeta: decision,
   });
 
   if (res?.result) {
-    const trade = {
-      side: action,
-      price,
-      time: ts,
-    };
-
-    state.trades.push(trade);
+    state.executionStats.trades++;
 
     if (global.broadcastTrade) {
-      global.broadcastTrade(trade, tenantId);
+      global.broadcastTrade(
+        {
+          side: decision.action,
+          price,
+          time: ts,
+        },
+        tenantId
+      );
     }
   }
 
   return {
-    decision: ai,
+    decision,
     result: res,
   };
 }
