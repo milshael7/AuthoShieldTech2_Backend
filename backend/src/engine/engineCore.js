@@ -1,9 +1,10 @@
 // ==========================================================
-// ENGINE CORE v2.0 (FULL EXECUTION LOOP)
+// ENGINE CORE v3.0 (AI DRIVEN EXECUTION LOOP)
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
+const aiBrain = require("../brain/aiBrain");
 
 /* =========================================================
 STATE
@@ -18,43 +19,11 @@ function getState(tenantId) {
     ENGINE_STATE.set(key, {
       positions: { scalp: null },
       trades: [],
+      lastPrice: null,
     });
   }
 
   return ENGINE_STATE.get(key);
-}
-
-/* =========================================================
-SIMPLE DECISION (TEMP)
-========================================================= */
-
-const PRICE_MEMORY = new Map();
-
-function getMemory(tenantId) {
-  const key = String(tenantId || "__default__");
-
-  if (!PRICE_MEMORY.has(key)) {
-    PRICE_MEMORY.set(key, []);
-  }
-
-  return PRICE_MEMORY.get(key);
-}
-
-function simpleDecision(tenantId, price) {
-  const mem = getMemory(tenantId);
-
-  mem.push(price);
-  if (mem.length > 5) mem.shift();
-
-  if (mem.length < 3) return { action: "WAIT" };
-
-  const last = mem[mem.length - 1];
-  const prev = mem[mem.length - 2];
-
-  if (last > prev) return { action: "BUY", confidence: 0.6 };
-  if (last < prev) return { action: "SELL", confidence: 0.6 };
-
-  return { action: "WAIT" };
 }
 
 /* =========================================================
@@ -78,6 +47,22 @@ function checkClose(position, price) {
 }
 
 /* =========================================================
+AI DECISION FILTER
+========================================================= */
+
+function interpretDecision(ai) {
+  const confidence = ai.confidence || 0;
+  const edge = ai.edge || 0;
+
+  if (confidence < 0.55) return "WAIT";
+
+  if (edge > 0.001) return "BUY";
+  if (edge < -0.001) return "SELL";
+
+  return "WAIT";
+}
+
+/* =========================================================
 ENGINE TICK
 ========================================================= */
 
@@ -90,6 +75,9 @@ function processTick({
   if (!tenantId || !symbol || !price) return null;
 
   const state = getState(tenantId);
+
+  const lastPrice = state.lastPrice || price;
+  state.lastPrice = price;
 
   // 1. Update price
   updatePrice(tenantId, symbol, price);
@@ -129,37 +117,61 @@ function processTick({
     }
   }
 
-  /* ================= DECISION ================= */
+  /* ================= AI DECISION ================= */
 
-  const decision = simpleDecision(tenantId, price);
+  const ai = aiBrain.decide({
+    tenantId,
+    symbol,
+    last: lastPrice,
+    paper: {
+      volatility: Math.abs(price - lastPrice) / Math.max(lastPrice, 1),
+      equity: 10000,
+      peakEquity: 10000,
+    },
+    baseConfidence: 0.5,
+    baseEdge: (price - lastPrice) / Math.max(lastPrice, 1),
+    pattern: "auto",
+    setup: "scalp",
+  });
 
-  if (decision.action === "WAIT") return;
+  const action = interpretDecision(ai);
+
+  if (action === "WAIT") return;
 
   if (state.positions.scalp) return; // no stacking
 
   /* ================= OPEN ================= */
 
+  const stopLoss =
+    action === "BUY"
+      ? price * 0.995
+      : price * 1.005;
+
+  const takeProfit =
+    action === "BUY"
+      ? price * 1.006
+      : price * 0.994;
+
   const res = executePaperOrder({
     tenantId,
     symbol,
-    action: decision.action,
+    action,
     price,
     qty: 0.01,
-    stopLoss:
-      decision.action === "BUY"
-        ? price * 0.995
-        : price * 1.005,
-    takeProfit:
-      decision.action === "BUY"
-        ? price * 1.005
-        : price * 0.995,
+    stopLoss,
+    takeProfit,
     state,
     ts,
+    decisionMeta: {
+      confidence: ai.confidence,
+      pattern: "auto",
+      setup: "scalp",
+    },
   });
 
   if (res?.result) {
     const trade = {
-      side: decision.action,
+      side: action,
       price,
       time: ts,
     };
@@ -172,7 +184,7 @@ function processTick({
   }
 
   return {
-    decision,
+    decision: ai,
     result: res,
   };
 }
