@@ -1,6 +1,6 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v27.0 (Institutional + AI Timing + Metrics Ready)
+// VERSION: v28.0 (AI Learning + Full Trade Lifecycle FIXED)
 // ==========================================================
 
 const outsideBrain = require("../../brain/aiBrain");
@@ -70,6 +70,7 @@ function executePaperOrder({
   state,
   ts = Date.now(),
   plan = {},
+  decisionMeta = {}, // 🔥 NEW (pattern/setup/confidence)
 }) {
   if (!state || !symbol) return null;
 
@@ -103,6 +104,11 @@ function executePaperOrder({
       takeProfit,
       slot: normalizedSlot,
       bestPnl: 0,
+
+      // 🔥 STORE AI CONTEXT
+      confidence: safeNum(decisionMeta.confidence, 0),
+      pattern: decisionMeta.pattern || "unknown",
+      setup: decisionMeta.setup || "unknown",
     };
 
     enrichPositionWithTiming(position, plan);
@@ -135,17 +141,21 @@ function executePaperOrder({
 
     const duration = ts - pos.time;
 
+    /* ================= AI LEARNING FIX ================= */
     try {
       outsideBrain.recordTradeOutcome({
         tenantId,
+        symbol: pos.symbol,
         pnl,
-        duration,
-        expectedDuration: pos.expectedDuration,
+        pattern: pos.pattern || "unknown",
+        setup: pos.setup || "unknown",
         confidence: pos.confidence || 0,
-        timeConfidence: pos.timeConfidence,
-        reason: "ENGINE_CLOSE",
       });
-    } catch {}
+    } catch (err) {
+      console.error("AI record error:", err.message);
+    }
+
+    /* ================= RESET ================= */
 
     state.positions[normalizedSlot] = null;
     state.position = null;
