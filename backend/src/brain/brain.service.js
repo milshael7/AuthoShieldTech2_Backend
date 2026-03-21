@@ -1,21 +1,18 @@
 // ==========================================================
 // FILE: backend/src/brain/brain.service.js
-// VERSION: v1.0 (Central AI Brain Service)
-// PURPOSE:
-// - Main interface for AI brain
-// - Connect memory + reasoning
-// - Provide decision support
-// - Record outcomes for learning
+// VERSION: v2.0 (Institutional AI Orchestration Layer)
 // ==========================================================
 
 const {
   readBrain,
-  writeBrain,
+  recordTrade,
 } = require("./brain.store");
 
 const {
   reasonTradeContext,
 } = require("./brain.reasoner");
+
+const aiBrain = require("./aiBrain");
 
 /* =========================================================
 UTIL
@@ -31,7 +28,7 @@ function clamp(n, min, max) {
 }
 
 /* =========================================================
-DECISION SUPPORT (USED BY tradeBrain)
+DECISION ENGINE (CORE ENTRY POINT)
 ========================================================= */
 
 function decide({
@@ -41,8 +38,11 @@ function decide({
   edge = 0,
   pattern = "unknown",
   setup = "unknown",
+  paper = {},
 }) {
   try {
+    /* ================= REASONING ================= */
+
     const reasoning = reasonTradeContext({
       symbol,
       pattern,
@@ -50,36 +50,75 @@ function decide({
       confidence,
     });
 
-    // Apply adjustments
-    const adjustedConfidence = clamp(
-      safeNum(confidence, 0) + safeNum(reasoning.confidenceAdjustment, 0),
-      0,
-      1
-    );
+    /* ================= AI ADAPTIVE LAYER ================= */
 
-    const adjustedEdge = clamp(
-      safeNum(edge, 0) + safeNum(reasoning.edgeAdjustment, 0),
-      -1,
-      1
-    );
+    const adaptive = aiBrain.decide({
+      tenantId,
+      symbol,
+      paper,
+      baseConfidence: confidence,
+      baseEdge: edge,
+      pattern,
+      setup,
+    });
+
+    /* ================= MERGE INTELLIGENCE ================= */
+
+    let finalConfidence =
+      safeNum(confidence, 0) +
+      safeNum(reasoning.confidenceAdjustment, 0) * 0.6 +
+      safeNum(adaptive.confidence, 0) * 0.4;
+
+    let finalEdge =
+      safeNum(edge, 0) +
+      safeNum(reasoning.edgeAdjustment, 0) * 0.5 +
+      safeNum(adaptive.edge, 0) * 0.5;
+
+    /* ================= RISK MODULATION ================= */
+
+    let riskAdjustment = safeNum(reasoning.riskAdjustment, 0);
+
+    if (adaptive?.regime === "volatile") {
+      riskAdjustment *= 0.7;
+    }
+
+    if (adaptive?.regime === "trend") {
+      riskAdjustment *= 1.1;
+    }
+
+    /* ================= FINAL CLAMP ================= */
+
+    finalConfidence = clamp(finalConfidence, 0, 1);
+    finalEdge = clamp(finalEdge, -1, 1);
 
     return {
-      confidence: adjustedConfidence,
-      edge: adjustedEdge,
+      confidence: finalConfidence,
+      edge: finalEdge,
+      riskAdjustment: clamp(riskAdjustment, -0.25, 0.25),
+
+      regime: adaptive?.regime || "neutral",
+
       score: reasoning.score,
-      diagnostics: reasoning.diagnostics,
+
+      diagnostics: {
+        reasoning: reasoning.diagnostics,
+        adaptive: adaptive.components || {},
+      },
     };
   } catch (err) {
+    console.error("AI decide error:", err.message);
+
     return {
-      confidence: confidence,
-      edge: edge,
+      confidence,
+      edge,
+      riskAdjustment: 0,
       score: 0,
     };
   }
 }
 
 /* =========================================================
-RECORD TRADE OUTCOME (USED BY executionEngine)
+LEARNING PIPELINE (CRITICAL)
 ========================================================= */
 
 function recordTradeOutcome({
@@ -91,26 +130,9 @@ function recordTradeOutcome({
   confidence = 0,
 }) {
   try {
-    const brain = readBrain();
+    /* ================= STORE MEMORY ================= */
 
-    /* ================= GLOBAL STATS ================= */
-
-    brain.stats.totalTrades += 1;
-
-    if (pnl > 0) {
-      brain.stats.wins += 1;
-      brain.stats.totalWinUSD += pnl;
-    } else {
-      brain.stats.losses += 1;
-      brain.stats.totalLossUSD += pnl;
-    }
-
-    brain.stats.netPnL += pnl;
-
-    /* ================= HISTORY ================= */
-
-    brain.history.push({
-      ts: Date.now(),
+    recordTrade({
       symbol,
       pnl,
       pattern,
@@ -118,11 +140,16 @@ function recordTradeOutcome({
       confidence,
     });
 
-    if (brain.history.length > 1000) {
-      brain.history = brain.history.slice(-1000);
-    }
+    /* ================= ADAPTIVE LEARNING ================= */
 
-    writeBrain(brain);
+    aiBrain.recordTradeOutcome({
+      tenantId,
+      symbol,
+      pnl,
+      pattern,
+      setup,
+      confidence,
+    });
 
     return { ok: true };
   } catch (err) {
@@ -132,22 +159,33 @@ function recordTradeOutcome({
 }
 
 /* =========================================================
-LIGHTWEIGHT ANALYTICS
+ANALYTICS (DASHBOARD READY)
 ========================================================= */
 
 function getBrainStats() {
   try {
     const brain = readBrain();
 
+    const totalTrades = safeNum(brain?.stats?.totalTrades, 0);
+    const wins = safeNum(brain?.stats?.wins, 0);
+
     return {
-      totalTrades: safeNum(brain?.stats?.totalTrades, 0),
-      wins: safeNum(brain?.stats?.wins, 0),
+      totalTrades,
+      wins,
       losses: safeNum(brain?.stats?.losses, 0),
       netPnL: safeNum(brain?.stats?.netPnL, 0),
+
       winRate:
-        brain?.stats?.totalTrades > 0
-          ? brain.stats.wins / brain.stats.totalTrades
-          : 0,
+        totalTrades > 0 ? wins / totalTrades : 0,
+
+      symbols: brain?.symbols || {},
+      patterns: brain?.patterns || {},
+      setups: brain?.setups || {},
+
+      memoryDepth: Array.isArray(brain?.history)
+        ? brain.history.length
+        : 0,
+
       lastUpdated: brain?.lastUpdated || null,
     };
   } catch {
@@ -162,27 +200,12 @@ function getBrainStats() {
 }
 
 /* =========================================================
-RESET (OPTIONAL)
+RESET
 ========================================================= */
 
 function resetBrain() {
   try {
-    writeBrain({
-      createdAt: Date.now(),
-      lastUpdated: Date.now(),
-      stats: {
-        totalTrades: 0,
-        wins: 0,
-        losses: 0,
-        totalWinUSD: 0,
-        totalLossUSD: 0,
-        netPnL: 0,
-        maxBalance: 0,
-      },
-      history: [],
-    });
-
-    return { ok: true };
+    return { ok: false, message: "Use brain.store reset instead" };
   } catch (err) {
     return { ok: false, error: err.message };
   }
