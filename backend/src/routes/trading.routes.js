@@ -1,6 +1,7 @@
 // ==========================================================
 // FILE: backend/src/routes/trading.routes.js
-// VERSION: v12 (REAL ENGINE TELEMETRY + AI FIXED)
+// VERSION: v13 (CLEAN + REAL TELEMETRY + STABLE AI)
+// MAINTENANCE SAFE — SINGLE ENGINE FLOW
 // ==========================================================
 
 const express = require("express");
@@ -52,7 +53,7 @@ router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
       ok: true,
       data: {
         action: last?.side || "WAIT",
-        confidence: last?.confidence || 0.5,
+        confidence: safeNum(last?.confidence, 0),
         edge: 0,
         regime: "live",
         reason: "engine_live",
@@ -73,14 +74,16 @@ router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
     const state = engineCore.getState(tenantId) || {};
     const trades = state.trades || [];
 
-    const totalTrades = trades.length;
     let wins = 0;
     let pnl = 0;
 
     for (const t of trades) {
-      if (t.pnl > 0) wins++;
-      pnl += safeNum(t.pnl);
+      const tpnl = safeNum(t.pnl);
+      if (tpnl > 0) wins++;
+      pnl += tpnl;
     }
+
+    const totalTrades = trades.length;
 
     return res.json({
       ok: true,
@@ -88,7 +91,7 @@ router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
         totalTrades,
         winRate: totalTrades > 0 ? wins / totalTrades : 0,
         netPnL: pnl,
-        memoryDepth: trades.length,
+        memoryDepth: totalTrades,
       },
     });
   } catch (err) {
@@ -106,15 +109,16 @@ router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
     const state = engineCore.getState(tenantId) || {};
     const trades = state.trades || [];
 
-    const totalTrades = trades.length;
-
     let wins = 0;
     let pnl = 0;
 
     for (const t of trades) {
-      if (t.pnl > 0) wins++;
-      pnl += safeNum(t.pnl);
+      const tpnl = safeNum(t.pnl);
+      if (tpnl > 0) wins++;
+      pnl += tpnl;
     }
+
+    const totalTrades = trades.length;
 
     return res.json({
       ok: true,
@@ -130,7 +134,7 @@ router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
 });
 
 /* =========================================================
-🔥 STATUS — FULLY FIXED
+🔥 STATUS — REAL ENGINE TELEMETRY
 ========================================================= */
 
 router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
@@ -140,13 +144,12 @@ router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
     const state = engineCore.getState(tenantId) || {};
     const trades = state.trades || [];
     const decisions = state.decisions || [];
+    const stats = state.executionStats || {};
 
-    /* ================= ENGINE ================= */
+    /* ================= ENGINE STATUS ================= */
 
     const engine =
-      trades.length > 0 || decisions.length > 0
-        ? "RUNNING"
-        : "STARTING";
+      stats.ticks > 0 ? "RUNNING" : "STARTING";
 
     /* ================= AI RATE ================= */
 
@@ -191,9 +194,9 @@ router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
       engine,
 
       telemetry: {
-        ticks: decisions.length,
-        decisions: decisions.length,
-        trades: trades.length,
+        ticks: safeNum(stats.ticks),
+        decisions: safeNum(stats.decisions),
+        trades: safeNum(stats.trades),
         memoryMb: Math.round(
           process.memoryUsage().rss / 1024 / 1024
         ),
@@ -242,7 +245,8 @@ router.post("/order", requireRole(ADMIN, MANAGER), (req, res) => {
   try {
     marketEngine.registerTenant(tenantId);
 
-    const price = marketEngine.getPrice(tenantId, symbol) || 0;
+    const price =
+      marketEngine.getPrice(tenantId, symbol) || 0;
 
     const state = engineCore.getState(tenantId);
 
