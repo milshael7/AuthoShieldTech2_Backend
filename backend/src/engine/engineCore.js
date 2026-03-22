@@ -1,5 +1,12 @@
 // ==========================================================
-// ENGINE CORE v3.1 (STABLE + AI TRACKING FIXED)
+// 🔒 AUTOSHIELD CORE — VERIFIED BUILD
+// FILE: engineCore.js
+// VERSION: v4.0 (FULL TRADE LIFECYCLE + ANALYTICS FIXED)
+//
+// RULES:
+// - DO NOT MODIFY WITHOUT VERSION CHANGE
+// - CONNECTED TO DASHBOARD + ANALYTICS
+// - REAL TRADE LIFECYCLE (OPEN → CLOSE)
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
@@ -24,6 +31,7 @@ function getState(tenantId) {
         decisions: 0,
         trades: 0,
       },
+      lastOpenTrade: null, // 🔥 TRACK ACTIVE TRADE
     });
   }
 
@@ -58,17 +66,11 @@ function simpleDecision(tenantId, price) {
   const prev = mem[mem.length - 2];
 
   if (last > prev) {
-    return {
-      action: "BUY",
-      confidence: 0.6 + Math.random() * 0.2, // slight realism
-    };
+    return { action: "BUY", confidence: 0.65 };
   }
 
   if (last < prev) {
-    return {
-      action: "SELL",
-      confidence: 0.6 + Math.random() * 0.2,
-    };
+    return { action: "SELL", confidence: 0.65 };
   }
 
   return { action: "WAIT", confidence: 0 };
@@ -103,7 +105,7 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
 
   const state = getState(tenantId);
 
-  /* ================= TICK ================= */
+  /* ================= TRACK ================= */
   state.executionStats.ticks++;
 
   /* ================= PRICE ================= */
@@ -112,7 +114,7 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   const currentPos = state.positions.scalp;
 
   /* =========================================================
-  CLOSE
+  CLOSE (🔥 FIXED — FULL TRADE RECORD)
   ========================================================= */
 
   if (currentPos) {
@@ -131,6 +133,31 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
 
       if (res?.result) {
         state.executionStats.trades++;
+
+        const openTrade = state.lastOpenTrade;
+
+        // 🔥 BUILD FULL TRADE
+        const closedTrade = {
+          symbol,
+          side: openTrade?.side || currentPos.side,
+          entry: openTrade?.price || currentPos.entry,
+          exit: price,
+          pnl: res.result.pnl,
+          win: res.result.pnl > 0,
+          duration: res.result.duration,
+          confidence: openTrade?.confidence || 0,
+          openTime: openTrade?.time,
+          closeTime: ts,
+        };
+
+        state.trades.push(closedTrade);
+
+        // cap memory
+        if (state.trades.length > 500) {
+          state.trades.shift();
+        }
+
+        state.lastOpenTrade = null;
 
         if (global.broadcastTrade) {
           global.broadcastTrade(
@@ -155,7 +182,6 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
 
   const decision = simpleDecision(tenantId, price);
 
-  // 🔥 ONLY TRACK REAL DECISIONS
   if (decision.action !== "WAIT") {
     state.executionStats.decisions++;
 
@@ -164,7 +190,6 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
       time: ts,
     });
 
-    // cap memory
     if (state.decisions.length > 500) {
       state.decisions.shift();
     }
@@ -174,7 +199,7 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   if (state.positions.scalp) return;
 
   /* =========================================================
-  OPEN
+  OPEN (🔥 FIXED — TRACK OPEN TRADE)
   ========================================================= */
 
   const res = executePaperOrder({
@@ -199,13 +224,13 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   if (res?.result) {
     state.executionStats.trades++;
 
-    // 🔥 PUSH OPEN TRADE INTO STATE
-    state.trades.push({
+    // 🔥 TRACK OPEN TRADE
+    state.lastOpenTrade = {
       side: decision.action,
       price,
       time: ts,
       confidence: decision.confidence,
-    });
+    };
 
     if (global.broadcastTrade) {
       global.broadcastTrade(
