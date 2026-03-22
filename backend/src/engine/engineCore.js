@@ -1,31 +1,46 @@
 // ==========================================================
-// 🔒 PROTECTED CORE FILE — DO NOT MODIFY WITHOUT AUTHORIZATION
-// MODULE: ENGINE CORE (ORCHESTRATOR)
-// VERSION: v1.0 (CONTROL LAYER)
-//
-// PURPOSE:
-// - Central brain loop
-// - Connects market → decision → execution → state
+// 🔒 AUTOSHIELD CORE — VERIFIED BUILD
+// FILE: engineCore.js
+// VERSION: v4.0 (FULL TRADE LIFECYCLE + ANALYTICS FIXED)
 //
 // RULES:
-// 1. NO direct state mutation
-// 2. NO execution logic here
-// 3. ONLY orchestrates flow
-// 4. Deterministic input → output
-//
+// - DO NOT MODIFY WITHOUT VERSION CHANGE
+// - CONNECTED TO DASHBOARD + ANALYTICS
+// - REAL TRADE LIFECYCLE (OPEN → CLOSE)
 // ==========================================================
 
-const { execute } = require("./executionEngine");
+const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
 
-/* ================= SIMPLE DECISION ENGINE ================= */
-/*
-  TEMPORARY — This will later be replaced by your AI (tradeBrain)
+/* =========================================================
+STATE
+========================================================= */
 
-  Right now we use simple logic so system behaves REAL:
-  - If price momentum up → BUY
-  - If price momentum down → SELL
-*/
+const ENGINE_STATE = new Map();
+
+function getState(tenantId) {
+  const key = String(tenantId || "__default__");
+
+  if (!ENGINE_STATE.has(key)) {
+    ENGINE_STATE.set(key, {
+      positions: { scalp: null },
+      trades: [],
+      decisions: [],
+      executionStats: {
+        ticks: 0,
+        decisions: 0,
+        trades: 0,
+      },
+      lastOpenTrade: null, // 🔥 TRACK ACTIVE TRADE
+    });
+  }
+
+  return ENGINE_STATE.get(key);
+}
+
+/* =========================================================
+DECISION MEMORY
+========================================================= */
 
 const PRICE_MEMORY = new Map();
 
@@ -43,81 +58,203 @@ function simpleDecision(tenantId, price) {
   const mem = getMemory(tenantId);
 
   mem.push(price);
+  if (mem.length > 5) mem.shift();
 
-  if (mem.length > 5) {
-    mem.shift();
-  }
-
-  if (mem.length < 3) {
-    return { action: "WAIT" };
-  }
+  if (mem.length < 3) return { action: "WAIT", confidence: 0 };
 
   const last = mem[mem.length - 1];
   const prev = mem[mem.length - 2];
 
   if (last > prev) {
-    return {
-      action: "BUY",
-      confidence: 0.6,
-    };
+    return { action: "BUY", confidence: 0.65 };
   }
 
   if (last < prev) {
-    return {
-      action: "SELL",
-      confidence: 0.6,
-    };
+    return { action: "SELL", confidence: 0.65 };
   }
 
-  return { action: "WAIT" };
+  return { action: "WAIT", confidence: 0 };
 }
 
-/* ================= ENGINE TICK ================= */
+/* =========================================================
+CLOSE LOGIC
+========================================================= */
 
-function processTick({
-  tenantId,
-  symbol,
-  price,
-  ts = Date.now(),
-}) {
+function checkClose(position, price) {
+  if (!position) return null;
+
+  if (position.side === "LONG") {
+    if (price <= position.stopLoss) return "STOP_LOSS";
+    if (price >= position.takeProfit) return "TAKE_PROFIT";
+  }
+
+  if (position.side === "SHORT") {
+    if (price >= position.stopLoss) return "STOP_LOSS";
+    if (price <= position.takeProfit) return "TAKE_PROFIT";
+  }
+
+  return null;
+}
+
+/* =========================================================
+ENGINE TICK
+========================================================= */
+
+function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   if (!tenantId || !symbol || !price) return null;
 
-  // 1. Update price in state
+  const state = getState(tenantId);
+
+  /* ================= TRACK ================= */
+  state.executionStats.ticks++;
+
+  /* ================= PRICE ================= */
   updatePrice(tenantId, symbol, price);
 
-  // 2. Get decision (TEMP logic)
+  const currentPos = state.positions.scalp;
+
+  /* =========================================================
+  CLOSE (🔥 FIXED — FULL TRADE RECORD)
+  ========================================================= */
+
+  if (currentPos) {
+    const closeReason = checkClose(currentPos, price);
+
+    if (closeReason) {
+      const res = executePaperOrder({
+        tenantId,
+        symbol,
+        action: "CLOSE",
+        price,
+        state,
+        ts,
+        reason: closeReason,
+      });
+
+      if (res?.result) {
+        state.executionStats.trades++;
+
+        const openTrade = state.lastOpenTrade;
+
+        // 🔥 BUILD FULL TRADE
+        const closedTrade = {
+          symbol,
+          side: openTrade?.side || currentPos.side,
+          entry: openTrade?.price || currentPos.entry,
+          exit: price,
+          pnl: res.result.pnl,
+          win: res.result.pnl > 0,
+          duration: res.result.duration,
+          confidence: openTrade?.confidence || 0,
+          openTime: openTrade?.time,
+          closeTime: ts,
+        };
+
+        state.trades.push(closedTrade);
+
+        // cap memory
+        if (state.trades.length > 500) {
+          state.trades.shift();
+        }
+
+        state.lastOpenTrade = null;
+
+        if (global.broadcastTrade) {
+          global.broadcastTrade(
+            {
+              side: closeReason,
+              price,
+              time: ts,
+              pnl: res.result.pnl,
+            },
+            tenantId
+          );
+        }
+      }
+
+      return;
+    }
+  }
+
+  /* =========================================================
+  DECISION
+  ========================================================= */
+
   const decision = simpleDecision(tenantId, price);
 
-  // 3. Execute decision
-  const result = execute({
+  if (decision.action !== "WAIT") {
+    state.executionStats.decisions++;
+
+    state.decisions.push({
+      ...decision,
+      time: ts,
+    });
+
+    if (state.decisions.length > 500) {
+      state.decisions.shift();
+    }
+  }
+
+  if (decision.action === "WAIT") return;
+  if (state.positions.scalp) return;
+
+  /* =========================================================
+  OPEN (🔥 FIXED — TRACK OPEN TRADE)
+  ========================================================= */
+
+  const res = executePaperOrder({
     tenantId,
-    action: decision.action,
     symbol,
+    action: decision.action,
     price,
-    qty: 0.01, // fixed size for now
+    qty: 0.01,
     stopLoss:
       decision.action === "BUY"
         ? price * 0.995
-        : decision.action === "SELL"
-        ? price * 1.005
-        : null,
+        : price * 1.005,
     takeProfit:
       decision.action === "BUY"
         ? price * 1.005
-        : decision.action === "SELL"
-        ? price * 0.995
-        : null,
+        : price * 0.995,
+    state,
     ts,
+    decisionMeta: decision,
   });
+
+  if (res?.result) {
+    state.executionStats.trades++;
+
+    // 🔥 TRACK OPEN TRADE
+    state.lastOpenTrade = {
+      side: decision.action,
+      price,
+      time: ts,
+      confidence: decision.confidence,
+    };
+
+    if (global.broadcastTrade) {
+      global.broadcastTrade(
+        {
+          side: decision.action,
+          price,
+          time: ts,
+        },
+        tenantId
+      );
+    }
+  }
 
   return {
     decision,
-    result,
+    result: res,
   };
 }
 
-/* ================= EXPORT ================= */
+/* =========================================================
+EXPORTS
+========================================================= */
 
 module.exports = {
   processTick,
+  getState,
 };
