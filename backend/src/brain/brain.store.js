@@ -1,16 +1,29 @@
 // ==========================================================
-// FILE: backend/src/brain/brain.store.js
-// VERSION: v2.1 (Hardened Memory Engine)
+// 🔒 PROTECTED CORE FILE — MAINTENANCE SAFE
+// FILE: brain.store.js
+// VERSION: v3.0 (Tenant-Aware + Safe + Observable)
+// ==========================================================
+//
 // PURPOSE:
-// - Persistent AI memory
-// - Safe, atomic, corruption-resistant storage
+// - Persistent AI memory (per tenant)
+// - Atomic writes (no corruption)
+// - Debug visibility
+// - Safe recovery
+//
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
 
-const BRAIN_PATH = path.join(__dirname, "brain.memory.json");
-const TMP_PATH = path.join(__dirname, "brain.memory.tmp.json");
+/* =========================================================
+PATHS
+========================================================= */
+
+const BASE_PATH = path.join(__dirname, "memory");
+
+if (!fs.existsSync(BASE_PATH)) {
+  fs.mkdirSync(BASE_PATH, { recursive: true });
+}
 
 /* =========================================================
 UTIL
@@ -19,6 +32,15 @@ UTIL
 function safeNum(v, fallback = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function getPath(tenantId) {
+  const id = String(tenantId || "__default__");
+  return {
+    main: path.join(BASE_PATH, `brain_${id}.json`),
+    tmp: path.join(BASE_PATH, `brain_${id}.tmp.json`),
+    backup: path.join(BASE_PATH, `brain_${id}.bak.json`),
+  };
 }
 
 /* =========================================================
@@ -37,7 +59,6 @@ function defaultBrain() {
       totalWinUSD: 0,
       totalLossUSD: 0,
       netPnL: 0,
-      maxBalance: 0,
     },
 
     symbols: {},
@@ -49,16 +70,15 @@ function defaultBrain() {
 }
 
 /* =========================================================
-INIT
+ENSURE FILE
 ========================================================= */
 
-function ensureBrain() {
+function ensureBrain(tenantId) {
+  const { main } = getPath(tenantId);
+
   try {
-    if (!fs.existsSync(BRAIN_PATH)) {
-      fs.writeFileSync(
-        BRAIN_PATH,
-        JSON.stringify(defaultBrain(), null, 2)
-      );
+    if (!fs.existsSync(main)) {
+      fs.writeFileSync(main, JSON.stringify(defaultBrain(), null, 2));
     }
   } catch (err) {
     console.error("Brain init error:", err.message);
@@ -66,66 +86,82 @@ function ensureBrain() {
 }
 
 /* =========================================================
-SAFE READ
+READ
 ========================================================= */
 
-function readBrain() {
-  ensureBrain();
+function readBrain(tenantId) {
+  const { main, backup } = getPath(tenantId);
+
+  ensureBrain(tenantId);
 
   try {
-    const raw = fs.readFileSync(BRAIN_PATH, "utf-8");
+    const raw = fs.readFileSync(main, "utf-8");
     const parsed = JSON.parse(raw);
 
-    // minimal shape validation
     if (!parsed.stats || !parsed.history) {
-      throw new Error("Invalid brain structure");
+      throw new Error("Invalid structure");
     }
 
     return parsed;
+
   } catch (err) {
-    console.error("Brain read failed, rebuilding:", err.message);
+    console.error("⚠️ Brain corrupted. Attempting recovery...");
+
+    try {
+      if (fs.existsSync(backup)) {
+        const raw = fs.readFileSync(backup, "utf-8");
+        return JSON.parse(raw);
+      }
+    } catch {}
 
     const fresh = defaultBrain();
-    writeBrain(fresh);
+    writeBrain(tenantId, fresh);
     return fresh;
   }
 }
 
 /* =========================================================
-SAFE WRITE (ATOMIC)
+WRITE (ATOMIC + BACKUP)
 ========================================================= */
 
-function writeBrain(brain) {
+function writeBrain(tenantId, brain) {
+  const { main, tmp, backup } = getPath(tenantId);
+
   try {
     brain.lastUpdated = Date.now();
 
-    // write temp first
-    fs.writeFileSync(TMP_PATH, JSON.stringify(brain, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(brain, null, 2));
 
-    // then replace original
-    fs.renameSync(TMP_PATH, BRAIN_PATH);
+    // backup current
+    if (fs.existsSync(main)) {
+      fs.copyFileSync(main, backup);
+    }
+
+    fs.renameSync(tmp, main);
+
   } catch (err) {
     console.error("Brain write error:", err.message);
   }
 }
 
 /* =========================================================
-UPDATE MEMORY
+RECORD TRADE (CORE LEARNING)
 ========================================================= */
 
 function recordTrade({
+  tenantId,
   symbol,
   pnl,
   pattern = "unknown",
   setup = "unknown",
   confidence = 0,
 }) {
-  const brain = readBrain();
+  const brain = readBrain(tenantId);
 
   const profit = safeNum(pnl, 0);
   const sym = String(symbol || "UNKNOWN").toUpperCase();
-  const pat = String(pattern || "unknown");
-  const set = String(setup || "unknown");
+  const pat = String(pattern);
+  const set = String(setup);
 
   /* ================= GLOBAL ================= */
 
@@ -144,12 +180,7 @@ function recordTrade({
   /* ================= SYMBOL ================= */
 
   if (!brain.symbols[sym]) {
-    brain.symbols[sym] = {
-      trades: 0,
-      wins: 0,
-      losses: 0,
-      net: 0,
-    };
+    brain.symbols[sym] = { trades: 0, wins: 0, losses: 0, net: 0 };
   }
 
   const s = brain.symbols[sym];
@@ -161,12 +192,7 @@ function recordTrade({
   /* ================= PATTERN ================= */
 
   if (!brain.patterns[pat]) {
-    brain.patterns[pat] = {
-      trades: 0,
-      wins: 0,
-      losses: 0,
-      net: 0,
-    };
+    brain.patterns[pat] = { trades: 0, wins: 0, losses: 0, net: 0 };
   }
 
   const p = brain.patterns[pat];
@@ -194,8 +220,7 @@ function recordTrade({
   profit > 0 ? st.wins++ : st.losses++;
 
   st.avgConfidence =
-    (safeNum(st.avgConfidence) * (st.trades - 1) +
-      safeNum(confidence)) /
+    (safeNum(st.avgConfidence) * (st.trades - 1) + safeNum(confidence)) /
     st.trades;
 
   /* ================= HISTORY ================= */
@@ -213,39 +238,39 @@ function recordTrade({
     brain.history.shift();
   }
 
-  writeBrain(brain);
+  writeBrain(tenantId, brain);
 }
 
 /* =========================================================
-QUERY HELPERS
+DEBUG SNAPSHOT (🔥 IMPORTANT FOR YOU)
 ========================================================= */
 
-function getSymbolStats(symbol) {
-  const brain = readBrain();
-  return brain.symbols?.[symbol] || null;
-}
+function getBrainSnapshot(tenantId) {
+  const brain = readBrain(tenantId);
 
-function getPatternStats(pattern) {
-  const brain = readBrain();
-  return brain.patterns?.[pattern] || null;
-}
-
-function getSetupStats(setup) {
-  const brain = readBrain();
-  return brain.setups?.[setup] || null;
+  return {
+    stats: brain.stats,
+    symbols: brain.symbols,
+    patterns: brain.patterns,
+    setups: brain.setups,
+    lastTrades: brain.history.slice(-20),
+  };
 }
 
 /* =========================================================
 RESET
 ========================================================= */
 
-function resetBrain() {
+function resetBrain(tenantId) {
+  const { main } = getPath(tenantId);
+
   try {
-    if (fs.existsSync(BRAIN_PATH)) {
-      fs.unlinkSync(BRAIN_PATH);
+    if (fs.existsSync(main)) {
+      fs.unlinkSync(main);
     }
 
-    ensureBrain();
+    ensureBrain(tenantId);
+
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -257,13 +282,9 @@ EXPORTS
 ========================================================= */
 
 module.exports = {
-  ensureBrain,
   readBrain,
   writeBrain,
   recordTrade,
-  getSymbolStats,
-  getPatternStats,
-  getSetupStats,
+  getBrainSnapshot,
   resetBrain,
-  BRAIN_PATH,
 };
