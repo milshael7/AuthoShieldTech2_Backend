@@ -1,16 +1,18 @@
 // ==========================================================
 // FILE: backend/src/brain/aiBrain.js
-// VERSION: v3.0 (Institutional Adaptive Intelligence Core)
+// VERSION: v3.5 (CACHED + STABLE + ADAPTIVE FIXED)
 // ==========================================================
 
-const {
-  recordTrade,
-  readBrain,
-} = require("./brain.store");
+const { recordTrade, readBrain } = require("./brain.store");
+const { reasonTradeContext } = require("./brain.reasoner");
 
-const {
-  reasonTradeContext,
-} = require("./brain.reasoner");
+/* =========================================================
+CACHE (🔥 FIX)
+========================================================= */
+
+let BRAIN_CACHE = null;
+let LAST_LOAD = 0;
+const CACHE_TTL = 3000;
 
 /* =========================================================
 STATE
@@ -31,16 +33,45 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/* =========================================================
+BRAIN LOAD (🔥 FIXED)
+========================================================= */
+
+function getBrain() {
+  const now = Date.now();
+
+  if (BRAIN_CACHE && now - LAST_LOAD < CACHE_TTL) {
+    return BRAIN_CACHE;
+  }
+
+  const brain = readBrain() || {};
+
+  if (!brain.stats) {
+    brain.stats = {
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      netPnL: 0,
+    };
+  }
+
+  BRAIN_CACHE = brain;
+  LAST_LOAD = now;
+
+  return brain;
+}
+
+/* =========================================================
+STATE
+========================================================= */
+
 function getState(id) {
   const key = String(id || "__default__");
 
   if (!LOCAL_STATE.has(key)) {
     LOCAL_STATE.set(key, {
       lastRegime: "neutral",
-      confidenceDrift: 0,
-      performanceBias: 0,
       recentPnL: [],
-      aggression: 1,
     });
   }
 
@@ -48,7 +79,7 @@ function getState(id) {
 }
 
 /* =========================================================
-REGIME DETECTION
+REGIME
 ========================================================= */
 
 function detectRegime(volatility, trendStrength = 0) {
@@ -59,52 +90,24 @@ function detectRegime(volatility, trendStrength = 0) {
 }
 
 /* =========================================================
-LEARNING HELPERS
+EDGES
 ========================================================= */
 
-function getSymbolEdge(symbol, brain) {
-  const s = brain.symbols?.[symbol];
-  if (!s || s.trades < 5) return 0;
-
-  const winRate = s.wins / Math.max(1, s.trades);
-  return clamp((winRate - 0.5) * 0.4, -0.2, 0.2);
-}
-
-function getPatternEdge(pattern, brain) {
-  const p = brain.patterns?.[pattern];
-  if (!p || p.trades < 5) return 0;
-
-  const winRate = p.wins / Math.max(1, p.trades);
-  return clamp((winRate - 0.5) * 0.5, -0.25, 0.25);
-}
-
-function getSetupEdge(setup, brain) {
-  const s = brain.setups?.[setup];
-  if (!s || s.trades < 5) return 0;
-
-  const winRate = s.wins / Math.max(1, s.trades);
-  return clamp((winRate - 0.5) * 0.6, -0.3, 0.3);
-}
-
-function computePerformanceBias(brainStats) {
-  const net = safe(brainStats.netPnL, 0);
-  const trades = safe(brainStats.totalTrades, 1);
-
-  return clamp(net / (trades * 500), -0.2, 0.2);
+function getEdge(bucket, scale, limit = 0.25) {
+  if (!bucket || bucket.trades < 5) return 0;
+  const winRate = bucket.wins / Math.max(1, bucket.trades);
+  return clamp((winRate - 0.5) * scale, -limit, limit);
 }
 
 /* =========================================================
-RECENT MEMORY (FAST LEARNING)
+RECENT MEMORY
 ========================================================= */
 
 function updateRecentPnL(state, pnl) {
   if (!Number.isFinite(pnl)) return;
 
   state.recentPnL.push(pnl);
-
-  if (state.recentPnL.length > 20) {
-    state.recentPnL.shift();
-  }
+  if (state.recentPnL.length > 20) state.recentPnL.shift();
 }
 
 function getRecentBias(state) {
@@ -115,25 +118,23 @@ function getRecentBias(state) {
 }
 
 /* =========================================================
-CONFIDENCE CALIBRATION
+CONFIDENCE
 ========================================================= */
 
-function calibrateConfidence(base, brainStats) {
+function calibrateConfidence(base, stats) {
   const winRate =
-    brainStats.totalTrades > 0
-      ? brainStats.wins / brainStats.totalTrades
+    stats.totalTrades > 0
+      ? stats.wins / stats.totalTrades
       : 0.5;
 
-  let drift = 0;
+  if (winRate > 0.65) base += 0.05;
+  if (winRate < 0.4) base -= 0.08;
 
-  if (winRate > 0.65) drift += 0.06;
-  if (winRate < 0.4) drift -= 0.08;
-
-  return clamp(base + drift, 0, 1);
+  return clamp(base, 0, 1);
 }
 
 /* =========================================================
-MAIN DECISION OVERLAY
+DECISION ENGINE
 ========================================================= */
 
 function decide({
@@ -147,15 +148,14 @@ function decide({
   setup = "unknown",
 }) {
   const state = getState(tenantId);
-  const brain = readBrain();
+  const brain = getBrain();
 
   const volatility = safe(paper?.volatility, 0);
-  const trendStrength = Math.abs(safe(baseEdge, 0));
+  const trendStrength = Math.abs(baseEdge);
 
   const regime = detectRegime(volatility, trendStrength);
-  state.lastRegime = regime;
 
-  /* ================= REASONER ================= */
+  /* ================= REASONING ================= */
 
   const reasoning = reasonTradeContext({
     symbol,
@@ -164,16 +164,25 @@ function decide({
     confidence: baseConfidence,
   });
 
-  /* ================= LEARNING LAYERS ================= */
+  /* ================= EDGES ================= */
 
-  const symbolEdge = getSymbolEdge(symbol, brain);
-  const patternEdge = getPatternEdge(pattern, brain);
-  const setupEdge = getSetupEdge(setup, brain);
+  const symbolEdge = getEdge(brain.symbols?.[symbol], 0.4, 0.2);
+  const patternEdge = getEdge(brain.patterns?.[pattern], 0.5, 0.25);
+  const setupEdge = getEdge(brain.setups?.[setup], 0.6, 0.3);
 
-  const perfBias = computePerformanceBias(brain.stats);
+  const perfBias = clamp(
+    safe(brain.stats?.netPnL) /
+      Math.max(1, brain.stats.totalTrades * 500),
+    -0.2,
+    0.2
+  );
+
   const recentBias = getRecentBias(state);
 
-  state.performanceBias = perfBias;
+  /* ================= BASELINE (🔥 FIX) ================= */
+
+  if (!baseConfidence) baseConfidence = 0.35;
+  if (!baseEdge) baseEdge = 0.0003;
 
   /* ================= CONFIDENCE ================= */
 
@@ -199,14 +208,10 @@ function decide({
     perfBias * 0.5 +
     recentBias;
 
-  /* ================= REGIME ADAPTATION ================= */
+  /* ================= REGIME ================= */
 
   if (regime === "volatile") {
-    confidence *= 0.82;
-    edge *= 0.75;
-  }
-
-  if (regime === "range") {
+    confidence *= 0.8;
     edge *= 0.7;
   }
 
@@ -215,50 +220,28 @@ function decide({
     edge *= 1.15;
   }
 
-  /* ================= DRAWDOWN PROTECTION ================= */
+  /* ================= DRAWDOWN ================= */
 
   const equity = safe(paper?.equity, 0);
   const peak = safe(paper?.peakEquity, equity);
 
-  const drawdown =
-    peak > 0 ? (peak - equity) / peak : 0;
+  const dd = peak > 0 ? (peak - equity) / peak : 0;
 
-  if (drawdown > 0.05) {
+  if (dd > 0.05) {
     confidence *= 0.65;
     edge *= 0.6;
   }
-
-  /* ================= ADAPTIVE AGGRESSION ================= */
-
-  if (recentBias > 0.05) {
-    confidence *= 1.05;
-    edge *= 1.05;
-  }
-
-  if (recentBias < -0.05) {
-    confidence *= 0.85;
-    edge *= 0.8;
-  }
-
-  /* ================= FINAL ================= */
 
   return {
     confidence: clamp(confidence, 0, 1),
     edge: clamp(edge, -1, 1),
     regime,
     score: reasoning.score,
-    components: {
-      symbolEdge,
-      patternEdge,
-      setupEdge,
-      perfBias,
-      recentBias,
-    },
   };
 }
 
 /* =========================================================
-LEARNING (TRADE OUTCOME)
+LEARNING
 ========================================================= */
 
 function recordTradeOutcome({
@@ -282,6 +265,9 @@ function recordTradeOutcome({
       confidence,
     });
 
+    // 🔥 invalidate cache
+    BRAIN_CACHE = null;
+
     return { ok: true };
   } catch (err) {
     console.error("AI learning error:", err.message);
@@ -298,9 +284,7 @@ function resetTenant(tenantId) {
   return { ok: true };
 }
 
-/* =========================================================
-EXPORTS
-========================================================= */
+/* ========================================================= */
 
 module.exports = {
   decide,
