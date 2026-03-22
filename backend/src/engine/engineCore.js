@@ -1,13 +1,13 @@
 // ==========================================================
-// ENGINE CORE v4.0 (CONNECTED TO OUTSIDE BRAIN)
-// MAINTENANCE SAFE — DO NOT SPLIT BRAIN SYSTEM
+// ENGINE CORE v5.0 (SINGLE BRAIN — MEMORY CONNECTED)
+// MAINTENANCE SAFE — DO NOT ADD SECOND BRAIN
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
 
-// 🔥 CONNECT REAL PERSISTENT BRAIN
-const aiBrain = require("../../brain/aiBrain");
+// 🔥 ONLY BRAIN (SOURCE OF TRUTH)
+const memoryBrain = require("../../brainMemory/memoryBrain");
 
 /* =========================================================
 STATE
@@ -32,6 +32,54 @@ function getState(tenantId) {
   }
 
   return ENGINE_STATE.get(key);
+}
+
+/* =========================================================
+SIMPLE DECISION (TEMP — UNTIL ADVANCED AI LAYER)
+========================================================= */
+
+const PRICE_MEMORY = new Map();
+
+function getMemory(tenantId) {
+  const key = String(tenantId || "__default__");
+
+  if (!PRICE_MEMORY.has(key)) {
+    PRICE_MEMORY.set(key, []);
+  }
+
+  return PRICE_MEMORY.get(key);
+}
+
+function simpleDecision(tenantId, price) {
+  const mem = getMemory(tenantId);
+
+  mem.push(price);
+  if (mem.length > 5) mem.shift();
+
+  if (mem.length < 3) {
+    return { action: "WAIT", confidence: 0 };
+  }
+
+  const last = mem[mem.length - 1];
+  const prev = mem[mem.length - 2];
+
+  if (last > prev) {
+    return {
+      action: "BUY",
+      confidence: 0.6,
+      edge: 0.001,
+    };
+  }
+
+  if (last < prev) {
+    return {
+      action: "SELL",
+      confidence: 0.6,
+      edge: -0.001,
+    };
+  }
+
+  return { action: "WAIT", confidence: 0, edge: 0 };
 }
 
 /* =========================================================
@@ -92,10 +140,17 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
       if (res?.result) {
         state.executionStats.trades++;
 
-        // 🔥 FEED LEARNING INTO REAL BRAIN
-        aiBrain.recordTradeOutcome({
+        // 🔥 RECORD TRADE TO REAL BRAIN
+        memoryBrain.recordTrade({
           tenantId,
-          pnl: res.result.pnl || 0,
+          symbol: currentPos.symbol,
+          entry: currentPos.entry,
+          exit: price,
+          qty: currentPos.qty,
+          pnl: res.result.pnl,
+          confidence: currentPos.confidence || 0,
+          edge: 0,
+          volatility: 0,
         });
 
         if (global.broadcastTrade) {
@@ -116,24 +171,33 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
   }
 
   /* =========================================================
-  🧠 REAL AI DECISION
+  DECISION
   ========================================================= */
 
-  const decision = aiBrain.decide({
-    tenantId,
-    last: price,
-    paper: {}, // can extend later
-  });
+  const decision = simpleDecision(tenantId, price);
 
-  state.executionStats.decisions++;
+  if (decision.action !== "WAIT") {
+    state.executionStats.decisions++;
 
-  state.decisions.push({
-    ...decision,
-    time: ts,
-  });
+    state.decisions.push({
+      ...decision,
+      time: ts,
+    });
 
-  if (state.decisions.length > 500) {
-    state.decisions.shift();
+    if (state.decisions.length > 500) {
+      state.decisions.shift();
+    }
+
+    // 🔥 RECORD SIGNAL TO REAL BRAIN
+    memoryBrain.recordSignal({
+      tenantId,
+      symbol,
+      action: decision.action,
+      confidence: decision.confidence,
+      edge: decision.edge,
+      price,
+      volatility: 0,
+    });
   }
 
   if (decision.action === "WAIT") return;
@@ -170,14 +234,6 @@ function processTick({ tenantId, symbol, price, ts = Date.now() }) {
       price,
       time: ts,
       confidence: decision.confidence,
-    });
-
-    // 🔥 LOG SIGNAL TO BRAIN
-    aiBrain.recordSignal({
-      tenantId,
-      action: decision.action,
-      confidence: decision.confidence,
-      edge: decision.edge,
     });
 
     if (global.broadcastTrade) {
