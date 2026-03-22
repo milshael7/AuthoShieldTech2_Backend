@@ -1,15 +1,18 @@
 // ==========================================================
-// FILE: backend/src/routes/tradingAnalytics.js
-// VERSION: v1.0 (Safe Trading Analytics Memory Routes)
-// PURPOSE
-// - Provide /api/analytics/trading endpoints expected by server.js
-// - Read from app.locals.tradingAnalytics process memory
-// - Expose summary, raw state, and maintenance reset
-// - Stay safe if memory store is missing or partially shaped
+// 🔒 PROTECTED CORE FILE — MAINTENANCE SAFE
+// FILE: tradingAnalytics.js
+// VERSION: v2.0 (Tenant-Aware + Engine-Ready)
+// ==========================================================
+//
+// PURPOSE:
+// - Central analytics memory
+// - Per-tenant tracking
+// - Safe reads + writes
+// - Ready for engine integration
+//
 // ==========================================================
 
 const express = require("express");
-
 const router = express.Router();
 
 /* =========================================================
@@ -25,137 +28,168 @@ function ensureArray(v) {
   return Array.isArray(v) ? v : [];
 }
 
+function getTenantId(req) {
+  return req.user?.companyId || req.user?.id || "__default__";
+}
+
+/* =========================================================
+STORE
+========================================================= */
+
 function createStore() {
   return {
     tradeArchive: [],
     decisionArchive: [],
     recentResets: [],
     recentLogins: [],
+    createdAt: Date.now(),
   };
 }
 
-function getStore(req) {
+function getStore(req, tenantId) {
   if (!req.app.locals.tradingAnalytics) {
-    req.app.locals.tradingAnalytics = createStore();
+    req.app.locals.tradingAnalytics = {};
   }
 
-  const store = req.app.locals.tradingAnalytics;
+  if (!req.app.locals.tradingAnalytics[tenantId]) {
+    req.app.locals.tradingAnalytics[tenantId] = createStore();
+  }
+
+  const store = req.app.locals.tradingAnalytics[tenantId];
 
   store.tradeArchive = ensureArray(store.tradeArchive);
   store.decisionArchive = ensureArray(store.decisionArchive);
   store.recentResets = ensureArray(store.recentResets);
   store.recentLogins = ensureArray(store.recentLogins);
 
-  global.tradingAnalytics = store;
+  global.tradingAnalytics = req.app.locals.tradingAnalytics;
 
   return store;
 }
 
+/* =========================================================
+SUMMARY ENGINE
+========================================================= */
+
 function summarizeTrades(trades) {
   const totalTrades = trades.length;
+
   let wins = 0;
   let losses = 0;
   let breakeven = 0;
-  let realizedPnl = 0;
-  let grossProfit = 0;
-  let grossLossAbs = 0;
+  let pnl = 0;
 
-  for (const trade of trades) {
-    const pnl = safeNum(trade?.pnl, 0);
+  for (const t of trades) {
+    const p = safeNum(t?.pnl, 0);
+    pnl += p;
 
-    realizedPnl += pnl;
-
-    if (pnl > 0) {
-      wins += 1;
-      grossProfit += pnl;
-    } else if (pnl < 0) {
-      losses += 1;
-      grossLossAbs += Math.abs(pnl);
-    } else {
-      breakeven += 1;
-    }
+    if (p > 0) wins++;
+    else if (p < 0) losses++;
+    else breakeven++;
   }
 
-  const decidedTrades = wins + losses;
-  const winRate = decidedTrades > 0 ? wins / decidedTrades : 0;
-  const avgPnl = totalTrades > 0 ? realizedPnl / totalTrades : 0;
-  const profitFactor =
-    grossLossAbs > 0 ? grossProfit / grossLossAbs : grossProfit > 0 ? Infinity : 0;
+  const decided = wins + losses;
 
   return {
     totalTrades,
     wins,
     losses,
     breakeven,
-    winRate,
-    realizedPnl,
-    avgPnl,
-    grossProfit,
-    grossLossAbs,
-    profitFactor,
+    winRate: decided > 0 ? wins / decided : 0,
+    netPnL: pnl,
+    avgPnL: totalTrades > 0 ? pnl / totalTrades : 0,
   };
 }
 
 /* =========================================================
-GET /api/analytics/trading
+GET SUMMARY
 ========================================================= */
 
 router.get("/trading", (req, res) => {
-  const store = getStore(req);
+  const tenantId = getTenantId(req);
+  const store = getStore(req, tenantId);
 
   const trades = ensureArray(store.tradeArchive);
   const decisions = ensureArray(store.decisionArchive);
-  const recentResets = ensureArray(store.recentResets);
-  const recentLogins = ensureArray(store.recentLogins);
-
-  const summary = summarizeTrades(trades);
 
   return res.json({
     ok: true,
     summary: {
-      ...summary,
+      ...summarizeTrades(trades),
       totalDecisions: decisions.length,
-      recentResetCount: recentResets.length,
-      recentLoginCount: recentLogins.length,
     },
-    tradeArchive: trades.slice(-500),
-    decisionArchive: decisions.slice(-500),
-    recentResets: recentResets.slice(-100),
-    recentLogins: recentLogins.slice(-100),
+    trades: trades.slice(-200),
+    decisions: decisions.slice(-200),
   });
 });
 
 /* =========================================================
-GET /api/analytics/trading/state
+STATE (DEBUG)
 ========================================================= */
 
 router.get("/trading/state", (req, res) => {
-  const store = getStore(req);
+  const tenantId = getTenantId(req);
+  const store = getStore(req, tenantId);
 
   return res.json({
     ok: true,
-    state: {
-      tradeArchive: ensureArray(store.tradeArchive).slice(-5000),
-      decisionArchive: ensureArray(store.decisionArchive).slice(-3000),
-      recentResets: ensureArray(store.recentResets).slice(-1000),
-      recentLogins: ensureArray(store.recentLogins).slice(-1000),
-    },
+    state: store,
   });
 });
 
 /* =========================================================
-POST /api/analytics/trading/maintenance/reset
+RESET
 ========================================================= */
 
-router.post("/trading/maintenance/reset", (req, res) => {
-  req.app.locals.tradingAnalytics = createStore();
-  global.tradingAnalytics = req.app.locals.tradingAnalytics;
+router.post("/trading/reset", (req, res) => {
+  const tenantId = getTenantId(req);
+
+  req.app.locals.tradingAnalytics[tenantId] = createStore();
 
   return res.json({
     ok: true,
-    message: "Trading analytics memory reset",
-    state: req.app.locals.tradingAnalytics,
+    message: "Analytics reset",
   });
 });
+
+/* =========================================================
+🔥 ENGINE HOOK (CRITICAL)
+========================================================= */
+
+// This is what your engine will call
+
+global.pushTradeAnalytics = function (tenantId, trade) {
+  try {
+    if (!global.tradingAnalytics) return;
+
+    const store =
+      global.tradingAnalytics[tenantId] ||
+      (global.tradingAnalytics[tenantId] = createStore());
+
+    store.tradeArchive.push(trade);
+
+    if (store.tradeArchive.length > 2000) {
+      store.tradeArchive.shift();
+    }
+
+  } catch {}
+};
+
+global.pushDecisionAnalytics = function (tenantId, decision) {
+  try {
+    if (!global.tradingAnalytics) return;
+
+    const store =
+      global.tradingAnalytics[tenantId] ||
+      (global.tradingAnalytics[tenantId] = createStore());
+
+    store.decisionArchive.push(decision);
+
+    if (store.decisionArchive.length > 2000) {
+      store.decisionArchive.shift();
+    }
+
+  } catch {}
+};
 
 module.exports = router;
