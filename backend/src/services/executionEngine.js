@@ -1,9 +1,11 @@
 // ==========================================================
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v30.0 (Analytics Enabled + Stable AI + Broadcast)
+// VERSION: v31.0 (SINGLE BRAIN — MEMORY CONNECTED)
+// MAINTENANCE SAFE — NO SPLIT BRAIN
 // ==========================================================
 
-const outsideBrain = require("../../brain/aiBrain");
+// 🔥 ONLY BRAIN
+const memoryBrain = require("../../brainMemory/memoryBrain");
 
 /* =========================================================
 UTIL
@@ -55,7 +57,7 @@ function enrichPositionWithTiming(pos, plan = {}) {
 }
 
 /* =========================================================
-STATE HELPERS (🔥 NEW)
+STATE HELPERS
 ========================================================= */
 
 function ensureAnalyticsState(state) {
@@ -84,7 +86,7 @@ function executePaperOrder({
 }) {
   if (!state || !symbol) return null;
 
-  ensureAnalyticsState(state); // 🔥 IMPORTANT
+  ensureAnalyticsState(state);
 
   const normalizedSlot = normalizeSlot(slot);
   const normalizedAction = String(action || "").toUpperCase();
@@ -130,7 +132,7 @@ function executePaperOrder({
     state.positions[normalizedSlot] = position;
     state.position = position;
 
-    /* 🔥 SAVE DECISION (for analytics) */
+    // 🔥 STORE DECISION (UI + analytics)
     state.decisions.push({
       action: normalizedAction,
       confidence: position.confidence,
@@ -138,14 +140,16 @@ function executePaperOrder({
       symbol,
     });
 
-    const trade = {
-      side: normalizedAction,
-      price: px,
-      time: ts,
-    };
-
+    // 🔥 BROADCAST
     if (global.broadcastTrade) {
-      global.broadcastTrade(trade, tenantId);
+      global.broadcastTrade(
+        {
+          side: normalizedAction,
+          price: px,
+          time: ts,
+        },
+        tenantId
+      );
     }
 
     return {
@@ -175,22 +179,30 @@ function executePaperOrder({
 
     const duration = ts - pos.time;
 
-    /* ================= AI LEARNING ================= */
+    /* =========================================================
+    🔥 RECORD TRADE TO MEMORY BRAIN (ONLY ONCE — SOURCE OF TRUTH)
+    ========================================================= */
 
     try {
-      outsideBrain.recordTradeOutcome({
+      memoryBrain.recordTrade({
         tenantId,
         symbol: pos.symbol,
+        entry: pos.entry,
+        exit: px,
+        qty: pos.qty,
         pnl,
-        pattern: pos.pattern || "unknown",
-        setup: pos.setup || "unknown",
         confidence: pos.confidence || 0,
+        edge: 0,
+        volatility: 0,
       });
     } catch (err) {
-      console.error("AI record error:", err.message);
+      console.error("Memory brain error:", err.message);
     }
 
-    /* 🔥 SAVE TRADE (for analytics) */
+    /* =========================================================
+    STORE TRADE (LOCAL STATE FOR UI)
+    ========================================================= */
+
     state.trades.push({
       symbol: pos.symbol,
       side: pos.side,
@@ -204,20 +216,27 @@ function executePaperOrder({
       time: ts,
     });
 
-    /* ================= RESET ================= */
+    /* =========================================================
+    RESET
+    ========================================================= */
 
     state.positions[normalizedSlot] = null;
     state.position = null;
 
-    const trade = {
-      side: reason,
-      price: px,
-      time: ts,
-      pnl,
-    };
+    /* =========================================================
+    BROADCAST
+    ========================================================= */
 
     if (global.broadcastTrade) {
-      global.broadcastTrade(trade, tenantId);
+      global.broadcastTrade(
+        {
+          side: reason,
+          price: px,
+          time: ts,
+          pnl,
+        },
+        tenantId
+      );
     }
 
     return {
