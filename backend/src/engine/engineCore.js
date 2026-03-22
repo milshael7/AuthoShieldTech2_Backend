@@ -1,23 +1,13 @@
 // ==========================================================
-// 🔒 PROTECTED CORE FILE — MAINTENANCE SAFE
-// ENGINE CORE v4.1 (AI CONNECTED + DEBUG + SAFE)
-// ==========================================================
-//
-// PURPOSE:
-// - Orchestrates market → decision → execution → state
-// - Connects AI brain properly
-//
-// RULES:
-// - NO hidden mutations
-// - ALL decisions tracked
-// - FAIL SAFE on bad data
-// - DEBUG friendly
-//
+// ENGINE CORE v4.0 (CONNECTED TO OUTSIDE BRAIN)
+// MAINTENANCE SAFE — DO NOT SPLIT BRAIN SYSTEM
 // ==========================================================
 
 const { executePaperOrder } = require("../services/executionEngine");
 const { updatePrice } = require("./stateStore");
-const aiBrain = require("../brain/aiBrain");
+
+// 🔥 CONNECT REAL PERSISTENT BRAIN
+const aiBrain = require("../../brain/aiBrain");
 
 /* =========================================================
 STATE
@@ -45,56 +35,11 @@ function getState(tenantId) {
 }
 
 /* =========================================================
-UTIL
-========================================================= */
-
-function isValidNumber(n) {
-  return Number.isFinite(Number(n));
-}
-
-/* =========================================================
-BASE SIGNAL (NOT AI)
-========================================================= */
-
-const PRICE_MEMORY = new Map();
-
-function getMemory(tenantId) {
-  const key = String(tenantId || "__default__");
-
-  if (!PRICE_MEMORY.has(key)) {
-    PRICE_MEMORY.set(key, []);
-  }
-
-  return PRICE_MEMORY.get(key);
-}
-
-function generateSignal(tenantId, price) {
-  const mem = getMemory(tenantId);
-
-  mem.push(price);
-  if (mem.length > 5) mem.shift();
-
-  if (mem.length < 3) {
-    return { action: "WAIT", confidence: 0 };
-  }
-
-  const last = mem[mem.length - 1];
-  const prev = mem[mem.length - 2];
-
-  if (last > prev) return { action: "BUY", confidence: 0.55 };
-  if (last < prev) return { action: "SELL", confidence: 0.55 };
-
-  return { action: "WAIT", confidence: 0 };
-}
-
-/* =========================================================
 CLOSE LOGIC
 ========================================================= */
 
 function checkClose(position, price) {
   if (!position) return null;
-
-  if (!isValidNumber(price)) return null;
 
   if (position.side === "LONG") {
     if (price <= position.stopLoss) return "STOP_LOSS";
@@ -114,180 +59,143 @@ ENGINE TICK
 ========================================================= */
 
 function processTick({ tenantId, symbol, price, ts = Date.now() }) {
-  try {
-    if (!tenantId || !symbol || !isValidNumber(price)) {
-      return null; // HARD FAIL SAFE
-    }
+  if (!tenantId || !symbol || !price) return null;
 
-    const state = getState(tenantId);
+  const state = getState(tenantId);
 
-    /* ================= TRACK ================= */
-    state.executionStats.ticks++;
+  /* ================= TRACK ================= */
+  state.executionStats.ticks++;
 
-    /* ================= PRICE ================= */
-    updatePrice(tenantId, symbol, price);
+  /* ================= PRICE ================= */
+  updatePrice(tenantId, symbol, price);
 
-    const currentPos = state.positions.scalp;
+  const currentPos = state.positions.scalp;
 
-    /* =========================================================
-    CLOSE POSITION
-    ========================================================= */
+  /* =========================================================
+  CLOSE
+  ========================================================= */
 
-    if (currentPos) {
-      const reason = checkClose(currentPos, price);
+  if (currentPos) {
+    const closeReason = checkClose(currentPos, price);
 
-      if (reason) {
-        const res = executePaperOrder({
+    if (closeReason) {
+      const res = executePaperOrder({
+        tenantId,
+        symbol,
+        action: "CLOSE",
+        price,
+        state,
+        ts,
+        reason: closeReason,
+      });
+
+      if (res?.result) {
+        state.executionStats.trades++;
+
+        // 🔥 FEED LEARNING INTO REAL BRAIN
+        aiBrain.recordTradeOutcome({
           tenantId,
-          symbol,
-          action: "CLOSE",
-          price,
-          state,
-          ts,
-          reason,
+          pnl: res.result.pnl || 0,
         });
 
-        if (res?.result) {
-          state.executionStats.trades++;
-
-          state.trades.push({
-            type: "CLOSE",
-            reason,
-            price,
-            pnl: res.result.pnl,
-            time: ts,
-          });
-
-          broadcast({
-            tenantId,
-            side: reason,
-            price,
-            pnl: res.result.pnl,
-            time: ts,
-          });
+        if (global.broadcastTrade) {
+          global.broadcastTrade(
+            {
+              side: closeReason,
+              price,
+              time: ts,
+              pnl: res.result.pnl,
+            },
+            tenantId
+          );
         }
-
-        return;
       }
+
+      return;
     }
-
-    /* =========================================================
-    BASE SIGNAL (RAW)
-    ========================================================= */
-
-    const base = generateSignal(tenantId, price);
-
-    if (base.action === "WAIT") return;
-    if (state.positions.scalp) return;
-
-    /* =========================================================
-    AI DECISION LAYER
-    ========================================================= */
-
-    const ai = aiBrain.decide({
-      tenantId,
-      symbol,
-      last: price,
-      paper: state,
-      baseConfidence: base.confidence,
-      baseEdge: 0,
-      pattern: "momentum",
-      setup: "micro_trend",
-    });
-
-    // 🔒 FAIL SAFE
-    if (!ai || !isValidNumber(ai.confidence)) return;
-
-    /* ================= FILTER ================= */
-
-    if (ai.confidence < 0.55) {
-      return; // AI rejects weak setup
-    }
-
-    /* ================= TRACK DECISION ================= */
-
-    state.executionStats.decisions++;
-
-    state.decisions.push({
-      action: base.action,
-      confidence: ai.confidence,
-      regime: ai.regime,
-      time: ts,
-    });
-
-    // prevent memory explosion
-    if (state.decisions.length > 500) {
-      state.decisions.shift();
-    }
-
-    /* =========================================================
-    EXECUTE TRADE
-    ========================================================= */
-
-    const res = executePaperOrder({
-      tenantId,
-      symbol,
-      action: base.action,
-      price,
-      qty: 0.01,
-      stopLoss:
-        base.action === "BUY"
-          ? price * 0.995
-          : price * 1.005,
-      takeProfit:
-        base.action === "BUY"
-          ? price * 1.005
-          : price * 0.995,
-      state,
-      ts,
-      decisionMeta: {
-        confidence: ai.confidence,
-        pattern: "momentum",
-        setup: "micro_trend",
-      },
-    });
-
-    if (res?.result) {
-      state.executionStats.trades++;
-
-      state.trades.push({
-        type: "OPEN",
-        side: base.action,
-        price,
-        confidence: ai.confidence,
-        time: ts,
-      });
-
-      broadcast({
-        tenantId,
-        side: base.action,
-        price,
-        time: ts,
-      });
-    }
-
-    return {
-      base,
-      ai,
-      result: res,
-    };
-
-  } catch (err) {
-    console.error("ENGINE ERROR:", err.message);
-    return null;
   }
-}
 
-/* =========================================================
-SAFE BROADCAST WRAPPER
-========================================================= */
+  /* =========================================================
+  🧠 REAL AI DECISION
+  ========================================================= */
 
-function broadcast(data) {
-  try {
+  const decision = aiBrain.decide({
+    tenantId,
+    last: price,
+    paper: {}, // can extend later
+  });
+
+  state.executionStats.decisions++;
+
+  state.decisions.push({
+    ...decision,
+    time: ts,
+  });
+
+  if (state.decisions.length > 500) {
+    state.decisions.shift();
+  }
+
+  if (decision.action === "WAIT") return;
+  if (state.positions.scalp) return;
+
+  /* =========================================================
+  OPEN TRADE
+  ========================================================= */
+
+  const res = executePaperOrder({
+    tenantId,
+    symbol,
+    action: decision.action,
+    price,
+    qty: 0.01,
+    stopLoss:
+      decision.action === "BUY"
+        ? price * 0.995
+        : price * 1.005,
+    takeProfit:
+      decision.action === "BUY"
+        ? price * 1.005
+        : price * 0.995,
+    state,
+    ts,
+    decisionMeta: decision,
+  });
+
+  if (res?.result) {
+    state.executionStats.trades++;
+
+    state.trades.push({
+      side: decision.action,
+      price,
+      time: ts,
+      confidence: decision.confidence,
+    });
+
+    // 🔥 LOG SIGNAL TO BRAIN
+    aiBrain.recordSignal({
+      tenantId,
+      action: decision.action,
+      confidence: decision.confidence,
+      edge: decision.edge,
+    });
+
     if (global.broadcastTrade) {
-      global.broadcastTrade(data, data.tenantId);
+      global.broadcastTrade(
+        {
+          side: decision.action,
+          price,
+          time: ts,
+        },
+        tenantId
+      );
     }
-  } catch {}
+  }
+
+  return {
+    decision,
+    result: res,
+  };
 }
 
 /* =========================================================
