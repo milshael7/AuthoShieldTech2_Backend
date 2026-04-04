@@ -1,213 +1,97 @@
 // ==========================================================
-// FILE: backend/src/services/strategyEngine.js
-// VERSION: v19.0 (Institutional Alignment + Timing Intelligence)
+// 🔒 STEALTH VISION — v20.0 (SENSITIVE ALIGNMENT & SYNC)
+// Replacement for: backend/src/services/strategyEngine.js
 // ==========================================================
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-
-/* ================= CONFIG ================= */
-
-const BASE_RISK = 0.01;
-const MIN_CONFIDENCE = 0.45;
-const MIN_EDGE = 0.0012;
-
-/* ================= STATE ================= */
-
-const MEMORY = new Map();
-
-/* ================= UTILS ================= */
-
 const safe = (v, f = 0) => (Number.isFinite(Number(v)) ? Number(v) : f);
 
-/* ================= PRICE MEMORY ================= */
+/* ================= CONFIG (STEALTH TUNED) ================= */
+const BASE_RISK = 0.02;         // 2% per trade
+const STEALTH_THRESHOLD = 0.25; // Synced with Stealth Brain v26.0
+const MEMORY = new Map();
+
+/* ================= TREND & MOMENTUM ================= */
 
 function updateMemory(id, price) {
-  const key = String(id || "__default__");
-
-  if (!MEMORY.has(key)) {
-    MEMORY.set(key, []);
-  }
-
+  const key = String(id || "default");
+  if (!MEMORY.has(key)) MEMORY.set(key, []);
   const arr = MEMORY.get(key);
-
   arr.push(price);
-  if (arr.length > 200) arr.shift();
-
+  if (arr.length > 100) arr.shift(); // Lean memory for Render stability
   return arr;
 }
 
-/* ================= TREND ================= */
-
-function getTrend(prices) {
-  if (prices.length < 20) return "NEUTRAL";
+function analyzeMarket(prices) {
+  if (prices.length < 20) return { trend: "CALIBRATING", momentum: 0 };
 
   const start = prices[prices.length - 20];
   const end = prices[prices.length - 1];
-
   const move = (end - start) / start;
 
-  if (Math.abs(move) < 0.002) return "CHOP";
-  if (move > 0) return "UP";
-  if (move < 0) return "DOWN";
+  let trend = "SIDEWAYS";
+  if (move > 0.0015) trend = "BULLISH";
+  if (move < -0.0015) trend = "BEARISH";
 
-  return "NEUTRAL";
+  // Momentum check (last 5 ticks)
+  const momStart = prices[prices.length - 5];
+  const momentum = (end - momStart) / momStart;
+
+  return { trend, momentum, move };
 }
 
-/* ================= MOMENTUM ================= */
+/* ================= ALIGNMENT (THE "EYES") ================= */
 
-function getMomentum(prices) {
-  if (prices.length < 5) return 0;
+function getAlignmentScore({ trend, momentum }) {
+  let score = 0.15; // Baseline "Market Awareness"
 
-  const a = prices[prices.length - 5];
-  const b = prices[prices.length - 1];
-
-  return (b - a) / a;
-}
-
-/* ================= RANGE ================= */
-
-function getRange(prices) {
-  const slice = prices.slice(-30);
-
-  const high = Math.max(...slice);
-  const low = Math.min(...slice);
-  const last = slice[slice.length - 1];
-
-  return {
-    high,
-    low,
-    mid: (high + low) / 2,
-    nearHigh: (high - last) / last < 0.002,
-    nearLow: (last - low) / last < 0.002,
-  };
-}
-
-/* ================= ALIGNMENT SCORE ================= */
-
-function getAlignmentScore({ trend, momentum, range }) {
-  let score = 0;
-
-  if (trend === "UP" && momentum > 0) score += 0.4;
-  if (trend === "DOWN" && momentum < 0) score += 0.4;
-
-  if (range.nearLow && momentum > 0) score += 0.3;
-  if (range.nearHigh && momentum < 0) score += 0.3;
+  if (trend === "BULLISH" && momentum > 0) score += 0.45;
+  if (trend === "BEARISH" && momentum < 0) score += 0.45;
+  
+  // Reversal detection (Counter-trend momentum)
+  if (trend === "BULLISH" && momentum < -0.0002) score += 0.2; 
+  if (trend === "BEARISH" && momentum > 0.0002) score += 0.2;
 
   return clamp(score, 0, 1);
 }
 
-/* ================= TIMING ================= */
-
-function estimateMoveTime({ volatility, alignment }) {
-  let base = 120000;
-
-  base *= 1 + volatility * 2;
-  base *= 1 + (1 - alignment);
-
-  return clamp(base, 30000, 600000);
-}
-
-/* ================= LEVELS ================= */
-
-function buildLevels(action, price, range) {
-  const buffer = price * 0.002;
-
-  if (action === "BUY") {
-    const stop = range.low - buffer;
-    const risk = price - stop;
-
-    return {
-      stopLoss: stop,
-      takeProfit: price + risk * 1.8,
-    };
-  }
-
-  if (action === "SELL") {
-    const stop = range.high + buffer;
-    const risk = stop - price;
-
-    return {
-      stopLoss: stop,
-      takeProfit: price - risk * 1.8,
-    };
-  }
-
-  return { stopLoss: null, takeProfit: null };
-}
-
-/* ================= CORE ================= */
+/* ================= DECISION ================= */
 
 function buildDecision(ctx = {}) {
-  const {
-    tenantId,
-    symbol = "BTCUSDT",
-    price,
-    volatility = 0,
-  } = ctx;
-
+  const { tenantId, symbol = "BTCUSDT", price } = ctx;
   const px = safe(price, NaN);
-  if (!Number.isFinite(px)) {
-    return { action: "WAIT", confidence: 0 };
-  }
+
+  if (!Number.isFinite(px)) return { action: "WAIT", confidence: 0 };
 
   const prices = updateMemory(tenantId, px);
-
-  const trend = getTrend(prices);
-  const momentum = getMomentum(prices);
-  const range = getRange(prices);
-
-  const alignment = getAlignmentScore({ trend, momentum, range });
+  const { trend, momentum } = analyzeMarket(prices);
+  const alignment = getAlignmentScore({ trend, momentum });
 
   let action = "WAIT";
-  let confidence = alignment;
-  let edge = momentum;
-
-  // 🔥 Decision Logic (clean + strong)
-
-  if (alignment > 0.6) {
-    if (trend === "UP" && range.nearLow) {
-      action = "BUY";
-    } else if (trend === "DOWN" && range.nearHigh) {
-      action = "SELL";
-    }
+  
+  // Entry Logic
+  if (alignment >= STEALTH_THRESHOLD) {
+    if (momentum > 0) action = "BUY";
+    if (momentum < 0) action = "SELL";
   }
 
-  // 🔥 Secondary entries (weaker setups)
-
-  if (action === "WAIT" && alignment > 0.45) {
-    if (momentum > MIN_EDGE) action = "BUY";
-    if (momentum < -MIN_EDGE) action = "SELL";
-  }
-
-  // 🔥 Final filters
-
-  if (confidence < MIN_CONFIDENCE) {
-    action = "WAIT";
-  }
-
-  const levels = buildLevels(action, px, range);
+  // Risk & Levels
+  const riskAmount = px * 0.005; // 0.5% dynamic SL
+  const stopLoss = action === "BUY" ? px - riskAmount : px + riskAmount;
+  const takeProfit = action === "BUY" ? px + (riskAmount * 2) : px - (riskAmount * 2);
 
   return {
     symbol,
     action,
-    confidence: clamp(confidence, 0, 1),
-    edge,
-    riskPct: BASE_RISK * confidence,
-    stopLoss: levels.stopLoss,
-    takeProfit: levels.takeProfit,
-
-    // 🔥 NEW
-    alignmentScore: alignment,
-    expectedMoveTime: estimateMoveTime({
-      volatility,
-      alignment,
-    }),
-
-    reason: "alignment_strategy",
+    confidence: alignment, 
+    edge: momentum,
+    riskPct: BASE_RISK * alignment,
+    stopLoss,
+    takeProfit,
+    regime: trend,
+    reason: action === "WAIT" ? "WAITING_FOR_ALIGNMENT" : "STEALTH_CONFIRMED",
     ts: Date.now(),
   };
 }
 
-module.exports = {
-  buildDecision,
-};
+module.exports = { buildDecision };
