@@ -1,15 +1,6 @@
 // ==========================================================
-// 🔒 AUTOSHIELD CORE — VERIFIED BUILD
+// 🔒 AUTOSHIELD CORE — v7.0 (SYNCHRONIZED & PRICE-GUARDED)
 // FILE: backend/src/routes/paper.routes.js
-// VERSION: v6.0 (ENGINE CORE CONNECTED — NO FAKE STATE)
-//
-// PURPOSE:
-// - FULLY CONNECTED TO engineCore (REAL DATA)
-// - REMOVES paperTrader DEPENDENCY
-// - POWERS:
-//   • Chart trades
-//   • Positions
-//   • Dashboard stats
 // ==========================================================
 
 const express = require("express");
@@ -19,171 +10,76 @@ const engineCore = require("../engine/engineCore");
 const executionEngine = require("../services/executionEngine");
 const marketEngine = require("../services/marketEngine");
 
-/* =========================================================
-UTIL
-========================================================= */
-
-function getTenantId(req) {
-  return req.user?.companyId || req.user?.id || null;
-}
-
-function safeNum(v, fallback = 0) {
+/* ================= HELPERS ================= */
+const getTenantId = (req) => req.user?.companyId || req.user?.id || null;
+const safeNum = (v, fallback = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
-}
+};
 
-/* =========================================================
-STATUS
-========================================================= */
+/* ================= READ-ONLY ENDPOINTS ================= */
 
 router.get("/status", (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId);
-
-    return res.json({
-      ok: true,
-      engine: "RUNNING",
-      executionStats: state.executionStats || {},
-      trades: state.trades || [],
-      decisions: state.decisions || [],
-      time: Date.now(),
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
+  const state = engineCore.getState(getTenantId(req));
+  res.json({ ok: true, engine: "RUNNING", ...state, time: Date.now() });
 });
-
-/* =========================================================
-ACCOUNT (SIMPLIFIED LIVE STATE)
-========================================================= */
 
 router.get("/account", (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId);
-
-    const trades = state.trades || [];
-
-    const pnl = trades.reduce((sum, t) => sum + safeNum(t.pnl), 0);
-
-    return res.json({
-      ok: true,
-      account: {
-        netPnL: pnl,
-        totalTrades: trades.length,
-      },
-      time: Date.now(),
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
+  const trades = engineCore.getState(getTenantId(req)).trades || [];
+  const pnl = trades.reduce((sum, t) => sum + safeNum(t.pnl), 0);
+  res.json({ ok: true, account: { netPnL: pnl, totalTrades: trades.length } });
 });
-
-/* =========================================================
-POSITIONS (REAL ENGINE)
-========================================================= */
 
 router.get("/positions", (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId);
-
-    return res.json({
-      ok: true,
-      position: state.position || null,
-      positions: state.positions || {},
-      time: Date.now(),
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
+  const state = engineCore.getState(getTenantId(req));
+  res.json({ ok: true, position: state.position || null, positions: state.positions || {} });
 });
 
-/* =========================================================
-TRADES (🔥 THIS FIXES YOUR CHART)
-========================================================= */
-
+// 🔥 CRITICAL FOR CHART SYNC
 router.get("/orders", (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId);
-
-    const trades = state.trades || [];
-
-    return res.json({
-      ok: true,
-      trades,
-      orders: trades,
-      count: trades.length,
-      time: Date.now(),
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
+  const trades = engineCore.getState(getTenantId(req)).trades || [];
+  res.json({ ok: true, trades, count: trades.length });
 });
 
-/* =========================================================
-DECISIONS
-========================================================= */
-
-router.get("/decisions", (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId);
-
-    return res.json({
-      ok: true,
-      decisions: state.decisions || [],
-      count: (state.decisions || []).length,
-      time: Date.now(),
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
-});
-
-/* =========================================================
-MANUAL ORDER (CONNECTED TO ENGINE)
-========================================================= */
+/* ================= MANUAL ORDER (THE BRIDGE) ================= */
 
 router.post("/order", (req, res) => {
   try {
     const tenantId = getTenantId(req);
+    const { symbol, side, qty, stopLoss, takeProfit } = req.body;
 
-    const { symbol, side, qty, stopLoss, takeProfit } = req.body || {};
-
-    if (!symbol || !side) {
-      return res.json({ ok: false, error: "Invalid order" });
+    if (!symbol || !side || !qty) {
+      return res.status(400).json({ ok: false, error: "Missing required order fields (symbol, side, qty)" });
     }
 
+    // 1. Ensure Engine is Tracking this symbol
     marketEngine.registerTenant(tenantId);
 
-    const price = marketEngine.getPrice(tenantId, symbol);
+    // 2. 🔥 PRICE GUARD: Don't execute if market data is missing
+    const currentPrice = marketEngine.getPrice(tenantId, symbol);
+    if (!currentPrice || currentPrice <= 0) {
+      return res.status(422).json({ ok: false, error: `Market price for ${symbol} not available yet. Try again in 1s.` });
+    }
 
+    // 3. Dispatch to Execution Engine
     const state = engineCore.getState(tenantId);
-
     const result = executionEngine.executePaperOrder({
       tenantId,
       symbol,
-      action: side,
-      price,
-      qty,
-      stopLoss,
-      takeProfit,
+      side: String(side).toLowerCase(), // Standardize to buy/sell
+      price: currentPrice,
+      qty: safeNum(qty),
+      stopLoss: safeNum(stopLoss, null),
+      takeProfit: safeNum(takeProfit, null),
       state,
       ts: Date.now(),
     });
 
-    return res.json({
-      ok: true,
-      result,
-    });
+    return res.json({ ok: true, result });
   } catch (err) {
-    return res.json({ ok: false, error: err.message });
+    console.error("Order Route Error:", err.message);
+    return res.status(500).json({ ok: false, error: "Internal Engine Error" });
   }
 });
-
-/* ========================================================= */
 
 module.exports = router;
