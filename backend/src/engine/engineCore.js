@@ -1,76 +1,55 @@
 // ==========================================================
-// 🔒 AUTOSHIELD BRAIN — v6.2 (UNIVERSAL SYNC)
-// FILE: backend/src/engine/engineCore.js
-// ==========================================================
+// 🔒 AUTOSHIELD CORE — v32.5 (STEALTH LEARNING ENABLED)
+// FILE: backend/src/server.js
+// ==========================================
 
-const { executePaperOrder } = require("../services/executionEngine");
+// ... (Previous Imports stay the same)
 
-const ENGINE_STATE = new Map();
-
-function getState(tenantId) {
-  // FALLBACK: If tenantId is missing/null, use "guest" so memory still works
-  const key = tenantId && tenantId !== "undefined" ? String(tenantId) : "guest";
+/* ================= STEALTH EXECUTION LAYER ================= */
+// The AI calls this function. It doesn't know if it's Live or Paper.
+global.executeStealthTrade = async function(side, price, confidence) {
+  const isLive = process.env.NODE_ENV === 'production' && process.env.LIVE_TRADING === 'true';
   
-  if (!ENGINE_STATE.has(key)) {
-    console.log(`🧠 Initializing Brain for: ${key}`);
-    ENGINE_STATE.set(key, {
-      positions: { scalp: null },
-      priceHistory: [], 
-      metrics: { confidence: 0, velocity: 0, memoryUsage: 0 },
-      executionStats: { ticks: 0, decisions: 0, trades: 0 }
-    });
-  }
-  return ENGINE_STATE.get(key);
-}
-
-function processTick({ tenantId, symbol, price, ts = Date.now() }) {
-  const state = getState(tenantId);
-  state.executionStats.ticks++;
-
-  // 1. UPDATE MEMORY
-  state.priceHistory.push(Number(price));
-  if (state.priceHistory.length > 50) state.priceHistory.shift();
+  console.log(`[AI THINKING]: Signal Detected | Side: ${side} | Conf: ${confidence}%`);
   
-  // Calculate Memory % for the UI
-  state.metrics.memoryUsage = Math.round((state.priceHistory.length / 50) * 100);
+  // LOG THE "INTENT" (This is how the AI learns)
+  await analyticsEvents.record({
+    event: 'AI_INTENT',
+    data: { side, price, confidence, mode: isLive ? 'LIVE' : 'STEALTH_LEARNING' }
+  });
 
-  // 2. CALCULATE VELOCITY & CONFIDENCE
-  if (state.priceHistory.length > 5) {
-    const start = state.priceHistory[0];
-    const last = state.priceHistory[state.priceHistory.length - 1];
-    state.metrics.velocity = Number(((last - start) / start * 1000).toFixed(4));
-    state.metrics.confidence = Math.min(Math.abs(state.metrics.velocity * 500), 100);
-  }
-
-  // 3. BROADCAST TO DASHBOARD (Lively Sync)
-  // This ensures the "Memory" bar moves on your screen!
-  if (global.broadcastEngineStatus) {
-    global.broadcastEngineStatus(tenantId, {
-      memory: state.metrics.memoryUsage,
-      confidence: state.metrics.confidence,
-      velocity: state.metrics.velocity,
-      ticks: state.executionStats.ticks
-    });
-  }
-
-  // 4. TRADE LOGIC (Simplified for high activity)
-  if (!state.positions.scalp && state.metrics.confidence > 20) {
-    const side = state.metrics.velocity > 0 ? "BUY" : "SELL";
-    state.executionStats.decisions++;
-    
-    const res = executePaperOrder({
-      tenantId, symbol, side, price,
-      qty: 0.1,
-      state, ts
-    });
-
-    if (res?.ok) {
-      state.executionStats.trades++;
-      state.positions.scalp = res.trade;
+  if (confidence > 25) {
+    if (isLive) {
+      // Logic for real exchange goes here
+      return "LIVE_ORDER_PLACED";
+    } else {
+      // Logic for Paper/Stealth goes here
+      return engineCore.processPaperTrade(side, price);
     }
   }
+  return "WAITING_FOR_CONFIDENCE";
+};
 
-  return null;
-}
+/* ================= THE LEARNING DASHBOARD (Status Page) ================= */
+app.get("/", (req, res) => {
+  const learningStats = engineCore.getLearningStats() || { accuracy: "Calculating...", trades: 0 };
+  
+  res.send(`
+    <div style="text-align: center; font-family: 'Courier New', monospace; padding: 20px; background: #0a0a0a; color: #00ff88; min-height: 100vh;">
+      <h1 style="border-bottom: 2px solid #333; padding-bottom: 10px;">🛡️ AUTOSHIELD v32.5</h1>
+      <div style="margin: 20px auto; width: 80%; border: 1px solid #00ff88; padding: 20px; border-radius: 10px;">
+        <h2 style="color: #fff;">🧠 AI STEALTH LEARNING</h2>
+        <p style="font-size: 1.2em;">STATUS: <span style="color: #00ff88;">ACTIVE & OBSERVING</span></p>
+        <hr style="border-color: #333;">
+        <div style="display: flex; justify-content: space-around;">
+          <div><p>Confidence</p><h3>${global.lastConfidence || 0}%</h3></div>
+          <div><p>Learning Accuracy</p><h3>${learningStats.accuracy}</h3></div>
+          <div><p>Ghost Trades</p><h3>${learningStats.trades}</h3></div>
+        </div>
+      </div>
+      <p style="color: #555;">The AI is currently processing live candles to build "World Market" energy.</p>
+    </div>
+  `);
+});
 
-module.exports = { processTick, getState };
+// ... (Rest of your WebSocket and Port logic from v32.4 stays the same)
