@@ -1,5 +1,5 @@
 // ==========================================================
-// 🔒 AUTOSHIELD CORE — v32.1 (LIVELY & PERSISTENT)
+// 🔒 AUTOSHIELD CORE — v32.2 (SYNC-LOCK & RENDER-READY)
 // FILE: backend/src/server.js
 // ==========================================================
 
@@ -13,7 +13,8 @@ const { verify } = require("./lib/jwt");
 // Service & Analytics Imports
 const marketEngine = require("./services/marketEngine");
 const engineCore = require("./engine/engineCore");
-const { analyticsEvents, recordVisit } = require("./services/analyticsEngine"); // FIXED: Import the Lively Bus
+const users = require("./users/user.service"); // IMPORTED FOR BOOTSTRAP
+const { analyticsEvents, recordVisit } = require("./services/analyticsEngine");
 
 const app = express();
 app.use(cors());
@@ -22,24 +23,22 @@ app.use(express.json());
 /* ================= ROUTES ================= */
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/paper", require("./routes/paper.routes")); 
-app.use("/api/analytics", require("./routes/analytics.routes")); // FIXED: Analytics Route included
+app.use("/api/analytics", require("./routes/analytics.routes"));
 
 const server = http.createServer(app);
 
-/* ================= ENGINE BOOT ================= */
-console.log("🧠 AI Engine Linked to Market Feed...");
+/* ================= RENDER BOOTSTRAP (THE FIX) ================= */
+// This ensures your "Invalid Credentials" error goes away by 
+// re-creating the admin user if Render wiped the database file.
+try {
+  console.log("🔄 Running User Authority Bootstrap...");
+  users.ensureAdminFromEnv();
+} catch (err) {
+  console.error("❌ Bootstrap Failed:", err.message);
+}
 
 /* ================= WEBSOCKET SERVER ================= */
 const wss = new WebSocketServer({ server, path: "/ws" });
-
-// Global helper to find specific users on WS
-const getClientsByTenant = (tenantId, channel) => {
-  return Array.from(wss.clients).filter(ws => 
-    String(ws.tenantId) === String(tenantId) && 
-    ws.channel === channel && 
-    ws.readyState === 1
-  );
-};
 
 wss.on("connection", (ws, req) => {
   try {
@@ -56,12 +55,11 @@ wss.on("connection", (ws, req) => {
 
     marketEngine.registerTenant(ws.tenantId);
 
-    // FIX: RECORD CONNECTION IN ANALYTICS (Lively History)
+    // Record Connection in Lively Analytics
     recordVisit({
       type: "WS_CONNECTION",
       path: channel,
       source: "backend",
-      ip: req.socket.remoteAddress,
       tenantId: ws.tenantId
     });
 
@@ -75,7 +73,6 @@ wss.on("connection", (ws, req) => {
 });
 
 /* ================= THE LIVELY ANALYTICS BUS ================= */
-// Whenever something happens in the "Analytics Room", shout it to the UI
 analyticsEvents.on("new_event", (entry) => {
   const msg = JSON.stringify({
     channel: "analytics",
@@ -85,7 +82,6 @@ analyticsEvents.on("new_event", (entry) => {
   });
 
   wss.clients.forEach((ws) => {
-    // Only send analytics updates to users on the analytics channel
     if (ws.channel === "analytics" && ws.readyState === 1) {
       ws.send(msg);
     }
@@ -114,12 +110,10 @@ setInterval(() => {
 
 // Global Broadcast helper for Trade Events
 global.broadcastTrade = function (trade, tenantId) {
-  // RECORD TRADE IN ANALYTICS (Hand-in-Hand persistence)
   recordVisit({
     type: "TRADE_EXECUTION",
     path: "/trading",
     source: "executionEngine",
-    duration: trade.duration || 0,
     tenantId
   });
 
@@ -130,13 +124,17 @@ global.broadcastTrade = function (trade, tenantId) {
     ts: Date.now() 
   });
 
-  getClientsByTenant(tenantId, "paper").forEach(ws => ws.send(msg));
+  wss.clients.forEach((ws) => {
+    if (ws.channel === "paper" && String(ws.tenantId) === String(tenantId)) {
+      if (ws.readyState === 1) ws.send(msg);
+    }
+  });
 };
 
-/* ================= RAILWAY SAFETY ================= */
+/* ================= RAILWAY/RENDER SAFETY ================= */
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 AUTOSHIELD v32.1 ONLINE ON PORT ${PORT}`);
+  console.log(`🚀 AUTOSHIELD v32.2 ONLINE ON PORT ${PORT}`);
 });
 
 process.on('uncaughtException', (err) => console.error('SYSTEM CRASH PREVENTED:', err.message));
