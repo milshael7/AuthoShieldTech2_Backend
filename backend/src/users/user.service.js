@@ -1,14 +1,17 @@
-// backend/src/users/user.service.js
-// Enterprise User Authority Service — Hardened v2.1
-// Anti-Escalation • Audited • Subscription Safe • Tenant Validated
-// Adds: seat/freedom helpers for tool-request routing
+// ==========================================================
+// 🔒 AUTOSHIELD USER AUTHORITY — v2.2 (RENDER-PERSISTENT)
+// FILE: backend/src/users/user.service.js
+// ==========================================================
 
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { readDb, updateDb } = require("../lib/db");
 const { audit } = require("../lib/audit");
 
-/* ========================================================= */
+// Connect to Analytics for "Lively" growth tracking
+const { recordVisit } = require("../services/analyticsEngine");
+
+/* ================= CONSTANTS ================= */
 
 const ROLES = Object.freeze({
   ADMIN: "Admin",
@@ -36,33 +39,20 @@ const ROLE_VALUES = Object.values(ROLES);
 const SUB_VALUES = Object.values(SUBSCRIPTION);
 const APPROVAL_VALUES = Object.values(APPROVAL_STATUS);
 
-/* ========================================================= */
+/* ================= HELPERS ================= */
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function normEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
-function makeId(prefix = "usr") {
-  return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
-}
+function nowIso() { return new Date().toISOString(); }
+function normEmail(email) { return String(email || "").trim().toLowerCase(); }
+function makeId(prefix = "usr") { return `${prefix}_${crypto.randomBytes(12).toString("hex")}`; }
 
 function resolveAccountType(role) {
   switch (role) {
-    case ROLES.ADMIN:
-      return "admin";
-    case ROLES.MANAGER:
-      return "manager";
+    case ROLES.ADMIN: return "admin";
+    case ROLES.MANAGER: return "manager";
     case ROLES.COMPANY:
-    case ROLES.SMALL_COMPANY:
-      return "company";
-    case ROLES.INDIVIDUAL:
-      return "single";
-    default:
-      return "seat";
+    case ROLES.SMALL_COMPANY: return "company";
+    case ROLES.INDIVIDUAL: return "single";
+    default: return "seat";
   }
 }
 
@@ -72,79 +62,15 @@ function safeUser(u) {
   return rest;
 }
 
-/* =========================================================
-   ROLE / SEAT / FREEDOM HELPERS (USED BY ROUTES)
-========================================================= */
+// Seat/Freedom Helpers
+const isSeatUser = (u) => Boolean(u?.companyId) && !Boolean(u?.freedomEnabled);
+const hasFreedom = (u) => Boolean(u?.freedomEnabled);
+const isAdmin = (u) => String(u?.role) === ROLES.ADMIN;
+const isManager = (u) => String(u?.role) === ROLES.MANAGER;
+const isCompany = (u) => String(u?.role) === ROLES.COMPANY || String(u?.role) === ROLES.SMALL_COMPANY;
+const isIndividual = (u) => String(u?.role) === ROLES.INDIVIDUAL;
 
-/**
- * Seat = user is tied to a company AND does not have freedom.
- * This matches your rule: seat requests go to company first.
- */
-function isSeatUser(u) {
-  return Boolean(u?.companyId) && !Boolean(u?.freedomEnabled);
-}
-
-/**
- * Freedom = user can act independently (direct tool request allowed).
- */
-function hasFreedom(u) {
-  return Boolean(u?.freedomEnabled);
-}
-
-function isAdmin(u) {
-  return String(u?.role) === ROLES.ADMIN;
-}
-
-function isManager(u) {
-  return String(u?.role) === ROLES.MANAGER;
-}
-
-function isCompany(u) {
-  return String(u?.role) === ROLES.COMPANY || String(u?.role) === ROLES.SMALL_COMPANY;
-}
-
-function isIndividual(u) {
-  return String(u?.role) === ROLES.INDIVIDUAL;
-}
-
-/* =========================================================
-   VALIDATION HELPERS
-========================================================= */
-
-function validateRole(role) {
-  if (!ROLE_VALUES.includes(role)) {
-    throw new Error("Invalid role");
-  }
-}
-
-function validateSubscription(status) {
-  if (!SUB_VALUES.includes(status)) {
-    throw new Error("Invalid subscription status");
-  }
-}
-
-function validateApprovalStatus(status) {
-  if (!APPROVAL_VALUES.includes(status)) {
-    throw new Error("Invalid approval status");
-  }
-}
-
-function validateCompany(companyId) {
-  if (!companyId) return;
-
-  const db = readDb();
-  const exists = (db.companies || []).some(
-    (c) => String(c.id) === String(companyId)
-  );
-
-  if (!exists) {
-    throw new Error("Invalid company reference");
-  }
-}
-
-/* =========================================================
-   CRUD
-========================================================= */
+/* ================= CRUD ================= */
 
 function listUsers() {
   const db = readDb();
@@ -162,9 +88,7 @@ function findByEmail(email) {
   return (db.users || []).find((u) => normEmail(u.email) === e) || null;
 }
 
-/* =========================================================
-   CREATE USER (NO ADMIN ESCALATION)
-========================================================= */
+/* ================= CREATE USER ================= */
 
 async function createUser({
   email,
@@ -176,18 +100,10 @@ async function createUser({
 }) {
   const e = normEmail(email);
   if (!e) throw new Error("Email required");
-  if (!password || String(password).length < 8)
-    throw new Error("Password too short");
+  if (!password || String(password).length < 8) throw new Error("Password too short");
 
-  validateRole(role);
-  validateSubscription(subscriptionStatus);
-  validateApprovalStatus(status);
-  validateCompany(companyId);
-
-  if (role === ROLES.ADMIN) {
-    throw new Error("Admin creation not allowed here");
-  }
-
+  if (role === ROLES.ADMIN) throw new Error("Admin creation not allowed here");
+  
   const exists = findByEmail(e);
   if (exists) throw new Error("Email already exists");
 
@@ -199,13 +115,10 @@ async function createUser({
     role,
     accountType: resolveAccountType(role),
     companyId,
-
     freedomEnabled: false,
     autoprotectEnabled: false,
     managedCompanies: [],
-
-    securityFlags: {},
-
+    securityFlags: { failedLogins: 0 },
     locked: subscriptionStatus === SUBSCRIPTION.LOCKED,
     subscriptionStatus,
     status,
@@ -219,135 +132,46 @@ async function createUser({
     return db;
   });
 
-  audit({
-    actor: "system",
-    role: "system",
-    action: "USER_CREATED",
-    target: user.id,
-  });
+  // RECORD IN LIVELY ANALYTICS
+  recordVisit({ type: "USER_REGISTERED", path: "/signup", source: "system", tenantId: user.id });
+
+  audit({ actor: "system", role: "system", action: "USER_CREATED", target: user.id });
 
   return safeUser(user);
 }
 
-/* =========================================================
-   PASSWORD VERIFY
-========================================================= */
+/* ================= PASSWORD VERIFY ================= */
 
 async function verifyPassword(user, password) {
   if (!user?.passwordHash) return false;
   return bcrypt.compare(String(password || ""), user.passwordHash);
 }
 
-/* =========================================================
-   MUTATION METHODS (AUDITED)
-========================================================= */
+/* ================= RENDER BOOTSTRAP (THE FIX) ================= */
 
-function setSubscriptionStatus(userId, subscriptionStatus) {
-  validateSubscription(subscriptionStatus);
-
-  updateDb((db) => {
-    const u = db.users.find((x) => String(x.id) === String(userId));
-    if (!u) return db;
-
-    u.subscriptionStatus = subscriptionStatus;
-    u.locked = subscriptionStatus === SUBSCRIPTION.LOCKED;
-    u.updatedAt = nowIso();
-
-    return db;
-  });
-
-  audit({
-    actor: "system",
-    role: "system",
-    action: "SUBSCRIPTION_STATUS_CHANGED",
-    target: userId,
-    metadata: { subscriptionStatus },
-  });
-}
-
-function setApprovalStatus(userId, status) {
-  validateApprovalStatus(status);
-
-  updateDb((db) => {
-    const u = db.users.find((x) => String(x.id) === String(userId));
-    if (!u) return db;
-
-    u.status = status;
-    u.updatedAt = nowIso();
-    return db;
-  });
-
-  audit({
-    actor: "system",
-    role: "system",
-    action: "APPROVAL_STATUS_CHANGED",
-    target: userId,
-    metadata: { status },
-  });
-}
-
-/* =========================================================
-   AUTODEV CONTROL (VALIDATED)
-========================================================= */
-
-function setFreedom(userId, enabled) {
-  updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
-    if (!u) return db;
-
-    u.freedomEnabled = !!enabled;
-    u.updatedAt = nowIso();
-    return db;
-  });
-}
-
-function setAutoProtect(userId, enabled) {
-  updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
-    if (!u) return db;
-
-    u.autoprotectEnabled = !!enabled;
-    u.updatedAt = nowIso();
-    return db;
-  });
-}
-
-function attachCompany(userId, companyId) {
-  validateCompany(companyId);
-
-  updateDb((db) => {
-    const u = db.users.find((x) => x.id === userId);
-    if (!u) return db;
-
-    if (!Array.isArray(u.managedCompanies)) {
-      u.managedCompanies = [];
-    }
-
-    if (!u.managedCompanies.includes(companyId)) {
-      u.managedCompanies.push(companyId);
-    }
-
-    u.updatedAt = nowIso();
-    return db;
-  });
-}
-
-/* =========================================================
-   ADMIN BOOTSTRAP
-========================================================= */
-
+/**
+ * This function ensures that if Render wipes your file, your 
+ * Admin account is re-created instantly from Environment Variables.
+ */
 function ensureAdminFromEnv() {
-  const email = normEmail(process.env.ADMIN_EMAIL || "");
-  const password = String(process.env.ADMIN_PASSWORD || "");
+  const email = normEmail(process.env.ADMIN_EMAIL);
+  const password = process.env.ADMIN_PASSWORD;
 
-  if (!email || !password) return;
+  if (!email || !password) {
+    console.log("⚠️ RENDER_WATCH: No ADMIN_EMAIL/PASSWORD in environment.");
+    return;
+  }
 
   updateDb((db) => {
     db.users = Array.isArray(db.users) ? db.users : [];
-
     const existing = db.users.find((u) => normEmail(u.email) === email);
-    if (existing) return db;
+    
+    if (existing) {
+      console.log("✅ RENDER_WATCH: Admin User verified.");
+      return db;
+    }
 
+    console.log("🚀 RENDER_WATCH: File reset detected. Re-building Admin account...");
     const passwordHash = bcrypt.hashSync(password, 12);
 
     db.users.push({
@@ -357,12 +181,10 @@ function ensureAdminFromEnv() {
       role: ROLES.ADMIN,
       accountType: "admin",
       companyId: null,
-
       freedomEnabled: true,
-      autoprotectEnabled: false,
+      autoprotectEnabled: true,
       managedCompanies: [],
-      securityFlags: {},
-
+      securityFlags: { failedLogins: 0 },
       locked: false,
       subscriptionStatus: SUBSCRIPTION.ACTIVE,
       status: APPROVAL_STATUS.APPROVED,
@@ -374,33 +196,22 @@ function ensureAdminFromEnv() {
   });
 }
 
-/* ========================================================= */
+/* ================= EXPORTS ================= */
 
 module.exports = {
   ROLES,
   SUBSCRIPTION,
   APPROVAL_STATUS,
-
-  // helpers (important for tool request logic)
   isSeatUser,
   hasFreedom,
   isAdmin,
   isManager,
   isCompany,
   isIndividual,
-
   listUsers,
   findById,
   findByEmail,
   createUser,
   verifyPassword,
-
-  setSubscriptionStatus,
-  setApprovalStatus,
-
-  setFreedom,
-  setAutoProtect,
-  attachCompany,
-
-  ensureAdminFromEnv,
+  ensureAdminFromEnv, // EXPORTED TO SERVER.JS
 };
