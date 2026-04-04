@@ -1,179 +1,147 @@
 // ==========================================================
-// FILE: backend/src/services/paperTrader.js
-// VERSION: v52 (EQUITY TRACKING + MEMORY GUARD + SLIPPAGE)
+// 🔒 STEALTH CORE — v53 (SMART EXECUTION & BRAIN SYNC)
+// Replacement for: backend/src/services/paperTrader.js
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
-const executionEngine = require("./executionEngine");
 
 /* ================= CONFIG ================= */
-
-const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
-const HARD_STOP_LOSS = Number(process.env.TRADE_HARD_STOP_LOSS || -0.0045);
-const SLIPPAGE_BPS = 0.0002; // 0.02% slippage for realism
-const MAX_HISTORY = 500;    // Prevent memory leaks
+const START_BAL = Number(process.env.STARTING_CAPITAL || 100000);
+const HARD_STOP_LOSS = -0.0045; // -0.45%
+const SLIPPAGE_BPS = 0.0002;    // 0.02% Real-world friction
+const MAX_HISTORY = 300;       // Leaner for Render Stability (v53 optimization)
 
 /* ================= STATE ================= */
-
 const STATES = new Map();
-
-function safeNum(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
 
 function load(id) {
   if (!STATES.has(id)) {
     STATES.set(id, {
-      cashBalance: START_BAL,
+      balance: START_BAL,
       equity: START_BAL,
       position: null,
-      trades: [],
-      decisions: [],
-      lastPriceBySymbol: {},
-      executionStats: { ticks: 0, decisions: 0, trades: 0 }
+      history: [],
+      intelligence: [], // Renamed from 'decisions'
+      stats: { ticks: 0, signals: 0, executionCount: 0 }
     });
   }
   return STATES.get(id);
 }
 
-/* ================= SNAPSHOT ================= */
+/* ================= UNIVERSAL EXECUTION ================= */
+
+function executeExit(state, symbol, price, reason) {
+  const pos = state.position;
+  if (!pos) return;
+
+  // Real-world slippage calculation
+  const exitPrice = pos.side === "LONG" 
+    ? price * (1 - SLIPPAGE_BPS) 
+    : price * (1 + SLIPPAGE_BPS);
+
+  const pnl = pos.side === "LONG"
+      ? (exitPrice - pos.entry) * pos.qty
+      : (pos.entry - exitPrice) * pos.qty;
+
+  const record = {
+    type: "EXIT",
+    side: pos.side,
+    entry: pos.entry,
+    exit: exitPrice,
+    pnl,
+    reason,
+    timestamp: Date.now()
+  };
+
+  state.balance += pnl;
+  state.position = null;
+  state.history.push(record);
+  
+  if (state.history.length > MAX_HISTORY) state.history.shift();
+  state.stats.executionCount += 1;
+  
+  console.log(`[CORE]: Trade Closed | Reason: ${reason} | PnL: ${pnl.toFixed(2)}`);
+}
+
+function executeEntry(state, symbol, action, price) {
+  if (state.position) return;
+
+  const entryPrice = action === "BUY" 
+    ? price * (1 + SLIPPAGE_BPS) 
+    : price * (1 - SLIPPAGE_BPS);
+
+  // Risk Management: Use 2% of capital per trade for sustainability
+  const riskAmount = state.balance * 0.02; 
+  const qty = riskAmount / entryPrice;
+
+  state.position = {
+    symbol,
+    side: action === "BUY" ? "LONG" : "SHORT",
+    entry: entryPrice,
+    qty,
+    stopLoss: action === "BUY" ? entryPrice * 0.995 : entryPrice * 1.005,
+    takeProfit: action === "BUY" ? entryPrice * 1.01 : entryPrice * 0.99
+  };
+
+  console.log(`[CORE]: ${action} Executed at ${entryPrice.toFixed(2)}`);
+}
+
+/* ================= TICK & SYNC ================= */
+
+function tick(id, symbol, price) {
+  const state = load(id);
+  state.stats.ticks += 1;
+
+  /* --- REAL-TIME EQUITY SYNC --- */
+  let currentUnrealized = 0;
+  if (state.position) {
+    const pos = state.position;
+    currentUnrealized = pos.side === "LONG"
+      ? (price - pos.entry) * pos.qty
+      : (pos.entry - price) * pos.qty;
+    
+    // Automatic Stop/Profit Guards
+    const pnlPct = currentUnrealized / (pos.entry * pos.qty);
+    if (pnlPct <= HARD_STOP_LOSS) return executeExit(state, symbol, price, "HARD_STOP");
+    
+    if (pos.side === "LONG" && price <= pos.stopLoss) return executeExit(state, symbol, price, "STOP_LOSS");
+    if (pos.side === "SHORT" && price >= pos.stopLoss) return executeExit(state, symbol, price, "STOP_LOSS");
+  }
+  
+  state.equity = state.balance + currentUnrealized;
+
+  /* --- INTELLIGENCE (BRAIN) CALL --- */
+  const brainOutput = makeDecision({ symbol, last: price, core: state });
+  
+  // Sync confidence to Global for the Status Page (v32.5 server link)
+  global.lastConfidence = brainOutput.confidence || 0;
+
+  state.stats.signals += 1;
+  state.intelligence.push({ ...brainOutput, ts: Date.now() });
+  if (state.intelligence.length > MAX_HISTORY) state.intelligence.shift();
+
+  /* --- STEALTH EXECUTION LOGIC --- */
+  if (!state.position && brainOutput.confidence > 25) {
+    if (brainOutput.action === "BUY" || brainOutput.action === "SELL") {
+      executeEntry(state, symbol, brainOutput.action, price);
+    }
+  }
+
+  if (state.position && brainOutput.action === "CLOSE") {
+    executeExit(state, symbol, price, "AI_SIGNAL");
+  }
+}
 
 function snapshot(id) {
   const s = load(id);
   return {
     equity: s.equity,
-    cashBalance: s.cashBalance,
+    balance: s.balance,
     position: s.position,
-    trades: s.trades,
-    decisions: s.decisions,
-    executionStats: s.executionStats
+    history: s.history,
+    intelligence: s.intelligence,
+    stats: s.stats
   };
 }
 
-/* ================= CLOSE TRADE ================= */
-
-function closeTrade({ state, symbol, price, reason }) {
-  const pos = state.position;
-  if (!pos) return;
-
-  // Apply slippage to the exit price
-  const effectiveExit = pos.side === "LONG" 
-    ? price * (1 - SLIPPAGE_BPS) 
-    : price * (1 + SLIPPAGE_BPS);
-
-  const pnl =
-    pos.side === "LONG"
-      ? (effectiveExit - pos.entry) * pos.qty
-      : (pos.entry - effectiveExit) * pos.qty;
-
-  const trade = {
-    side: "CLOSE",
-    symbol,
-    slot: pos.slot || "scalp",
-    entry: pos.entry,
-    exit: effectiveExit,
-    qty: pos.qty,
-    pnl,
-    time: Date.now(),
-    reason
-  };
-
-  state.cashBalance += pnl;
-  state.position = null;
-  state.trades.push(trade);
-  
-  // Memory Guard: keep history lean
-  if (state.trades.length > MAX_HISTORY) state.trades.shift();
-  
-  state.executionStats.trades += 1;
-}
-
-/* ================= OPEN TRADE ================= */
-
-function openTrade({ state, symbol, action, price }) {
-  if (state.position) return;
-
-  // Apply slippage to the entry price
-  const effectiveEntry = action === "BUY" 
-    ? price * (1 + SLIPPAGE_BPS) 
-    : price * (1 - SLIPPAGE_BPS);
-
-  const qty = (state.cashBalance * 0.01) / effectiveEntry;
-
-  state.position = {
-    symbol,
-    side: action === "BUY" ? "LONG" : "SHORT",
-    entry: effectiveEntry,
-    qty,
-    time: Date.now(),
-    stopLoss:
-      action === "BUY"
-        ? effectiveEntry * 0.995
-        : effectiveEntry * 1.005
-  };
-}
-
-/* ================= TICK ================= */
-
-function tick(id, symbol, price) {
-  const state = load(id);
-  const lastPrice = safeNum(state.lastPriceBySymbol[symbol], price);
-  state.lastPriceBySymbol[symbol] = price;
-  state.executionStats.ticks += 1;
-
-  const pos = state.position;
-
-  /* ================= EQUITY UPDATE ================= */
-  let unrealizedPnl = 0;
-  if (pos && pos.symbol === symbol) {
-    unrealizedPnl = pos.side === "LONG"
-      ? (price - pos.entry) * pos.qty
-      : (pos.entry - price) * pos.qty;
-  }
-  state.equity = state.cashBalance + unrealizedPnl;
-
-  /* ================= MANAGE OPEN ================= */
-  if (pos && pos.symbol === symbol) {
-    const pnlPct = unrealizedPnl / (pos.entry * pos.qty);
-
-    if (Number.isFinite(pos.stopLoss)) {
-      const stop = pos.stopLoss;
-      if (
-        (pos.side === "LONG" && (price <= stop || (lastPrice > stop && price < stop))) ||
-        (pos.side === "SHORT" && (price >= stop || (lastPrice < stop && price > stop)))
-      ) {
-        return closeTrade({ state, symbol, price, reason: "STOP_LOSS" });
-      }
-    }
-
-    if (pnlPct <= HARD_STOP_LOSS) {
-      return closeTrade({ state, symbol, price, reason: "HARD_STOP" });
-    }
-  }
-
-  /* ================= DECISION ================= */
-  const plan = makeDecision({
-    symbol,
-    last: price,
-    paper: state
-  });
-
-  state.executionStats.decisions += 1;
-  state.decisions.push({ ...plan, time: Date.now() });
-  
-  if (state.decisions.length > MAX_HISTORY) state.decisions.shift();
-
-  if (!state.position && (plan.action === "BUY" || plan.action === "SELL")) {
-    openTrade({ state, symbol, action: plan.action, price });
-  }
-
-  if (state.position && plan.action === "CLOSE") {
-    closeTrade({ state, symbol, price, reason: "AI_CLOSE" });
-  }
-}
-
-module.exports = {
-  tick,
-  snapshot
-};
+module.exports = { tick, snapshot };
