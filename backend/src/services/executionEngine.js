@@ -1,78 +1,24 @@
 // ==========================================================
+// 🔒 AUTOSHIELD CORE — v32.0 (SYNCHRONIZED & SLIPPAGE-AWARE)
 // FILE: backend/src/services/executionEngine.js
-// VERSION: v31.0 (SINGLE BRAIN — MEMORY CONNECTED)
-// MAINTENANCE SAFE — NO SPLIT BRAIN
 // ==========================================================
 
-// 🔥 ONLY BRAIN
 const memoryBrain = require("../../brainMemory/memoryBrain");
 
-/* =========================================================
-UTIL
-========================================================= */
+/* ================= HELPERS ================= */
+const safeNum = (v, f = 0) => (Number.isFinite(Number(v)) ? Number(v) : f);
+const roundMoney = (v) => Number(safeNum(v).toFixed(8));
+const roundQty = (qty) => Number(safeNum(qty).toFixed(6));
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
+/* ================= SIMULATION CONFIG ================= */
+const FEE_RATE = 0.0006; // 0.06% (Standard Binance/Bybit Fee)
+const SLIPPAGE = 0.0002; // 0.02% (Simulated market impact)
 
-function safeNum(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function roundQty(qty) {
-  return Number(safeNum(qty, 0).toFixed(6));
-}
-
-function roundMoney(v) {
-  return Number(safeNum(v, 0).toFixed(8));
-}
-
-function normalizeSlot(slot) {
-  const s = String(slot || "").toLowerCase();
-  return s === "structure" ? "structure" : "scalp";
-}
-
-/* =========================================================
-AI TIMING DEFAULTS
-========================================================= */
-
-const MIN_DURATION = 60 * 1000;
-const MAX_DURATION = 20 * 60 * 1000;
-
-/* =========================================================
-POSITION HELPERS
-========================================================= */
-
-function enrichPositionWithTiming(pos, plan = {}) {
-  const expectedDuration = clamp(
-    safeNum(plan.expectedDuration, 3 * 60 * 1000),
-    MIN_DURATION,
-    MAX_DURATION
-  );
-
-  pos.expectedDuration = expectedDuration;
-  pos.timeConfidence = clamp(safeNum(plan.timeConfidence, 0.5), 0, 1);
-  pos.exitWindow = expectedDuration * (0.6 + pos.timeConfidence * 0.6);
-}
-
-/* =========================================================
-STATE HELPERS
-========================================================= */
-
-function ensureAnalyticsState(state) {
-  if (!state.trades) state.trades = [];
-  if (!state.decisions) state.decisions = [];
-}
-
-/* =========================================================
-EXECUTION CORE
-========================================================= */
-
+/* ================= EXECUTION CORE ================= */
 function executePaperOrder({
   tenantId,
   symbol,
-  action,
+  side,       // Changed from 'action' to 'side' to match Route
   price,
   qty,
   stopLoss,
@@ -86,183 +32,96 @@ function executePaperOrder({
 }) {
   if (!state || !symbol) return null;
 
-  ensureAnalyticsState(state);
-
-  const normalizedSlot = normalizeSlot(slot);
-  const normalizedAction = String(action || "").toUpperCase();
-  const px = safeNum(price, 0);
-
+  const normalizedSide = String(side || "").toUpperCase();
+  const px = safeNum(price);
   if (px <= 0) return null;
 
-  if (!state.positions) {
-    state.positions = { structure: null, scalp: null };
-  }
+  // Ensure State structure
+  if (!state.trades) state.trades = [];
+  if (!state.decisions) state.decisions = [];
+  if (!state.positions) state.positions = { structure: null, scalp: null };
 
-  let pos = state.positions[normalizedSlot];
+  let pos = state.positions[slot] || state.positions["scalp"];
 
-  /* =========================================================
-  OPEN
-  ========================================================= */
+  /* ================= OPEN POSITION ================= */
+  if (normalizedSide === "BUY" || normalizedSide === "SELL") {
+    if (pos) return { ok: false, error: "Position already open in this slot" };
 
-  if (normalizedAction === "BUY" || normalizedAction === "SELL") {
-    if (pos) return null;
-
-    const side = normalizedAction === "BUY" ? "LONG" : "SHORT";
-
+    // Apply Slippage to Entry (Buy higher, Sell lower)
+    const slipPrice = normalizedSide === "BUY" ? px * (1 + SLIPPAGE) : px * (1 - SLIPPAGE);
+    
     const position = {
       symbol,
-      side,
-      entry: px,
+      side: normalizedSide === "BUY" ? "LONG" : "SHORT",
+      entry: roundMoney(slipPrice),
       qty: roundQty(qty || 1),
-      capitalUsed: roundMoney(px * (qty || 1)),
       time: ts,
-      stopLoss,
-      takeProfit,
-      slot: normalizedSlot,
-      bestPnl: 0,
-
-      // AI CONTEXT
-      confidence: safeNum(decisionMeta.confidence, 0),
-      pattern: decisionMeta.pattern || "unknown",
-      setup: decisionMeta.setup || "unknown",
+      stopLoss: safeNum(stopLoss, null),
+      takeProfit: safeNum(takeProfit, null),
+      slot,
+      confidence: safeNum(decisionMeta.confidence || 0.5),
+      capitalUsed: roundMoney(slipPrice * (qty || 1))
     };
 
-    enrichPositionWithTiming(position, plan);
+    state.positions[slot] = position;
+    state.position = position; // Maintain global ref for UI
 
-    state.positions[normalizedSlot] = position;
-    state.position = position;
-
-    // 🔥 STORE DECISION (UI + analytics)
-    state.decisions.push({
-      action: normalizedAction,
-      confidence: position.confidence,
-      time: ts,
-      symbol,
-    });
-
-    // 🔥 BROADCAST
+    // Broadcast
     if (global.broadcastTrade) {
-      global.broadcastTrade(
-        {
-          side: normalizedAction,
-          price: px,
-          time: ts,
-        },
-        tenantId
-      );
+      global.broadcastTrade({ side: normalizedSide, price: slipPrice, time: ts }, tenantId);
     }
 
-    return {
-      ok: true,
-      result: {
-        event: "OPEN",
-        side,
-        price: px,
-        entry: px,
-        qty: position.qty,
-        time: ts,
-      },
-    };
+    return { ok: true, result: { event: "OPEN", ...position } };
   }
 
-  /* =========================================================
-  CLOSE
-  ========================================================= */
+  /* ================= CLOSE POSITION ================= */
+  if (normalizedSide === "CLOSE") {
+    if (!pos) return { ok: false, error: "No active position to close" };
 
-  if (normalizedAction === "CLOSE") {
-    if (!pos) return null;
+    // Apply Slippage to Exit
+    const exitPrice = pos.side === "LONG" ? px * (1 - SLIPPAGE) : px * (1 + SLIPPAGE);
+    
+    // PnL Calculation including Simulated Fees
+    const grossPnl = pos.side === "LONG" 
+      ? (exitPrice - pos.entry) * pos.qty 
+      : (pos.entry - exitPrice) * pos.qty;
+    
+    const fees = (pos.entry * pos.qty * FEE_RATE) + (exitPrice * pos.qty * FEE_RATE);
+    const netPnl = roundMoney(grossPnl - fees);
 
-    const pnl =
-      pos.side === "LONG"
-        ? (px - pos.entry) * pos.qty
-        : (pos.entry - px) * pos.qty;
-
-    const duration = ts - pos.time;
-
-    /* =========================================================
-    🔥 RECORD TRADE TO MEMORY BRAIN (ONLY ONCE — SOURCE OF TRUTH)
-    ========================================================= */
-
-    try {
-      memoryBrain.recordTrade({
-        tenantId,
-        symbol: pos.symbol,
-        entry: pos.entry,
-        exit: px,
-        qty: pos.qty,
-        pnl,
-        confidence: pos.confidence || 0,
-        edge: 0,
-        volatility: 0,
-      });
-    } catch (err) {
-      console.error("Memory brain error:", err.message);
-    }
-
-    /* =========================================================
-    STORE TRADE (LOCAL STATE FOR UI)
-    ========================================================= */
-
-    state.trades.push({
+    const tradeRecord = {
       symbol: pos.symbol,
       side: pos.side,
       entry: pos.entry,
-      exit: px,
+      exit: roundMoney(exitPrice),
       qty: pos.qty,
-      pnl,
-      win: pnl > 0,
-      duration,
-      confidence: pos.confidence || 0,
+      pnl: netPnl,
+      fees: roundMoney(fees),
+      duration: ts - pos.time,
       time: ts,
-    });
+      reason
+    };
 
-    /* =========================================================
-    RESET
-    ========================================================= */
+    // Store to UI State
+    state.trades.push(tradeRecord);
+    
+    // Store to Permanent Memory
+    try {
+      memoryBrain.recordTrade({ tenantId, ...tradeRecord, confidence: pos.confidence });
+    } catch (e) { console.error("Memory Error", e); }
 
-    state.positions[normalizedSlot] = null;
-    state.position = null;
-
-    /* =========================================================
-    BROADCAST
-    ========================================================= */
+    // Clear Position
+    state.positions[slot] = null;
+    if (state.position?.slot === slot) state.position = null;
 
     if (global.broadcastTrade) {
-      global.broadcastTrade(
-        {
-          side: reason,
-          price: px,
-          time: ts,
-          pnl,
-        },
-        tenantId
-      );
+      global.broadcastTrade({ side: "CLOSE", price: exitPrice, time: ts, pnl: netPnl }, tenantId);
     }
 
-    return {
-      ok: true,
-      result: {
-        event: "CLOSE",
-        reason,
-        price: px,
-        exit: px,
-        pnl,
-        qty: pos.qty,
-        duration,
-        expectedDuration: pos.expectedDuration,
-        timeEfficiency: duration / pos.expectedDuration,
-        time: ts,
-      },
-    };
+    return { ok: true, result: { event: "CLOSE", ...tradeRecord } };
   }
 
   return null;
 }
 
-/* =========================================================
-EXPORTS
-========================================================= */
-
-module.exports = {
-  executePaperOrder,
-};
+module.exports = { executePaperOrder };
