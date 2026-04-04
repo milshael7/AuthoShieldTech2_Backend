@@ -1,19 +1,16 @@
 // ==========================================================
-// 🔒 AUTOSHIELD CORE — v8.0 (ENGINE-LINKED & PERFORMANCE-OPTIMIZED)
+// 🔒 AUTOSHIELD MARKET ENGINE — v8.1 (LIVELY & AUTO-START)
 // FILE: backend/src/services/marketEngine.js
 // ==========================================================
 
 const fs = require("fs");
 const path = require("path");
-// 🔥 THE MISSING LINK: Import the brain
 const engineCore = require("../engine/engineCore");
+const { recordVisit } = require("./analyticsEngine"); // Sync with Analytics
 
 /* ================= CONFIG ================= */
-const STATE_DIR = process.env.MARKET_STATE_DIR || path.join("/tmp", "market_engine");
-if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
-
 const SYMBOLS = {
-  BTCUSDT: { start: 65000, vol: 0.0005 }, // Reduced volatility for more realistic paper trading
+  BTCUSDT: { start: 65000, vol: 0.0005 },
   ETHUSDT: { start: 3500, vol: 0.0006 },
   SOLUSDT: { start: 150, vol: 0.0008 }
 };
@@ -39,14 +36,14 @@ function tickTenant(tenantId) {
     const next = simulate(prev, SYMBOLS[sym].vol);
 
     state.prices[sym] = next;
-    state.snapshot[sym] = { price: next };
+    state.snapshot[sym] = { price: next, symbol: sym, ts: now };
 
-    // 1. Update Candles
+    // 1. Update Candles for Charting
     updateCandle(state, sym, next, now);
 
-    // 2. 🔥 TRIGGER THE BRAIN (The missing connection)
-    // Every tick now asks the AI: "Should we buy/sell/close?"
+    // 2. 🔥 TRIGGER THE BRAIN
     try {
+      // This is the hand-in-hand connection to engineCore
       engineCore.processTick({
         tenantId,
         symbol: sym,
@@ -54,8 +51,19 @@ function tickTenant(tenantId) {
         ts: now
       });
     } catch (err) {
-      console.error(`AI Engine Error [${tenantId}]:`, err.message);
+      // Don't swallow the error silently—log it so we can fix it
+      console.error(`⚠️ AI BRAIN ERROR [${tenantId}]:`, err.message);
     }
+  }
+
+  // 3. LIVELY PULSE: Record a "Thinking" event every 20 ticks (approx 10s)
+  if (Math.random() > 0.95) {
+    recordVisit({
+      type: "AI_HEARTBEAT",
+      path: "/engine",
+      source: "marketEngine",
+      tenantId: tenantId
+    });
   }
 }
 
@@ -64,10 +72,9 @@ function updateCandle(state, symbol, price, now) {
   const arr = state.candles[symbol];
   const last = arr[arr.length - 1];
 
-  // 1 Minute Candles (60000ms)
   if (!last || now - last.t >= 60000) {
     arr.push({ t: now, o: price, h: price, l: price, c: price });
-    if (arr.length > 1000) arr.shift();
+    if (arr.length > 500) arr.shift();
   } else {
     last.h = Math.max(last.h, price);
     last.l = Math.min(last.l, price);
@@ -79,8 +86,13 @@ function updateCandle(state, symbol, price, now) {
 
 function registerTenant(tenantId) {
   const id = String(tenantId);
-  if (TENANTS.has(id)) return;
+  if (TENANTS.has(id)) {
+    console.log(`🟢 Tenant ${id} already active.`);
+    return;
+  }
 
+  console.log(`🚀 Waking up AI for Tenant: ${id}`);
+  
   TENANTS.set(id, {
     prices: {},
     snapshot: {},
@@ -88,12 +100,15 @@ function registerTenant(tenantId) {
     lastTick: Date.now()
   });
   
-  // Ensure engineCore initializes state for this tenant
-  engineCore.getState(id);
+  // Ensure engineCore is ready for this user
+  if (engineCore.getState) {
+    engineCore.getState(id);
+  }
 }
 
 function getMarketSnapshot(tenantId) {
-  return TENANTS.get(String(tenantId))?.snapshot || {};
+  const data = TENANTS.get(String(tenantId))?.snapshot;
+  return data || {};
 }
 
 function getPrice(tenantId, symbol) {
@@ -110,12 +125,17 @@ function getCandles(tenantId, symbol) {
 
 /* ================= ENGINE LOOP ================= */
 
-// Run ticks for all active tenants
+// Main loop: This is the heartbeat of the entire backend
 setInterval(() => {
+  if (TENANTS.size === 0) {
+    // If no one is logged in, the engine stays quiet to save Render CPU
+    return;
+  }
+  
   for (const tenantId of TENANTS.keys()) {
     tickTenant(tenantId);
   }
-}, 500); // 500ms is more stable for Railway environments
+}, 500); 
 
 module.exports = {
   registerTenant,
