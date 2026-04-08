@@ -1,49 +1,42 @@
 // ==========================================================
-// 🧠 STEALTH BRAIN — v26.0 (WORLD MARKET ALIGNMENT)
-// Replacement for: backend/src/services/tradeBrain.js
+// 🧠 STEALTH BRAIN — v26.1 (FAST SYNC & SCALE FIX)
+// FILE: backend/src/services/tradeBrain.js
 // ==========================================================
 
 const aiBrain = require("../../brain/aiBrain");
 const { buildDecision } = require("./strategyEngine");
 
-/* ================= CONFIG (STEALTH TUNED) ================= */
-const START_BAL = Number(process.env.STARTING_CAPITAL || 100000);
-const MIN_CONFIDENCE_TO_TRADE = 0.25; // Synced with Stealth Core v53
-const TRADE_COOLDOWN_MS = 10000;      // 10s cooldown to prevent Render flooding
-const EXPLORATION_RATE = 0.05;        // 5% Chance to "Learn" on new patterns
+/* ================= CONFIG ================= */
+const MIN_CONF_INT = 15; // 15% - Switched to Integer to match v53.1 Core
+const TRADE_COOLDOWN_MS = 5000; // Reduced to 5s for better learning speed
+const EXPLORATION_RATE = 0.08;  // Increased to 8% to force more "Learning" action
 
-/* ================= STATE ================= */
 const BRAIN_STATE = new Map();
 
 function getBrainState(id) {
   const key = String(id || "default");
   if (!BRAIN_STATE.has(key)) {
     BRAIN_STATE.set(key, {
-      smoothedConfidence: 0.3,
+      smoothedConfidence: 0.2, // Start slightly lower but more reactive
       edgeMomentum: 0,
       lastTradeTime: 0,
       priceMemory: [],
-      regime: "INITIALIZING",
-      learningAccuracy: 0.5 // Start at 50%
+      regime: "INITIALIZING"
     });
   }
   return BRAIN_STATE.get(key);
 }
 
-/* ================= MARKET REGIME (THE "FEEL") ================= */
 function detectMarketRegime(prices) {
-  if (prices.length < 20) return "OBSERVING";
-  const start = prices[prices.length - 20];
+  if (prices.length < 10) return "LEARNING"; // Faster exit from "Observing"
+  const start = prices[0];
   const end = prices[prices.length - 1];
   const move = (end - start) / start;
-
-  if (Math.abs(move) < 0.001) return "RANGE"; 
+  if (Math.abs(move) < 0.0005) return "STABLE"; 
   return move > 0 ? "BULL_RUN" : "BEAR_PRESSURE";
 }
 
-/* ================= DECISION ================= */
 function makeDecision(context = {}) {
-  // 🔄 SYNC NOTE: 'paper' is now 'core' in v53 Stealth Core
   const { tenantId, symbol = "BTCUSDT", last, core = {} } = context;
   const brain = getBrainState(tenantId);
   const price = Number(last);
@@ -51,52 +44,45 @@ function makeDecision(context = {}) {
 
   if (!price || price <= 0) return { action: "WAIT", confidence: 0 };
 
-  // Update Price Memory
   brain.priceMemory.push(price);
   if (brain.priceMemory.length > 50) brain.priceMemory.shift();
   brain.regime = detectMarketRegime(brain.priceMemory);
 
-  // 🏛️ Strategy Layer
-  let strategy = {};
+  // 🏛️ Strategy & AI Fusion
+  let strategy = { action: "WAIT", confidence: 0.1, edge: 0 };
+  let ai = { confidence: 0.1, edge: 0 };
+
   try {
-    strategy = buildDecision({
-      tenantId,
-      symbol,
-      price,
-      volatility: core.stats?.volatility || 0,
-      coreState: core, // Updated name
-    }) || {};
-  } catch (e) { strategy = { action: "WAIT", confidence: 0.1 }; }
+    strategy = buildDecision({ tenantId, symbol, price, coreState: core }) || strategy;
+  } catch (e) { /* Silent fail */ }
 
-  // 🤖 AI Overlay (The Learning Feed)
-  let ai = { confidence: 0, edge: 0 };
   try {
-    ai = aiBrain.decide({ tenantId, symbol, last, core }) || {};
-  } catch (e) {}
+    ai = aiBrain.decide({ tenantId, symbol, last, core }) || ai;
+  } catch (e) { /* Silent fail */ }
 
-  // 🧪 Weighted Fusion (Confidence & Edge)
-  let rawConf = (strategy.confidence || 0.5) * 0.7 + (ai.confidence || 0) * 0.3;
-  let rawEdge = (strategy.edge || 0) * 0.7 + (ai.edge || 0) * 0.3;
+  // 🧪 Vercel-Ready Fusion (Shifted to 50/50 for faster reaction)
+  let rawConf = (strategy.confidence || 0) * 0.5 + (ai.confidence || 0) * 0.5;
+  let rawEdge = (strategy.edge || 0) * 0.5 + (ai.edge || 0) * 0.5;
 
-  // 📉 Smoothing (Confidence Decay)
-  brain.smoothedConfidence = (brain.smoothedConfidence * 0.6) + (rawConf * 0.4);
-  const finalConfidence = Math.round(brain.smoothedConfidence * 100); // 0-100 scale
+  // 📉 Fast-Attack Smoothing (30% Old / 70% New)
+  // This makes the UI needle jump much faster when price moves
+  brain.smoothedConfidence = (brain.smoothedConfidence * 0.3) + (rawConf * 0.7);
+  const finalConfidence = Math.min(Math.round(brain.smoothedConfidence * 100), 100);
 
-  // 🛡️ Execution Logic
   let action = strategy.action || "WAIT";
 
-  // Exploration Mode: If the AI is "Curious," it takes a small Ghost Trade
-  if (action === "WAIT" && Math.random() < EXPLORATION_RATE && finalConfidence > 15) {
+  // Exploration Mode (Force activity if market is moving but strategy is hesitant)
+  if (action === "WAIT" && Math.random() < EXPLORATION_RATE && finalConfidence > 10) {
     action = rawEdge > 0 ? "BUY" : "SELL";
-    console.log(`[BRAIN]: Exploration Trade Triggered | Conf: ${finalConfidence}%`);
   }
 
-  // Cooldown & Threshold Check
+  // 🛡️ Guard Rails
   if (now - brain.lastTradeTime < TRADE_COOLDOWN_MS) {
     if (action === "BUY" || action === "SELL") action = "WAIT";
   }
 
-  if ((action === "BUY" || action === "SELL") && finalConfidence < (MIN_CONFIDENCE_TO_TRADE * 100)) {
+  // FIXED SCALE: Comparing Integer vs Integer (e.g., 20 > 15)
+  if ((action === "BUY" || action === "SELL") && finalConfidence < MIN_CONF_INT) {
     action = "WAIT";
   }
 
@@ -105,10 +91,10 @@ function makeDecision(context = {}) {
   return {
     symbol,
     action,
-    confidence: finalConfidence, // 0-100 for your phone display
+    confidence: finalConfidence, 
     edge: rawEdge,
     regime: brain.regime,
-    reason: action === "WAIT" ? "OBSERVING_MARKET" : "STEALTH_ENTRY",
+    reason: action === "WAIT" ? "MARKET_SCAN" : "ALGO_CONFIRMED",
     ts: now
   };
 }
