@@ -1,6 +1,6 @@
 // ==========================================================
-// 🔒 STEALTH CORE — v53 (SMART EXECUTION & BRAIN SYNC)
-// Replacement for: backend/src/services/paperTrader.js
+// 🔒 STEALTH CORE — v53.1 (BROADCAST-STABILIZED)
+// FILE: backend/src/services/paperTrader.js
 // ==========================================================
 
 const { makeDecision } = require("./tradeBrain");
@@ -9,7 +9,7 @@ const { makeDecision } = require("./tradeBrain");
 const START_BAL = Number(process.env.STARTING_CAPITAL || 100000);
 const HARD_STOP_LOSS = -0.0045; // -0.45%
 const SLIPPAGE_BPS = 0.0002;    // 0.02% Real-world friction
-const MAX_HISTORY = 300;       // Leaner for Render Stability (v53 optimization)
+const MAX_HISTORY = 300;        
 
 /* ================= STATE ================= */
 const STATES = new Map();
@@ -21,7 +21,7 @@ function load(id) {
       equity: START_BAL,
       position: null,
       history: [],
-      intelligence: [], // Renamed from 'decisions'
+      intelligence: [], 
       stats: { ticks: 0, signals: 0, executionCount: 0 }
     });
   }
@@ -34,7 +34,6 @@ function executeExit(state, symbol, price, reason) {
   const pos = state.position;
   if (!pos) return;
 
-  // Real-world slippage calculation
   const exitPrice = pos.side === "LONG" 
     ? price * (1 - SLIPPAGE_BPS) 
     : price * (1 + SLIPPAGE_BPS);
@@ -60,7 +59,7 @@ function executeExit(state, symbol, price, reason) {
   if (state.history.length > MAX_HISTORY) state.history.shift();
   state.stats.executionCount += 1;
   
-  console.log(`[CORE]: Trade Closed | Reason: ${reason} | PnL: ${pnl.toFixed(2)}`);
+  console.log(`[CORE]: 🛑 Trade Closed | Reason: ${reason} | PnL: ${pnl.toFixed(2)}`);
 }
 
 function executeEntry(state, symbol, action, price) {
@@ -70,7 +69,6 @@ function executeEntry(state, symbol, action, price) {
     ? price * (1 + SLIPPAGE_BPS) 
     : price * (1 - SLIPPAGE_BPS);
 
-  // Risk Management: Use 2% of capital per trade for sustainability
   const riskAmount = state.balance * 0.02; 
   const qty = riskAmount / entryPrice;
 
@@ -83,10 +81,10 @@ function executeEntry(state, symbol, action, price) {
     takeProfit: action === "BUY" ? entryPrice * 1.01 : entryPrice * 0.99
   };
 
-  console.log(`[CORE]: ${action} Executed at ${entryPrice.toFixed(2)}`);
+  console.log(`[CORE]: 🚀 ${action} Executed at ${entryPrice.toFixed(2)}`);
 }
 
-/* ================= TICK & SYNC ================= */
+/* ================= TICK & SYNC — v53.1 ================= */
 
 function tick(id, symbol, price) {
   const state = load(id);
@@ -100,7 +98,6 @@ function tick(id, symbol, price) {
       ? (price - pos.entry) * pos.qty
       : (pos.entry - price) * pos.qty;
     
-    // Automatic Stop/Profit Guards
     const pnlPct = currentUnrealized / (pos.entry * pos.qty);
     if (pnlPct <= HARD_STOP_LOSS) return executeExit(state, symbol, price, "HARD_STOP");
     
@@ -113,21 +110,28 @@ function tick(id, symbol, price) {
   /* --- INTELLIGENCE (BRAIN) CALL --- */
   const brainOutput = makeDecision({ symbol, last: price, core: state });
   
-  // Sync confidence to Global for the Status Page (v32.5 server link)
-  global.lastConfidence = brainOutput.confidence || 0;
+  // ⚡ SYNC: Force-updating the global confidence for the Frontend Dashboard
+  const currentConf = brainOutput.confidence || 0;
+  global.lastConfidence = currentConf; 
+
+  // 📡 HEARTBEAT: Logs every 20 ticks so you can see it's alive in Railway/Render
+  if (state.stats.ticks % 20 === 0) {
+     console.log(`[ENGINE]: Pulse Check | Ticks: ${state.stats.ticks} | Confidence: ${currentConf}%`);
+  }
 
   state.stats.signals += 1;
   state.intelligence.push({ ...brainOutput, ts: Date.now() });
   if (state.intelligence.length > MAX_HISTORY) state.intelligence.shift();
 
   /* --- STEALTH EXECUTION LOGIC --- */
-  if (!state.position && brainOutput.confidence > 25) {
+  // v53.1: Threshold lowered to 15 to help the needle move during the "Learning" phase
+  if (!state.position && currentConf > 15) {
     if (brainOutput.action === "BUY" || brainOutput.action === "SELL") {
       executeEntry(state, symbol, brainOutput.action, price);
     }
   }
 
-  if (state.position && brainOutput.action === "CLOSE") {
+  if (state.position && (brainOutput.action === "CLOSE" || currentConf < 5)) {
     executeExit(state, symbol, price, "AI_SIGNAL");
   }
 }
