@@ -1,12 +1,11 @@
 // ==========================================================
-// 🧠 ENGINE CORE — v15.0 (LOGIC ONLY / NO WEB CONFLICTS)
+// 🧠 ENGINE CORE — v15.1 (STABLE TRANSLATION & HEARTBEAT)
 // FILE: backend/src/engine/engineCore.js
 // ==========================================================
 
-const stealthCore = require("../services/paperTrader"); // Sync with v53
-const tradeBrain = require("../services/tradeBrain");   // Sync with v26
+const stealthCore = require("../services/paperTrader"); // Sync with v53.1
+const tradeBrain = require("../services/tradeBrain");   // Sync with v26.1
 
-// 🔒 INTERNAL STATE (Private to the Engine)
 const ENGINE_STATE = {
   bootTime: Date.now(),
   lastAction: "IDLE",
@@ -15,19 +14,19 @@ const ENGINE_STATE = {
 
 /**
  * ⚡ PROCESS TICK
- * This is called by marketEngine.js (v9.0)
+ * Routes data from marketEngine to StealthCore
  */
 function processTick({ tenantId, symbol, price, ts }) {
   ENGINE_STATE.totalProcessed++;
   
-  // Hand off to the Stealth Core for execution & brain logic
-  // This is the heartbeat of the v53 system
+  // Hand off to the Stealth Core (v53.1)
+  // This now updates global.lastConfidence automatically
   return stealthCore.tick(tenantId, symbol, price);
 }
 
 /**
  * 📊 GET LEARNING STATS
- * This is called by server.js (v32.5) for your "Happy Person" dashboard
+ * Formats data for the "Render Status: STABLE" Dashboard
  */
 function getLearningStats(tenantId = "default") {
   const snapshot = stealthCore.snapshot(tenantId);
@@ -38,23 +37,23 @@ function getLearningStats(tenantId = "default") {
   const wins = history.filter(t => t.pnl > 0).length;
   const total = history.length;
   
+  // v15.1 Fix: Ensure we don't return "NaN" or "Infinity" if history is wiped
   const accuracyPct = total > 0 
     ? ((wins / total) * 100).toFixed(1) + "%" 
-    : "CALIBRATING...";
+    : "LEARNING...";
 
   return {
     accuracy: accuracyPct,
     trades: total,
+    // Pulling the forced global from PaperTrader v53.1
     confidence: global.lastConfidence || 0,
     regime: brain.regime || "OBSERVING",
+    // Stats for the "Brain" pulse
+    signals: snapshot.stats?.signals || 0,
     uptime: Math.floor((Date.now() - ENGINE_STATE.bootTime) / 60000) + "m"
   };
 }
 
-/**
- * 🚜 GET STATE
- * Used by routes to fetch the full snapshot
- */
 function getState(tenantId) {
   return stealthCore.snapshot(tenantId);
 }
