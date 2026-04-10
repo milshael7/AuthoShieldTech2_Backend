@@ -1,9 +1,9 @@
 // ==========================================================
-// 🔒 STEALTH PULSE — v9.1 (AUTO-IGNITION & SYNC)
+// 🔒 STEALTH PULSE — v9.2 (BRIDGE-COMPLIANT)
 // FILE: backend/src/services/marketEngine.js
 // ==========================================================
 
-const stealthCore = require("./paperTrader"); // Sync with v53.1
+const stealthCore = require("./paperTrader"); 
 const { recordVisit } = require("./analyticsEngine");
 
 /* ================= CONFIG ================= */
@@ -17,8 +17,6 @@ const TENANTS = new Map();
 
 /* ================= SIMULATION ================= */
 function simulate(price, vol) {
-  // Drift adjusted to 0.49 to ensure the AI sees a slight upward bias 
-  // helping it find "Confidence" faster during the learning phase.
   const drift = (Math.random() - 0.49) * 0.0001; 
   const change = price * (vol * (Math.random() - 0.5) + drift);
   return Number((price + change).toFixed(2));
@@ -41,16 +39,13 @@ function tickTenant(tenantId) {
 
     updateCandle(state, sym, next, now);
 
-    // 🔥 SYNCED TO STEALTH CORE v53.1
     try {
-      // This is the CRITICAL line that feeds the AI Brain
       stealthCore.tick(tenantId, sym, next);
     } catch (err) {
-      // Silent recovery to prevent loop crash
+      // Silent recovery
     }
   }
 
-  // 🛰️ RENDER HEARTBEAT: Log every 60 ticks (~1 min) to keep the instance warm
   if (state.ticks % 60 === 0) {
     console.log(`[PULSE]: Active Learning | ID: ${tenantId} | Confidence: ${global.lastConfidence}%`);
   }
@@ -72,7 +67,7 @@ function updateCandle(state, symbol, price, now) {
   }
 }
 
-/* ================= LIFECYCLE ================= */
+/* ================= LIFECYCLE & HELPERS ================= */
 
 function registerTenant(tenantId) {
   const id = String(tenantId || "default");
@@ -91,12 +86,11 @@ function registerTenant(tenantId) {
   stealthCore.snapshot(id);
 }
 
-// v9.1: Auto-register the default tenant so the engine NEVER idles
+// v9.2: Auto-register default
 registerTenant("default");
 
 function getMarketSnapshot(tenantId) {
   const id = String(tenantId || "default");
-  // If a request comes in for a tenant we don't have, start it immediately
   if (!TENANTS.has(id)) registerTenant(id);
   return TENANTS.get(id)?.snapshot || {};
 }
@@ -108,6 +102,16 @@ function getCandles(tenantId, symbol) {
     time: Math.floor(c.t / 1000),
     open: c.o, high: c.h, low: c.l, close: c.c
   }));
+}
+
+/**
+ * 🛰️ STEP 2 FIX: Added getPrice helper
+ * This ensures paper.routes.js can execute manual orders without crashing.
+ */
+function getPrice(tenantId, symbol) {
+  const id = String(tenantId || "default");
+  if (!TENANTS.has(id)) registerTenant(id);
+  return TENANTS.get(id)?.prices?.[symbol] || 0;
 }
 
 /* ================= ENGINE LOOP ================= */
@@ -122,5 +126,6 @@ setInterval(() => {
 module.exports = {
   registerTenant,
   getMarketSnapshot,
-  getCandles
+  getCandles,
+  getPrice // <--- Exported for v13.0 Routes & v14.0 Server
 };
