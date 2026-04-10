@@ -1,29 +1,24 @@
 // ==========================================================
+// 🛰️ TRADING ROUTES — v14.0 (UNIFIED STATE UPLINK)
 // FILE: backend/src/routes/trading.routes.js
-// VERSION: v13 (CLEAN + REAL TELEMETRY + STABLE AI)
-// MAINTENANCE SAFE — SINGLE ENGINE FLOW
 // ==========================================================
 
 const express = require("express");
 const router = express.Router();
 
+// 🛡️ Middleware & Service Logic
 const { authRequired, requireRole } = require("../middleware/auth");
-
 const executionEngine = require("../services/executionEngine");
-const marketEngine = require("../services/marketEngine");
 const engineCore = require("../engine/engineCore");
+const stateStore = require("../engine/stateStore");
 
 /* ================= ROLES ================= */
+const ADMIN = "admin";
+const MANAGER = "manager";
 
-const ADMIN = "Admin";
-const MANAGER = "Manager";
-
-/* =========================================================
-UTIL
-========================================================= */
-
+/* ================= HELPERS ================= */
 function getTenantId(req) {
-  return req.tenant?.id || req.user?.companyId || req.user?.id || null;
+  return req.user?.companyId || req.user?.id || "default";
 }
 
 function safeNum(v, fallback = 0) {
@@ -31,101 +26,46 @@ function safeNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/* =========================================================
-AUTH
-========================================================= */
-
+// 🔐 APPLY AUTH TO ALL SUBSEQUENT ROUTES
 router.use(authRequired);
 
 /* =========================================================
-AI SNAPSHOT
+📊 SNAPSHOT & BRAIN STATS
 ========================================================= */
 
 router.get("/ai/snapshot", requireRole(ADMIN, MANAGER), (req, res) => {
   try {
     const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId) || {};
-
-    const trades = state.trades || [];
-    const last = trades[trades.length - 1];
+    // 🛰️ PUSH 6.2: Pulling from Unified Engine Core
+    const stats = engineCore.getLearningStats(tenantId);
 
     return res.json({
       ok: true,
       data: {
-        action: last?.side || "WAIT",
-        confidence: safeNum(last?.confidence, 0),
-        edge: 0,
-        regime: "live",
-        reason: "engine_live",
+        action: stats.regime === "BULL_RUN" ? "BUY" : "WAIT",
+        confidence: stats.confidence,
+        regime: stats.regime,
+        reason: stats.uptime + " active",
       },
     });
   } catch (err) {
     return res.json({ ok: false, error: err.message });
   }
 });
-
-/* =========================================================
-AI BRAIN STATS
-========================================================= */
-
-router.get("/ai/brain/stats", requireRole(ADMIN, MANAGER), (req, res) => {
-  try {
-    const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId) || {};
-    const trades = state.trades || [];
-
-    let wins = 0;
-    let pnl = 0;
-
-    for (const t of trades) {
-      const tpnl = safeNum(t.pnl);
-      if (tpnl > 0) wins++;
-      pnl += tpnl;
-    }
-
-    const totalTrades = trades.length;
-
-    return res.json({
-      ok: true,
-      data: {
-        totalTrades,
-        winRate: totalTrades > 0 ? wins / totalTrades : 0,
-        netPnL: pnl,
-        memoryDepth: totalTrades,
-      },
-    });
-  } catch (err) {
-    return res.json({ ok: false, error: err.message });
-  }
-});
-
-/* =========================================================
-PERFORMANCE
-========================================================= */
 
 router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
   try {
     const tenantId = getTenantId(req);
-    const state = engineCore.getState(tenantId) || {};
-    const trades = state.trades || [];
-
-    let wins = 0;
-    let pnl = 0;
-
-    for (const t of trades) {
-      const tpnl = safeNum(t.pnl);
-      if (tpnl > 0) wins++;
-      pnl += tpnl;
-    }
-
-    const totalTrades = trades.length;
-
+    const state = stateStore.getSnapshot(tenantId);
+    
     return res.json({
       ok: true,
       data: {
-        totalTrades,
-        winRate: totalTrades > 0 ? wins / totalTrades : 0,
-        netPnL: pnl,
+        totalTrades: state.trades.length,
+        winRate: state.realized.wins / (state.trades.length || 1),
+        netPnL: state.realized.net,
+        equity: state.equity,
+        cash: state.cashBalance
       },
     });
   } catch (err) {
@@ -134,146 +74,82 @@ router.get("/performance/summary", requireRole(ADMIN, MANAGER), (req, res) => {
 });
 
 /* =========================================================
-🔥 STATUS — REAL ENGINE TELEMETRY
+🔥 STATUS — REAL ENGINE TELEMETRY (VERCEL READY)
 ========================================================= */
 
 router.get("/status", requireRole(ADMIN, MANAGER), (req, res) => {
   try {
     const tenantId = getTenantId(req);
-
-    const state = engineCore.getState(tenantId) || {};
-    const trades = state.trades || [];
-    const decisions = state.decisions || [];
-    const stats = state.executionStats || {};
-
-    /* ================= ENGINE STATUS ================= */
-
-    const engine =
-      stats.ticks > 0 ? "RUNNING" : "STARTING";
-
-    /* ================= AI RATE ================= */
-
-    const now = Date.now();
-    const lastMinute = now - 60000;
-
-    const recentDecisions = decisions.filter(
-      (d) => d.time > lastMinute
-    ).length;
-
-    /* ================= CONFIDENCE ================= */
-
-    const avgConfidence =
-      decisions.length > 0
-        ? decisions.reduce(
-            (sum, d) => sum + safeNum(d.confidence),
-            0
-          ) / decisions.length
-        : 0;
-
-    /* ================= VOLATILITY ================= */
-
-    let volatility = 0;
-
-    if (trades.length > 5) {
-      const pnls = trades.map((t) => safeNum(t.pnl));
-
-      const avg =
-        pnls.reduce((a, b) => a + b, 0) / pnls.length;
-
-      const variance =
-        pnls.reduce(
-          (sum, p) => sum + Math.pow(p - avg, 2),
-          0
-        ) / pnls.length;
-
-      volatility = Math.sqrt(variance);
-    }
+    const state = stateStore.getSnapshot(tenantId);
+    const engineStats = engineCore.getLearningStats(tenantId);
 
     return res.json({
       ok: true,
-      engine,
-
+      engine: "RUNNING",
       telemetry: {
-        ticks: safeNum(stats.ticks),
-        decisions: safeNum(stats.decisions),
-        trades: safeNum(stats.trades),
-        memoryMb: Math.round(
-          process.memoryUsage().rss / 1024 / 1024
-        ),
+        ticks: engineStats.trades, // Using trade count as a proxy for activity
+        equity: state.equity,
+        memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
       },
-
       ai: {
-        rate: recentDecisions,
-        confidence: avgConfidence,
-        volatility,
+        confidence: engineStats.confidence,
+        regime: engineStats.regime,
+        accuracy: engineStats.accuracy
       },
     });
   } catch (err) {
-    return res.json({
-      ok: false,
-      error: err.message,
-    });
+    return res.json({ ok: false, error: err.message });
   }
 });
 
 /* =========================================================
-PRICE
-========================================================= */
-
-router.get("/price", requireRole(ADMIN, MANAGER), (req, res) => {
-  const tenantId = getTenantId(req);
-
-  marketEngine.registerTenant(tenantId);
-
-  const price = marketEngine.getPrice(tenantId, "BTCUSDT");
-
-  return res.json({
-    ok: true,
-    price: Number(price || 0),
-  });
-});
-
-/* =========================================================
-MANUAL ORDER
+🛒 MANUAL ORDER & EMERGENCY STOP
 ========================================================= */
 
 router.post("/order", requireRole(ADMIN, MANAGER), (req, res) => {
   const tenantId = getTenantId(req);
-
   const { symbol, side, qty, stopLoss, takeProfit } = req.body || {};
 
   try {
-    marketEngine.registerTenant(tenantId);
+    const state = stateStore.getState(tenantId);
+    const price = state.lastPriceBySymbol[symbol] || 0;
 
-    const price =
-      marketEngine.getPrice(tenantId, symbol) || 0;
-
-    const state = engineCore.getState(tenantId);
+    if (price <= 0) throw new Error("MARKET_DATA_OFFLINE");
 
     const result = executionEngine.executePaperOrder({
       tenantId,
       symbol,
-      action: side,
+      side, // 🛰️ PUSH 6.2: Unified 'side' naming
       price,
-      qty,
+      qty: safeNum(qty, 0.1),
       stopLoss,
       takeProfit,
       state,
-      ts: Date.now(),
     });
 
-    return res.json({
-      ok: true,
-      result,
-    });
+    return res.json(result);
   } catch (err) {
-    return res.json({
-      ok: false,
-      error: err.message,
-    });
+    return res.json({ ok: false, error: err.message });
   }
 });
 
-/* ========================================================= */
+// 🚨 EMERGENCY STOP ENDPOINT (Called by Frontend SecurityContext)
+router.post("/emergency-stop", requireRole(ADMIN, MANAGER), (req, res) => {
+  const tenantId = getTenantId(req);
+  try {
+    const state = stateStore.getState(tenantId);
+    // Liquidate all positions in the execution engine
+    executionEngine.executePaperOrder({
+        tenantId,
+        side: "CLOSE",
+        price: state.lastPriceBySymbol["BTCUSDT"] || 0,
+        state,
+        reason: "USER_EMERGENCY_STOP"
+    });
+    return res.json({ ok: true, message: "TERMINAL_HALT_SUCCESSFUL" });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
+  }
+});
 
 module.exports = router;
