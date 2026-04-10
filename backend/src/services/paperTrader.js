@@ -1,5 +1,5 @@
 // ==========================================================
-// 🔒 STEALTH CORE — v53.1 (BROADCAST-STABILIZED)
+// 🔒 STEALTH CORE — v53.2 (PRODUCTION HARDENED)
 // FILE: backend/src/services/paperTrader.js
 // ==========================================================
 
@@ -84,7 +84,7 @@ function executeEntry(state, symbol, action, price) {
   console.log(`[CORE]: 🚀 ${action} Executed at ${entryPrice.toFixed(2)}`);
 }
 
-/* ================= TICK & SYNC — v53.1 ================= */
+/* ================= TICK & SYNC — v53.2 ================= */
 
 function tick(id, symbol, price) {
   const state = load(id);
@@ -114,7 +114,7 @@ function tick(id, symbol, price) {
   const currentConf = brainOutput.confidence || 0;
   global.lastConfidence = currentConf; 
 
-  // 📡 HEARTBEAT: Logs every 20 ticks so you can see it's alive in Railway/Render
+  // 📡 HEARTBEAT: Logs every 20 ticks
   if (state.stats.ticks % 20 === 0) {
      console.log(`[ENGINE]: Pulse Check | Ticks: ${state.stats.ticks} | Confidence: ${currentConf}%`);
   }
@@ -124,7 +124,6 @@ function tick(id, symbol, price) {
   if (state.intelligence.length > MAX_HISTORY) state.intelligence.shift();
 
   /* --- STEALTH EXECUTION LOGIC --- */
-  // v53.1: Threshold lowered to 15 to help the needle move during the "Learning" phase
   if (!state.position && currentConf > 15) {
     if (brainOutput.action === "BUY" || brainOutput.action === "SELL") {
       executeEntry(state, symbol, brainOutput.action, price);
@@ -133,6 +132,23 @@ function tick(id, symbol, price) {
 
   if (state.position && (brainOutput.action === "CLOSE" || currentConf < 5)) {
     executeExit(state, symbol, price, "AI_SIGNAL");
+  }
+}
+
+/**
+ * 🚨 PUSH 5.2.1: EMERGENCY TERMINATION
+ * Clears all positions immediately without AI intervention.
+ */
+function emergencyStop(id) {
+  const state = load(id);
+  if (state.position) {
+    console.warn(`[CORE]: ⚠️ EMERGENCY_STOP_SIGNAL_RECEIVED for ${id}`);
+    state.position = null; // Instant drop to prevent further losses
+    state.history.push({
+      type: "EMERGENCY_EXIT",
+      timestamp: Date.now(),
+      reason: "SECURITY_BREACH_PROTOCOL"
+    });
   }
 }
 
@@ -148,4 +164,8 @@ function snapshot(id) {
   };
 }
 
-module.exports = { tick, snapshot };
+module.exports = { 
+  tick, 
+  snapshot, 
+  emergencyStop 
+};
