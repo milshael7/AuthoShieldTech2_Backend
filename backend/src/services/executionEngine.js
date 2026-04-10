@@ -1,9 +1,15 @@
 // ==========================================================
-// 🔒 AUTOSHIELD CORE — v32.0 (SYNCHRONIZED & SLIPPAGE-AWARE)
+// 🔒 AUTOSHIELD CORE — v32.1 (SLIPPAGE & FEE ANALYTICS)
 // FILE: backend/src/services/executionEngine.js
 // ==========================================================
 
-const memoryBrain = require("../../brainMemory/memoryBrain");
+// 🛰️ PUSH 5.4: Safe import for persistent memory
+let memoryBrain = { recordTrade: () => {} };
+try {
+  memoryBrain = require("../../brainMemory/memoryBrain");
+} catch (e) {
+  console.warn("[EXEC_ENGINE]: brainMemory module not found, trades will persist in local state only.");
+}
 
 /* ================= HELPERS ================= */
 const safeNum = (v, f = 0) => (Number.isFinite(Number(v)) ? Number(v) : f);
@@ -11,14 +17,14 @@ const roundMoney = (v) => Number(safeNum(v).toFixed(8));
 const roundQty = (qty) => Number(safeNum(qty).toFixed(6));
 
 /* ================= SIMULATION CONFIG ================= */
-const FEE_RATE = 0.0006; // 0.06% (Standard Binance/Bybit Fee)
-const SLIPPAGE = 0.0002; // 0.02% (Simulated market impact)
+const FEE_RATE = 0.0006; // 0.06% Simulated exchange fee
+const SLIPPAGE = 0.0002; // 0.02% Simulated market impact
 
 /* ================= EXECUTION CORE ================= */
 function executePaperOrder({
   tenantId,
   symbol,
-  side,       // Changed from 'action' to 'side' to match Route
+  side,       
   price,
   qty,
   stopLoss,
@@ -26,28 +32,27 @@ function executePaperOrder({
   slot = "scalp",
   state,
   ts = Date.now(),
-  plan = {},
   decisionMeta = {},
   reason = "SIGNAL",
 }) {
-  if (!state || !symbol) return null;
+  if (!state || !symbol) return { ok: false, error: "MISSING_STATE_OR_SYMBOL" };
 
   const normalizedSide = String(side || "").toUpperCase();
   const px = safeNum(price);
-  if (px <= 0) return null;
+  if (px <= 0) return { ok: false, error: "INVALID_PRICE" };
 
-  // Ensure State structure
+  // 🛰️ PUSH 5.4: Hardening State structure for clean UI sync
   if (!state.trades) state.trades = [];
   if (!state.decisions) state.decisions = [];
-  if (!state.positions) state.positions = { structure: null, scalp: null };
+  if (!state.positions) state.positions = { scalp: null, swing: null };
 
-  let pos = state.positions[slot] || state.positions["scalp"];
+  let pos = state.positions[slot];
 
   /* ================= OPEN POSITION ================= */
   if (normalizedSide === "BUY" || normalizedSide === "SELL") {
-    if (pos) return { ok: false, error: "Position already open in this slot" };
+    if (pos) return { ok: false, error: "SLOT_OCCUPIED" };
 
-    // Apply Slippage to Entry (Buy higher, Sell lower)
+    // ENTRY SLIPPAGE: Buy slightly higher, Sell slightly lower
     const slipPrice = normalizedSide === "BUY" ? px * (1 + SLIPPAGE) : px * (1 - SLIPPAGE);
     
     const position = {
@@ -64,24 +69,31 @@ function executePaperOrder({
     };
 
     state.positions[slot] = position;
-    state.position = position; // Maintain global ref for UI
+    state.position = position; // UI Global reference
 
-    // Broadcast
+    // 📡 Broadcaster Hook (Used by Socket Controller)
     if (global.broadcastTrade) {
-      global.broadcastTrade({ side: normalizedSide, price: slipPrice, time: ts }, tenantId);
+      global.broadcastTrade({ 
+        event: "ENTRY", 
+        side: normalizedSide, 
+        price: slipPrice, 
+        time: ts,
+        slot 
+      }, tenantId);
     }
 
+    console.log(`[EXEC]: 🛰️ Node Initialized | ${normalizedSide} at ${slipPrice.toFixed(2)}`);
     return { ok: true, result: { event: "OPEN", ...position } };
   }
 
   /* ================= CLOSE POSITION ================= */
   if (normalizedSide === "CLOSE") {
-    if (!pos) return { ok: false, error: "No active position to close" };
+    if (!pos) return { ok: false, error: "NO_ACTIVE_POSITION" };
 
-    // Apply Slippage to Exit
+    // EXIT SLIPPAGE: Sell slightly lower, Buy back slightly higher
     const exitPrice = pos.side === "LONG" ? px * (1 - SLIPPAGE) : px * (1 + SLIPPAGE);
     
-    // PnL Calculation including Simulated Fees
+    // MATH: Gross PnL - (Entry Fee + Exit Fee)
     const grossPnl = pos.side === "LONG" 
       ? (exitPrice - pos.entry) * pos.qty 
       : (pos.entry - exitPrice) * pos.qty;
@@ -97,31 +109,37 @@ function executePaperOrder({
       qty: pos.qty,
       pnl: netPnl,
       fees: roundMoney(fees),
-      duration: ts - pos.time,
+      duration: Math.floor((ts - pos.time) / 1000) + "s",
       time: ts,
       reason
     };
 
-    // Store to UI State
     state.trades.push(tradeRecord);
+    if (state.trades.length > 100) state.trades.shift(); // Memory management
     
-    // Store to Permanent Memory
+    // PERSISTENCE
     try {
       memoryBrain.recordTrade({ tenantId, ...tradeRecord, confidence: pos.confidence });
-    } catch (e) { console.error("Memory Error", e); }
+    } catch (e) { /* silent fail */ }
 
-    // Clear Position
+    // CLEANUP
     state.positions[slot] = null;
     if (state.position?.slot === slot) state.position = null;
 
     if (global.broadcastTrade) {
-      global.broadcastTrade({ side: "CLOSE", price: exitPrice, time: ts, pnl: netPnl }, tenantId);
+      global.broadcastTrade({ 
+        event: "EXIT", 
+        price: exitPrice, 
+        pnl: netPnl, 
+        reason 
+      }, tenantId);
     }
 
+    console.log(`[EXEC]: 🛑 Liquidated | PnL: ${netPnl > 0 ? '+' : ''}${netPnl.toFixed(2)} | Reason: ${reason}`);
     return { ok: true, result: { event: "CLOSE", ...tradeRecord } };
   }
 
-  return null;
+  return { ok: false, error: "UNSUPPORTED_ACTION" };
 }
 
 module.exports = { executePaperOrder };
